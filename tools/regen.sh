@@ -4,8 +4,8 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 selection=${1:-all}
 case "$selection" in
-    main|ovl00|all) ;;
-    *) echo 'Usage: tools/regen.sh [main|ovl00|all]' >&2; exit 2 ;;
+    main|ovl00|ovl01|all) ;;
+    *) echo 'Usage: tools/regen.sh [main|ovl00|ovl01|all]' >&2; exit 2 ;;
 esac
 regen() (
     local name=$1 profile config executable expected actual tmp
@@ -14,9 +14,12 @@ regen() (
         config="$root/recomp/$profile/dw5xl.toml"
         executable=SLES_538.60
     else
-        profile=dw5xl/overlays/ovl00
-        config="$root/recomp/$profile/ovl00.toml"
-        executable=OVL_00.BIN
+        profile="dw5xl/overlays/$name"
+        config="$root/recomp/$profile/$name.toml"
+        case "$name" in
+            ovl00) executable=OVL_00.BIN ;;
+            ovl01) executable=OVL_01.BIN ;;
+        esac
     fi
     if [[ ! -f "$root/game/dw5xl/$executable" ]]; then
         echo "Missing your disc file: game/dw5xl/$executable" >&2
@@ -26,7 +29,7 @@ regen() (
         expected=$(awk '{print $1}' "$root/recomp/$profile/input.sha256")
         actual=$(sha256sum "$root/game/dw5xl/$executable" | awk '{print $1}')
         if [[ "$actual" != "$expected" ]]; then
-            echo 'Unsupported OVL00; input SHA256 does not match the profile' >&2
+            echo "Unsupported $name; input SHA256 does not match the profile" >&2
             return 1
         fi
     fi
@@ -49,3 +52,4 @@ regen() (
 cd "$root"
 if [[ "$selection" == main || "$selection" == all ]]; then regen main; fi
 if [[ "$selection" == ovl00 || "$selection" == all ]]; then regen ovl00; fi
+if [[ "$selection" == ovl01 || "$selection" == all ]]; then regen ovl01; fi

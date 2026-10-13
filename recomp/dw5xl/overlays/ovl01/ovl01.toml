@@ -1,0 +1,40 @@
+# PAL XL OVL01 native module using the established overlay framework.
+# No header-derived clipping: callback code extends into the header's second extent.
+[general]
+input = "game/dw5xl/OVL_01.BIN"
+input_format = "raw"
+module_id = "dw5xl_ovl01"
+raw_base = 0x61A800
+raw_code_offset = 0x80
+ghidra_output = "recomp/dw5xl/overlays/ovl01/ghidra_functions.code.csv"
+output = "recomp/dw5xl/overlays/ovl01/output"
+single_file_output = false
+patch_syscalls = false
+patch_cop0 = true
+patch_cache = true
+stubs = []
+skip = []
+
+# Verified internal targets of original15-case dispatch64AAC4.
+entry_points = ["0x64aacc", "0x64aae4", "0x64ab14", "0x64ab44", "0x64ab74", "0x64abd0", "0x64abd8", "0x64abe0", "0x64abe8", "0x64abf0", "0x64abf8", "0x64ac00"]
+
+[jump_tables]
+[[jump_tables.table]]
+address = "0x6946E0"
+entries = [
+  { index = 0, target = "0x64ac14" },
+  { index = 1, target = "0x64aacc" },
+  { index = 2, target = "0x64aae4" },
+  { index = 3, target = "0x64ab14" },
+  { index = 4, target = "0x64ab44" },
+  { index = 5, target = "0x64ab74" },
+  { index = 6, target = "0x64abd0" },
+  { index = 7, target = "0x64abd8" },
+  { index = 8, target = "0x64abe0" },
+  { index = 9, target = "0x64abe8" },
+  { index = 10, target = "0x64abf0" },
+  { index = 11, target = "0x64abf8" },
+  { index = 12, target = "0x64ac00" },
+  { index = 13, target = "0x64ac08" },
+  { index = 14, target = "0x64ac10" },
+]

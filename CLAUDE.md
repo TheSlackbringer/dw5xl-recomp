@@ -27,6 +27,7 @@ Keep it up to date (append dated sections; record causes, fixes, debug switches 
   local notes; dependency provenance belongs in `THIRD_PARTY.md`.
 - **Downloads need explicit permission** (name, source, size). Ask before running the game in a visible window; never
   screenshot the user's screen (use frame dumps instead). Hidden runs still play audio on the user's speakers.
+- Hidden tests use a separate silent audio output while retaining game audio processing/capture. Live tests use the owner's current output. Never change the default output or route other applications.
 - Only the user's own discs; never commit or distribute game files (`game/`, `discs/`).
 - Prefer the game's own SDK library code over runtime HLE stubs when a function only builds packets/structs (wrong
   stubs caused the black title screen). HLE only what touches hardware the runtime cannot model.
@@ -57,6 +58,7 @@ Keep it up to date (append dated sections; record causes, fixes, debug switches 
   regenerate with `tools/regen.sh`), builds, logs and `notes/`. Never force-add those.
 - Parallel agents: give each its own worktree (`git worktree add ../dw5-ps2-<task> -b <task>`), its own `game/` and `app/deps/` symlinks, its own
   `tools/regen.sh` output and `app/build-<task>` dir. Full build ~10+ min. Merge results back via branches.
+- **No automatic Git staging or commits.** Leave changes unstaged; create commits only when the owner explicitly commands it.
 - Commits use the repo-local identity (the owner's GitHub handle with their GitHub noreply email, already configured in
   `.git/config`); never use the global git identity or add real names/emails. The owner is always the author; Claude may be added
   with a `Co-Authored-By` trailer.

@@ -25,7 +25,9 @@ the original DW5 disc, so both games run in one port. FMV movies must work in th
 - **Ask before downloads** (state file, source, size) and before opening the game in a visible window. Never take
   screenshots of the user's screen; use the runtime's frame dumps. Hidden runs still play audio on the user's speakers –
   don't run tests while the user is testing something else.
+- Hidden tests use a separate silent audio output while retaining game audio processing/capture. Live tests use the owner's current output. Never change the default output or route other applications.
 - Only the owner's discs. **Never commit or distribute game data** (`game/`, `discs/`), Ghidra DBs or generated code.
+- **No automatic Git staging or commits.** Leave changes unstaged; create commits only when the owner explicitly commands it.
 - **No personal identity in the project.** Commits use the repo-local identity already configured in `.git/config`
   (the owner's GitHub handle + GitHub noreply email). Never use the global git identity and don't add real names/emails
   anywhere. The owner is always the author; an AI assistant may only appear as a `Co-Authored-By` trailer.
@@ -148,9 +150,8 @@ No `perf`: use `tools/debug/gdb_sample_profile.sh`.
 - Decision rights stay with the owner: direction (native vs emulation), priorities, downloads, publishing.
   Present 2-4 options with a recommendation; survey other projects first.
 - Multi-agent: split independent coding/recomp tasks across parallel agents with self-contained briefs; agents do
-  analysis/patch writing in their own worktree or scratch subfolder; one integrator applies, builds, tests, commits.
-- Keep `notes/BRINGUP.md` updated (dated sections: cause → fix → evidence → debug switches → lesson) and commit
-  after each verified fix. Keep `AGENTS.md`/`CLAUDE.md` current when rules or workflow change.
+  analysis/patch writing in their own worktree or scratch subfolder; one integrator applies, builds and tests; commits require the owner's command.
+- Keep `notes/BRINGUP.md` updated (dated sections: cause → fix → evidence → debug switches → lesson) after each verified fix. Commit only on the owner's command. Keep `AGENTS.md`/`CLAUDE.md` current when rules or workflow change.
 
 ## 10. Ghidra: GUI, MCP and headless
 Setup on this machine:
@@ -217,7 +218,7 @@ owner plays or tests something else (audio overlaps). Check with `pgrep -x dw5xl
    ~0.6 ms period waveform).
 4. Locate code in Ghidra (MCP or headless), find the root cause, patch, `tools/regen.sh` if the toml changed, rebuild,
    re-run the SAME script and compare frames/logs.
-5. Milestone → offer a visible run to the owner → update BRINGUP.md → commit.
+5. Milestone → offer a visible run to the owner → update BRINGUP.md. Commit only on the owner's command.
 - Dev-harness command file: `PS2X_CTRL=<file>` (polled ~10x/s; `press BTN ticks`, `shot <png>`, `threads <txt>`, `quit`).
 - `PS2X_HOST_INPUT` goes through the real host-input path (keyboard mapping + libpad2 bridge); `PS2X_INPUT` injects
   guest pad masks directly.

@@ -980,6 +980,48 @@ void VU1Interpreter::finishXgkick()
     if (!m_xgkick.active)
         return;
 
+    // Opt-in bounded debugging only: retain exact produced packet and VU state.
+    // No interpretation, rewriting or timing changes occur when disabled.
+    static const char *capturePrefix = std::getenv("PS2X_XGKICK_CAPTURE");
+    static const uint64_t captureFrom = std::getenv("PS2X_XGKICK_FROM")
+        ? std::strtoull(std::getenv("PS2X_XGKICK_FROM"), nullptr, 0) : 4500u;
+    static const uint64_t captureTo = std::getenv("PS2X_XGKICK_TO")
+        ? std::strtoull(std::getenv("PS2X_XGKICK_TO"), nullptr, 0) : 4505u;
+    static uint32_t captured = 0u;
+    if (capturePrefix && *capturePrefix && m_activeMemory && captured < 16u)
+    {
+        const uint64_t tick = m_activeMemory->gs().vsyncTick.load(std::memory_order_acquire);
+        if (tick >= captureFrom && tick <= captureTo)
+        {
+            const uint32_t index = captured++;
+            const std::string stem = std::string(capturePrefix) + "." + std::to_string(index);
+            const auto dump = [&](const char *suffix, const void *data, size_t size)
+            {
+                const std::string path = stem + suffix;
+                if (FILE *file = std::fopen(path.c_str(), "wb"))
+                {
+                    std::fwrite(data, 1u, size, file);
+                    std::fclose(file);
+                }
+            };
+            dump(".gif", m_xgkick.packet.data(), m_xgkick.totalBytes);
+            dump(".code", m_activeMemory->getVU1Code(), PS2_VU1_CODE_SIZE);
+            dump(".data", m_activeVuData, m_activeVuDataSize);
+            if (FILE *file = std::fopen((stem + ".txt").c_str(), "w"))
+            {
+                std::fprintf(file, "tick=%llu pc=%04x source=%04x bytes=%u cycle=%llu top=%u itop=%u\n",
+                    static_cast<unsigned long long>(tick), m_state.pc, m_xgkick.sourceAddress,
+                    m_xgkick.totalBytes, static_cast<unsigned long long>(m_cycle), m_state.top, m_state.itop);
+                for (unsigned i = 0; i < 16u; ++i)
+                    std::fprintf(file, "vi%u=%04x\n", i, static_cast<unsigned>(m_state.vi[i]));
+                for (unsigned i = 0; i < 32u; ++i)
+                    std::fprintf(file, "vf%u=%g,%g,%g,%g\n", i,
+                        m_state.vf[i][0], m_state.vf[i][1], m_state.vf[i][2], m_state.vf[i][3]);
+                std::fclose(file);
+            }
+        }
+    }
+
     if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)

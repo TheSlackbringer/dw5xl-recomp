@@ -1,0 +1,9 @@
+{
+  "game": "Dynasty Warriors 5: Xtreme Legends",
+  "system": "PS2",
+  "type": "recomp",
+  "toolchain": "PS2Recomp",
+  "status": "in-progress",
+  "original": { "region": "Europe", "serial": "SLES-53860" },
+  "targets": ["Linux", "Windows"]
+}

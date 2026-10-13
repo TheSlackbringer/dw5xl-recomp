@@ -66,7 +66,28 @@ target_precompile_headers(dw5xl_ovl00 PRIVATE
 set_target_properties(dw5xl_ovl00 PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
 target_link_libraries(dw5xl PRIVATE dw5xl_ovl00)
 
-option(DW5XL_BUILD_TESTS "Build game-independent module dispatch tests" OFF)
+# Overlay headers/symbols are isolated from the base executable's generated code.
+set(DW5XL_OVL01_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../recomp/dw5xl/overlays/ovl01/output")
+file(GLOB DW5XL_OVL01_SOURCES CONFIGURE_DEPENDS "${DW5XL_OVL01_DIR}/*.cpp")
+if(NOT DW5XL_OVL01_SOURCES)
+    message(FATAL_ERROR "Missing generated OVL01 code; run tools/regen.sh ovl01")
+endif()
+add_library(dw5xl_ovl01 STATIC ${DW5XL_OVL01_SOURCES})
+target_link_libraries(dw5xl_ovl01 PRIVATE ps2_runtime)
+target_include_directories(dw5xl_ovl01 PRIVATE "${DW5XL_OVL01_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
+target_compile_options(dw5xl_ovl01 PRIVATE -march=x86-64-v3)
+target_precompile_headers(dw5xl_ovl01 PRIVATE
+    "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_runtime_macros.h"
+    "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_runtime.h"
+    "${DW5XL_OVL01_DIR}/ps2_recompiled_functions.h"
+    "${DW5XL_OVL01_DIR}/ps2_recompiled_stubs.h"
+    "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_syscalls.h"
+    "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_stubs.h"
+)
+set_target_properties(dw5xl_ovl01 PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
+target_link_libraries(dw5xl PRIVATE dw5xl_ovl01)
+
+option(DW5XL_BUILD_TESTS "Build runtime and locally generated helper tests" OFF)
 if(DW5XL_BUILD_TESTS)
     enable_testing()
     add_executable(dw5xl_overlay_dispatch_test tests/overlay_dispatch_test.cpp)
@@ -84,4 +105,15 @@ if(DW5XL_BUILD_TESTS)
     target_link_libraries(dw5xl_vif_unpack_boundary_test PRIVATE ps2_runtime)
     target_compile_options(dw5xl_vif_unpack_boundary_test PRIVATE -march=x86-64-v3)
     add_test(NAME vif_unpack_boundary COMMAND dw5xl_vif_unpack_boundary_test)
+    add_executable(dw5xl_original_gs_helper_test tests/original_gs_helper_test.cpp
+        "${DW5XL_GENERATED_DIR}/FUN_00110c78_0x110c78.cpp"
+        "${DW5XL_GENERATED_DIR}/FUN_001111d8_0x1111d8.cpp")
+    target_link_libraries(dw5xl_original_gs_helper_test PRIVATE ps2_runtime)
+    target_include_directories(dw5xl_original_gs_helper_test PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
+    target_compile_options(dw5xl_original_gs_helper_test PRIVATE -march=x86-64-v3)
+    add_test(NAME original_gs_helper COMMAND dw5xl_original_gs_helper_test)
+    add_executable(dw5xl_overlay_lifecycle_test tests/overlay_lifecycle_test.cpp)
+    target_link_libraries(dw5xl_overlay_lifecycle_test PRIVATE ps2_runtime)
+    target_compile_options(dw5xl_overlay_lifecycle_test PRIVATE -march=x86-64-v3)
+    add_test(NAME overlay_lifecycle COMMAND dw5xl_overlay_lifecycle_test)
 endif()
