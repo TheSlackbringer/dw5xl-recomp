@@ -29,6 +29,7 @@ Keep it up to date (append dated sections; record causes, fixes, debug switches 
   screenshot the user's screen (use frame dumps instead). Hidden runs still play audio on the user's speakers.
 - Hidden tests use a separate silent audio output while retaining game audio processing/capture. Live tests use default desktop output. Never change the default output or route other applications.
 - Legitimate original discs only; never commit or distribute game files (`game/`, `discs/`).
+- **GPU renderer only: use Vulkan/paraLLEl-GS for development, game runs, debugging and performance testing.** Do not run CPU renderer comparisons, develop CPU-renderer fixes, or propose switching back to CPU unless explicitly requested. Existing CPU backend code may remain; its presence does not authorize CPU work.
 - **No automatic Git staging or commits.** Leave changes unstaged; create commits only upon explicit command.
 - Prefer the game's own SDK library code over runtime HLE stubs when a function only builds packets/structs.
   HLE only what touches hardware the runtime cannot model.
@@ -71,7 +72,7 @@ Keep it up to date (append dated sections; record causes, fixes, debug switches 
 Current build and run commands are in `notes/PROJECT_SETUP.md`.
 Headless test pattern (no window, frame dumps you can view):
 `PS2X_GS_BACKEND=vulkan PS2X_HIDDEN=1 PS2X_DUMP_DIR=<dir> PS2X_DUMP_EVERY=100 PS2X_EXIT_TICK=900 PS2X_HOST_INPUT="400:ENTER:20" ...`
-(`PS2X_GS_BACKEND=cpu` is fallback; Start at tick 400 skips the intro; the main menu is up by ~tick 750). Keys: Enter=Start, X/Space=Cross, C=Circle,
+(Start at tick 400 skips the intro; the main menu is up by ~tick 750). Keys: Enter=Start, X/Space=Cross, C=Circle,
 Z=Square, V=Triangle, arrows/WASD.
 
 Ghidra: ONE source project, `ghidra/dw5xl.gpr`. Use it through GUI/MCP for interactive lookups (check MCP first when
@@ -81,7 +82,7 @@ Working split: the main session builds, runs and tests one thing at a time and u
 questions go to parallel background agents (each with its own headless copy or code-reading brief).
 
 ## Debug switches (env)
-`PS2X_STATS` vsync/flip rate · `PS2X_GS_BACKEND=vulkan|cpu` · `PS2X_GS_SCALE=1|2|4|8|16` (SSAA) · `PS2X_GS_SYNCREADBACK=1` · `PS2X_NO_WEAVE=1` ·
+`PS2X_STATS` vsync/flip rate · `PS2X_GS_BACKEND=vulkan` · `PS2X_GS_SCALE=1|2|4|8|16` (SSAA) · `PS2X_GS_SYNCREADBACK=1` · `PS2X_NO_WEAVE=1` ·
 `PS2X_GS_TRACE=<file>` + `_FROM/_TO` ticks (REG/DRAW/XFER; pseudo-reg 0x7F marks GIF packet path) · `PS2X_VRAM_DUMP=<file>` raw 4 MiB GS memory
 at exit (CT32 deswizzle: block/column tables) · `PS2X_IPU_DUMP=<dir>` / `PS2X_IPU_TRACE` · `PS2X_SPU2_TRACE` · `PS2X_LIBSD_TRACE` ·
 `PS2X_KSNG_TRACE` / `PS2X_KSNH_TRACE` (sound RPCs) · `PS2X_SIFAUDIO_TRACE` · `PS2X_MPEGAUDIO_TRACE` · `PS2X_AUDIO_DUMP=<pcm>` (s16 stereo 48 kHz) ·

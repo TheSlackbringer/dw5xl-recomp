@@ -27,6 +27,7 @@ the original DW5 disc, so both games run in one port. FMV movies must work in th
   don't run tests while the user is testing something else.
 - Hidden tests use a separate silent audio output while retaining game audio processing/capture. Live tests use default desktop output. Never change the default output or route other applications.
 - Legitimate original discs only. **Never commit or distribute game data** (`game/`, `discs/`), Ghidra DBs or generated code.
+- **GPU renderer only: use Vulkan/paraLLEl-GS for development, game runs, debugging and performance testing.** Do not run CPU renderer comparisons, develop CPU-renderer fixes, or propose switching back to CPU unless explicitly requested. Existing CPU backend code may remain; its presence does not authorize CPU work.
 - **No automatic Git staging or commits.** Leave changes unstaged; create commits only upon explicit command.
 - Prefer the game's own SDK library code over runtime HLE stubs when a function only builds packets/structs.
   HLE only what touches hardware the runtime cannot model.
@@ -67,7 +68,7 @@ Game files live in ignored local folders (`game/dw5xl`, `game/dw5`, `discs/`).
 Current build and run commands are in `notes/PROJECT_SETUP.md`.
 Headless test (no window, frame PNG dumps), from `game/dw5xl`: `PS2X_GS_BACKEND=vulkan PS2X_HIDDEN=1 PS2X_DUMP_DIR=<dir>
 PS2X_DUMP_EVERY=100 PS2X_EXIT_TICK=1000 PS2X_HOST_INPUT="400:ENTER:20,..." ../../app/build/dw5xl ./SLES_538.60`
-(`PS2X_GS_BACKEND=cpu` remains available as reference fallback; tick = vsync, 50/s on PAL; pre-create the dump dir).
+(tick = vsync, 50/s on PAL; pre-create the dump dir).
 Host input names: ENTER(Start) X(Cross) C(Circle) Z(Square) V(Triangle) UP DOWN LEFT RIGHT Q E (L1 R1).
 Leave ~100 ticks between menu presses (scroll animations swallow input). Known sequences:
 - Intro skip → main menu: `400:ENTER:20` (menu up by ~750).
@@ -102,7 +103,7 @@ Recompiled C++ for any function: `recomp/dw5xl/output/*_0x<addr>.cpp` (each inst
 6. **Codebase cleanup:** Strip temporary debug instrumentation (`DW5XL-DEBUG`/`DW5XL-TEST`), retain useful traces behind env vars, implement authentic `sceSdSetEffectAttr` (currently bypassed), and prepare generic upstreamable fixes (VIF DIRECT, libgraph, MPEG 0xB7, MC getdir, Vulkan PAL scanout & async ring buffer).
 
 ## 7. Debug toolkit (env vars, all optional)
-`PS2X_STATS` (vsync/flip rate) · `PS2X_GS_BACKEND=vulkan|cpu` (Vulkan compute renderer is recommended default; CPU is fallback) ·
+`PS2X_STATS` (vsync/flip rate) · `PS2X_GS_BACKEND=vulkan` (required backend for current development and testing) ·
 `PS2X_GS_SCALE=1|2|4|8|16` (SSAA scaling factor; default 1x) · `PS2X_GS_SYNCREADBACK=1` (force synchronous readback for A/B testing) ·
 `PS2X_NO_WEAVE=1` (bypass ReusableFieldWeaver) · `PS2X_GS_TRACE=<file>` + `PS2X_GS_TRACE_FROM/_TO=<tick>` (REG/DRAW/XFER lines;
 pseudo-register `reg_0x7f` = GIF packet marker, value = path<<32|size; note: its TEST printer shows ATST off by one bit,
@@ -184,7 +185,7 @@ visible playtest or other test is active (audio overlaps). Check with `pgrep -x 
 
 **Hidden scripted runs (the main loop):**
 1. Reproduce: `PS2X_GS_BACKEND=vulkan PS2X_HIDDEN=1 PS2X_HOST_INPUT="<tick>:<KEY>:<hold>,..." PS2X_DUMP_DIR=<dir> PS2X_DUMP_EVERY=<n>
-   PS2X_EXIT_TICK=<n> timeout <s> ../../app/build/dw5xl ./SLES_538.60 > run.log 2>&1` (from `game/dw5xl`; use `cpu` for fallback).
+   PS2X_EXIT_TICK=<n> timeout <s> ../../app/build/dw5xl ./SLES_538.60 > run.log 2>&1` (from `game/dw5xl`; explicitly select `vulkan`).
    Frame dumps are the presented frames (`frame_<tick>.png`, `final.png`); view them as images. Contact sheets:
    `magick montage frame_*.png -tile 4x4 -geometry 256x179+2+2 -label '%f' sheet.png`.
 2. Timeline landmarks (ticks = vsyncs, 50/s; approximate): Koei logo 0–200, ω-Force ~300, Start at 400 skips to the main menu

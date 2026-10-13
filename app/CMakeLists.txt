@@ -87,6 +87,26 @@ target_precompile_headers(dw5xl_ovl01 PRIVATE
 set_target_properties(dw5xl_ovl01 PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
 target_link_libraries(dw5xl PRIVATE dw5xl_ovl01)
 
+set(DW5XL_OVL02_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../recomp/dw5xl/overlays/ovl02/output")
+file(GLOB DW5XL_OVL02_SOURCES CONFIGURE_DEPENDS "${DW5XL_OVL02_DIR}/*.cpp")
+if(NOT DW5XL_OVL02_SOURCES)
+    message(FATAL_ERROR "Missing generated OVL02 code; run tools/regen.sh ovl02")
+endif()
+add_library(dw5xl_ovl02 STATIC ${DW5XL_OVL02_SOURCES})
+target_link_libraries(dw5xl_ovl02 PRIVATE ps2_runtime)
+target_include_directories(dw5xl_ovl02 PRIVATE "${DW5XL_OVL02_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
+target_compile_options(dw5xl_ovl02 PRIVATE -march=x86-64-v3)
+target_precompile_headers(dw5xl_ovl02 PRIVATE
+    "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_runtime_macros.h"
+    "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_runtime.h"
+    "${DW5XL_OVL02_DIR}/ps2_recompiled_functions.h"
+    "${DW5XL_OVL02_DIR}/ps2_recompiled_stubs.h"
+    "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_syscalls.h"
+    "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_stubs.h"
+)
+set_target_properties(dw5xl_ovl02 PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
+target_link_libraries(dw5xl PRIVATE dw5xl_ovl02)
+
 option(DW5XL_BUILD_TESTS "Build runtime and locally generated helper tests" OFF)
 if(DW5XL_BUILD_TESTS)
     enable_testing()
@@ -112,6 +132,11 @@ if(DW5XL_BUILD_TESTS)
     target_include_directories(dw5xl_original_gs_helper_test PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
     target_compile_options(dw5xl_original_gs_helper_test PRIVATE -march=x86-64-v3)
     add_test(NAME original_gs_helper COMMAND dw5xl_original_gs_helper_test)
+    add_executable(dw5xl_disc_validation_test tests/disc_validation_test.cpp)
+    target_link_libraries(dw5xl_disc_validation_test PRIVATE ps2_runtime)
+    target_include_directories(dw5xl_disc_validation_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
+    target_compile_options(dw5xl_disc_validation_test PRIVATE -march=x86-64-v3)
+    add_test(NAME disc_validation COMMAND dw5xl_disc_validation_test)
     add_executable(dw5xl_overlay_lifecycle_test tests/overlay_lifecycle_test.cpp)
     target_link_libraries(dw5xl_overlay_lifecycle_test PRIVATE ps2_runtime)
     target_compile_options(dw5xl_overlay_lifecycle_test PRIVATE -march=x86-64-v3)

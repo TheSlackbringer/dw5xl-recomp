@@ -65,10 +65,8 @@ stubs = [
   "sceGsPutDispEnv@0x00111118",
   "sceGsSyncV@0x00111970",
   "sceGsSyncPath@0x00111A08",
-  "sceGsSetDefLoadImage@0x00111D20",
-  "sceGsSetDefStoreImage@0x00111F08",
-  "sceGsExecLoadImage@0x00112048",
-  "sceGsExecStoreImage@0x001121C8",
+  # Original GS image functions build native DMA packets using GS block addresses.
+  # Keep Load/Store builders and executors unbound (0x111D20..0x1121C8).
   "sceGsSyncVCallback@0x00112858",
   "memclr@0x00112C80",
   "sceDmaGetChan@0x00112CB8",

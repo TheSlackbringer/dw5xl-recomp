@@ -1,0 +1,43 @@
+# PAL XL Load Original module. Disc verification is replaced only in this module's app-owned dispatch descriptor.
+[general]
+input = "game/dw5xl/OVL_02.BIN"
+input_format = "raw"
+module_id = "dw5xl_ovl02"
+raw_base = 0x61A800
+raw_code_offset = 0x80
+ghidra_output = "recomp/dw5xl/overlays/ovl02/ghidra_functions.code.csv"
+output = "recomp/dw5xl/overlays/ovl02/output"
+single_file_output = false
+patch_syscalls = false
+patch_cop0 = true
+patch_cache = true
+stubs = []
+skip = []
+entry_points = ["0x63C7C0", "0x63ACC0", "0x6381B0", "0x639530", "0x636410", "0x636F10", "0x6378C0", "0x62F560", "0x61A880", "0x620A20",
+  # Explicit dispatcher entries: standalone inherited loop-tail functions can
+  # reach these verified switch arms through runtime indirect dispatch.
+  "0x637F08", "0x637F1C", "0x637F38", "0x637F60", "0x637F7C", "0x6380B8", "0x6380F4",
+  "0x62F384", "0x62F394", "0x62F39C"]
+[jump_tables]
+[[jump_tables.table]]
+address = "0x640130"
+entries = [
+  { index = 0, target = "0x62F384" },
+  { index = 1, target = "0x62F384" },
+  { index = 2, target = "0x62F394" },
+  { index = 3, target = "0x62F39C" },
+  { index = 4, target = "0x62F384" },
+  { index = 5, target = "0x62F384" },
+  { index = 6, target = "0x62F384" },
+]
+[[jump_tables.table]]
+address = "0x6405F0"
+entries = [
+  { index = 0, target = "0x637F08" },
+  { index = 1, target = "0x637F1C" },
+  { index = 2, target = "0x637F38" },
+  { index = 3, target = "0x637F60" },
+  { index = 4, target = "0x637F7C" },
+  { index = 5, target = "0x6380B8" },
+  { index = 6, target = "0x6380F4" },
+]

@@ -4,8 +4,8 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 selection=${1:-all}
 case "$selection" in
-    main|ovl00|ovl01|all) ;;
-    *) echo 'Usage: tools/regen.sh [main|ovl00|ovl01|all]' >&2; exit 2 ;;
+    main|ovl00|ovl01|ovl02|all) ;;
+    *) echo 'Usage: tools/regen.sh [main|ovl00|ovl01|ovl02|all]' >&2; exit 2 ;;
 esac
 regen() (
     local name=$1 profile config executable expected actual tmp
@@ -19,6 +19,7 @@ regen() (
         case "$name" in
             ovl00) executable=OVL_00.BIN ;;
             ovl01) executable=OVL_01.BIN ;;
+            ovl02) executable=OVL_02.BIN ;;
         esac
     fi
     if [[ ! -f "$root/game/dw5xl/$executable" ]]; then
@@ -53,3 +54,4 @@ cd "$root"
 if [[ "$selection" == main || "$selection" == all ]]; then regen main; fi
 if [[ "$selection" == ovl00 || "$selection" == all ]]; then regen ovl00; fi
 if [[ "$selection" == ovl01 || "$selection" == all ]]; then regen ovl01; fi
+if [[ "$selection" == ovl02 || "$selection" == all ]]; then regen ovl02; fi
