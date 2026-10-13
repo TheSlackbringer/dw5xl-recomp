@@ -1,0 +1,33 @@
+From 78fd0e315420e4ced83ec0466eb7fce27697f273 Mon Sep 17 00:00:00 2001
+From: Fizban <35464167+Fiztba@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 00:20:00 -0400
+Subject: [PATCH] Preserve active IPU input channel fields when suspending DMA
+
+---
+ ps2xRuntime/src/lib/ps2_memory.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index f8bea67..f9a30a0 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1218,6 +1218,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         return true;
+     }
+ 
++    if (address == 0x1000B400u)
++    {
++        const auto current = m_ioRegisters.find(address);
++        if (current != m_ioRegisters.end() && (current->second & 0x100u) != 0u)
++        {
++            // While active, only STR may be cleared. Preserve the fetched
++            // tag and channel fields when the guest suspends input DMA.
++            if ((value & 0x100u) == 0u)
++                current->second &= ~0x100u;
++            return true;
++        }
++    }
++
+     m_ioRegisters[address] = value;
+ 
+     if (address >= 0x1000B400u && address < 0x1000B500u)

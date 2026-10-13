@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Priestley <voicedrew11@gmail.com>
+Date: Sat, 3 Oct 2026 12:21:29 -0400
+Subject: [PATCH 04/14] gs: apply DISPLAY.MAGV to the presented height
+
+---
+ ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 2c33776..2c3e6c5 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -321,9 +321,12 @@ namespace
+         const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
+         const uint32_t dh = static_cast<uint32_t>((display64 >> 44) & 0x07FFu);
+         const uint32_t magh = static_cast<uint32_t>((display64 >> 23) & 0x0Fu);
++        // DISPLAY.MAGV (bits 27..28) magnifies vertically by MAGV+1, so the
++        // frame buffer area read is (DH+1)/(MAGV+1) lines.
++        const uint32_t magv = static_cast<uint32_t>((display64 >> 27) & 0x03u);
+ 
+         outWidth = (dw + 1u) / (magh + 1u);
+-        outHeight = dh + 1u;
++        outHeight = (dh + 1u) / (magv + 1u);
+         if (outWidth < 64u || outHeight < 64u)
+         {
+             outWidth = kDefaultDisplayWidth;

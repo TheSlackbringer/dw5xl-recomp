@@ -1,0 +1,715 @@
+From 9efa95f71509657a0d6706979805b5d03e5d7ca8 Mon Sep 17 00:00:00 2001
+From: Fizban <35464167+Fiztba@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 21:53:28 -0400
+Subject: [PATCH] Add Vulkan GS rasterization and logical scanout
+
+---
+ ps2xRuntime/CMakeLists.txt                    |   1 +
+ ps2xRuntime/cmake/VulkanGs.cmake              |  20 ++
+ .../include/runtime/gs/gs_cpu_backend.h       |   3 +-
+ .../include/runtime/gs/gs_vulkan_backend.h    |  32 ++
+ ps2xRuntime/src/lib/gs/gs_record.cpp          |  29 +-
+ ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp  | 324 ++++++++++++++++++
+ ps2xRuntime/src/lib/gs/gs_vulkan_scanout.cpp  | 169 +++++++++
+ ps2xRuntime/src/lib/gs/gs_vulkan_scanout.h    |  22 ++
+ 8 files changed, 597 insertions(+), 3 deletions(-)
+ create mode 100644 ps2xRuntime/cmake/VulkanGs.cmake
+ create mode 100644 ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
+ create mode 100644 ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+ create mode 100644 ps2xRuntime/src/lib/gs/gs_vulkan_scanout.cpp
+ create mode 100644 ps2xRuntime/src/lib/gs/gs_vulkan_scanout.h
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 8a34a27..1a1e92b 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -516,6 +516,7 @@ target_include_directories(ps2_runtime PUBLIC
+ )
+ 
+ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
++include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VulkanGs.cmake")
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+     ps2_runtime
+diff --git a/ps2xRuntime/cmake/VulkanGs.cmake b/ps2xRuntime/cmake/VulkanGs.cmake
+new file mode 100644
+index 0000000..7f9c530
+--- /dev/null
++++ b/ps2xRuntime/cmake/VulkanGs.cmake
+@@ -0,0 +1,20 @@
++# paraLLEl-GS is LGPL-3.0-or-later; Granite and submodules retain their licenses.
++option(PS2X_ENABLE_VULKAN_GS "Build the Vulkan compute GS renderer" OFF)
++set(PS2X_PARALLEL_GS_SOURCE_DIR "" CACHE PATH "Pinned paraLLEl-GS checkout with minimal submodules")
++if(PS2X_ENABLE_VULKAN_GS)
++    if(NOT EXISTS "${PS2X_PARALLEL_GS_SOURCE_DIR}/gs/gs_interface.cpp")
++        message(FATAL_ERROR "Set PS2X_PARALLEL_GS_SOURCE_DIR to paraLLEl-GS cc6184af7e0c03da603045ca371ffa5dae9b0655 with Granite, volk and Vulkan-Headers initialized")
++    endif()
++    set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
++    set(GRANITE_TOOLS OFF CACHE BOOL "" FORCE)
++    set(GRANITE_RENDERDOC_CAPTURE OFF CACHE BOOL "" FORCE)
++    set(GRANITE_INSTALL_TARGETS OFF CACHE BOOL "" FORCE)
++    set(GRANITE_VULKAN_DXGI_INTEROP OFF CACHE BOOL "" FORCE)
++    if(MSVC)
++        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
++    endif()
++    add_subdirectory("${PS2X_PARALLEL_GS_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/parallel-gs" EXCLUDE_FROM_ALL)
++    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_vulkan_backend.cpp src/lib/gs/gs_vulkan_scanout.cpp)
++    target_link_libraries(ps2_runtime PRIVATE parallel-gs)
++    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_VULKAN_GS=1)
++endif()
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 3e1e9fc..18eed77 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -30,6 +30,8 @@ public:
+     void TextureFlush() override;
+     void Sync(GSSyncReason reason) override;
+     PresentationFrame Present(const GSPresentationRequest &request) override;
++    // Convert an already synchronized memory image without CPU raster jobs.
++    PresentationFrame PresentFromLocalMemory(const GSPresentationRequest &request);
+ 
+     bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
+     uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
+@@ -173,7 +175,6 @@ private:
+ 
+     void PerformLocalToLocalTransfer();
+     void PerformLocalToHostTransfer();
+-    PresentationFrame PresentFromLocalMemory(const GSPresentationRequest &request);
+     bool CopyFrameToHostRgba(const GSFrameReg &frame,
+                              uint32_t width,
+                              uint32_t height,
+diff --git a/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h b/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
+new file mode 100644
+index 0000000..50905a4
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_vulkan_backend.h
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#pragma once
++#include "runtime/gs/gs_backend.h"
++#include <memory>
++
++// GS rasterization and texture/VRAM operations execute in paraLLEl-GS Vulkan
++// compute shaders. The native EE/IOP runtime and frontend remain in place.
++class GSVulkanBackend final : public GSRasterBackend
++{
++public:
++    GSVulkanBackend();
++    ~GSVulkanBackend() override;
++    void Initialize(uint8_t *, uint32_t) override;
++    void Reset() override;
++    void Submit(const GSPrimitiveBatch &) override;
++    void LoadClut(const GSTex0Reg &, const GSTexClutReg &) override;
++    void BeginTransfer(const GSTransferCommand &) override;
++    void UploadImage(const uint8_t *, uint32_t) override;
++    void Flush() override;
++    void TextureFlush() override;
++    void Sync(GSSyncReason) override;
++    PresentationFrame Present(const GSPresentationRequest &) override;
++    bool ClearFramebuffer(const GSContext &, uint32_t) override;
++    uint32_t ConsumeLocalToHostBytes(uint8_t *, uint32_t) override;
++    uint32_t ReadVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) const override;
++    void WriteVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override;
++    void SnapshotVram(std::vector<uint8_t> &) const override;
++    GSTransferSnapshot GetTransferSnapshot() const override;
++private:
++    struct Impl;
++    std::unique_ptr<Impl> m_impl;
++};
+diff --git a/ps2xRuntime/src/lib/gs/gs_record.cpp b/ps2xRuntime/src/lib/gs/gs_record.cpp
+index 046f08d..ca29d58 100644
+--- a/ps2xRuntime/src/lib/gs/gs_record.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_record.cpp
+@@ -1,12 +1,17 @@
+ #include "gs_record.h"
+ 
+ #include "runtime/gs/gs_cpu_backend.h"
++#ifdef PS2X_HAS_VULKAN_GS
++#include "runtime/gs/gs_vulkan_backend.h"
++#endif
+ 
+ #include <atomic>
+ #include <cfenv>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <mutex>
++#include <cstring>
++#include <stdexcept>
+ 
+ namespace
+ {
+@@ -170,6 +175,26 @@ namespace
+ 
+ std::unique_ptr<GSRasterBackend> makeGsRasterBackend()
+ {
++    std::unique_ptr<GSRasterBackend> backend;
++    const char *choice = std::getenv("PS2X_GS_BACKEND");
++    const bool cpu = choice && std::strcmp(choice, "cpu") == 0;
++    const bool vulkan = choice && std::strcmp(choice, "vulkan") == 0;
++    if (choice && *choice && !cpu && !vulkan && std::strcmp(choice, "auto") != 0)
++        throw std::invalid_argument("PS2X_GS_BACKEND must be auto, cpu or vulkan");
++#ifdef PS2X_HAS_VULKAN_GS
++    if (!cpu)
++    {
++        try { backend = std::make_unique<GSVulkanBackend>(); }
++        catch (const std::exception &error)
++        {
++            if (vulkan) throw;
++            std::fprintf(stderr, "[gs] Vulkan unavailable (%s); using CPU renderer\n", error.what());
++        }
++    }
++#else
++    if (vulkan) throw std::runtime_error("This build does not include the Vulkan GS renderer");
++#endif
++    if (!backend) backend = std::make_unique<GSCpuBackend>();
+     static std::atomic<bool> s_recorded{false};
+     const char *path = std::getenv("PS2X_GS_RECORD");
+     if (path && *path && !s_recorded.exchange(true))
+@@ -178,9 +203,9 @@ std::unique_ptr<GSRasterBackend> makeGsRasterBackend()
+         {
+             std::setvbuf(file, nullptr, _IOFBF, 1u << 20u);
+             std::fprintf(stderr, "[gs] recording backend calls to %s\n", path);
+-            return std::make_unique<RecordingBackend>(std::make_unique<GSCpuBackend>(), file);
++            return std::make_unique<RecordingBackend>(std::move(backend), file);
+         }
+         std::fprintf(stderr, "[gs] cannot open PS2X_GS_RECORD file %s\n", path);
+     }
+-    return std::make_unique<GSCpuBackend>();
++    return backend;
+ }
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+new file mode 100644
+index 0000000..8cf8281
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_backend.cpp
+@@ -0,0 +1,324 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#include "runtime/gs/gs_vulkan_backend.h"
++#include "gs_vulkan_scanout.h"
++#include "runtime/gs/gs_cpu_backend.h"
++#include "runtime/gs/ps2_gs_memory.h"
++#include "gs_interface.hpp"
++#include "context.hpp"
++#include "thread_id.hpp"
++#include <algorithm>
++#include <array>
++#include <bit>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++#include <stdexcept>
++
++namespace
++{
++constexpr uint32_t vramBytes = 4u << 20;
++using Reg = ParallelGS::RegisterAddr;
++uint64_t tex0Bits(const GSTex0Reg &t, bool load)
++{
++    return t.tbp0 | (uint64_t(t.tbw) << 14) | (uint64_t(t.psm) << 20) |
++        (uint64_t(t.tw) << 26) | (uint64_t(t.th) << 30) | (uint64_t(t.tcc) << 34) |
++        (uint64_t(t.tfx) << 35) | (uint64_t(t.cbp) << 37) | (uint64_t(t.cpsm) << 51) |
++        (uint64_t(t.csm) << 55) | (uint64_t(t.csa) << 56) | (uint64_t(load ? t.cld : 0) << 61);
++}
++uint64_t texclutBits(const GSTexClutReg &t)
++{
++    return t.cbw | (uint64_t(t.cou) << 6) | (uint64_t(t.cov) << 12);
++}
++uint32_t transferBits(uint8_t psm)
++{
++    return uint32_t(GSMem::BitsPerPixel(GSMem::PixelStorageMode(psm)));
++}
++}
++
++struct GSVulkanBackend::Impl
++{
++    // Declaration order ensures interface dies before device before context.
++    Vulkan::Context context;
++    Vulkan::Device device;
++    ParallelGS::GSInterface gs;
++    mutable std::mutex mutex;
++    std::vector<uint8_t> snapshot = std::vector<uint8_t>(vramBytes);
++    GSCpuBackend scanout;
++    std::array<uint64_t, 128> state{};
++    std::array<bool, 128> valid{};
++    GSTransferCommand transfer{};
++    GSTransferSnapshot transferState{};
++    uint64_t uploadedBytes = 0;
++    std::vector<uint8_t> uploadTail;
++    std::vector<uint8_t> fifo;
++    size_t fifoRead = 0;
++    bool initialized = false;
++    uint64_t draws = 0;
++    uint64_t gpuPresentations = 0, convertedPresentations = 0;
++
++    Impl()
++    {
++        if (!Vulkan::Context::init_loader(nullptr))
++            throw std::runtime_error("Vulkan loader is unavailable");
++        context.set_num_thread_indices(1);
++        if (!context.init_instance_and_device(nullptr, 0, nullptr, 0,
++            Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT |
++            Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT |
++            Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT))
++            throw std::runtime_error("Vulkan device creation failed");
++        device.set_context(context);
++        device.init_frame_contexts(4);
++        if (!gs.init(&device, ParallelGS::GSOptions{}))
++            throw std::runtime_error("Vulkan device lacks paraLLEl-GS features");
++        scanout.Initialize(snapshot.data(), vramBytes);
++        const auto &gpu = device.get_gpu_properties();
++        if (gpu.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
++            throw std::runtime_error("software Vulkan devices are not a GPU renderer");
++        std::fprintf(stderr, "[gs:vulkan] device=%s vendor=0x%04x device=0x%04x; GPU compute rasterization\n",
++            gpu.deviceName, gpu.vendorID, gpu.deviceID);
++    }
++    ~Impl()
++    {
++        Util::register_thread_index(0);
++        gs.flush(); device.wait_idle();
++        const char *stats = std::getenv("PS2X_STATS");
++        if (stats && *stats && *stats != '0')
++            std::fprintf(stderr, "[gs:vulkan] draws=%llu GPU scanouts=%llu CPU display conversions=%llu\n",
++                static_cast<unsigned long long>(draws), static_cast<unsigned long long>(gpuPresentations),
++                static_cast<unsigned long long>(convertedPresentations));
++    }
++
++    std::unique_lock<std::mutex> access()
++    {
++        // EE, VU and presentation callers share this serialized device slot.
++        // Granite requires a thread-local index even with one command pool.
++        std::unique_lock lock(mutex);
++        Util::register_thread_index(0);
++        return lock;
++    }
++
++    void reg(Reg id, uint64_t bits, bool force = false)
++    {
++        const auto index = static_cast<unsigned>(id);
++        if (force || !valid[index] || state[index] != bits)
++        {
++            gs.write_register(id, bits);
++            state[index] = bits;
++            valid[index] = true;
++        }
++    }
++    void readSnapshot()
++    {
++        const void *mapped = gs.map_vram_read(0, vramBytes);
++        if (!mapped) throw std::runtime_error("Vulkan GS VRAM readback failed");
++        std::memcpy(snapshot.data(), mapped, vramBytes);
++    }
++    void submit(const GSPrimitiveBatch &b)
++    {
++        const auto &s = b.state; const auto &c = s.context;
++        unsigned type = s.prim.type;
++        if (type == GS_PRIM_TRISTRIP || type == GS_PRIM_TRIFAN) type = GS_PRIM_TRIANGLE;
++        if (type == GS_PRIM_LINESTRIP) type = GS_PRIM_LINE;
++        reg(Reg::PRMODECONT, 1);
++        reg(Reg::FRAME_1, c.frame.fbp | (uint64_t(c.frame.fbw) << 16) |
++            (uint64_t(c.frame.psm) << 24) | (uint64_t(c.frame.fbmsk) << 32));
++        reg(Reg::ZBUF_1, c.zbuf.zbp | (uint64_t(c.zbuf.psm & 15) << 24) | (uint64_t(c.zbuf.zmask) << 32));
++        reg(Reg::SCISSOR_1, c.scissor.x0 | (uint64_t(c.scissor.x1) << 16) |
++            (uint64_t(c.scissor.y0) << 32) | (uint64_t(c.scissor.y1) << 48));
++        reg(Reg::XYOFFSET_1, c.xyoffset.ofx | (uint64_t(c.xyoffset.ofy) << 32));
++        // Palette events already arrive separately via LoadClut.
++        const bool autoMip = (c.tex1 & (1ull << 9)) != 0;
++        const bool enteringAutoMip = autoMip && (!valid[unsigned(Reg::TEX1_1)] || !(state[unsigned(Reg::TEX1_1)] & (1ull << 9)));
++        reg(Reg::TEX1_1, c.tex1);
++        reg(Reg::TEX0_1, tex0Bits(c.tex0, false), enteringAutoMip);
++        reg(Reg::CLAMP_1, c.clamp);
++        // The current frontend stores explicit MIPTBP writes, but does not
++        // materialize MTBA-generated values. Preserve the library's generated
++        // mip addresses rather than overwriting them with an absent zero value.
++        if (!autoMip || c.miptbp1 != 0) reg(Reg::MIPTBP1_1, c.miptbp1);
++        reg(Reg::MIPTBP2_1, c.miptbp2);
++        reg(Reg::ALPHA_1, c.alpha); reg(Reg::TEST_1, c.test); reg(Reg::FBA_1, c.fba);
++        reg(Reg::TEXCLUT, texclutBits(s.texclut));
++        reg(Reg::TEXA, s.texa.ta0 | (uint64_t(s.texa.aem) << 15) | (uint64_t(s.texa.ta1) << 32));
++        reg(Reg::FOGCOL, s.fogR | (uint64_t(s.fogG) << 8) | (uint64_t(s.fogB) << 16));
++        reg(Reg::PABE, s.pabe); reg(Reg::SCANMSK, s.scanmsk);
++        reg(Reg::DIMX, s.dimx); reg(Reg::DTHE, s.dthe); reg(Reg::COLCLAMP, s.colclamp);
++        const auto &p = s.prim;
++        // Independent frontend batches use list primitives in context zero.
++        reg(Reg::PRIM, type | (uint64_t(p.iip) << 3) | (uint64_t(p.tme) << 4) |
++            (uint64_t(p.fge) << 5) | (uint64_t(p.abe) << 6) | (uint64_t(p.aa1) << 7) |
++            (uint64_t(p.fst) << 8) | (uint64_t(p.fix) << 10), true);
++        for (unsigned i = 0; i < b.vertexCount && i < b.vertices.size(); ++i)
++        {
++            const auto &v = b.vertices[i];
++            reg(Reg::RGBAQ, v.r | (uint64_t(v.g) << 8) | (uint64_t(v.b) << 16) |
++                (uint64_t(v.a) << 24) | (uint64_t(std::bit_cast<uint32_t>(v.q)) << 32), true);
++            reg(Reg::ST, std::bit_cast<uint32_t>(v.s) | (uint64_t(std::bit_cast<uint32_t>(v.t)) << 32), true);
++            reg(Reg::UV, v.u | (uint64_t(v.v) << 16), true);
++            reg(Reg::FOG, uint64_t(v.fog) << 56, true);
++            const auto x = uint16_t(int32_t(std::nearbyint(v.x * 16.0f)));
++            const auto y = uint16_t(int32_t(std::nearbyint(v.y * 16.0f)));
++            reg(Reg::XYZ2, x | (uint64_t(y) << 16) | (uint64_t(uint32_t(v.z)) << 32), true);
++        }
++        ++draws;
++    }
++
++    void imagePacket(const uint8_t *data, size_t count)
++    {
++        while (count)
++        {
++            const size_t bytes = std::min<size_t>(count, 0x7fff * 16u);
++            const uint64_t qwords = (bytes + 15u) / 16u;
++            std::vector<uint8_t> packet(size_t(qwords) * 16u + 16u);
++            const uint64_t tag = qwords | (1ull << 15) | (2ull << 58);
++            std::memcpy(packet.data(), &tag, 8);
++            std::memcpy(packet.data() + 16, data, bytes);
++            gs.gif_transfer(2, packet.data(), packet.size());
++            count -= bytes; data += bytes;
++        }
++    }
++};
++
++GSVulkanBackend::GSVulkanBackend() : m_impl(std::make_unique<Impl>()) {}
++GSVulkanBackend::~GSVulkanBackend() = default;
++void GSVulkanBackend::Initialize(uint8_t *vram, uint32_t size)
++{
++    if (!vram || size < vramBytes) throw std::invalid_argument("Vulkan GS needs 4 MiB VRAM");
++    auto lock = m_impl->access();
++    auto *dst = m_impl->gs.map_vram_write(0, vramBytes);
++    if (!dst) throw std::runtime_error("Vulkan GS initial VRAM mapping failed");
++    std::memcpy(dst, vram, vramBytes);
++    m_impl->gs.end_vram_write(0, vramBytes);
++    m_impl->gs.reset_context_state(); m_impl->valid.fill(false);
++    m_impl->transfer = {}; m_impl->uploadedBytes = 0;
++    m_impl->uploadTail.clear(); m_impl->fifo.clear(); m_impl->fifoRead = 0;
++    m_impl->transferState = {}; m_impl->transferState.direction = 3;
++    m_impl->initialized = true;
++}
++void GSVulkanBackend::Reset()
++{
++    auto lock = m_impl->access();
++    m_impl->gs.flush(); m_impl->gs.reset_context_state(); m_impl->valid.fill(false);
++    m_impl->transferState = {}; m_impl->transferState.direction = 3;
++    m_impl->fifo.clear(); m_impl->fifoRead = 0; m_impl->uploadTail.clear();
++}
++void GSVulkanBackend::Submit(const GSPrimitiveBatch &b) { auto lock = m_impl->access(); m_impl->submit(b); }
++void GSVulkanBackend::LoadClut(const GSTex0Reg &t, const GSTexClutReg &c)
++{
++    auto lock = m_impl->access();
++    m_impl->reg(Reg::TEXCLUT, texclutBits(c)); m_impl->reg(Reg::TEX0_1, tex0Bits(t, true), true);
++}
++void GSVulkanBackend::BeginTransfer(const GSTransferCommand &c)
++{
++    auto lock = m_impl->access();
++    auto &p = *m_impl;
++    p.transfer = c; p.transferState = {}; p.transferState.direction = c.direction;
++    p.transferState.totalPixels = uint32_t(c.trxreg.rrw) * c.trxreg.rrh;
++    p.transferState.x = c.trxpos.dsax; p.transferState.y = c.trxpos.dsay;
++    p.uploadedBytes = 0; p.uploadTail.clear(); p.fifo.clear(); p.fifoRead = 0;
++    const auto &b = c.bitbltbuf; const auto &pos = c.trxpos;
++    p.reg(Reg::BITBLTBUF, b.sbp | (uint64_t(b.sbw) << 16) | (uint64_t(b.spsm) << 24) |
++        (uint64_t(b.dbp) << 32) | (uint64_t(b.dbw) << 48) | (uint64_t(b.dpsm) << 56), true);
++    p.reg(Reg::TRXPOS, pos.ssax | (uint64_t(pos.ssay) << 16) | (uint64_t(pos.dsax) << 32) |
++        (uint64_t(pos.dsay) << 48) | (uint64_t(pos.dir) << 59), true);
++    p.reg(Reg::TRXREG, c.trxreg.rrw | (uint64_t(c.trxreg.rrh) << 32), true);
++    p.reg(Reg::TRXDIR, c.direction, true);
++    if (c.direction == 1)
++    {
++        const size_t bytes = (size_t(p.transferState.totalPixels) * transferBits(b.spsm) + 7u) / 8u;
++        p.fifo.resize((bytes + 15u) & ~size_t(15u));
++        if (!p.fifo.empty()) p.gs.read_transfer_fifo(p.fifo.data(), uint32_t(p.fifo.size() / 16));
++        p.fifo.resize(bytes); p.transferState.localToHostPendingBytes = bytes;
++        p.transferState.copiedPixels = p.transferState.totalPixels;
++        p.transferState.direction = 3;
++    }
++    else if (c.direction == 2) { p.transferState.copiedPixels = p.transferState.totalPixels; p.transferState.direction = 3; }
++}
++void GSVulkanBackend::UploadImage(const uint8_t *data, uint32_t bytes)
++{
++    if (!data || !bytes) return;
++    auto lock = m_impl->access(); auto &p = *m_impl;
++    if (p.transferState.direction != 0 || !p.transferState.totalPixels) return;
++    const uint32_t bits = transferBits(p.transfer.bitbltbuf.dpsm);
++    if (!bits || !p.transfer.trxreg.rrw) return;
++    p.uploadTail.insert(p.uploadTail.end(), data, data + bytes); p.uploadedBytes += bytes;
++    p.transferState.copiedPixels = uint32_t(std::min<uint64_t>(p.transferState.totalPixels, p.uploadedBytes * 8u / bits));
++    const bool complete = p.transferState.copiedPixels == p.transferState.totalPixels;
++    const size_t emit = complete ? p.uploadTail.size() : p.uploadTail.size() & ~size_t(15);
++    if (emit) { p.imagePacket(p.uploadTail.data(), emit); p.uploadTail.erase(p.uploadTail.begin(), p.uploadTail.begin() + emit); }
++    const uint32_t position = complete ? ((p.transferState.copiedPixels - 1u) / (bits == 4 ? 2u : 1u)) * (bits == 4 ? 2u : 1u) : p.transferState.copiedPixels;
++    p.transferState.x = p.transfer.trxpos.dsax + position % p.transfer.trxreg.rrw;
++    p.transferState.y = p.transfer.trxpos.dsay + position / p.transfer.trxreg.rrw;
++    if (complete) { p.transferState.direction = 3; p.transferState.totalPixels = 0; }
++}
++void GSVulkanBackend::Flush() { auto lock = m_impl->access(); m_impl->gs.flush(); }
++void GSVulkanBackend::TextureFlush() { auto lock = m_impl->access(); m_impl->reg(Reg::TEXFLUSH, 0, true); }
++void GSVulkanBackend::Sync(GSSyncReason reason)
++{
++    auto lock = m_impl->access(); m_impl->gs.flush();
++    if (reason == GSSyncReason::Reset) m_impl->device.wait_idle();
++}
++void GSVulkanBackend::SnapshotVram(std::vector<uint8_t> &out) const
++{
++    auto lock = m_impl->access(); m_impl->readSnapshot(); out = m_impl->snapshot;
++}
++uint32_t GSVulkanBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
++{
++    auto lock = m_impl->access(); m_impl->readSnapshot(); return m_impl->scanout.ReadVram(psm, base, bw, x, y);
++}
++void GSVulkanBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++{
++    auto lock = m_impl->access(); auto &p = *m_impl; p.readSnapshot();
++    p.scanout.WriteVram(psm, base, bw, x, y, value);
++    auto *mapped = p.gs.map_vram_write(0, vramBytes); std::memcpy(mapped, p.snapshot.data(), vramBytes);
++    p.gs.end_vram_write(0, vramBytes);
++}
++GSTransferSnapshot GSVulkanBackend::GetTransferSnapshot() const
++{
++    auto lock = m_impl->access(); return m_impl->transferState;
++}
++uint32_t GSVulkanBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
++{
++    if (!dst || !maxBytes) return 0;
++    auto lock = m_impl->access(); auto &p = *m_impl;
++    const auto count = uint32_t(std::min<size_t>(maxBytes, p.fifo.size() - p.fifoRead));
++    if (dst && count) std::memcpy(dst, p.fifo.data() + p.fifoRead, count);
++    p.fifoRead += count; p.transferState.localToHostPendingBytes = p.fifo.size() - p.fifoRead; return count;
++}
++bool GSVulkanBackend::ClearFramebuffer(const GSContext &c, uint32_t rgba)
++{
++    if (!c.frame.fbw || (c.frame.psm != GS_PSM_CT32 && c.frame.psm != GS_PSM_CT24 &&
++        c.frame.psm != GS_PSM_CT16 && c.frame.psm != GS_PSM_CT16S)) return false;
++    GSPrimitiveBatch b{}; b.state.context = c;
++    b.state.context.test = 0; b.state.context.zbuf.zmask = true; b.state.prim.type = GS_PRIM_SPRITE;
++    b.state.colclamp = 1; b.vertexCount = 2;
++    b.vertices[0].x = float(c.scissor.x0) + c.xyoffset.ofx / 16.0f;
++    b.vertices[0].y = float(c.scissor.y0) + c.xyoffset.ofy / 16.0f;
++    b.vertices[1].x = float(c.scissor.x1 + 1u) + c.xyoffset.ofx / 16.0f;
++    b.vertices[1].y = float(c.scissor.y1 + 1u) + c.xyoffset.ofy / 16.0f;
++    for (auto &v : b.vertices) { v.r = uint8_t(rgba); v.g = uint8_t(rgba >> 8);
++        v.b = uint8_t(rgba >> 16); v.a = uint8_t(rgba >> 24); }
++    Submit(b); return true;
++}
++PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
++{
++    auto lock = m_impl->access(); auto &p = *m_impl;
++    PresentationFrame result;
++    try { result = presentVulkanGs(p.gs, p.device, request); ++p.gpuPresentations; }
++    catch (const VulkanGsScanoutUnsupported &error)
++    {
++        // Preserve the fixed host viewport contract for display modes outside
++        // the bounded GPU scanout bridge. Rasterization remains Vulkan.
++        std::fprintf(stderr, "[gs:vulkan] CPU display conversion: %s\n", error.what());
++        p.readSnapshot(); result = p.scanout.PresentFromLocalMemory(request);
++        ++p.convertedPresentations;
++    }
++    p.device.next_frame_context();
++    const char *stats = std::getenv("PS2X_STATS");
++    if (stats && *stats && *stats != '0' && (p.gpuPresentations + p.convertedPresentations) % 300u == 0)
++        std::fprintf(stderr, "[gs:vulkan] draws=%llu GPU scanouts=%llu CPU display conversions=%llu\n",
++            static_cast<unsigned long long>(p.draws), static_cast<unsigned long long>(p.gpuPresentations),
++            static_cast<unsigned long long>(p.convertedPresentations));
++    return result;
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_scanout.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_scanout.cpp
+new file mode 100644
+index 0000000..8b144fd
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_scanout.cpp
+@@ -0,0 +1,169 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#include "gs_vulkan_scanout.h"
++
++#include "gs_interface.hpp"
++#include "device.hpp"
++#include "buffer.hpp"
++#include "fence.hpp"
++
++#include <algorithm>
++#include <cstdlib>
++#include <cstring>
++
++namespace
++{
++constexpr unsigned hostWidth = 640, hostHeight = 512;
++struct Circuit
++{
++    bool enabled = false;
++    ParallelGS::DISPFBBits framebuffer{};
++    ParallelGS::DISPLAYBits display{};
++    unsigned width = 0, height = 0;
++};
++
++Circuit decodeCircuit(bool enabled, uint64_t framebuffer, uint64_t display, bool frameFields)
++{
++    Circuit result;
++    result.framebuffer = ParallelGS::Reg64<ParallelGS::DISPFBBits>(framebuffer).desc;
++    result.display = ParallelGS::Reg64<ParallelGS::DISPLAYBits>(display).desc;
++    result.enabled = enabled && result.framebuffer.FBW != 0 && display != 0;
++    if (!result.enabled) return result;
++    result.width = (static_cast<unsigned>(result.display.DW) + 1u) /
++                   (static_cast<unsigned>(result.display.MAGH) + 1u);
++    result.height = (static_cast<unsigned>(result.display.DH) + 1u) /
++                    (static_cast<unsigned>(result.display.MAGV) + 1u);
++    if (frameFields) result.height = (result.height + 1u) / 2u;
++    if (result.width < 64 || result.width > hostWidth || result.height < 64 || result.height > 448)
++        throw VulkanGsScanoutUnsupported("GPU logical scanout supports widths 64..640 and source heights 64..448");
++    return result;
++}
++
++// GSPresentationRequest describes a logical viewport but has no SMODE1 clock
++// mode. Re-express its decoded source rectangle in a progressive NTSC-derived
++// viewport. This avoids analog-mode cropping of tall FRAME buffers, while the
++// actual sampling/merge remains ParallelGS GPU work. Relative CRT offsets are
++// retained in source-pixel units; no game identity is consulted.
++void normalizeCircuit(Circuit &c, unsigned minX, unsigned minY, bool frameFields)
++{
++    if (!c.enabled) return;
++    const unsigned x = (static_cast<unsigned>(c.display.DX) - minX) /
++                       (static_cast<unsigned>(c.display.MAGH) + 1u);
++    unsigned y = (static_cast<unsigned>(c.display.DY) - minY) /
++                 (static_cast<unsigned>(c.display.MAGV) + 1u);
++    if (frameFields) y /= 2u;
++    if (318u + x * 2u > 4095u || 50u + y > 2047u)
++        throw VulkanGsScanoutUnsupported("GPU logical scanout CRT offsets exceed the viewport encoding");
++    c.display.DX = 318u + x * 2u;
++    c.display.DY = 50u + y;
++    c.display.DW = c.width * 2u - 1u;
++    c.display.DH = c.height - 1u;
++    c.display.MAGH = 1;
++    c.display.MAGV = 0;
++}
++
++bool noWeave()
++{
++    const char *value = std::getenv("PS2X_NO_WEAVE");
++    return value && *value && *value != '0';
++}
++}
++
++PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
++                                  const GSPresentationRequest &request)
++{
++    using namespace ParallelGS;
++    using namespace Vulkan;
++    auto pmode = Reg64<PMODEBits>(request.pmode).desc;
++    const bool interlaced = (request.smode2 & 1u) != 0;
++    const bool frameMode = (request.smode2 & 2u) != 0;
++    const bool frameFields = interlaced && frameMode;
++    Circuit first = decodeCircuit(pmode.EN1 != 0, request.dispfb1, request.display1, frameFields);
++    Circuit second = decodeCircuit(pmode.EN2 != 0, request.dispfb2, request.display2, frameFields);
++    if (!first.enabled && !second.enabled) return {};
++    pmode.EN1 = first.enabled; pmode.EN2 = second.enabled;
++    const unsigned sourceHeight = std::max(first.height, second.height);
++    const bool movieFields = frameFields && sourceHeight <= 256;
++    if (movieFields && ((first.enabled && first.height != 224) || (second.enabled && second.height != 224)))
++        throw VulkanGsScanoutUnsupported("GPU bounded FRAME-field presentation currently requires 224 source rows");
++
++    auto &priv = gs.get_priv_register_state();
++    priv.pmode = pmode;
++    priv.bgcolor = Reg64<BGCOLORBits>(request.bgcolor).desc;
++    priv.smode1 = {};
++    priv.smode1.LC = SMODE1Bits::LC_ANALOG;
++    priv.smode1.CMOD = movieFields ? SMODE1Bits::CMOD_NTSC : SMODE1Bits::CMOD_PROGRESSIVE;
++    priv.smode2 = {};
++    priv.smode2.INT = movieFields;
++    priv.smode2.FFMD = movieFields;
++    priv.smode2.DPMS = (request.smode2 >> 2u) & 3u;
++    if (movieFields)
++    {
++        // Align the logical field viewport with NTSC's nominal non-overscan
++        // origin. Original MAGH/MAGV still control GPU source sampling.
++        for (auto *c : {&first, &second}) if (c->enabled)
++        { c->display.DX = 636; c->display.DY = 50; }
++    }
++    else
++    {
++        const unsigned minX = first.enabled && second.enabled
++            ? std::min<unsigned>(first.display.DX, second.display.DX)
++            : static_cast<unsigned>(first.enabled ? first.display.DX : second.display.DX);
++        const unsigned minY = first.enabled && second.enabled
++            ? std::min<unsigned>(first.display.DY, second.display.DY)
++            : static_cast<unsigned>(first.enabled ? first.display.DY : second.display.DY);
++        normalizeCircuit(first, minX, minY, frameFields);
++        normalizeCircuit(second, minX, minY, frameFields);
++    }
++    priv.dispfb1 = first.framebuffer; priv.display1 = first.display;
++    priv.dispfb2 = second.framebuffer; priv.display2 = second.display;
++
++    VSyncInfo info{};
++    info.phase = static_cast<uint32_t>(request.vsyncTick & 1u);
++    info.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    info.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
++    info.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
++    info.force_progressive = !movieFields;
++    info.adapt_to_internal_horizontal_resolution = true;
++    info.raw_circuit_scanout = !movieFields;
++    info.skip_deinterlace = movieFields && noWeave();
++    gs.flush();
++    auto output = gs.vsync(info);
++    if (!output.image) throw std::runtime_error("ParallelGS GPU scanout returned no image");
++    const auto width = output.image->get_width(), height = output.image->get_height();
++    if (!width || !height || width > hostWidth || height > hostHeight)
++        throw VulkanGsScanoutUnsupported("ParallelGS image exceeds the fixed host viewport");
++    if (output.image->get_create_info().format != VK_FORMAT_R8G8B8A8_UNORM)
++        throw std::runtime_error("ParallelGS GPU scanout returned an unexpected pixel format");
++
++    BufferCreateInfo bufferInfo{};
++    bufferInfo.size = static_cast<VkDeviceSize>(width) * height * 4u;
++    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++    bufferInfo.domain = BufferDomain::CachedHost;
++    auto readback = device.create_buffer(bufferInfo);
++    if (!readback) throw std::runtime_error("GPU scanout readback allocation failed");
++    auto command = device.request_command_buffer();
++    // vsync already transitions this image to TRANSFER_SRC with COPY/read
++    // visibility. Both operations use Granite's generic queue submission.
++    command->copy_image_to_buffer(*readback, *output.image, 0, {}, {width, height, 1},
++                                 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
++    command->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                     VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
++    Fence fence;
++    device.submit(command, &fence);
++    if (!fence || !fence->wait_timeout(10'000'000'000ull))
++        throw std::runtime_error("GPU scanout readback fence did not complete within 10 seconds");
++    const auto *mapped = static_cast<const uint8_t *>(device.map_host_buffer(*readback, MEMORY_ACCESS_READ_BIT));
++    if (!mapped) throw std::runtime_error("GPU scanout readback mapping failed");
++    PresentationFrame result{};
++    result.width = width; result.height = height;
++    result.displayFbp = result.sourceFbp = first.enabled ? first.framebuffer.FBP : second.framebuffer.FBP;
++    result.pixels.assign(hostWidth * hostHeight * 4u, 0);
++    for (unsigned y = 0; y < height; ++y)
++    {
++        auto *row = result.pixels.data() + static_cast<size_t>(y) * hostWidth * 4u;
++        std::memcpy(row, mapped + static_cast<size_t>(y) * width * 4u, width * 4u);
++        for (unsigned x = 0; x < width; ++x) row[x * 4u + 3u] = 255;
++    }
++    device.unmap_host_buffer(*readback, MEMORY_ACCESS_READ_BIT);
++    return result;
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_scanout.h b/ps2xRuntime/src/lib/gs/gs_vulkan_scanout.h
+new file mode 100644
+index 0000000..1c4b471
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_scanout.h
+@@ -0,0 +1,22 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#pragma once
++
++#include "runtime/gs/gs_types.h"
++#include <stdexcept>
++
++namespace ParallelGS { class GSInterface; }
++namespace Vulkan { class Device; }
++
++// Only this exception denotes an unsupported logical viewport. Vulkan failures
++// remain ordinary runtime errors and must not silently select another renderer.
++class VulkanGsScanoutUnsupported : public std::runtime_error
++{
++public:
++    using std::runtime_error::runtime_error;
++};
++
++// Caller serializes GS/device access and advances the device frame context.
++// Rasterization, VRAM sampling, circuit merge and field deinterlacing stay on
++// the GPU. The RGBA readback bridges the existing fixed 640-stride host UI.
++PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
++                                  const GSPresentationRequest &request);
+-- 
+2.55.0.windows.3
+

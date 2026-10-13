@@ -1,0 +1,923 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Priestley <Voicedrew11@gmail.com>
+Date: Sat, 3 Oct 2026 11:42:22 -0400
+Subject: [PATCH 03/14] Add opt-in GS diagnostics with env-gated tracing
+
+- PS2X_GS_TRACE: text trace of GS activity (register writes, image transfers, draw primitives)
+- PS2X_GS_TRACE_FROM/TO: vsync tick range for filtering trace output
+- PS2X_VRAM_DUMP: raw 4 MB GS local memory dump on shutdown
+
+Implements gs_trace.h/.cpp with buffered file output, hooks in:
+- gs_frontend.cpp: register writes and draw primitives
+- gs_cpu_backend.cpp: image transfer tracking
+- ps2_runtime.cpp: vsync tick markers and shutdown VRAM dump
+
+Trace output verified working: includes register values with decoded fields,
+image transfer details, and primitive draw information with vsync markers.
+
+Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/CMakeLists.txt                |   1 +
+ ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp |   4 +
+ ps2xRuntime/src/lib/gs/gs_frontend.cpp    |  25 +
+ ps2xRuntime/src/lib/gs/gs_trace.cpp       | 694 ++++++++++++++++++++++
+ ps2xRuntime/src/lib/gs/gs_trace.h         |  55 ++
+ ps2xRuntime/src/lib/ps2_runtime.cpp       |   5 +
+ 6 files changed, 784 insertions(+)
+ create mode 100644 ps2xRuntime/src/lib/gs/gs_trace.cpp
+ create mode 100644 ps2xRuntime/src/lib/gs/gs_trace.h
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 589d768..646f37f 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -383,6 +383,7 @@ add_library(ps2_runtime STATIC
+     src/lib/gs/ps2_gs_memory.cpp
+     src/lib/gs/gs_frontend.cpp
+     src/lib/gs/gs_cpu_backend.cpp
++    src/lib/gs/gs_trace.cpp
+     src/lib/ps2_iop_host.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..2c33776 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1,4 +1,5 @@
+ #include "runtime/gs/gs_cpu_backend.h"
++#include "gs_trace.h"
+ #include "runtime/gs/ps2_gs_common.h"
+ #include "runtime/gs/ps2_gs_psmct16.h"
+ #include "runtime/gs/ps2_gs_psmct32.h"
+@@ -1471,6 +1472,9 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+     m_transferState.direction = command.direction;
+     m_transferState.localToHostPendingBytes = 0u;
+ 
++    if (GSTrace::enabled())
++        GSTrace::imageTransfer(m_transfer.bitbltbuf, m_transfer.trxpos, m_transfer.trxreg, command.direction);
++
+     if (command.direction == 2u)
+         PerformLocalToLocalTransfer();
+     else if (command.direction == 1u)
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 5726579..346f518 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -2,6 +2,7 @@
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "ps2_log.h"
+ #include "runtime/ps2_memory.h"
++#include "gs_trace.h"
+ #include <atomic>
+ #include <algorithm>
+ #include <cmath>
+@@ -119,6 +120,17 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+     if (!m_backend)
+         m_backend = std::make_unique<GSCpuBackend>();
+     m_backend->Initialize(vram, vramSize);
++    GSTrace::initialize();
++    GSTrace::setLocalMemory(vram, vramSize);
++    GSTrace::setPrivilegedRegisters(privRegs);
++    GSTrace::setSnapshotCallback([this](std::vector<uint8_t> &out)
++                                 {
++                                     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
++                                     if (m_backend)
++                                         m_backend->SnapshotVram(out);
++                                     else
++                                         out.clear();
++                                 });
+     reset();
+ }
+ 
+@@ -1107,6 +1119,13 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+ 
+ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+ {
++    if (GSTrace::enabled())
++    {
++        const uint64_t traceTick = m_privRegs ? m_privRegs->vsyncTick.load(std::memory_order_acquire) : 0u;
++        GSTrace::setTick(traceTick);
++        GSTrace::registerWrite(regAddr, value, traceTick);
++    }
++
+     const bool interestingReg =
+         regAddr == GS_REG_PRIM ||
+         regAddr == GS_REG_RGBAQ ||
+@@ -1616,6 +1635,12 @@ void GS::vertexKick(bool drawing)
+     {
+         GSPrimitiveBatch batch = buildDrawBatch(needed);
+         updatePreferredDisplaySourceForDraw(batch);
++        if (GSTrace::enabled())
++        {
++            const uint64_t traceTick = m_privRegs ? m_privRegs->vsyncTick.load(std::memory_order_acquire) : 0u;
++            GSTrace::setTick(traceTick);
++            GSTrace::drawPrimitive(batch, traceTick);
++        }
+         m_backend->Submit(batch);
+         recordDrawDebugEventUnlocked(needed);
+     }
+diff --git a/ps2xRuntime/src/lib/gs/gs_trace.cpp b/ps2xRuntime/src/lib/gs/gs_trace.cpp
+new file mode 100644
+index 0000000..91a0cbc
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_trace.cpp
+@@ -0,0 +1,694 @@
++#include "gs_trace.h"
++
++#include "runtime/ps2_memory.h"
++
++#include <atomic>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <mutex>
++#include <string>
++#include <vector>
++
++namespace
++{
++    std::once_flag g_initOnce;
++    std::atomic<bool> g_enabled{false};
++    bool g_initialized = false;
++    bool g_active = false;
++
++    FILE *g_file = nullptr;
++    std::string g_tracePath;
++    uint64_t g_from = 0u;
++    uint64_t g_to = std::numeric_limits<uint64_t>::max();
++    uint64_t g_lastTick = std::numeric_limits<uint64_t>::max();
++    uint64_t g_lastPrivTick = std::numeric_limits<uint64_t>::max();
++    uint64_t g_currentTick = 0u;
++
++    bool g_vramDumpEnabled = false;
++    std::string g_vramDumpPath;
++
++    const uint8_t *g_vram = nullptr;
++    uint32_t g_vramSize = 0u;
++    const GSRegisters *g_privRegs = nullptr;
++    std::function<void(std::vector<uint8_t> &)> g_snapshot;
++
++    std::mutex g_mutex;
++
++    // Buffered file, never flushed per line.  The stdio default would be a few
++    // KiB; a megabyte keeps the hot path off the syscall path entirely.
++    constexpr size_t kTraceBufferBytes = 1u << 20u;
++    std::vector<char> g_traceBuffer;
++
++    const char *primName(uint32_t type)
++    {
++        switch (type)
++        {
++        case 0: return "POINT";
++        case 1: return "LINE";
++        case 2: return "LINESTRIP";
++        case 3: return "TRIANGLE";
++        case 4: return "TRISTRIP";
++        case 5: return "TRIFAN";
++        case 6: return "SPRITE";
++        default: return "?";
++        }
++    }
++
++    const char *psmName(uint32_t psm)
++    {
++        switch (psm)
++        {
++        case 0: return "CT32";
++        case 1: return "CT24";
++        case 2: return "CT16";
++        case 10: return "CT16S";
++        case 19: return "T8";
++        case 20: return "T4";
++        case 27: return "T8H";
++        case 36: return "T4HL";
++        case 44: return "T4HH";
++        case 48: return "Z32";
++        case 49: return "Z24";
++        case 50: return "Z16";
++        case 58: return "Z16S";
++        default: return "?";
++        }
++    }
++
++    const char *xferDirName(uint32_t dir)
++    {
++        switch (dir)
++        {
++        case 0: return "HOST2LOCAL";
++        case 1: return "LOCAL2HOST";
++        case 2: return "LOCAL2LOCAL";
++        default: return "DEACTIVATED";
++        }
++    }
++
++    const char *regName(uint8_t addr, int &context)
++    {
++        context = 0;
++        switch (addr)
++        {
++        case GS_REG_PRIM: return "PRIM";
++        case GS_REG_RGBAQ: return "RGBAQ";
++        case GS_REG_ST: return "ST";
++        case GS_REG_UV: return "UV";
++        case GS_REG_XYZF2: return "XYZF2";
++        case GS_REG_XYZ2: return "XYZ2";
++        case GS_REG_XYZF3: return "XYZF3";
++        case GS_REG_XYZ3: return "XYZ3";
++        case GS_REG_FOG: return "FOG";
++        case GS_REG_TEX0_1: return "TEX0_1";
++        case GS_REG_TEX0_2: context = 1; return "TEX0_2";
++        case GS_REG_CLAMP_1: return "CLAMP_1";
++        case GS_REG_CLAMP_2: context = 1; return "CLAMP_2";
++        case GS_REG_TEX1_1: return "TEX1_1";
++        case GS_REG_TEX1_2: context = 1; return "TEX1_2";
++        case GS_REG_TEX2_1: return "TEX2_1";
++        case GS_REG_TEX2_2: context = 1; return "TEX2_2";
++        case GS_REG_XYOFFSET_1: return "XYOFFSET_1";
++        case GS_REG_XYOFFSET_2: context = 1; return "XYOFFSET_2";
++        case GS_REG_PRMODECONT: return "PRMODECONT";
++        case GS_REG_PRMODE: return "PRMODE";
++        case GS_REG_TEXCLUT: return "TEXCLUT";
++        case GS_REG_SCANMSK: return "SCANMSK";
++        case GS_REG_MIPTBP1_1: return "MIPTBP1_1";
++        case GS_REG_MIPTBP1_2: context = 1; return "MIPTBP1_2";
++        case GS_REG_MIPTBP2_1: return "MIPTBP2_1";
++        case GS_REG_MIPTBP2_2: context = 1; return "MIPTBP2_2";
++        case GS_REG_TEXA: return "TEXA";
++        case GS_REG_FOGCOL: return "FOGCOL";
++        case GS_REG_TEXFLUSH: return "TEXFLUSH";
++        case GS_REG_SCISSOR_1: return "SCISSOR_1";
++        case GS_REG_SCISSOR_2: context = 1; return "SCISSOR_2";
++        case GS_REG_ALPHA_1: return "ALPHA_1";
++        case GS_REG_ALPHA_2: context = 1; return "ALPHA_2";
++        case GS_REG_DIMX: return "DIMX";
++        case GS_REG_DTHE: return "DTHE";
++        case GS_REG_COLCLAMP: return "COLCLAMP";
++        case GS_REG_TEST_1: return "TEST_1";
++        case GS_REG_TEST_2: context = 1; return "TEST_2";
++        case GS_REG_PABE: return "PABE";
++        case GS_REG_FBA_1: return "FBA_1";
++        case GS_REG_FBA_2: context = 1; return "FBA_2";
++        case GS_REG_FRAME_1: return "FRAME_1";
++        case GS_REG_FRAME_2: context = 1; return "FRAME_2";
++        case GS_REG_ZBUF_1: return "ZBUF_1";
++        case GS_REG_ZBUF_2: context = 1; return "ZBUF_2";
++        case GS_REG_BITBLTBUF: return "BITBLTBUF";
++        case GS_REG_TRXPOS: return "TRXPOS";
++        case GS_REG_TRXREG: return "TRXREG";
++        case GS_REG_TRXDIR: return "TRXDIR";
++        case GS_REG_HWREG: return "HWREG";
++        case GS_REG_SIGNAL: return "SIGNAL";
++        case GS_REG_FINISH: return "FINISH";
++        case GS_REG_LABEL: return "LABEL";
++        // Privileged display registers, reached through the runtime's own A+D
++        // register numbering (see gs_frontend.cpp).
++        case 0x59: return "DISPFB1";
++        case 0x5A: return "DISPLAY1";
++        case 0x5B: return "DISPFB2";
++        case 0x5C: return "DISPLAY2";
++        case 0x5F: return "BGCOLOR";
++        default: return nullptr;
++        }
++    }
++
++    void formatPrimBits(char *buf, size_t cap, uint64_t value)
++    {
++        std::snprintf(buf, cap,
++                      "type=%s iip=%u tme=%u fge=%u abe=%u aa1=%u fst=%u ctxt=%u fix=%u",
++                      primName(static_cast<uint32_t>(value & 0x7u)),
++                      static_cast<unsigned>((value >> 3) & 1u),
++                      static_cast<unsigned>((value >> 4) & 1u),
++                      static_cast<unsigned>((value >> 5) & 1u),
++                      static_cast<unsigned>((value >> 6) & 1u),
++                      static_cast<unsigned>((value >> 7) & 1u),
++                      static_cast<unsigned>((value >> 8) & 1u),
++                      static_cast<unsigned>((value >> 9) & 1u),
++                      static_cast<unsigned>((value >> 10) & 1u));
++    }
++
++    void emitRegisterLine(uint8_t addr, uint64_t value, uint64_t tick)
++    {
++        int ctx = 0;
++        const char *name = regName(addr, ctx);
++        char decoded[256];
++        decoded[0] = '\0';
++
++        auto u = [&](unsigned shift, unsigned mask) -> unsigned
++        { return static_cast<unsigned>((value >> shift) & mask); };
++
++        switch (addr)
++        {
++        case GS_REG_PRIM:
++        case GS_REG_PRMODE:
++            formatPrimBits(decoded, sizeof(decoded), value);
++            break;
++        case GS_REG_PRMODECONT:
++            std::snprintf(decoded, sizeof(decoded), "ac=%u", u(0, 1));
++            break;
++        case GS_REG_RGBAQ:
++            std::snprintf(decoded, sizeof(decoded), "r=%u g=%u b=%u a=%u qbits=0x%08x",
++                          u(0, 0xFF), u(8, 0xFF), u(16, 0xFF), u(24, 0xFF),
++                          static_cast<unsigned>((value >> 32) & 0xFFFFFFFFu));
++            break;
++        case GS_REG_ST: {
++            float s = 0.0f, t = 0.0f;
++            uint32_t sb = static_cast<uint32_t>(value & 0xFFFFFFFFu);
++            uint32_t tb = static_cast<uint32_t>((value >> 32) & 0xFFFFFFFFu);
++            std::memcpy(&s, &sb, 4);
++            std::memcpy(&t, &tb, 4);
++            std::snprintf(decoded, sizeof(decoded), "s=%g t=%g", s, t);
++            break;
++        }
++        case GS_REG_UV:
++            std::snprintf(decoded, sizeof(decoded), "u=%u v=%u", u(0, 0x3FFF), u(16, 0x3FFF));
++            break;
++        case GS_REG_XYZF2:
++        case GS_REG_XYZF3:
++            std::snprintf(decoded, sizeof(decoded), "x=%u y=%u z=%u fog=%u",
++                          u(0, 0xFFFF), u(16, 0xFFFF), u(32, 0xFFFFFF), u(56, 0xFF));
++            break;
++        case GS_REG_XYZ2:
++        case GS_REG_XYZ3:
++            std::snprintf(decoded, sizeof(decoded), "x=%u y=%u z=%u",
++                          u(0, 0xFFFF), u(16, 0xFFFF), static_cast<unsigned>((value >> 32) & 0xFFFFFFFFu));
++            break;
++        case GS_REG_FRAME_1:
++        case GS_REG_FRAME_2:
++            std::snprintf(decoded, sizeof(decoded),
++                          "fbp=%u fbw=%u psm=%s(0x%x) fbmsk=0x%08x",
++                          u(0, 0x1FF), u(16, 0x3F), psmName(u(24, 0x3F)), u(24, 0x3F),
++                          static_cast<unsigned>((value >> 32) & 0xFFFFFFFFu));
++            break;
++        case GS_REG_ZBUF_1:
++        case GS_REG_ZBUF_2:
++            std::snprintf(decoded, sizeof(decoded), "zbp=%u zpsm=%s(0x%x) zmask=%u",
++                          u(0, 0x1FF), psmName(u(24, 0xF) | 0x30u), u(24, 0xF), u(32, 1));
++            break;
++        case GS_REG_TEX0_1:
++        case GS_REG_TEX0_2:
++        case GS_REG_TEX2_1:
++        case GS_REG_TEX2_2:
++            std::snprintf(decoded, sizeof(decoded),
++                          "tbp0=%u tbw=%u psm=%s(0x%x) tw=%u th=%u tcc=%u tfx=%u "
++                          "cbp=%u cpsm=%s(0x%x) csm=%u csa=%u cld=%u",
++                          u(0, 0x3FFF), u(14, 0x3F), psmName(u(20, 0x3F)), u(20, 0x3F),
++                          u(26, 0xF), u(30, 0xF), u(34, 1), u(35, 3),
++                          u(37, 0x3FFF), psmName(u(51, 0xF)), u(51, 0xF),
++                          u(55, 1), u(56, 0x1F), u(61, 7));
++            break;
++        case GS_REG_TEX1_1:
++        case GS_REG_TEX1_2:
++            std::snprintf(decoded, sizeof(decoded),
++                          "lcm=%u mxl=%u mmag=%u mmin=%u mtba=%u l=%u k=%u",
++                          u(0, 1), u(2, 7), u(5, 1), u(6, 7), u(9, 1), u(11, 3), u(13, 3));
++            break;
++        case GS_REG_CLAMP_1:
++        case GS_REG_CLAMP_2:
++            std::snprintf(decoded, sizeof(decoded),
++                          "wms=%u wmt=%u minu=%u maxu=%u minv=%u maxv=%u",
++                          u(0, 3), u(2, 3), u(4, 0x3FF), u(14, 0x3FF), u(24, 0x3FF), u(34, 0x3FF));
++            break;
++        case GS_REG_TEXCLUT:
++            std::snprintf(decoded, sizeof(decoded), "cbw=%u cou=%u cov=%u",
++                          u(0, 0x3F), u(6, 0x3F), u(12, 0x3FF));
++            break;
++        case GS_REG_TEXA:
++            std::snprintf(decoded, sizeof(decoded), "ta0=0x%x aem=%u ta1=0x%x",
++                          u(0, 0xFF), u(15, 1), u(32, 0xFF));
++            break;
++        case GS_REG_ALPHA_1:
++        case GS_REG_ALPHA_2:
++            std::snprintf(decoded, sizeof(decoded), "a=%u b=%u c=%u d=%u fix=0x%x",
++                          u(0, 3), u(2, 3), u(4, 3), u(6, 3), u(32, 0xFF));
++            break;
++        case GS_REG_TEST_1:
++        case GS_REG_TEST_2:
++            std::snprintf(decoded, sizeof(decoded),
++                          "atst=%u aref=0x%x afail=%u date=%u atm=%u zte=%u ztst=%u",
++                          u(0, 7), u(4, 0xFF), u(12, 3), u(14, 1), u(15, 1), u(16, 1), u(17, 3));
++            break;
++        case GS_REG_SCISSOR_1:
++        case GS_REG_SCISSOR_2:
++            std::snprintf(decoded, sizeof(decoded), "x0=%u x1=%u y0=%u y1=%u",
++                          u(0, 0x7FF), u(16, 0x7FF), u(32, 0x7FF), u(48, 0x7FF));
++            break;
++        case GS_REG_XYOFFSET_1:
++        case GS_REG_XYOFFSET_2:
++            std::snprintf(decoded, sizeof(decoded), "ofx=%u ofy=%u",
++                          static_cast<unsigned>(value & 0xFFFFu), u(32, 0xFFFF));
++            break;
++        case GS_REG_FBA_1:
++        case GS_REG_FBA_2:
++            std::snprintf(decoded, sizeof(decoded), "fba=%u", u(0, 1));
++            break;
++        case GS_REG_BITBLTBUF:
++            std::snprintf(decoded, sizeof(decoded),
++                          "sbp=%u sbw=%u spsm=%s(0x%x) dbp=%u dbw=%u dpsm=%s(0x%x)",
++                          u(0, 0x3FFF), u(16, 0x3F), psmName(u(24, 0x3F)), u(24, 0x3F),
++                          static_cast<unsigned>((value >> 32) & 0x3FFFu), u(48, 0x3F),
++                          psmName(u(56, 0x3F)), u(56, 0x3F));
++            break;
++        case GS_REG_TRXPOS:
++            std::snprintf(decoded, sizeof(decoded),
++                          "ssax=%u ssay=%u dsax=%u dsay=%u dir=%u",
++                          u(0, 0x7FF), u(16, 0x7FF), u(32, 0x7FF), u(48, 0x7FF), u(59, 3));
++            break;
++        case GS_REG_TRXREG:
++            std::snprintf(decoded, sizeof(decoded), "rrw=%u rrh=%u",
++                          static_cast<unsigned>(value & 0xFFFu), u(32, 0xFFFu));
++            break;
++        case GS_REG_TRXDIR:
++            std::snprintf(decoded, sizeof(decoded), "xdir=%u (%s)", u(0, 3), xferDirName(u(0, 3)));
++            break;
++        case GS_REG_FOG:
++            std::snprintf(decoded, sizeof(decoded), "fog=0x%x", u(56, 0xFF));
++            break;
++        case GS_REG_FOGCOL:
++            std::snprintf(decoded, sizeof(decoded), "r=0x%x g=0x%x b=0x%x",
++                          u(0, 0xFF), u(8, 0xFF), u(16, 0xFF));
++            break;
++        case GS_REG_SCANMSK:
++            std::snprintf(decoded, sizeof(decoded), "msk=%u", u(0, 3));
++            break;
++        case GS_REG_DIMX:
++            std::snprintf(decoded, sizeof(decoded), "dm00=%u dm01=%u dm10=%u dm11=%u",
++                          u(0, 7), u(4, 7), u(8, 7), u(12, 7));
++            break;
++        case GS_REG_DTHE:
++            std::snprintf(decoded, sizeof(decoded), "dthe=%u", u(0, 1));
++            break;
++        case GS_REG_COLCLAMP:
++            std::snprintf(decoded, sizeof(decoded), "clamp=%u", u(0, 1));
++            break;
++        case GS_REG_PABE:
++            std::snprintf(decoded, sizeof(decoded), "pabe=%u", u(0, 1));
++            break;
++        case 0x59: // DISPFB1
++        case 0x5B: // DISPFB2
++            std::snprintf(decoded, sizeof(decoded),
++                          "fbp=%u fbw=%u psm=%s(0x%x) dbx=%u dby=%u",
++                          u(0, 0x1FF), u(9, 0x3F), psmName(u(15, 0x1F)), u(15, 0x1F),
++                          u(32, 0x7FF), u(43, 0x7FF));
++            break;
++        case 0x5A: // DISPLAY1
++        case 0x5C: // DISPLAY2
++            std::snprintf(decoded, sizeof(decoded),
++                          "dx=%u dy=%u magh=%u magv=%u dw=%u dh=%u",
++                          u(0, 0xFFF), u(12, 0x7FF), u(23, 0xF), u(27, 3), u(32, 0xFFF), u(44, 0x7FF));
++            break;
++        case 0x5F: // BGCOLOR
++            std::snprintf(decoded, sizeof(decoded), "r=%u g=%u b=%u", u(0, 0xFF), u(8, 0xFF), u(16, 0xFF));
++            break;
++        default:
++            break;
++        }
++
++        if (name)
++            std::fprintf(g_file, "REG tick=%llu ctx=%d %-11s value=0x%016llx %s\n",
++                         static_cast<unsigned long long>(tick), ctx,
++                         name, static_cast<unsigned long long>(value), decoded);
++        else
++            std::fprintf(g_file, "REG tick=%llu ctx=%d reg_0x%02x value=0x%016llx\n",
++                         static_cast<unsigned long long>(tick), ctx,
++                         static_cast<unsigned>(addr), static_cast<unsigned long long>(value));
++    }
++
++    void emitPrivilegedLine(uint64_t tick)
++    {
++        if (!g_privRegs)
++            return;
++        const GSRegisters &r = *g_privRegs;
++        auto field = [](uint64_t v, unsigned shift, unsigned mask) -> unsigned
++        { return static_cast<unsigned>((v >> shift) & mask); };
++
++        std::fprintf(g_file,
++                     "PRIV tick=%llu PMODE(en1=%u en2=%u crtmd=%u mmod=%u amod=%u slbg=%u alp=0x%x) "
++                     "SMODE2(int=%u ffmd=%u dpl=%u) "
++                     "DISPFB1(fbp=%u fbw=%u psm=0x%x dbx=%u dby=%u) "
++                     "DISPLAY1(dx=%u dy=%u magh=%u magv=%u dw=%u dh=%u) "
++                     "BGCOLOR(r=%u g=%u b=%u)\n",
++                     static_cast<unsigned long long>(tick),
++                     field(r.pmode, 0, 1), field(r.pmode, 1, 1), field(r.pmode, 2, 7),
++                     field(r.pmode, 5, 1), field(r.pmode, 6, 1), field(r.pmode, 7, 1), field(r.pmode, 8, 0xFF),
++                     field(r.smode2, 0, 1), field(r.smode2, 1, 1), field(r.smode2, 2, 3),
++                     field(r.dispfb1, 0, 0x1FF), field(r.dispfb1, 9, 0x3F), field(r.dispfb1, 15, 0x1F),
++                     field(r.dispfb1, 32, 0x7FF), field(r.dispfb1, 43, 0x7FF),
++                     field(r.display1, 0, 0xFFF), field(r.display1, 12, 0x7FF), field(r.display1, 23, 0xF),
++                     field(r.display1, 27, 3), field(r.display1, 32, 0xFFF), field(r.display1, 44, 0x7FF),
++                     field(r.bgcolor, 0, 0xFF), field(r.bgcolor, 8, 0xFF), field(r.bgcolor, 16, 0xFF));
++    }
++
++    void initFromEnv()
++    {
++        g_initialized = true;
++        if (const char *f = std::getenv("PS2X_GS_TRACE"))
++        {
++            if (*f)
++            {
++                g_tracePath = f;
++                const char *from = std::getenv("PS2X_GS_TRACE_FROM");
++                const char *to = std::getenv("PS2X_GS_TRACE_TO");
++                if (from && *from)
++                    g_from = std::strtoull(from, nullptr, 0);
++                if (to && *to)
++                    g_to = std::strtoull(to, nullptr, 0);
++                g_file = std::fopen(g_tracePath.c_str(), "wb");
++                if (g_file)
++                {
++                    g_traceBuffer.resize(kTraceBufferBytes);
++                    std::setvbuf(g_file, g_traceBuffer.data(), _IOFBF, g_traceBuffer.size());
++                    g_active = true;
++                    std::fprintf(stderr, "[gs:trace] writing %s (ticks %llu..%llu)\n",
++                                 g_tracePath.c_str(),
++                                 static_cast<unsigned long long>(g_from),
++                                 static_cast<unsigned long long>(g_to));
++                }
++                else
++                {
++                    std::fprintf(stderr, "[gs:trace] failed to open %s\n", g_tracePath.c_str());
++                }
++            }
++        }
++
++        if (const char *v = std::getenv("PS2X_VRAM_DUMP"))
++        {
++            if (*v)
++            {
++                g_vramDumpEnabled = true;
++                g_vramDumpPath = v;
++                std::fprintf(stderr, "[gs:trace] VRAM dump -> %s\n", g_vramDumpPath.c_str());
++            }
++        }
++
++        g_enabled.store(g_file != nullptr || g_vramDumpEnabled, std::memory_order_relaxed);
++    }
++
++    void ensureInitLocked()
++    {
++        if (!g_initialized)
++            initFromEnv();
++    }
++
++    void ensureTickLocked(uint64_t tick)
++    {
++        if (!g_file || !g_active)
++            return;
++        if (tick < g_from)
++            return;
++        if (tick > g_to)
++        {
++            // Ticks are monotonic; nothing further will be recorded.
++            g_active = false;
++            return;
++        }
++        if (tick != g_lastTick)
++        {
++            g_lastTick = tick;
++            std::fprintf(g_file, "=== VSYNC tick %llu ===\n",
++                         static_cast<unsigned long long>(tick));
++        }
++    }
++
++    uint32_t transferBytes(uint8_t psm, uint32_t pixels)
++    {
++        switch (psm)
++        {
++        case GS_PSM_CT32:
++        case GS_PSM_CT24:
++        case GS_PSM_Z32:
++        case GS_PSM_Z24:
++        case GS_PSM_T8H:
++        case GS_PSM_T4HL:
++        case GS_PSM_T4HH:
++            return pixels * 4u;
++        case GS_PSM_CT16:
++        case GS_PSM_CT16S:
++        case GS_PSM_Z16:
++        case GS_PSM_Z16S:
++            return pixels * 2u;
++        case GS_PSM_T8:
++            return pixels;
++        case GS_PSM_T4:
++            return (pixels + 1u) / 2u;
++        default:
++            return pixels * 4u;
++        }
++    }
++}
++
++namespace GSTrace
++{
++    void initialize()
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        ensureInitLocked();
++    }
++
++    bool enabled()
++    {
++        return g_enabled.load(std::memory_order_relaxed);
++    }
++
++    void setLocalMemory(const uint8_t *vram, uint32_t size)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        g_vram = vram;
++        g_vramSize = size;
++    }
++
++    void setPrivilegedRegisters(const GSRegisters *regs)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        g_privRegs = regs;
++    }
++
++    void setSnapshotCallback(std::function<void(std::vector<uint8_t> &)> callback)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        g_snapshot = std::move(callback);
++    }
++
++    void setTick(uint64_t tick)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        g_currentTick = tick;
++    }
++
++    void onTick(uint64_t tick)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        ensureInitLocked();
++        if (!g_file || !g_active)
++            return;
++        g_currentTick = tick;
++        ensureTickLocked(tick);
++        if (tick >= g_from && tick <= g_to && tick != g_lastPrivTick)
++        {
++            g_lastPrivTick = tick;
++            emitPrivilegedLine(tick);
++        }
++    }
++
++    void registerWrite(uint8_t regAddr, uint64_t value, uint64_t tick)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        ensureInitLocked();
++        if (!g_file || !g_active)
++            return;
++        ensureTickLocked(tick);
++        if (!g_active)
++            return;
++        emitRegisterLine(regAddr, value, tick);
++    }
++
++    void imageTransfer(const GSBitBltBuf &buf,
++                       const GSTrxPos &pos,
++                       const GSTrxReg &reg,
++                       uint32_t direction)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        ensureInitLocked();
++        if (!g_file || !g_active)
++            return;
++        const uint64_t tick = g_currentTick;
++        ensureTickLocked(tick);
++        if (!g_active)
++            return;
++        const uint32_t pixels = static_cast<uint32_t>(reg.rrw) * static_cast<uint32_t>(reg.rrh);
++        const uint32_t bytes = transferBytes(buf.dpsm, pixels);
++        std::fprintf(g_file,
++                     "XFER tick=%llu dir=%u(%s) sbp=%u sbw=%u spsm=%s(0x%x) "
++                     "dbp=%u dbw=%u dpsm=%s(0x%x) ss=(%u,%u) ds=(%u,%u) rect=%ux%u pixels=%u bytes=%u\n",
++                     static_cast<unsigned long long>(tick),
++                     static_cast<unsigned>(direction), xferDirName(direction),
++                     buf.sbp, static_cast<unsigned>(buf.sbw), psmName(buf.spsm), buf.spsm,
++                     buf.dbp, static_cast<unsigned>(buf.dbw), psmName(buf.dpsm), buf.dpsm,
++                     static_cast<unsigned>(pos.ssax), static_cast<unsigned>(pos.ssay),
++                     static_cast<unsigned>(pos.dsax), static_cast<unsigned>(pos.dsay),
++                     static_cast<unsigned>(reg.rrw), static_cast<unsigned>(reg.rrh),
++                     pixels, bytes);
++    }
++
++    void drawPrimitive(const GSPrimitiveBatch &batch, uint64_t tick)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        ensureInitLocked();
++        if (!g_file || !g_active || batch.vertexCount == 0u)
++            return;
++        ensureTickLocked(tick);
++        if (!g_active)
++            return;
++
++        const GSDrawState &state = batch.state;
++        const GSContext &ctx = state.context;
++        char primBits[128];
++        formatPrimBits(primBits, sizeof(primBits), static_cast<uint64_t>(state.prim.type) |
++                                                  (static_cast<uint64_t>(state.prim.iip) << 3) |
++                                                  (static_cast<uint64_t>(state.prim.tme) << 4) |
++                                                  (static_cast<uint64_t>(state.prim.fge) << 5) |
++                                                  (static_cast<uint64_t>(state.prim.abe) << 6) |
++                                                  (static_cast<uint64_t>(state.prim.aa1) << 7) |
++                                                  (static_cast<uint64_t>(state.prim.fst) << 8) |
++                                                  (static_cast<uint64_t>(state.prim.ctxt) << 9) |
++                                                  (static_cast<uint64_t>(state.prim.fix) << 10));
++
++        const float ofx = static_cast<float>(ctx.xyoffset.ofx >> 4);
++        const float ofy = static_cast<float>(ctx.xyoffset.ofy >> 4);
++        float xMin = 1e30f, xMax = -1e30f, yMin = 1e30f, yMax = -1e30f;
++        float uMin = 1e30f, uMax = -1e30f, vMin = 1e30f, vMax = -1e30f;
++        float sMin = 1e30f, sMax = -1e30f, tMin = 1e30f, tMax = -1e30f, qMin = 1e30f, qMax = -1e30f;
++        for (uint8_t i = 0; i < batch.vertexCount; ++i)
++        {
++            const GSVertex &v = batch.vertices[i];
++            const float px = v.x - ofx;
++            const float py = v.y - ofy;
++            xMin = std::fmin(xMin, px); xMax = std::fmax(xMax, px);
++            yMin = std::fmin(yMin, py); yMax = std::fmax(yMax, py);
++            uMin = std::fmin(uMin, static_cast<float>(v.u)); uMax = std::fmax(uMax, static_cast<float>(v.u));
++            vMin = std::fmin(vMin, static_cast<float>(v.v)); vMax = std::fmax(vMax, static_cast<float>(v.v));
++            sMin = std::fmin(sMin, v.s); sMax = std::fmax(sMax, v.s);
++            tMin = std::fmin(tMin, v.t); tMax = std::fmax(tMax, v.t);
++            qMin = std::fmin(qMin, v.q); qMax = std::fmax(qMax, v.q);
++        }
++
++        std::fprintf(g_file,
++                     "DRAW tick=%llu %s %s frame(fbp=%u fbw=%u psm=%s(0x%x) fbmsk=0x%08x) "
++                     "tex(tbp0=%u tbw=%u psm=%s(0x%x) tw=%u th=%u tcc=%u tfx=%u "
++                     "cbp=%u cpsm=%s(0x%x) csm=%u csa=%u cld=%u) "
++                     "xy=[%g,%g]x[%g,%g] uv=[%g,%g]x[%g,%g] stq=[%g,%g][%g,%g][%g,%g]",
++                     static_cast<unsigned long long>(tick),
++                     primName(static_cast<uint32_t>(state.prim.type)), primBits,
++                     ctx.frame.fbp, ctx.frame.fbw, psmName(ctx.frame.psm), ctx.frame.psm, ctx.frame.fbmsk,
++                     ctx.tex0.tbp0, static_cast<unsigned>(ctx.tex0.tbw), psmName(ctx.tex0.psm), ctx.tex0.psm,
++                     static_cast<unsigned>(ctx.tex0.tw), static_cast<unsigned>(ctx.tex0.th),
++                     static_cast<unsigned>(ctx.tex0.tcc), static_cast<unsigned>(ctx.tex0.tfx),
++                     ctx.tex0.cbp, psmName(ctx.tex0.cpsm), ctx.tex0.cpsm,
++                     static_cast<unsigned>(ctx.tex0.csm), static_cast<unsigned>(ctx.tex0.csa),
++                     static_cast<unsigned>(ctx.tex0.cld),
++                     xMin, xMax, yMin, yMax,
++                     uMin, uMax, vMin, vMax,
++                     sMin, sMax, tMin, tMax, qMin, qMax);
++        for (uint8_t i = 0; i < batch.vertexCount; ++i)
++        {
++            const GSVertex &v = batch.vertices[i];
++            std::fprintf(g_file, " v%u(rgba=%u,%u,%u,%u q=%g u=%u v=%u fog=%u xy=(%g,%g))",
++                         static_cast<unsigned>(i), v.r, v.g, v.b, v.a, v.q,
++                         static_cast<unsigned>(v.u), static_cast<unsigned>(v.v),
++                         static_cast<unsigned>(v.fog), v.x - ofx, v.y - ofy);
++        }
++        std::fputc('\n', g_file);
++    }
++
++    void shutdown()
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        ensureInitLocked();
++
++        if (g_vramDumpEnabled)
++        {
++            std::vector<uint8_t> snapshot;
++            if (g_snapshot)
++                g_snapshot(snapshot);
++            else if (g_vram && g_vramSize)
++                snapshot.assign(g_vram, g_vram + g_vramSize);
++
++            if (!snapshot.empty())
++            {
++                if (FILE *vf = std::fopen(g_vramDumpPath.c_str(), "wb"))
++                {
++                    std::fwrite(snapshot.data(), 1u, snapshot.size(), vf);
++                    std::fclose(vf);
++                    std::fprintf(stderr, "[gs:trace] wrote %zu bytes VRAM to %s\n",
++                                 snapshot.size(), g_vramDumpPath.c_str());
++                }
++                else
++                {
++                    std::fprintf(stderr, "[gs:trace] failed to open VRAM dump %s\n", g_vramDumpPath.c_str());
++                }
++            }
++            else
++            {
++                std::fprintf(stderr, "[gs:trace] no VRAM available to dump\n");
++            }
++            g_vramDumpEnabled = false;
++        }
++
++        if (g_file)
++        {
++            std::fflush(g_file);
++            std::fclose(g_file);
++            g_file = nullptr;
++            g_active = false;
++            std::fprintf(stderr, "[gs:trace] trace written to %s\n", g_tracePath.c_str());
++        }
++    }
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_trace.h b/ps2xRuntime/src/lib/gs/gs_trace.h
+new file mode 100644
+index 0000000..123db66
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_trace.h
+@@ -0,0 +1,55 @@
++#ifndef PS2X_GS_TRACE_H
++#define PS2X_GS_TRACE_H
++
++// Optional, env-gated GS diagnostics.  Nothing here is active unless the
++// process is launched with PS2X_GS_TRACE and/or PS2X_VRAM_DUMP set.
++//
++//   PS2X_GS_TRACE=<file>       append a text trace of GS activity
++//   PS2X_GS_TRACE_FROM=<tick>  first vsync tick to record (default 0)
++//   PS2X_GS_TRACE_TO=<tick>    last vsync tick to record (default infinite)
++//   PS2X_VRAM_DUMP=<file>      raw 4 MiB GS local memory written on shutdown
++//
++// The trace file is buffered and only flushed/closed by shutdown().
++
++#include "runtime/gs/gs_types.h"
++
++#include <cstdint>
++#include <functional>
++#include <vector>
++
++struct GSRegisters;
++
++namespace GSTrace
++{
++    // Parse the env vars once.  Safe to call redundantly.
++    void initialize();
++    // Cheap (atomic) test used to keep the hot path free when tracing is off.
++    bool enabled();
++
++    // Registers the 4 MiB local memory + privileged register block backing the
++    // active GS.  Called once from GS::init().
++    void setLocalMemory(const uint8_t *vram, uint32_t size);
++    void setPrivilegedRegisters(const GSRegisters *regs);
++    void setSnapshotCallback(std::function<void(std::vector<uint8_t> &)> callback);
++
++    // Current vsync tick, updated from the GS frontend so backend-side hooks
++    // (image transfers) can tag their output without another header change.
++    void setTick(uint64_t tick);
++
++    // Emit a marker when a new in-range vsync tick starts.  Safe to call from
++    // the dev harness every frame.
++    void onTick(uint64_t tick);
++
++    void registerWrite(uint8_t regAddr, uint64_t value, uint64_t tick);
++    void imageTransfer(const GSBitBltBuf &buf,
++                       const GSTrxPos &pos,
++                       const GSTrxReg &reg,
++                       uint32_t direction);
++    void drawPrimitive(const GSPrimitiveBatch &batch, uint64_t tick);
++
++    // Flush/close the trace file and write the VRAM dump if requested.  Safe to
++    // call multiple times.
++    void shutdown();
++}
++
++#endif
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 33f9e3f..cd09ced 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -5,6 +5,7 @@
+ #include "game_overrides.h"
+ #include "ps2_runtime_macros.h"
+ #include "runtime/gs/gs_frontend.h"
++#include "gs/gs_trace.h"
+ #include "runtime/ee_scheduler.h"
+ #include "ThreadNaming.h"
+ #include "Kernel/Stubs/Audio.h"
+@@ -555,6 +556,7 @@ namespace ps2x_dev
+                 else if (cmd == "quit")
+                 {
+                     std::cerr << "[dev] quit at tick " << tick << std::endl;
++                    GSTrace::shutdown();
+                     std::cout.flush();
+                     std::cerr.flush();
+                     std::_Exit(0);
+@@ -564,6 +566,7 @@ namespace ps2x_dev
+ 
+         void step(uint64_t tick)
+         {
++            GSTrace::onTick(tick);
+             pollCtrl(tick);
+             uint32_t mask = 0u;
+             for (const PressEvent &ev : events)
+@@ -586,6 +589,7 @@ namespace ps2x_dev
+             {
+                 writePng(dumpDir() + "/final.png");
+                 std::cerr << "[dev] exit tick " << tick << " reached" << std::endl;
++                GSTrace::shutdown();
+                 std::cout.flush();
+                 std::cerr.flush();
+                 std::_Exit(0);
+@@ -2691,6 +2695,7 @@ void PS2Runtime::run()
+     {
+         gameThread.join();
+     }
++    GSTrace::shutdown();
+ 
+     if (m_debugUiInitialized && m_debugUiShutdownCallback)
+     {

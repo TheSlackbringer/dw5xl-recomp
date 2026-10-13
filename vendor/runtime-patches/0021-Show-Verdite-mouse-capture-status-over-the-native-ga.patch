@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex Local <codex-local@localhost>
+Date: Fri, 9 Oct 2026 17:22:37 -0400
+Subject: [PATCH 21/22] Show Verdite mouse capture status over the native game
+ picture
+
+---
+ ps2xRuntime/include/runtime/host_input.h      | 10 ++++
+ .../Verdite2-mouse-indicator-LICENSE.txt      | 21 +++++++
+ ps2xRuntime/src/lib/ps2_pad.cpp               | 58 +++++++++++++++++++
+ ps2xRuntime/src/lib/ps2_runtime.cpp           | 30 +++++++++-
+ 4 files changed, 118 insertions(+), 1 deletion(-)
+ create mode 100644 ps2xRuntime/licenses/Verdite2-mouse-indicator-LICENSE.txt
+
+diff --git a/ps2xRuntime/include/runtime/host_input.h b/ps2xRuntime/include/runtime/host_input.h
+index 1b38f05..5329555 100644
+--- a/ps2xRuntime/include/runtime/host_input.h
++++ b/ps2xRuntime/include/runtime/host_input.h
+@@ -11,6 +11,12 @@ namespace ps2_host_input
+         bool captured = false;
+     };
+ 
++    struct MouseCaptureIndicator
++    {
++        bool captured = false;
++        float alpha = 0.0f;
++    };
++
+     // Device APIs are sampled by the window thread. Guest pad reads consume a
+     // synchronized snapshot and game hooks consume each mouse delta once.
+     void enableVerditeControls();
+@@ -18,4 +24,8 @@ namespace ps2_host_input
+     void setGameplayActive(bool active);
+     MouseLook takeMouseLook();
+     void discardMouseLook();
++    // Querying the indicator does not consume camera motion or call device APIs.
++    MouseCaptureIndicator mouseCaptureIndicator();
++    // Window-thread overlay, called after the game picture has been drawn.
++    void drawMouseCaptureIndicator(float x, float y, float width, float height);
+ }
+diff --git a/ps2xRuntime/licenses/Verdite2-mouse-indicator-LICENSE.txt b/ps2xRuntime/licenses/Verdite2-mouse-indicator-LICENSE.txt
+new file mode 100644
+index 0000000..04c698c
+--- /dev/null
++++ b/ps2xRuntime/licenses/Verdite2-mouse-indicator-LICENSE.txt
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2026 Voicedrew11
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index b49f21e..e947cf4 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -43,6 +43,9 @@ namespace
+         bool verdite = false;
+         bool gameplay = false;
+         bool captured = false;
++        bool focused = false;
++        bool indicatorCaptured = false, indicatorShown = false;
++        double inputTime = 0.0, indicatorTime = 0.0;
+         double yaw = 0.0, pitch = 0.0;
+         Clock::time_point gameplayTime{}, motionTime{};
+     };
+@@ -164,6 +167,52 @@ namespace ps2_host_input
+         return result;
+     }
+ 
++    MouseCaptureIndicator mouseCaptureIndicator()
++    {
++        std::lock_guard<std::mutex> lock(gMutex);
++        MouseCaptureIndicator result;
++        result.captured = gState.verdite && gState.focused && gState.captured && gState.gameplay;
++        if (!gState.verdite || !gState.indicatorShown) return result;
++        // Verdite2's announcement: 140 ms in, 1100 ms held, 420 ms out.
++        const double age = gState.inputTime - gState.indicatorTime;
++        if (age < 0.0 || age >= 1.66) return result;
++        if (age < 0.14) result.alpha = static_cast<float>(age / 0.14);
++        else if (age < 1.24) result.alpha = 1.0f;
++        else result.alpha = static_cast<float>((1.66 - age) / 0.42);
++        return result;
++    }
++
++    void drawMouseCaptureIndicator(float x, float y, float width, float height)
++    {
++        const MouseCaptureIndicator indicator = mouseCaptureIndicator();
++        if (indicator.alpha <= 0.001f || width < 64.0f || height < 64.0f) return;
++        // Procedural glyph and released-state cut from Verdite2's
++        // patches/MouseIndicator.cs (MIT, Voicedrew11/verdite2).
++        static constexpr const char *glyph[] = {
++            "....#....", "....#....", "...###...", "..#####..",
++            ".##.#.##.", ".##.#.##.", ".#######.", ".#######.",
++            ".#######.", ".#######.", ".#######.", "..#####..", "...###..."
++        };
++        const int cell = std::max(2, static_cast<int>(std::round(height / 180.0f)));
++        const float margin = std::max(static_cast<float>(cell * 2), std::round(height * 0.03f));
++        const int originX = static_cast<int>(std::round(x + width - margin - cell * 9));
++        const int originY = static_cast<int>(std::round(y + margin));
++        const Color shadow{0, 0, 0, static_cast<unsigned char>(255.0f * 0.55f * indicator.alpha)};
++        const Color white{255, 255, 255, static_cast<unsigned char>(255.0f * indicator.alpha)};
++        auto blit = [&](int offset, Color color) {
++            for (int row = 0; row < 13; ++row)
++                for (int column = 0; column < 9; ++column)
++                {
++                    if (glyph[row][column] != '#') continue;
++                    if (!indicator.captured && (row - column == 4 || row - column == 5)) continue;
++                    DrawRectangle(originX + (column + offset) * cell,
++                                  originY + (row + offset) * cell, cell, cell, color);
++                }
++        };
++        blit(1, shadow);
++        blit(0, white);
++    }
++
+     void poll(uint64_t vsyncTick)
+     {
+         if (!IsWindowReady()) return;
+@@ -333,6 +382,15 @@ namespace ps2_host_input
+             gState.pressed = pressed;
+             gState.sticks = sticks;
+             gState.captured = captured;
++            gState.focused = focused;
++            gState.inputTime = now;
++            const bool indicatorCaptured = verdite && focused && captured && gState.gameplay;
++            if (indicatorCaptured != gState.indicatorCaptured)
++            {
++                gState.indicatorCaptured = indicatorCaptured;
++                gState.indicatorShown = true;
++                gState.indicatorTime = now;
++            }
+             if (discardMotion || !captured || !gameplay) gState.yaw = gState.pitch = 0.0;
+             else if (std::isfinite(delta.x) && std::isfinite(delta.y) && (delta.x != 0.0f || delta.y != 0.0f))
+             {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index ee7f674..6edf514 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -13,6 +13,7 @@
+ #include "Kernel/Stubs/GS.h"
+ #include "Kernel/Stubs/MPEG.h"
+ #include "ps2_host_backend.h"
++#include "rlgl.h"
+ #include "ps2_iop_host.h"
+ #include "ps2x/iop/iop_subsystem.h"
+ 
+@@ -388,7 +389,7 @@ namespace
+ //   PS2X_EXIT_TICK=<n>       dump final.png and _Exit(0) at vsync tick n
+ //   PS2X_INPUT="t:BTN[+BTN]:dur,..."  scripted pad presses at vsync tick t
+ //   PS2X_CTRL=<file>         command file polled ~10x/s, consumed on read:
+-//       press BTN[+BTN] <ticks> | shot <path.png> | quit | tick <path.txt>
++//       press BTN[+BTN] <ticks> | shot <path.png> | hostshot <path.png> | quit | tick <path.txt>
+ //       threads <path.txt>   (EE threads, semaphores, event flags)
+ //   PS2X_THREADS_AT_EXIT=1   print the thread dump to stderr at the exit tick
+ // Buttons: UP DOWN LEFT RIGHT START SELECT CROSS CIRCLE SQUARE TRIANGLE
+@@ -508,6 +509,7 @@ namespace ps2x_dev
+         uint64_t exitTick = 0u;
+         uint64_t lastDumpBucket = std::numeric_limits<uint64_t>::max();
+         std::string ctrlPath;
++        std::vector<std::string> hostShots;
+         std::chrono::steady_clock::time_point lastCtrlPoll{};
+         bool stats = false;
+         std::chrono::steady_clock::time_point statsStart{};
+@@ -581,6 +583,12 @@ namespace ps2x_dev
+                     ls >> path;
+                     writePng(path);
+                 }
++                else if (cmd == "hostshot")
++                {
++                    std::string path;
++                    std::getline(ls >> std::ws, path);
++                    if (!path.empty()) hostShots.push_back(path);
++                }
+                 else if (cmd == "threads")
+                 {
+                     std::string path;
+@@ -606,6 +614,24 @@ namespace ps2x_dev
+             }
+         }
+ 
++        void captureHostFrame()
++        {
++            if (hostShots.empty()) return;
++            // Flush the game and overlay into the backbuffer before EndDrawing
++            // swaps it. ExportImage preserves the requested absolute path.
++            rlDrawRenderBatchActive();
++            Image image = LoadImageFromScreen();
++            for (const std::string &path : hostShots)
++            {
++                const bool ok = image.data && ExportImage(image, path.c_str());
++                const auto indicator = ps2_host_input::mouseCaptureIndicator();
++                std::cerr << "[dev] hostshot " << path << (ok ? " ok" : " FAILED")
++                          << " mouse=" << indicator.captured << " alpha=" << indicator.alpha << std::endl;
++            }
++            UnloadImage(image);
++            hostShots.clear();
++        }
++
+         // PS2X_STATS=1: once per wall-clock second, print guest VSync ticks
+         // and display flips (DISPFB1/DISPFB2 changes, sampled per host frame).
+         void stepStats(uint64_t tick)
+@@ -2784,10 +2810,12 @@ void PS2Runtime::run()
+             dstWidth,
+             dstHeight};
+         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        ps2_host_input::drawMouseCaptureIndicator(dstRect.x, dstRect.y, dstRect.width, dstRect.height);
+         if (m_debugUiInitialized && m_debugUiDrawCallback)
+         {
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
+         }
++        devHarness.captureHostFrame();
+         EndDrawing();
+ 
+         if (WindowShouldClose())

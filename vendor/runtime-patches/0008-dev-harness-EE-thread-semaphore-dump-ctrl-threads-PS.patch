@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Priestley <voicedrew11@gmail.com>
+Date: Sat, 3 Oct 2026 13:19:10 -0400
+Subject: [PATCH 08/14] dev harness: EE thread/semaphore dump (ctrl 'threads',
+ PS2X_THREADS_AT_EXIT)
+
+---
+ ps2xRuntime/src/lib/ps2_runtime.cpp | 37 +++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index cd09ced..2d94b6e 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -388,6 +388,8 @@ namespace
+ //   PS2X_INPUT="t:BTN[+BTN]:dur,..."  scripted pad presses at vsync tick t
+ //   PS2X_CTRL=<file>         command file polled ~10x/s, consumed on read:
+ //       press BTN[+BTN] <ticks> | shot <path.png> | quit | tick <path.txt>
++//       threads <path.txt>   (EE threads, semaphores, event flags)
++//   PS2X_THREADS_AT_EXIT=1   print the thread dump to stderr at the exit tick
+ // Buttons: UP DOWN LEFT RIGHT START SELECT CROSS CIRCLE SQUARE TRIANGLE
+ //          L1 R1 L2 R2 L3 R3
+ // ---------------------------------------------------------------------------
+@@ -473,8 +475,33 @@ namespace ps2x_dev
+         return (d && *d) ? std::string(d) : std::string(".");
+     }
+ 
++    static void writeThreads(std::ostream &o, PS2Runtime *rt)
++    {
++        if (!rt)
++            return;
++        static const char *kStatus[] = {"Running", "Ready", "Waiting", "WaitingSuspended", "Suspended", "Dormant"};
++        static const char *kWait[] = {"None", "Sleep", "Semaphore", "EventFlag", "VSync", "External", "Mpeg"};
++        const EeKernelSnapshot snap = rt->eeScheduler().snapshot();
++        o << "running=" << snap.runningThreadId << " eeCycle=" << snap.eeCycle << "\n";
++        for (const EeThreadSnapshot &t : snap.threads)
++        {
++            o << std::hex << "thread " << std::dec << t.id
++              << " status=" << kStatus[std::min<size_t>(static_cast<size_t>(t.status), 5u)]
++              << " wait=" << kWait[std::min<size_t>(static_cast<size_t>(t.waitReason), 6u)]
++              << " waitId=" << t.waitId << " prio=" << t.currentPriority << std::hex
++              << " pc=0x" << t.pc << " ra=0x" << t.ra << " sp=0x" << t.sp
++              << " entry=0x" << t.entry << std::dec << " wakeups=" << t.wakeupCount << "\n";
++        }
++        for (const EeSemaphoreSnapshot &sem : snap.semaphores)
++            o << "sema " << sem.id << " count=" << sem.count << "/" << sem.maxCount << " waiters=" << sem.waiters << "\n";
++        for (const EeEventFlagSnapshot &ef : snap.eventFlags)
++            o << std::hex << "evf " << std::dec << ef.id << std::hex << " bits=0x" << ef.bits << std::dec << " waiters=" << ef.waiters << "\n";
++        o.flush();
++    }
++
+     struct Harness
+     {
++        PS2Runtime *runtime = nullptr;
+         std::vector<PressEvent> events;
+         uint64_t dumpEvery = 0u;
+         uint64_t exitTick = 0u;
+@@ -546,6 +573,13 @@ namespace ps2x_dev
+                     ls >> path;
+                     writePng(path);
+                 }
++                else if (cmd == "threads")
++                {
++                    std::string path;
++                    ls >> path;
++                    std::ofstream o(path);
++                    writeThreads(o, runtime);
++                }
+                 else if (cmd == "tick")
+                 {
+                     std::string path;
+@@ -588,6 +622,8 @@ namespace ps2x_dev
+             if (exitTick != 0u && tick >= exitTick)
+             {
+                 writePng(dumpDir() + "/final.png");
++                if (const char *t = std::getenv("PS2X_THREADS_AT_EXIT"); t && *t && *t != '0')
++                    writeThreads(std::cerr, runtime);
+                 std::cerr << "[dev] exit tick " << tick << " reached" << std::endl;
+                 GSTrace::shutdown();
+                 std::cout.flush();
+@@ -2620,6 +2656,7 @@ void PS2Runtime::run()
+ 
+     uint64_t tick = 0;
+     ps2x_dev::Harness devHarness;
++    devHarness.runtime = this;
+     devHarness.init();
+     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+     {

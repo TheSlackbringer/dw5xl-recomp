@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fizban <35464167+Fiztba@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 21:05:03 -0400
+Subject: [PATCH] Bound GS diagnostics and include the active CRT2 state
+
+---
+ ps2xRuntime/src/lib/gs/gs_trace.cpp | 33 +++++++++++++++++------------
+ 1 file changed, 19 insertions(+), 14 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_trace.cpp b/ps2xRuntime/src/lib/gs/gs_trace.cpp
+index 91a0cbc..03a8a07 100644
+--- a/ps2xRuntime/src/lib/gs/gs_trace.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_trace.cpp
+@@ -375,6 +375,8 @@ namespace
+                      "SMODE2(int=%u ffmd=%u dpl=%u) "
+                      "DISPFB1(fbp=%u fbw=%u psm=0x%x dbx=%u dby=%u) "
+                      "DISPLAY1(dx=%u dy=%u magh=%u magv=%u dw=%u dh=%u) "
++                     "DISPFB2(fbp=%u fbw=%u psm=0x%x dbx=%u dby=%u) "
++                     "DISPLAY2(dx=%u dy=%u magh=%u magv=%u dw=%u dh=%u) "
+                      "BGCOLOR(r=%u g=%u b=%u)\n",
+                      static_cast<unsigned long long>(tick),
+                      field(r.pmode, 0, 1), field(r.pmode, 1, 1), field(r.pmode, 2, 7),
+@@ -384,6 +386,10 @@ namespace
+                      field(r.dispfb1, 32, 0x7FF), field(r.dispfb1, 43, 0x7FF),
+                      field(r.display1, 0, 0xFFF), field(r.display1, 12, 0x7FF), field(r.display1, 23, 0xF),
+                      field(r.display1, 27, 3), field(r.display1, 32, 0xFFF), field(r.display1, 44, 0x7FF),
++                     field(r.dispfb2, 0, 0x1FF), field(r.dispfb2, 9, 0x3F), field(r.dispfb2, 15, 0x1F),
++                     field(r.dispfb2, 32, 0x7FF), field(r.dispfb2, 43, 0x7FF),
++                     field(r.display2, 0, 0xFFF), field(r.display2, 12, 0x7FF), field(r.display2, 23, 0xF),
++                     field(r.display2, 27, 3), field(r.display2, 32, 0xFFF), field(r.display2, 44, 0x7FF),
+                      field(r.bgcolor, 0, 0xFF), field(r.bgcolor, 8, 0xFF), field(r.bgcolor, 16, 0xFF));
+     }
+ 
+@@ -438,17 +444,17 @@ namespace
+             initFromEnv();
+     }
+ 
+-    void ensureTickLocked(uint64_t tick)
++    bool ensureTickLocked(uint64_t tick)
+     {
+         if (!g_file || !g_active)
+-            return;
++            return false;
+         if (tick < g_from)
+-            return;
++            return false;
+         if (tick > g_to)
+         {
+             // Ticks are monotonic; nothing further will be recorded.
+             g_active = false;
+-            return;
++            return false;
+         }
+         if (tick != g_lastTick)
+         {
+@@ -456,6 +462,7 @@ namespace
+             std::fprintf(g_file, "=== VSYNC tick %llu ===\n",
+                          static_cast<unsigned long long>(tick));
+         }
++        return true;
+     }
+ 
+     uint32_t transferBytes(uint8_t psm, uint32_t pixels)
+@@ -530,8 +537,9 @@ namespace GSTrace
+         if (!g_file || !g_active)
+             return;
+         g_currentTick = tick;
+-        ensureTickLocked(tick);
+-        if (tick >= g_from && tick <= g_to && tick != g_lastPrivTick)
++        if (!ensureTickLocked(tick))
++            return;
++        if (tick != g_lastPrivTick)
+         {
+             g_lastPrivTick = tick;
+             emitPrivilegedLine(tick);
+@@ -544,8 +552,7 @@ namespace GSTrace
+         ensureInitLocked();
+         if (!g_file || !g_active)
+             return;
+-        ensureTickLocked(tick);
+-        if (!g_active)
++        if (!ensureTickLocked(tick))
+             return;
+         emitRegisterLine(regAddr, value, tick);
+     }
+@@ -560,8 +567,7 @@ namespace GSTrace
+         if (!g_file || !g_active)
+             return;
+         const uint64_t tick = g_currentTick;
+-        ensureTickLocked(tick);
+-        if (!g_active)
++        if (!ensureTickLocked(tick))
+             return;
+         const uint32_t pixels = static_cast<uint32_t>(reg.rrw) * static_cast<uint32_t>(reg.rrh);
+         const uint32_t bytes = transferBytes(buf.dpsm, pixels);
+@@ -584,8 +590,7 @@ namespace GSTrace
+         ensureInitLocked();
+         if (!g_file || !g_active || batch.vertexCount == 0u)
+             return;
+-        ensureTickLocked(tick);
+-        if (!g_active)
++        if (!ensureTickLocked(tick))
+             return;
+ 
+         const GSDrawState &state = batch.state;
+@@ -601,8 +606,8 @@ namespace GSTrace
+                                                   (static_cast<uint64_t>(state.prim.ctxt) << 9) |
+                                                   (static_cast<uint64_t>(state.prim.fix) << 10));
+ 
+-        const float ofx = static_cast<float>(ctx.xyoffset.ofx >> 4);
+-        const float ofy = static_cast<float>(ctx.xyoffset.ofy >> 4);
++        const float ofx = static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
++        const float ofy = static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
+         float xMin = 1e30f, xMax = -1e30f, yMin = 1e30f, yMax = -1e30f;
+         float uMin = 1e30f, uMax = -1e30f, vMin = 1e30f, vMax = -1e30f;
+         float sMin = 1e30f, sMax = -1e30f, tMin = 1e30f, tMax = -1e30f, qMin = 1e30f, qMax = -1e30f;

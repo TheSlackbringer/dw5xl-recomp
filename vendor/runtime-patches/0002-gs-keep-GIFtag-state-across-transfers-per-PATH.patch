@@ -1,0 +1,216 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Priestley <voicedrew11@gmail.com>
+Date: Sat, 3 Oct 2026 12:14:20 -0400
+Subject: [PATCH 02/14] gs: keep GIFtag state across transfers, per PATH
+
+A GIFtag's data may arrive in a later DMA than the tag (libgraph's
+sceGsExecLoadImage sends the header and the pixels as two DMAs). The
+parser restarted at every packet, so the pixel data was parsed as GIF
+tags. NLOOP=0 now means an empty tag again, and FLG=3 acts as IMAGE.
+---
+ ps2xRuntime/src/lib/gs/gs_frontend.cpp     | 136 +++++++++++++--------
+ ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp |   6 +
+ 2 files changed, 94 insertions(+), 48 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 5658928..5726579 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -638,13 +638,39 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+     return true;
+ }
+ 
++// Per-PATH GIF tag continuation state (see GS::processGIFPacket).
++struct GifPathResumeState
++{
++    uint32_t remaining = 0; // qwords (IMAGE) or register writes (PACKED/REGLIST) left in the current tag
++    uint32_t consumed = 0;
++    uint32_t nreg = 0;
++    uint8_t flg = 0;
++    bool reglistPad = false;
++    uint8_t regs[16] = {};
++};
++
++// Set by GifArbiter::drain() for the packet being processed; 0 = direct call.
++extern thread_local int g_gifArbiterCurrentPath;
++
++static GifPathResumeState &gifPathState()
++{
++    static GifPathResumeState s_states[4];
++    const int path = g_gifArbiterCurrentPath;
++    return s_states[(path >= 0 && path < 4) ? path : 0];
++}
++
++static bool gifPathMidTag()
++{
++    return gifPathState().remaining != 0;
++}
++
+ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
+ 
+-    if (tryProcessNativeImageUploadPacket(data, sizeBytes))
++    if (!gifPathMidTag() && tryProcessNativeImageUploadPacket(data, sizeBytes))
+         return;
+ 
+     PS2_IF_AGRESSIVE_LOGS({
+@@ -668,70 +694,84 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+         }
+     });
+ 
++    // The GIF unit keeps its tag state between transfers: a GIFtag's data may
++    // arrive in a later DMA transfer than the tag itself (libgraph's
++    // sceGsExecLoadImage sends the A+D/IMAGE header and the pixels as two
++    // separate DMAs). State is kept per PATH so an interleaved packet from
++    // another path does not consume it.
++    GifPathResumeState &st = gifPathState();
+     uint32_t offset = 0;
+     while (offset + 16 <= sizeBytes)
+     {
+-        uint64_t tagLo = loadLE64(data + offset);
+-        uint64_t tagHi = loadLE64(data + offset + 8);
+-        offset += 16;
+-
+-        m_curQ = 1.0f;
+-
+-        uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFF);
+-        uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3);
+-        uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xF);
+-        if (nreg == 0)
+-            nreg = 16;
++        if (st.remaining == 0)
++        {
++            const uint64_t tagLo = loadLE64(data + offset);
++            const uint64_t tagHi = loadLE64(data + offset + 8);
++            offset += 16;
+ 
+-        recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
++            m_curQ = 1.0f;
+ 
+-        bool pre = ((tagLo >> 46) & 1) != 0;
+-        if (pre)
+-        {
+-            writeRegisterUnlocked(GS_REG_PRIM, (tagLo >> 47) & 0x7FF);
++            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFF);
++            st.flg = static_cast<uint8_t>((tagLo >> 58) & 0x3);
++            if (st.flg == 3)
++                st.flg = GIF_FMT_IMAGE; // FLG=3 behaves as IMAGE
++            st.nreg = static_cast<uint32_t>((tagLo >> 60) & 0xF);
++            if (st.nreg == 0)
++                st.nreg = 16;
++
++            recordGifTagDebugEventUnlocked(sizeBytes, nloop, st.flg, st.nreg);
++
++            if (((tagLo >> 46) & 1) != 0)
++                writeRegisterUnlocked(GS_REG_PRIM, (tagLo >> 47) & 0x7FF);
++
++            for (uint32_t i = 0; i < st.nreg; ++i)
++                st.regs[i] = static_cast<uint8_t>((tagHi >> (i * 4)) & 0xF);
++
++            // NLOOP=0: the tag carries no data.
++            st.consumed = 0;
++            if (st.flg == GIF_FMT_IMAGE)
++                st.remaining = nloop; // qwords
++            else
++                st.remaining = nloop * st.nreg; // register writes
++            st.reglistPad = (st.flg == GIF_FMT_REGLIST) && ((nloop * st.nreg) & 1u);
++            continue;
+         }
+ 
+-        uint8_t regs[16];
+-        for (uint32_t i = 0; i < nreg; ++i)
+-            regs[i] = static_cast<uint8_t>((tagHi >> (i * 4)) & 0xF);
+-
+-        if (flg == GIF_FMT_PACKED)
++        if (st.flg == GIF_FMT_PACKED)
+         {
+-            for (uint32_t loop = 0; loop < nloop; ++loop)
++            while (st.remaining != 0 && offset + 16 <= sizeBytes)
+             {
+-                for (uint32_t r = 0; r < nreg; ++r)
+-                {
+-                    if (offset + 16 > sizeBytes)
+-                        return;
+-                    uint64_t lo = loadLE64(data + offset);
+-                    uint64_t hi = loadLE64(data + offset + 8);
+-                    offset += 16;
+-                    writeRegisterPacked(regs[r], lo, hi);
+-                }
++                const uint64_t lo = loadLE64(data + offset);
++                const uint64_t hi = loadLE64(data + offset + 8);
++                offset += 16;
++                writeRegisterPacked(st.regs[st.consumed % st.nreg], lo, hi);
++                ++st.consumed;
++                --st.remaining;
+             }
+         }
+-        else if (flg == GIF_FMT_REGLIST)
++        else if (st.flg == GIF_FMT_REGLIST)
+         {
+-            for (uint32_t loop = 0; loop < nloop; ++loop)
++            while (st.remaining != 0 && offset + 8 <= sizeBytes)
+             {
+-                for (uint32_t r = 0; r < nreg; ++r)
+-                {
+-                    if (offset + 8 > sizeBytes)
+-                        return;
+-                    writeRegisterUnlocked(regs[r], loadLE64(data + offset));
+-                    offset += 8;
+-                }
++                writeRegisterUnlocked(st.regs[st.consumed % st.nreg], loadLE64(data + offset));
++                offset += 8;
++                ++st.consumed;
++                --st.remaining;
+             }
+-            if ((nloop * nreg) & 1)
++            // An odd register count is padded to a whole qword.
++            if (st.remaining == 0 && st.reglistPad)
++            {
+                 offset += 8;
++                st.reglistPad = false;
++            }
+         }
+-        else if (flg == GIF_FMT_IMAGE)
++        else // IMAGE
+         {
+-            uint32_t imageBytes = nloop * 16;
+-            if (offset + imageBytes > sizeBytes)
+-                imageBytes = sizeBytes - offset;
+-            processImageData(data + offset, imageBytes);
+-            offset += imageBytes;
++            const uint32_t availQw = (sizeBytes - offset) / 16u;
++            const uint32_t takeQw = std::min<uint32_t>(availQw, st.remaining);
++            processImageData(data + offset, takeQw * 16u);
++            offset += takeQw * 16u;
++            st.remaining -= takeQw;
+         }
+     }
+ }
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index c289ba0..add77b8 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -2,6 +2,10 @@
+ #include <algorithm>
+ #include <cstring>
+ 
++// Path of the packet currently handed to the GS (read by gs_frontend.cpp to
++// keep per-path GIFtag continuation state); 0 outside drain().
++thread_local int g_gifArbiterCurrentPath = 0;
++
+ GifArbiter::GifArbiter(ProcessPacketFn processFn)
+     : m_processFn(std::move(processFn))
+ {
+@@ -56,7 +60,9 @@ void GifArbiter::drain()
+         auto &pkt = m_queue[i];
+         if (!pkt.data.empty())
+         {
++            g_gifArbiterCurrentPath = static_cast<int>(pkt.pathId);
+             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
++            g_gifArbiterCurrentPath = 0;
+         }
+     }
+     m_queue.clear();

@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex Local <codex-local@localhost>
+Date: Fri, 9 Oct 2026 17:12:57 -0400
+Subject: [PATCH 19/22] Add optional native menu loader and RPC diagnostics
+
+---
+ ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp | 38 ++++++++++++++
+ ps2xRuntime/src/lib/kfiv_input.cpp          | 58 +++++++++++++++++++--
+ 2 files changed, 91 insertions(+), 5 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 07fcd29..827e0a2 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -2,6 +2,8 @@
+ #include "RPC.h"
+ #include "../../ps2_iop_transport.h"
+ 
++#include <cstdlib>
++
+ namespace ps2_syscalls
+ {
+     namespace
+@@ -70,6 +72,41 @@ namespace ps2_syscalls
+             return out;
+         }
+ 
++        void logCompletedRpcTrace(const SifRpcDebugEvent &event)
++        {
++            static const bool enabled = []
++            {
++                const char *value = std::getenv("PS2X_RPC_TRACE");
++                return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
++            }();
++            if (!enabled)
++            {
++                return;
++            }
++            uint64_t signature = 1469598103934665603ull;
++            const auto mix = [&](uint32_t value)
++            {
++                signature = (signature ^ value) * 1099511628211ull;
++            };
++            mix(event.sid);
++            mix(event.rpcNum);
++            for (uint32_t i = 0; i < event.sendPreviewSize; ++i) mix(event.sendPreview[i]);
++            for (uint32_t i = 0; i < event.recvPreviewSize; ++i) mix(event.recvPreview[i]);
++            // SifCallRpc already serializes this path. Repeated polling replies
++            // are sampled at powers of two to keep diagnostic runs manageable.
++            static std::unordered_map<uint64_t, uint64_t> counts;
++            if (counts.size() >= 4096u && counts.find(signature) == counts.end()) return;
++            const uint64_t count = ++counts[signature];
++            if (count > 4u && (count & (count - 1u)) != 0u) return;
++            std::fprintf(stderr,
++                         "[rpc-complete] sid=0x%08x function=0x%x ra=0x%08x "
++                         "flags=0x%x result=0x%08x count=%llu send=[%s] recv=[%s]\n",
++                         event.sid, event.rpcNum, event.ra, event.flags, event.resultPtr,
++                         static_cast<unsigned long long>(count),
++                         formatRpcTraceBytes(event.sendPreview, event.sendPreviewSize).c_str(),
++                         formatRpcTraceBytes(event.recvPreview, event.recvPreviewSize).c_str());
++        }
++
+ #ifndef PS2X_ENABLE_IOP_RPC_TRACE
+ #define PS2X_ENABLE_IOP_RPC_TRACE 1
+ #endif
+@@ -638,6 +675,7 @@ namespace ps2_syscalls
+                 fillRpcDebugPreview(rdram, sendBuf, sendSize, event.sendPreview, event.sendPreviewSize);
+                 fillRpcDebugPreview(rdram, receiveBuffer, receiveSize, event.recvPreview, event.recvPreviewSize);
+                 event.result = 0;
++                logCompletedRpcTrace(event);
+ #if PS2X_ENABLE_IOP_RPC_TRACE
+                 if ((event.flags & kSifRpcDebugFlagUnhandled) != 0u)
+                 {
+diff --git a/ps2xRuntime/src/lib/kfiv_input.cpp b/ps2xRuntime/src/lib/kfiv_input.cpp
+index 50c61e8..69e628f 100644
+--- a/ps2xRuntime/src/lib/kfiv_input.cpp
++++ b/ps2xRuntime/src/lib/kfiv_input.cpp
+@@ -19,6 +19,7 @@ namespace
+     constexpr uint32_t kPause = 0x00101F90u;
+     constexpr uint32_t kInventory = 0x001D62C8u;
+     constexpr uint32_t kMenuPrelude = 0x00101CE0u;
++    constexpr uint32_t kMenuUpdate = 0x00206C40u;
+     constexpr uint32_t kPlayerYawReturn = 0x001B8868u;
+     constexpr uint32_t kPlayer = 0x00413F80u;
+     constexpr uint32_t kPitch = kPlayer + 0x10u;
+@@ -39,6 +40,7 @@ namespace
+         PS2Runtime::RecompiledFunction originalPause = nullptr;
+         PS2Runtime::RecompiledFunction originalInventory = nullptr;
+         PS2Runtime::RecompiledFunction originalMenuPrelude = nullptr;
++        PS2Runtime::RecompiledFunction originalMenuUpdate = nullptr;
+         uint64_t stateEntries = 0;
+         uint64_t normalizerEntries = 0;
+         uint64_t playerLookEntries = 0;
+@@ -48,7 +50,9 @@ namespace
+         bool pausePending = false;
+         bool menuPending = false;
+         bool inputTraceKnown = false;
+-        std::array<uint32_t, 18> inputTrace{};
++        std::array<uint32_t, 23> inputTrace{};
++        bool menuTraceKnown = false;
++        std::array<uint32_t, 8> menuTrace{};
+     };
+ 
+     // Guest execution and these hooks run on the EE thread. Host input owns its
+@@ -96,7 +100,7 @@ namespace
+         {
+             return;
+         }
+-        const std::array<uint32_t, 18> snapshot = {
++        const std::array<uint32_t, 23> snapshot = {
+             runtime.memory().read16(kPadHeld),
+             runtime.memory().read16(kPadEdge),
+             runtime.memory().read16(0x00413DB8u),
+@@ -115,6 +119,11 @@ namespace
+             gState.pausePending ? 1u : 0u,
+             gState.menuPending ? 1u : 0u,
+             runtime.memory().read32(0x0038CC94u),
++            runtime.memory().read32(0x0044685Cu),
++            runtime.memory().read32(0x00446858u),
++            runtime.memory().read32(0x0038A130u),
++            runtime.memory().read32(0x004469E8u),
++            runtime.memory().read32(0x004471D4u),
+         };
+         if (gState.inputTraceKnown && snapshot == gState.inputTrace)
+         {
+@@ -126,13 +135,16 @@ namespace
+                      "[kfiv-input] input-state %s held=%04x edge=%04x "
+                      "raw-held=%04x raw-edge=%04x circle=%04x start=%04x "
+                      "commands=%08x flags=%08x pause=%u player-block=%u "
+-                     "render-enabled=%u event=(%08x,%08x,%08x) "
+-                     "mode=%u pause-pending=%u menu-pending=%u input-lock-count=%d\n",
++                     "buffer-selector=%u event=(%08x,%08x,%08x) "
++                     "mode=%u pause-pending=%u menu-pending=%u input-lock-count=%d "
++                     "loader-ready=%u loader-step=%u loader-request=%08x "
++                     "bank-step=%u bank-info=%08x\n",
+                      reason, snapshot[0], snapshot[1], snapshot[2], snapshot[3],
+                      snapshot[4], snapshot[5], snapshot[6], snapshot[7], snapshot[8],
+                      snapshot[9], snapshot[10], snapshot[11], snapshot[12],
+                      snapshot[13], snapshot[14], snapshot[15], snapshot[16],
+-                     static_cast<int32_t>(snapshot[17]));
++                     static_cast<int32_t>(snapshot[17]), snapshot[18], snapshot[19], snapshot[20],
++                     snapshot[21], snapshot[22]);
+     }
+ 
+     void traceState(PS2Runtime &runtime, const char *reason)
+@@ -248,6 +260,30 @@ namespace
+         traceInputState(*runtime, "menu-prelude-return");
+     }
+ 
++    void menuUpdateHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        gState.originalMenuUpdate(rdram, ctx, runtime);
++        if (!gState.menuPending) return;
++        const std::array<uint32_t, 8> snapshot = {
++            runtime->memory().read32(0x00446B20u),
++            runtime->memory().read8(0x004472CDu),
++            runtime->memory().read8(0x004472DAu),
++            runtime->memory().read8(0x004472C4u),
++            runtime->memory().read32(0x00446AC4u),
++            runtime->memory().read32(0x00446AC8u),
++            runtime->memory().read16(0x00446DE8u),
++            runtime->memory().read32(0x00446C70u),
++        };
++        if (gState.menuTraceKnown && snapshot == gState.menuTrace) return;
++        gState.menuTraceKnown = true;
++        gState.menuTrace = snapshot;
++        std::fprintf(stderr,
++                     "[kfiv-input] menu-state handler=%08x selection=%u ready=%u "
++                     "phase=%u lifecycle=(%u,%u) actions=%04x config-state=%u\n",
++                     snapshot[0], snapshot[1], snapshot[2], snapshot[3],
++                     snapshot[4], snapshot[5], snapshot[6], snapshot[7]);
++    }
++
+     void yawNormalizerHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         ++gState.normalizerEntries;
+@@ -424,12 +460,24 @@ namespace
+             runtime.replaceFunction(kStateUpdate, previousStateUpdate);
+             return;
+         }
++        const auto previousMenuUpdateOriginal = gState.originalMenuUpdate;
+         gState = {};
+         gState.originalStateUpdate = originalStateUpdate;
+         gState.originalYawNormalizer = originalYawNormalizer;
+         gState.originalPause = originalPause;
+         gState.originalInventory = originalInventory;
+         gState.originalMenuPrelude = originalMenuPrelude;
++        // Extra observation is enabled only for diagnostic runs. Production
++        // menu execution keeps its original function registry entry.
++        if (traceEnabled() && runtime.memory().read32(kMenuUpdate) == 0x27BDFFB0u &&
++            runtime.hasFunction(kMenuUpdate))
++        {
++            const auto previous = runtime.lookupFunction(kMenuUpdate);
++            const auto original = previous == &menuUpdateHook
++                                      ? previousMenuUpdateOriginal : previous;
++            if (original && runtime.replaceFunction(kMenuUpdate, &menuUpdateHook))
++                gState.originalMenuUpdate = original;
++        }
+         ps2_host_input::enableVerditeControls();
+         ps2_host_input::setGameplayActive(false);
+         ps2_host_input::discardMouseLook();

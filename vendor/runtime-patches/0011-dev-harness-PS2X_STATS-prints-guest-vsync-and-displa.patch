@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Priestley <voicedrew11@gmail.com>
+Date: Sat, 3 Oct 2026 18:33:32 -0400
+Subject: [PATCH 11/14] dev harness: PS2X_STATS prints guest vsync and display
+ flip rates
+
+Once per wall-clock second: elapsed time, VSync tick, VSync ticks/s and
+display flips/s (DISPFB1/DISPFB2 changes sampled per host frame), i.e. the
+game's frame rate. Used to benchmark headless runs.
+---
+ ps2xRuntime/src/lib/ps2_runtime.cpp | 42 +++++++++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index ccdcc4d..c67a1b3 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -508,6 +508,11 @@ namespace ps2x_dev
+         uint64_t lastDumpBucket = std::numeric_limits<uint64_t>::max();
+         std::string ctrlPath;
+         std::chrono::steady_clock::time_point lastCtrlPoll{};
++        bool stats = false;
++        std::chrono::steady_clock::time_point statsStart{};
++        uint64_t statsTick = 0u;
++        uint64_t statsFlips = 0u;
++        uint64_t lastDispfb = 0u;
+ 
+         void init()
+         {
+@@ -515,6 +520,8 @@ namespace ps2x_dev
+             exitTick = envU64("PS2X_EXIT_TICK", 0u);
+             if (const char *c = std::getenv("PS2X_CTRL"))
+                 ctrlPath = c;
++            if (const char *st = std::getenv("PS2X_STATS"))
++                stats = *st && *st != '0';
+             if (const char *in = std::getenv("PS2X_INPUT"))
+             {
+                 std::stringstream ss(in);
+@@ -598,10 +605,45 @@ namespace ps2x_dev
+             }
+         }
+ 
++        // PS2X_STATS=1: once per wall-clock second, print guest VSync ticks
++        // and display flips (DISPFB1/DISPFB2 changes, sampled per host frame).
++        void stepStats(uint64_t tick)
++        {
++            if (!stats || !runtime)
++                return;
++            const uint64_t dispfb = runtime->memory().gs().dispfb1 ^ (runtime->memory().gs().dispfb2 << 1);
++            if (dispfb != lastDispfb)
++            {
++                lastDispfb = dispfb;
++                ++statsFlips;
++            }
++            const auto now = std::chrono::steady_clock::now();
++            if (statsStart == std::chrono::steady_clock::time_point{})
++            {
++                statsStart = now;
++                statsTick = tick;
++                statsFlips = 0u;
++                return;
++            }
++            const double secs = std::chrono::duration<double>(now - statsStart).count();
++            if (secs < 1.0)
++                return;
++            static const auto s_statsEpoch = now;
++            std::fprintf(stderr, "[stats] t=%.2f tick=%llu vsync/s=%.1f flips/s=%.1f\n",
++                         std::chrono::duration<double>(now - s_statsEpoch).count(),
++                         static_cast<unsigned long long>(tick),
++                         static_cast<double>(tick - statsTick) / secs,
++                         static_cast<double>(statsFlips) / secs);
++            statsStart = now;
++            statsTick = tick;
++            statsFlips = 0u;
++        }
++
+         void step(uint64_t tick)
+         {
+             GSTrace::onTick(tick);
+             pollCtrl(tick);
++            stepStats(tick);
+             uint32_t mask = 0u;
+             for (const PressEvent &ev : events)
+                 if (tick >= ev.start && tick < ev.start + ev.duration)

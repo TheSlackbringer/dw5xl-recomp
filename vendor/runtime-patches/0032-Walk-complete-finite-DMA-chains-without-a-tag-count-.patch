@@ -1,0 +1,62 @@
+From ff3a42c22a09ff8c42a44cabfd7ea3a9f641d71c Mon Sep 17 00:00:00 2001
+From: Fizban <35464167+Fiztba@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 22:58:43 -0400
+Subject: [PATCH] Walk complete finite DMA chains without a tag-count cutoff
+
+The 4096-tag guard silently dropped the final FINISH packet in longer valid VIF1 chains and marked DMA complete. Detect repeated tag and return-stack states with a constant-space cycle detector instead, retaining CALL/RET and interrupt termination.
+---
+ ps2xRuntime/src/lib/ps2_memory.cpp | 28 +++++++++++++++++++++++++---
+ 1 file changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index b41d650..06538db 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1365,7 +1365,6 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                     uint32_t asp = (chcr >> 4) & 0x3u;
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+-                    const int kMaxChainTags = 4096;
+                     std::vector<uint8_t> chainBuf;
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1423,11 +1422,34 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         channelBase == 0x10009000u || channelBase == 0x10008000u;
+                     const bool transferTagData = isVifChannel && (chcr & 0x40u) != 0u;
+ 
+-                    int tagsProcessed = 0;
++                    // A finite source chain can contain more than 4096 tags.
++                    // Detect a repeated DMA traversal state instead of dropping
++                    // a valid tail (including GS FINISH). The return stack is
++                    // part of the state: CALL may legitimately revisit a tag.
++                    // Brent's cycle detector uses constant space and needs no
++                    // allocation per tag. Payloads execute after this walk, so
++                    // tag memory remains unchanged during traversal.
++                    auto cycleAnchor = std::array<uint32_t, 4>{tagAddr, asr0, asr1, asp};
++                    uint64_t cyclePower = 1u;
++                    uint64_t cycleLength = 0u;
++                    uint64_t tagsProcessed = 0u;
+                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
+ 
+-                    while (tagsProcessed < kMaxChainTags)
++                    while (true)
+                     {
++                        if (tagsProcessed != 0u)
++                        {
++                            const auto currentState = std::array<uint32_t, 4>{tagAddr, asr0, asr1, asp};
++                            ++cycleLength;
++                            if (currentState == cycleAnchor)
++                                break;
++                            if (cycleLength == cyclePower)
++                            {
++                                cycleAnchor = currentState;
++                                cyclePower = std::min(cyclePower, std::numeric_limits<uint64_t>::max() / 2u) * 2u;
++                                cycleLength = 0u;
++                            }
++                        }
+                         const uint32_t currentTagAddr = tagAddr;
+                         const bool tagInSPR = isScratchpad(tagAddr);
+                         uint32_t physTag = 0;
+-- 
+2.55.0.windows.3
+

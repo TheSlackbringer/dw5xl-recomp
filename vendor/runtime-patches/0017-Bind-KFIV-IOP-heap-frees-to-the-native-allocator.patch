@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex Local <codex-local@localhost>
+Date: Fri, 9 Oct 2026 17:09:01 -0400
+Subject: [PATCH 17/22] Bind KFIV IOP heap frees to the native allocator
+
+---
+ ps2xRuntime/CMakeLists.txt                 |  1 +
+ ps2xRuntime/include/runtime/kfiv_runtime.h | 10 +++
+ ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp   | 49 ++++++++++-
+ ps2xRuntime/src/lib/game_overrides.cpp     |  2 +
+ ps2xRuntime/src/lib/kfiv_runtime.cpp       | 99 ++++++++++++++++++++++
+ 5 files changed, 157 insertions(+), 4 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/kfiv_runtime.h
+ create mode 100644 ps2xRuntime/src/lib/kfiv_runtime.cpp
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 0d45a2f..8a34a27 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -378,6 +378,7 @@ endfunction()
+ add_library(ps2_runtime STATIC
+     src/lib/game_overrides.cpp
+     src/lib/kfiv_input.cpp
++    src/lib/kfiv_runtime.cpp
+     src/lib/gs/ps2_gif_arbiter.cpp
+     src/lib/ps2_audio.cpp
+     src/lib/ps2_audio_vag.cpp
+diff --git a/ps2xRuntime/include/runtime/kfiv_runtime.h b/ps2xRuntime/include/runtime/kfiv_runtime.h
+new file mode 100644
+index 0000000..81ac584
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/kfiv_runtime.h
+@@ -0,0 +1,10 @@
++#ifndef PS2_RUNTIME_KFIV_RUNTIME_H
++#define PS2_RUNTIME_KFIV_RUNTIME_H
++
++namespace ps2_kfiv_runtime
++{
++    // Register verified USA SDK bindings missing from the recompiler map.
++    void registerOverrides();
++}
++
++#endif
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index dc975ed..8598d41 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -53,6 +53,39 @@ namespace ps2_stubs
+ 
+     namespace
+     {
++        bool iopHeapTraceEnabled()
++        {
++            static const bool enabled = []
++            {
++                const char *value = std::getenv("PS2X_IOP_HEAP_TRACE");
++                return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
++            }();
++            return enabled;
++        }
++
++        void traceIopHeapAllocation(const char *name, const R5900Context *ctx,
++                                    uint32_t size, uint32_t address)
++        {
++            if (iopHeapTraceEnabled())
++            {
++                std::fprintf(stderr,
++                             "[iop-heap] %s caller=0x%08x size=0x%x "
++                             "address=0x%08x\n",
++                             name, ctx ? getRegU32(ctx, 31) : 0u, size, address);
++            }
++        }
++
++        void traceIopHeapFree(const char *name, const R5900Context *ctx,
++                              uint32_t address, int32_t result)
++        {
++            if (iopHeapTraceEnabled())
++            {
++                std::fprintf(stderr,
++                             "[iop-heap] %s caller=0x%08x address=0x%08x result=%d\n",
++                             name, ctx ? getRegU32(ctx, 31) : 0u, address, result);
++            }
++        }
++
+         struct Ps2SifDmaTransfer
+         {
+             uint32_t src = 0;
+@@ -303,14 +336,18 @@ namespace ps2_stubs
+     {
+         (void)rdram;
+         const uint32_t reqSize = getRegU32(ctx, 4);
+-        setReturnU32(ctx, runtime ? runtime->allocateIopMemory(reqSize, 64u) : 0u);
++        const uint32_t address = runtime ? runtime->allocateIopMemory(reqSize, 64u) : 0u;
++        setReturnU32(ctx, address);
++        traceIopHeapAllocation("AllocIopHeap", ctx, reqSize, address);
+     }
+ 
+     void sceSifAllocSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         (void)rdram;
+         const uint32_t size = getRegU32(ctx, 5);
+-        setReturnU32(ctx, runtime ? runtime->allocateIopMemory(size, 64u) : 0u);
++        const uint32_t address = runtime ? runtime->allocateIopMemory(size, 64u) : 0u;
++        setReturnU32(ctx, address);
++        traceIopHeapAllocation("AllocSysMemory", ctx, size, address);
+     }
+ 
+     void sceSifBindRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -354,14 +391,18 @@ namespace ps2_stubs
+     {
+         (void)rdram;
+         const uint32_t addr = getRegU32(ctx, 4);
+-        setReturnS32(ctx, runtime && runtime->freeIopMemory(addr) ? 0 : -1);
++        const int32_t result = runtime && runtime->freeIopMemory(addr) ? 0 : -1;
++        setReturnS32(ctx, result);
++        traceIopHeapFree("FreeIopHeap", ctx, addr, result);
+     }
+ 
+     void sceSifFreeSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         (void)rdram;
+         const uint32_t addr = getRegU32(ctx, 4);
+-        setReturnS32(ctx, runtime && runtime->freeIopMemory(addr) ? 0 : -1);
++        const int32_t result = runtime && runtime->freeIopMemory(addr) ? 0 : -1;
++        setReturnS32(ctx, result);
++        traceIopHeapFree("FreeSysMemory", ctx, addr, result);
+     }
+ 
+     void sceSifGetDataTable(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
+index 8c0a7fc..942e12d 100644
+--- a/ps2xRuntime/src/lib/game_overrides.cpp
++++ b/ps2xRuntime/src/lib/game_overrides.cpp
+@@ -1,5 +1,6 @@
+ #include "game_overrides.h"
+ #include "runtime/kfiv_input.h"
++#include "runtime/kfiv_runtime.h"
+ #include "ps2_runtime.h"
+ #include "ps2_runtime_calls.h"
+ #include "ps2_stubs.h"
+@@ -127,6 +128,7 @@ namespace ps2_game_overrides
+                        bool fileCrcValid)
+     {
+         ps2_kfiv_input::registerOverrides();
++        ps2_kfiv_runtime::registerOverrides();
+ 
+         std::vector<Descriptor> descriptors;
+         {
+diff --git a/ps2xRuntime/src/lib/kfiv_runtime.cpp b/ps2xRuntime/src/lib/kfiv_runtime.cpp
+new file mode 100644
+index 0000000..f186f57
+--- /dev/null
++++ b/ps2xRuntime/src/lib/kfiv_runtime.cpp
+@@ -0,0 +1,99 @@
++#include "runtime/kfiv_runtime.h"
++
++#include "game_overrides.h"
++#include "ps2_runtime.h"
++#include "ps2_stubs.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <exception>
++#include <mutex>
++
++namespace
++{
++    constexpr uint32_t kFreeIopHeap = 0x00228690u;
++
++    bool heapTraceEnabled()
++    {
++        static const bool enabled = []
++        {
++            const char *value = std::getenv("PS2X_IOP_HEAP_TRACE");
++            return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
++        }();
++        return enabled;
++    }
++
++    void freeIopHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        // Match generated SDK stubs: finish this guest call at its saved return
++        // address, without executing the retail RPC client or changing its data.
++        ctx->pc = getRegU32(ctx, 31);
++        ps2_stubs::sceSifFreeIopHeap(rdram, ctx, runtime);
++    }
++
++    void applyKfivRuntime(PS2Runtime &runtime)
++    {
++        struct ExpectedInstruction
++        {
++            uint32_t address;
++            uint32_t instruction;
++        };
++        constexpr ExpectedInstruction expected[] = {
++            {kFreeIopHeap, 0x3C030044u},
++            {0x00228698u, 0x8C6282FCu},
++            {0x0022869Cu, 0x0080282Du},
++            {0x002286A4u, 0x04410003u},
++            {0x002286B0u, 0x0000102Du},
++            {0x002286D0u, 0x24050002u},
++            {0x002286E4u, 0x0C089240u},
++            {0x00228700u, 0x03E00008u},
++        };
++        try
++        {
++            for (const ExpectedInstruction &item : expected)
++            {
++                if (runtime.memory().read32(item.address) != item.instruction)
++                {
++                    std::fprintf(stderr,
++                                 "[kfiv-runtime] declined IOP heap free binding: "
++                                 "instruction mismatch at 0x%08x\n", item.address);
++                    return;
++                }
++            }
++        }
++        catch (const std::exception &)
++        {
++            std::fprintf(stderr,
++                         "[kfiv-runtime] declined IOP heap free binding: game RAM unavailable\n");
++            return;
++        }
++        if (!runtime.hasFunction(kFreeIopHeap))
++        {
++            std::fprintf(stderr,
++                         "[kfiv-runtime] declined IOP heap free binding: compiled function missing\n");
++            return;
++        }
++        // Only the SDK entry is replaced; retail continuations remain intact.
++        if (runtime.replaceFunction(kFreeIopHeap, &freeIopHeap) && heapTraceEnabled())
++        {
++            std::fprintf(stderr,
++                         "[kfiv-runtime] installed USA sceSifFreeIopHeap=0x%08x "
++                         "crc=0xbda82d37\n", kFreeIopHeap);
++        }
++    }
++}
++
++namespace ps2_kfiv_runtime
++{
++    void registerOverrides()
++    {
++        static std::once_flag registered;
++        std::call_once(registered, []
++        {
++            ps2_game_overrides::registerDescriptor({
++                "KFIV native IOP heap SDK binding", "SLUS_203.18",
++                0x00100008u, 0xBDA82D37u, &applyKfivRuntime});
++        });
++    }
++}

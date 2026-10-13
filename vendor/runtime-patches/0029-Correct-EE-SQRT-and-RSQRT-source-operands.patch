@@ -1,0 +1,68 @@
+From 4179fcdf016cb770deee699b19a1b0c47477b9ef Mon Sep 17 00:00:00 2001
+From: Fizban <35464167+Fiztba@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 22:48:04 -0400
+Subject: [PATCH] Correct EE SQRT and RSQRT source operands
+
+SQRT.S reads Ft rather than Fs on the R5900. RSQRT.S divides Fs by the square root of Ft. Capture inputs before aliasing writes and preserve the EE invalid/divide flags, zero flushing and bounded exceptional values.
+---
+ ps2xRecomp/src/lib/fpu_translator.cpp | 37 +++++++++++++++++++++++++--
+ 1 file changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xRecomp/src/lib/fpu_translator.cpp b/ps2xRecomp/src/lib/fpu_translator.cpp
+index 944cee7..d00bf41 100644
+--- a/ps2xRecomp/src/lib/fpu_translator.cpp
++++ b/ps2xRecomp/src/lib/fpu_translator.cpp
+@@ -58,7 +58,17 @@ namespace ps2recomp
+                                    "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
+                                    ft, fd, fs, fd, fs, ft);
+             case COP1_S_SQRT:
+-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
++                // Unlike standard MIPS SQRT.S, the EE reads Ft (bits 16..20).
++                // Capture it before writing Fd, which may alias either source.
++                return fmt::format(
++                    "{{ uint32_t bits; std::memcpy(&bits, &ctx->f[{}], sizeof(bits)); "
++                    "ctx->fcr31 &= ~0x00030000u; "
++                    "if ((bits & 0x7F800000u) == 0u) {{ bits &= 0x80000000u; "
++                    "std::memcpy(&ctx->f[{}], &bits, sizeof(bits)); }} "
++                    "else {{ if (bits & 0x80000000u) ctx->fcr31 |= 0x00020040u; "
++                    "bits &= 0x7FFFFFFFu; if ((bits & 0x7F800000u) == 0x7F800000u) bits = 0x7F7FFFFFu; "
++                    "float input; std::memcpy(&input, &bits, sizeof(input)); "
++                    "ctx->f[{}] = FPU_SQRT_S(input); }} }}", ft, fd, fd);
+             case COP1_S_ABS:
+                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
+             case COP1_S_MOV:
+@@ -76,7 +86,30 @@ namespace ps2recomp
+             case COP1_S_CVT_W:
+                 return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
+             case COP1_S_RSQRT:
+-                return fmt::format("ctx->f[{}] = 1.0f / sqrtf(ctx->f[{}]);", fd, fs);
++                // EE RSQRT.S computes Fs / sqrt(abs(Ft)), not 1 / sqrt(Fs).
++                return fmt::format(
++                    "{{ uint32_t numeratorBits, denominatorBits; "
++                    "std::memcpy(&numeratorBits, &ctx->f[{}], sizeof(numeratorBits)); "
++                    "std::memcpy(&denominatorBits, &ctx->f[{}], sizeof(denominatorBits)); "
++                    "ctx->fcr31 &= ~0x00030000u; "
++                    "if ((denominatorBits & 0x7F800000u) == 0u) {{ "
++                    "ctx->fcr31 |= 0x00010020u; "
++                    "uint32_t resultBits = (denominatorBits & 0x80000000u) | 0x7F7FFFFFu; "
++                    "std::memcpy(&ctx->f[{}], &resultBits, sizeof(resultBits)); }} "
++                    "else {{ if (denominatorBits & 0x80000000u) ctx->fcr31 |= 0x00020040u; "
++                    "denominatorBits &= 0x7FFFFFFFu; "
++                    "if ((denominatorBits & 0x7F800000u) == 0x7F800000u) denominatorBits = 0x7F7FFFFFu; "
++                    "if ((numeratorBits & 0x7F800000u) == 0u) numeratorBits &= 0x80000000u; "
++                    "else if ((numeratorBits & 0x7F800000u) == 0x7F800000u) "
++                    "numeratorBits = (numeratorBits & 0x80000000u) | 0x7F7FFFFFu; "
++                    "float numerator, denominator; std::memcpy(&numerator, &numeratorBits, sizeof(numerator)); "
++                    "std::memcpy(&denominator, &denominatorBits, sizeof(denominator)); "
++                    "float result = numerator / FPU_SQRT_S(denominator); uint32_t resultBits; "
++                    "std::memcpy(&resultBits, &result, sizeof(resultBits)); "
++                    "if ((resultBits & 0x7F800000u) == 0u) resultBits &= 0x80000000u; "
++                    "else if ((resultBits & 0x7F800000u) == 0x7F800000u) "
++                    "resultBits = (resultBits & 0x80000000u) | 0x7F7FFFFFu; "
++                    "std::memcpy(&ctx->f[{}], &resultBits, sizeof(resultBits)); }} }}", fs, ft, fd, fd);
+             case COP1_S_ADDA:
+                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
+             case COP1_S_SUBA:
+-- 
+2.55.0.windows.3
+

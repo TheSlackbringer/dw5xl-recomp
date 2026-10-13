@@ -1,0 +1,1076 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex Local <codex-local@localhost>
+Date: Fri, 9 Oct 2026 16:35:05 -0400
+Subject: [PATCH 16/22] Add Verdite-style keyboard and native mouse look for
+ KFIV
+
+Sample physical input on the window thread and publish synchronized pad snapshots, merge keyboard with controllers, and track cursor capture across gameplay, pause, inventory and common menus. Register instruction-checked USA game overrides that consume mouse displacement once at the native player look update. Include opt-in host input fixtures and diagnostics for integration tests; no generated game code or assets.
+---
+ ps2xRuntime/CMakeLists.txt               |   1 +
+ ps2xRuntime/include/runtime/host_input.h |  21 ++
+ ps2xRuntime/include/runtime/kfiv_input.h |  10 +
+ ps2xRuntime/src/lib/game_overrides.cpp   |   2 +
+ ps2xRuntime/src/lib/kfiv_input.cpp       | 459 ++++++++++++++++++++++
+ ps2xRuntime/src/lib/ps2_pad.cpp          | 461 +++++++++++++++++------
+ ps2xRuntime/src/lib/ps2_runtime.cpp      |   6 +
+ 7 files changed, 849 insertions(+), 111 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/host_input.h
+ create mode 100644 ps2xRuntime/include/runtime/kfiv_input.h
+ create mode 100644 ps2xRuntime/src/lib/kfiv_input.cpp
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 41b685e..0d45a2f 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -377,6 +377,7 @@ endfunction()
+ 
+ add_library(ps2_runtime STATIC
+     src/lib/game_overrides.cpp
++    src/lib/kfiv_input.cpp
+     src/lib/gs/ps2_gif_arbiter.cpp
+     src/lib/ps2_audio.cpp
+     src/lib/ps2_audio_vag.cpp
+diff --git a/ps2xRuntime/include/runtime/host_input.h b/ps2xRuntime/include/runtime/host_input.h
+new file mode 100644
+index 0000000..1b38f05
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/host_input.h
+@@ -0,0 +1,21 @@
++#pragma once
++
++#include <cstdint>
++
++namespace ps2_host_input
++{
++    struct MouseLook
++    {
++        float yawRadians = 0.0f;
++        float pitchRadians = 0.0f;
++        bool captured = false;
++    };
++
++    // Device APIs are sampled by the window thread. Guest pad reads consume a
++    // synchronized snapshot and game hooks consume each mouse delta once.
++    void enableVerditeControls();
++    void poll(uint64_t vsyncTick = 0);
++    void setGameplayActive(bool active);
++    MouseLook takeMouseLook();
++    void discardMouseLook();
++}
+diff --git a/ps2xRuntime/include/runtime/kfiv_input.h b/ps2xRuntime/include/runtime/kfiv_input.h
+new file mode 100644
+index 0000000..fc531aa
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/kfiv_input.h
+@@ -0,0 +1,10 @@
++#ifndef PS2_RUNTIME_KFIV_INPUT_H
++#define PS2_RUNTIME_KFIV_INPUT_H
++
++namespace ps2_kfiv_input
++{
++    // Register the build-specific native input hooks. Safe to call repeatedly.
++    void registerOverrides();
++}
++
++#endif
+diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
+index 1e38bd4..8c0a7fc 100644
+--- a/ps2xRuntime/src/lib/game_overrides.cpp
++++ b/ps2xRuntime/src/lib/game_overrides.cpp
+@@ -1,4 +1,5 @@
+ #include "game_overrides.h"
++#include "runtime/kfiv_input.h"
+ #include "ps2_runtime.h"
+ #include "ps2_runtime_calls.h"
+ #include "ps2_stubs.h"
+@@ -125,6 +126,7 @@ namespace ps2_game_overrides
+                        uint32_t fileCrc32,
+                        bool fileCrcValid)
+     {
++        ps2_kfiv_input::registerOverrides();
+ 
+         std::vector<Descriptor> descriptors;
+         {
+diff --git a/ps2xRuntime/src/lib/kfiv_input.cpp b/ps2xRuntime/src/lib/kfiv_input.cpp
+new file mode 100644
+index 0000000..50c61e8
+--- /dev/null
++++ b/ps2xRuntime/src/lib/kfiv_input.cpp
+@@ -0,0 +1,459 @@
++#include "runtime/kfiv_input.h"
++
++#include "game_overrides.h"
++#include "ps2_runtime.h"
++#include "runtime/host_input.h"
++
++#include <array>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <exception>
++#include <mutex>
++
++namespace
++{
++    constexpr uint32_t kStateUpdate = 0x001B5A48u;
++    constexpr uint32_t kYawNormalizer = 0x0019B838u;
++    constexpr uint32_t kPause = 0x00101F90u;
++    constexpr uint32_t kInventory = 0x001D62C8u;
++    constexpr uint32_t kMenuPrelude = 0x00101CE0u;
++    constexpr uint32_t kPlayerYawReturn = 0x001B8868u;
++    constexpr uint32_t kPlayer = 0x00413F80u;
++    constexpr uint32_t kPitch = kPlayer + 0x10u;
++    constexpr uint32_t kYaw = kPlayer + 0x14u;
++    constexpr uint32_t kPlayerFlags = kPlayer + 0x1C8u;
++    constexpr uint64_t kPitchLocked = uint64_t{1} << 32;
++    constexpr uint32_t kGameplayByte = 0x0038CC50u;
++    constexpr uint32_t kPauseByte = 0x0038CC52u;
++    constexpr uint32_t kGameplayFlags = 0x0038CC80u;
++    constexpr uint32_t kPadHeld = 0x00413DA8u;
++    constexpr uint32_t kPadEdge = 0x00413DAAu;
++    constexpr uint32_t kStartConfig = 0x00446946u;
++
++    struct HookState
++    {
++        PS2Runtime::RecompiledFunction originalStateUpdate = nullptr;
++        PS2Runtime::RecompiledFunction originalYawNormalizer = nullptr;
++        PS2Runtime::RecompiledFunction originalPause = nullptr;
++        PS2Runtime::RecompiledFunction originalInventory = nullptr;
++        PS2Runtime::RecompiledFunction originalMenuPrelude = nullptr;
++        uint64_t stateEntries = 0;
++        uint64_t normalizerEntries = 0;
++        uint64_t playerLookEntries = 0;
++        uint64_t mouseApplications = 0;
++        bool gameplayKnown = false;
++        bool gameplayActive = false;
++        bool pausePending = false;
++        bool menuPending = false;
++        bool inputTraceKnown = false;
++        std::array<uint32_t, 18> inputTrace{};
++    };
++
++    // Guest execution and these hooks run on the EE thread. Host input owns its
++    // synchronized snapshot; no window or device API is called from here.
++    HookState gState;
++
++    bool traceEnabled()
++    {
++        static const bool enabled = []
++        {
++            const char *value = std::getenv("PS2X_INPUT_TRACE");
++            return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
++        }();
++        return enabled;
++    }
++
++    float readFloat(PS2Runtime &runtime, uint32_t address)
++    {
++        const uint32_t bits = runtime.memory().read32(address);
++        float value = 0.0f;
++        std::memcpy(&value, &bits, sizeof(value));
++        return value;
++    }
++
++    void writeFloat(PS2Runtime &runtime, uint32_t address, float value)
++    {
++        uint32_t bits = 0;
++        std::memcpy(&bits, &value, sizeof(bits));
++        // Both addresses are verified ordinary game RAM. Store32's DMA handler
++        // drain is unnecessary here and could disturb the guest call context.
++        runtime.memory().write32(address, bits);
++    }
++
++    bool isGameplayActive(PS2Runtime &runtime)
++    {
++        return runtime.memory().read8(kGameplayByte) != 0u &&
++               runtime.memory().read8(kPauseByte) == 0u && !gState.pausePending &&
++               !gState.menuPending &&
++               (runtime.memory().read32(kGameplayFlags) & 1u) == 0u;
++    }
++
++    void traceInputState(PS2Runtime &runtime, const char *reason)
++    {
++        if (!traceEnabled())
++        {
++            return;
++        }
++        const std::array<uint32_t, 18> snapshot = {
++            runtime.memory().read16(kPadHeld),
++            runtime.memory().read16(kPadEdge),
++            runtime.memory().read16(0x00413DB8u),
++            runtime.memory().read16(0x00413DBAu),
++            runtime.memory().read16(0x00446942u),
++            runtime.memory().read16(kStartConfig),
++            runtime.memory().read32(0x0038CC74u),
++            runtime.memory().read32(kGameplayFlags),
++            runtime.memory().read8(kPauseByte),
++            runtime.memory().read8(kPlayer + 0x1A8u),
++            runtime.memory().read32(0x00446F78u),
++            runtime.memory().read32(0x0038A13Cu),
++            runtime.memory().read32(0x0038A148u),
++            runtime.memory().read32(0x0038A134u),
++            runtime.memory().read32(0x0038D620u),
++            gState.pausePending ? 1u : 0u,
++            gState.menuPending ? 1u : 0u,
++            runtime.memory().read32(0x0038CC94u),
++        };
++        if (gState.inputTraceKnown && snapshot == gState.inputTrace)
++        {
++            return;
++        }
++        gState.inputTraceKnown = true;
++        gState.inputTrace = snapshot;
++        std::fprintf(stderr,
++                     "[kfiv-input] input-state %s held=%04x edge=%04x "
++                     "raw-held=%04x raw-edge=%04x circle=%04x start=%04x "
++                     "commands=%08x flags=%08x pause=%u player-block=%u "
++                     "render-enabled=%u event=(%08x,%08x,%08x) "
++                     "mode=%u pause-pending=%u menu-pending=%u input-lock-count=%d\n",
++                     reason, snapshot[0], snapshot[1], snapshot[2], snapshot[3],
++                     snapshot[4], snapshot[5], snapshot[6], snapshot[7], snapshot[8],
++                     snapshot[9], snapshot[10], snapshot[11], snapshot[12],
++                     snapshot[13], snapshot[14], snapshot[15], snapshot[16],
++                     static_cast<int32_t>(snapshot[17]));
++    }
++
++    void traceState(PS2Runtime &runtime, const char *reason)
++    {
++        if (!traceEnabled())
++        {
++            return;
++        }
++        std::fprintf(stderr,
++                     "[kfiv-input] %s active=%u state=%llu normalizer=%llu "
++                     "player-look=%llu mouse=%llu yaw=%.6f pitch=%.6f "
++                     "pos=(%.3f,%.3f,%.3f)\n",
++                     reason, gState.gameplayActive ? 1u : 0u,
++                     static_cast<unsigned long long>(gState.stateEntries),
++                     static_cast<unsigned long long>(gState.normalizerEntries),
++                     static_cast<unsigned long long>(gState.playerLookEntries),
++                     static_cast<unsigned long long>(gState.mouseApplications),
++                     readFloat(runtime, kYaw), readFloat(runtime, kPitch),
++                     readFloat(runtime, kPlayer), readFloat(runtime, kPlayer + 4u),
++                     readFloat(runtime, kPlayer + 8u));
++    }
++
++    bool publishGameplayGate(PS2Runtime &runtime)
++    {
++        const bool active = isGameplayActive(runtime);
++        const bool changed = !gState.gameplayKnown || active != gState.gameplayActive;
++        gState.gameplayKnown = true;
++        gState.gameplayActive = active;
++        ps2_host_input::setGameplayActive(active);
++        if (!active)
++        {
++            ps2_host_input::discardMouseLook();
++        }
++        if (changed)
++        {
++            traceState(runtime, "gameplay-transition");
++        }
++        return active;
++    }
++
++    void stateUpdateHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        // Only the entry slot is replaced. All generated continuation slots
++        // remain attached to the original function.
++        if (ctx->pc == kStateUpdate)
++        {
++            // The blocking pause loop has returned before this next main-loop
++            // update. Its generated continuations do not go through our entry.
++            gState.pausePending = false;
++            gState.menuPending = false;
++            ++gState.stateEntries;
++            publishGameplayGate(*runtime);
++            traceInputState(*runtime, "state-entry");
++        }
++        gState.originalStateUpdate(rdram, ctx, runtime);
++        publishGameplayGate(*runtime);
++        traceInputState(*runtime, "state-return");
++        if (gState.stateEntries <= 4u || gState.stateEntries % 120u == 0u)
++        {
++            traceState(*runtime, "state-sample");
++        }
++    }
++
++    void pauseHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        if (ctx->pc == kPause)
++        {
++            // This function is called every frame and enters its pause loop
++            // only on the configured Start edge. The first nested call can
++            // yield before the original sets the pause byte, so latch now.
++            const uint16_t edge = runtime->memory().read16(kPadEdge);
++            const uint16_t start = runtime->memory().read16(kStartConfig);
++            if ((edge & start) != 0u)
++            {
++                gState.pausePending = true;
++                publishGameplayGate(*runtime);
++                traceInputState(*runtime, "pause-entry");
++            }
++        }
++        gState.originalPause(rdram, ctx, runtime);
++        publishGameplayGate(*runtime);
++        traceInputState(*runtime, "pause-return");
++    }
++
++    void inventoryHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        if (ctx->pc == kInventory)
++        {
++            // Inventory executes its own pad/render loop, without the main
++            // state updater. Keep host input in menu mode across its original
++            // continuation slots until the main state updater resumes.
++            gState.menuPending = true;
++            publishGameplayGate(*runtime);
++            traceInputState(*runtime, "inventory-entry");
++        }
++        gState.originalInventory(rdram, ctx, runtime);
++        publishGameplayGate(*runtime);
++        traceInputState(*runtime, "inventory-return");
++    }
++
++    void menuPreludeHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        if (ctx->pc == kMenuPrelude)
++        {
++            // The main-loop overlay dispatcher calls this prelude only after
++            // its opening guards succeed, before inventory/shop/save loops.
++            gState.menuPending = true;
++            publishGameplayGate(*runtime);
++            traceInputState(*runtime, "menu-prelude-entry");
++        }
++        gState.originalMenuPrelude(rdram, ctx, runtime);
++        publishGameplayGate(*runtime);
++        traceInputState(*runtime, "menu-prelude-return");
++    }
++
++    void yawNormalizerHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        ++gState.normalizerEntries;
++        const bool playerLookCall = ctx->pc == kYawNormalizer &&
++                                    getRegU32(ctx, 31) == kPlayerYawReturn &&
++                                    getRegU32(ctx, 17) == kPlayer;
++        if (!playerLookCall)
++        {
++            gState.originalYawNormalizer(rdram, ctx, runtime);
++            return;
++        }
++
++        ++gState.playerLookEntries;
++        const bool active = publishGameplayGate(*runtime);
++        const ps2_host_input::MouseLook mouse = ps2_host_input::takeMouseLook();
++        const float yawBefore = ctx->f[12];
++        const float pitchBefore = readFloat(*runtime, kPitch);
++        float yawDelta = 0.0f;
++        float pitchDelta = 0.0f;
++        if (active && mouse.captured)
++        {
++            if (std::isfinite(mouse.yawRadians) && std::isfinite(yawBefore))
++            {
++                yawDelta = mouse.yawRadians;
++                // The caller has already added native controller velocity.
++                // The original function wraps this sum into [-pi, pi].
++                ctx->f[12] = yawBefore + yawDelta;
++            }
++            const bool pitchLocked =
++                (runtime->memory().read64(kPlayerFlags) & kPitchLocked) != 0u;
++            if (!pitchLocked && std::isfinite(mouse.pitchRadians) &&
++                std::isfinite(pitchBefore))
++            {
++                pitchDelta = mouse.pitchRadians;
++                if (pitchDelta != 0.0f)
++                {
++                    // After this call the original caller adds controller
++                    // pitch velocity and clamps to the game's original limits.
++                    writeFloat(*runtime, kPitch, pitchBefore + pitchDelta);
++                }
++            }
++        }
++        const bool applied = yawDelta != 0.0f || pitchDelta != 0.0f;
++        if (applied)
++        {
++            ++gState.mouseApplications;
++        }
++
++        // No camera velocity or pad state is changed. A mouse displacement is
++        // applied exactly once and cannot create artificial coast afterward.
++        gState.originalYawNormalizer(rdram, ctx, runtime);
++
++        if (traceEnabled() && (applied || gState.playerLookEntries <= 4u ||
++                              gState.playerLookEntries % 120u == 0u))
++        {
++            std::fprintf(stderr,
++                         "[kfiv-input] look=%llu active=%u captured=%u "
++                         "dyaw=%.6f dpitch=%.6f yaw-in=%.6f yaw-out=%.6f "
++                         "pitch-in=%.6f pitch-injected=%.6f mouse=%llu "
++                         "pos=(%.3f,%.3f,%.3f)\n",
++                         static_cast<unsigned long long>(gState.playerLookEntries),
++                         active ? 1u : 0u, mouse.captured ? 1u : 0u,
++                         yawDelta, pitchDelta, yawBefore, ctx->f[0], pitchBefore,
++                         readFloat(*runtime, kPitch),
++                         static_cast<unsigned long long>(gState.mouseApplications),
++                         readFloat(*runtime, kPlayer),
++                         readFloat(*runtime, kPlayer + 4u),
++                         readFloat(*runtime, kPlayer + 8u));
++        }
++    }
++
++    void applyKfivInput(PS2Runtime &runtime)
++    {
++        struct ExpectedInstruction
++        {
++            uint32_t address;
++            uint32_t instruction;
++        };
++        constexpr ExpectedInstruction expected[] = {
++            {kStateUpdate, 0x27BDFF10u},
++            {kYawNormalizer, 0xC7839480u},
++            {kPause, 0x27BDFFB0u},
++            {0x00101FACu, 0x97849DD6u},
++            {kInventory, 0x27BDFF80u},
++            {kMenuPrelude, 0x27BDFFD0u},
++            {0x001B6110u, 0x0C06DFB8u},
++            {0x001B8858u, 0xC6200014u},
++            {0x001B8860u, 0x0C066E0Eu},
++            {0x001B8864u, 0x460C0300u},
++            {0x001B8878u, 0xE6200014u},
++            {0x001B8888u, 0xE6210010u},
++        };
++
++        try
++        {
++            for (const ExpectedInstruction &item : expected)
++            {
++                if (runtime.memory().read32(item.address) != item.instruction)
++                {
++                    std::fprintf(stderr,
++                                 "[kfiv-input] declined hooks: instruction "
++                                 "mismatch at 0x%08x\n", item.address);
++                    return;
++                }
++            }
++        }
++        catch (const std::exception &)
++        {
++            std::fprintf(stderr, "[kfiv-input] declined hooks: game RAM unavailable\n");
++            return;
++        }
++
++        if (!runtime.hasFunction(kStateUpdate) || !runtime.hasFunction(kYawNormalizer) ||
++            !runtime.hasFunction(kPause) || !runtime.hasFunction(kInventory) ||
++            !runtime.hasFunction(kMenuPrelude))
++        {
++            std::fprintf(stderr, "[kfiv-input] declined hooks: compiled functions missing\n");
++            return;
++        }
++        const auto previousStateUpdate = runtime.lookupFunction(kStateUpdate);
++        const auto previousYawNormalizer = runtime.lookupFunction(kYawNormalizer);
++        const auto previousPause = runtime.lookupFunction(kPause);
++        const auto previousInventory = runtime.lookupFunction(kInventory);
++        const auto previousMenuPrelude = runtime.lookupFunction(kMenuPrelude);
++        const auto originalStateUpdate = previousStateUpdate == &stateUpdateHook
++                                             ? gState.originalStateUpdate
++                                             : previousStateUpdate;
++        const auto originalYawNormalizer = previousYawNormalizer == &yawNormalizerHook
++                                               ? gState.originalYawNormalizer
++                                               : previousYawNormalizer;
++        const auto originalPause = previousPause == &pauseHook
++                                       ? gState.originalPause
++                                       : previousPause;
++        const auto originalInventory = previousInventory == &inventoryHook
++                                           ? gState.originalInventory
++                                           : previousInventory;
++        const auto originalMenuPrelude = previousMenuPrelude == &menuPreludeHook
++                                             ? gState.originalMenuPrelude
++                                             : previousMenuPrelude;
++        if (!originalStateUpdate || !originalYawNormalizer || !originalPause ||
++            !originalInventory || !originalMenuPrelude)
++        {
++            std::fprintf(stderr, "[kfiv-input] declined hooks: original functions missing\n");
++            return;
++        }
++
++        if (!runtime.replaceFunction(kStateUpdate, &stateUpdateHook))
++        {
++            return;
++        }
++        if (!runtime.replaceFunction(kYawNormalizer, &yawNormalizerHook))
++        {
++            runtime.replaceFunction(kStateUpdate, previousStateUpdate);
++            return;
++        }
++        if (!runtime.replaceFunction(kPause, &pauseHook))
++        {
++            runtime.replaceFunction(kYawNormalizer, previousYawNormalizer);
++            runtime.replaceFunction(kStateUpdate, previousStateUpdate);
++            return;
++        }
++        if (!runtime.replaceFunction(kInventory, &inventoryHook))
++        {
++            runtime.replaceFunction(kPause, previousPause);
++            runtime.replaceFunction(kYawNormalizer, previousYawNormalizer);
++            runtime.replaceFunction(kStateUpdate, previousStateUpdate);
++            return;
++        }
++        if (!runtime.replaceFunction(kMenuPrelude, &menuPreludeHook))
++        {
++            runtime.replaceFunction(kInventory, previousInventory);
++            runtime.replaceFunction(kPause, previousPause);
++            runtime.replaceFunction(kYawNormalizer, previousYawNormalizer);
++            runtime.replaceFunction(kStateUpdate, previousStateUpdate);
++            return;
++        }
++        gState = {};
++        gState.originalStateUpdate = originalStateUpdate;
++        gState.originalYawNormalizer = originalYawNormalizer;
++        gState.originalPause = originalPause;
++        gState.originalInventory = originalInventory;
++        gState.originalMenuPrelude = originalMenuPrelude;
++        ps2_host_input::enableVerditeControls();
++        ps2_host_input::setGameplayActive(false);
++        ps2_host_input::discardMouseLook();
++        if (traceEnabled())
++        {
++            std::fprintf(stderr,
++                         "[kfiv-input] installed USA SLUS_203.18 hooks "
++                         "state=0x%08x yaw=0x%08x pause=0x%08x inventory=0x%08x "
++                         "menu=0x%08x crc=0xbda82d37\n",
++                         kStateUpdate, kYawNormalizer, kPause, kInventory, kMenuPrelude);
++        }
++    }
++}
++
++namespace ps2_kfiv_input
++{
++    void registerOverrides()
++    {
++        static std::once_flag registered;
++        std::call_once(registered, []
++        {
++            ps2_game_overrides::registerDescriptor({
++                "KFIV native mouse and keyboard input", "SLUS_203.18",
++                0x00100008u, 0xBDA82D37u, &applyKfivInput});
++        });
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 699e046..b49f21e 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,132 +1,371 @@
+ #include "runtime/ps2_pad.h"
++#include "runtime/host_input.h"
+ #include "ps2_host_backend.h"
+-#include <cstring>
++
++#include <algorithm>
++#include <array>
+ #include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <sstream>
++#include <string>
++#include <utility>
++#include <vector>
+ 
+ namespace ps2x_dev
+ {
+-    extern std::atomic<uint32_t> g_padPressedMask; // dev harness, ps2_runtime.cpp
++    extern std::atomic<uint32_t> g_padPressedMask;
+ }
+ 
+ namespace
+ {
+-    constexpr uint8_t kPadAnalogMarker = 0x73;
+-    constexpr uint8_t kPadStickCenter = 0x80;
+-
+-    constexpr uint16_t PAD_LEFT = 0x0080u;
+-    constexpr uint16_t PAD_DOWN = 0x0040u;
+-    constexpr uint16_t PAD_RIGHT = 0x0020u;
+-    constexpr uint16_t PAD_UP = 0x0010u;
+-    constexpr uint16_t PAD_START = 0x0008u;
+-    constexpr uint16_t PAD_R3 = 0x0004u;
+-    constexpr uint16_t PAD_L3 = 0x0002u;
+-    constexpr uint16_t PAD_SELECT = 0x0001u;
+-    constexpr uint16_t PAD_SQUARE = 0x8000u;
+-    constexpr uint16_t PAD_CROSS = 0x4000u;
+-    constexpr uint16_t PAD_CIRCLE = 0x2000u;
+-    constexpr uint16_t PAD_TRIANGLE = 0x1000u;
+-    constexpr uint16_t PAD_R1 = 0x0800u;
+-    constexpr uint16_t PAD_L1 = 0x0400u;
+-    constexpr uint16_t PAD_R2 = 0x0200u;
+-    constexpr uint16_t PAD_L2 = 0x0100u;
++    constexpr uint16_t PAD_SELECT = 0x0001u, PAD_L3 = 0x0002u, PAD_R3 = 0x0004u;
++    constexpr uint16_t PAD_START = 0x0008u, PAD_UP = 0x0010u, PAD_RIGHT = 0x0020u;
++    constexpr uint16_t PAD_DOWN = 0x0040u, PAD_LEFT = 0x0080u;
++    constexpr uint16_t PAD_L2 = 0x0100u, PAD_R2 = 0x0200u;
++    constexpr uint16_t PAD_L1 = 0x0400u, PAD_R1 = 0x0800u;
++    constexpr uint16_t PAD_TRIANGLE = 0x1000u, PAD_CIRCLE = 0x2000u;
++    constexpr uint16_t PAD_CROSS = 0x4000u, PAD_SQUARE = 0x8000u;
++    constexpr double kRadiansPerPixel = 0.15 * 3.14159265358979323846 / 180.0;
++    constexpr double kMaxMouseAngle = 3.14159265358979323846 / 2.0;
++    constexpr uint16_t kTapButtons = PAD_SELECT | PAD_START | PAD_TRIANGLE |
++                                     PAD_CIRCLE | PAD_CROSS | PAD_SQUARE;
++    using Clock = std::chrono::steady_clock;
++
++    struct State
++    {
++        uint16_t pressed = 0;
++        std::array<uint8_t, 4> sticks{128, 128, 128, 128};
++        bool verdite = false;
++        bool gameplay = false;
++        bool captured = false;
++        double yaw = 0.0, pitch = 0.0;
++        Clock::time_point gameplayTime{}, motionTime{};
++    };
++    State gState;
++    std::mutex gMutex;
++
++    // Only the window thread touches the following device and edge state.
++    bool gPreviousFocus = false, gPreviousGameplay = false;
++    bool gResumeCapture = false, gCursorDisabled = false;
++    std::array<bool, 3> gPreviousMouse{}, gSwallowedMouse{};
++    std::array<double, 16> gTapUntil{};
++    uint16_t gPreviousPressed = 0;
++
++    bool traceEnabled()
++    {
++        static const bool enabled = [] {
++            const char *value = std::getenv("PS2X_INPUT_TRACE");
++            return value && *value && std::strcmp(value, "0") != 0;
++        }();
++        return enabled;
++    }
++
++    // Optional host-side integration fixture. It exercises the same keyboard,
++    // mouse, capture and pad mapping as real devices; it never sets guest masks.
++    struct Event
++    {
++        uint64_t tick = 0, duration = 1;
++        std::string name;
++        float dx = 0.0f, dy = 0.0f;
++        bool consumed = false;
++    };
++    std::vector<Event> gEvents;
++    std::once_flag gScriptInit;
++    bool gScripted = false;
++
++    void initScript()
++    {
++        std::call_once(gScriptInit, [] {
++            const char *script = std::getenv("PS2X_HOST_INPUT");
++            if (!script || !*script) return;
++            std::stringstream entries(script);
++            std::string entry;
++            while (std::getline(entries, entry, ','))
++            {
++                std::vector<std::string> parts;
++                std::stringstream fields(entry);
++                std::string part;
++                while (std::getline(fields, part, ':')) parts.push_back(part);
++                if (parts.size() < 3 || parts[1].empty()) continue;
++                try
++                {
++                    Event event;
++                    event.tick = std::stoull(parts[0]);
++                    event.name = parts[1];
++                    if (event.name == "MOUSE" && parts.size() == 4)
++                    {
++                        event.dx = std::stof(parts[2]);
++                        event.dy = std::stof(parts[3]);
++                        if (!std::isfinite(event.dx) || !std::isfinite(event.dy)) continue;
++                    }
++                    else event.duration = std::max<uint64_t>(1, std::stoull(parts[2]));
++                    gEvents.push_back(event);
++                }
++                catch (const std::exception &) { }
++            }
++            gScripted = !gEvents.empty();
++            if (traceEnabled()) std::fprintf(stderr, "[host-input] fixture events=%zu\n", gEvents.size());
++        });
++    }
++
++    bool scriptedDown(const char *name, uint64_t tick)
++    {
++        for (const Event &event : gEvents)
++            if (event.name == name && tick >= event.tick && tick - event.tick < event.duration)
++                return true;
++        return false;
++    }
++
++    uint8_t stickByte(float value)
++    {
++        if (!std::isfinite(value)) value = 0.0f;
++        return static_cast<uint8_t>(128.0f + std::clamp(value, -1.0f, 1.0f) * 127.0f);
++    }
+ }
+ 
+-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
++namespace ps2_host_input
+ {
+-    if (!data || size < 32)
+-        return false;
++    void enableVerditeControls()
++    {
++        std::lock_guard<std::mutex> lock(gMutex);
++        gState.verdite = true;
++    }
+ 
+-    std::memset(data, 0, 32);
+-    data[0] = 0x01;
+-    data[1] = kPadAnalogMarker;
+-    data[2] = 0xFF;
+-    data[3] = 0xFF;
+-    data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
+-
+-    uint16_t btns = 0xFFFFu;
+-    constexpr int kGamepad = 0;
+-    const bool useGamepad = IsGamepadAvailable(kGamepad);
+-    auto clearBit = [&btns](uint16_t mask)
+-    { btns &= ~mask; };
+-
+-    if (useGamepad)
++    void setGameplayActive(bool active)
++    {
++        std::lock_guard<std::mutex> lock(gMutex);
++        if (gState.gameplay != active) gState.yaw = gState.pitch = 0.0;
++        gState.gameplay = active;
++        gState.gameplayTime = Clock::now();
++    }
++
++    void discardMouseLook()
++    {
++        std::lock_guard<std::mutex> lock(gMutex);
++        gState.yaw = gState.pitch = 0.0;
++    }
++
++    MouseLook takeMouseLook()
+     {
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
+-            clearBit(PAD_UP);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
+-            clearBit(PAD_DOWN);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
+-            clearBit(PAD_LEFT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
+-            clearBit(PAD_RIGHT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
+-            clearBit(PAD_CROSS);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
+-            clearBit(PAD_CIRCLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
+-            clearBit(PAD_SQUARE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
+-            clearBit(PAD_TRIANGLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
+-            clearBit(PAD_L1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
+-            clearBit(PAD_R1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
+-            clearBit(PAD_L2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
+-            clearBit(PAD_R2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
+-            clearBit(PAD_START);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
+-            clearBit(PAD_SELECT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
+-            clearBit(PAD_L3);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
+-            clearBit(PAD_R3);
+-
+-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
+-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
+-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
+-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
+-        data[6] = static_cast<uint8_t>(128 + lx * 127);
+-        data[7] = static_cast<uint8_t>(128 + ly * 127);
+-        data[4] = static_cast<uint8_t>(128 + rx * 127);
+-        data[5] = static_cast<uint8_t>(128 + ry * 127);
++        std::lock_guard<std::mutex> lock(gMutex);
++        MouseLook result;
++        result.captured = gState.captured && gState.gameplay;
++        if (result.captured && Clock::now() - gState.motionTime < std::chrono::milliseconds(250))
++        {
++            result.yawRadians = static_cast<float>(std::clamp(gState.yaw, -kMaxMouseAngle, kMaxMouseAngle));
++            result.pitchRadians = static_cast<float>(std::clamp(gState.pitch, -kMaxMouseAngle, kMaxMouseAngle));
++        }
++        gState.yaw = gState.pitch = 0.0;
++        return result;
+     }
+-    else
++
++    void poll(uint64_t vsyncTick)
+     {
+-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
+-            clearBit(PAD_UP);
+-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
+-            clearBit(PAD_DOWN);
+-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
+-            clearBit(PAD_LEFT);
+-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
+-            clearBit(PAD_RIGHT);
+-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+-            clearBit(PAD_CROSS);
+-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+-            clearBit(PAD_CIRCLE);
+-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+-            clearBit(PAD_SQUARE);
+-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
+-            clearBit(PAD_TRIANGLE);
+-        if (IsKeyDown(KEY_Q))
+-            clearBit(PAD_L1);
+-        if (IsKeyDown(KEY_E))
+-            clearBit(PAD_R1);
+-        if (IsKeyDown(KEY_LEFT_SHIFT))
+-            clearBit(PAD_L2);
+-        if (IsKeyDown(KEY_RIGHT_SHIFT))
+-            clearBit(PAD_R2);
+-        if (IsKeyDown(KEY_ENTER))
+-            clearBit(PAD_START);
+-        if (IsKeyDown(KEY_TAB))
+-            clearBit(PAD_SELECT);
++        if (!IsWindowReady()) return;
++        initScript();
++        bool verdite, gameplay, captured;
++        {
++            std::lock_guard<std::mutex> lock(gMutex);
++            verdite = gState.verdite;
++            gameplay = gState.gameplay;
++            captured = gState.captured;
++        }
++        const bool focused = gScripted || IsWindowFocused();
++        const double now = GetTime();
++        uint16_t pressed = 0;
++        std::array<uint8_t, 4> sticks{128, 128, 128, 128};
++        auto key = [&](int code, const char *name) {
++            return focused && (gScripted ? scriptedDown(name, vsyncTick) : IsKeyDown(code));
++        };
++        auto bind = [&](bool down, uint16_t mask) { if (down) pressed |= mask; };
++        bind(key(KEY_UP, "UP") || key(KEY_W, "W"), PAD_UP);
++        bind(key(KEY_DOWN, "DOWN") || key(KEY_S, "S"), PAD_DOWN);
++        bind(key(KEY_LEFT, "LEFT"), PAD_LEFT);
++        bind(key(KEY_RIGHT, "RIGHT"), PAD_RIGHT);
++        bind(key(KEY_ENTER, "ENTER"), PAD_START);
++        if (verdite)
++        {
++            bind(key(KEY_A, "A"), PAD_L1);
++            bind(key(KEY_D, "D"), PAD_R1);
++            bind(key(KEY_SPACE, "SPACE"), PAD_SQUARE);
++            bind(key(KEY_F, "F"), PAD_CROSS);
++            bind(key(KEY_Q, "Q"), PAD_TRIANGLE);
++            bind(key(KEY_TAB, "TAB") || key(KEY_ESCAPE, "ESCAPE"), PAD_CIRCLE);
++            bind(key(KEY_RIGHT_SHIFT, "RIGHTSHIFT"), PAD_SELECT);
++        }
++        else
++        {
++            bind(key(KEY_A, "A"), PAD_LEFT);
++            bind(key(KEY_D, "D"), PAD_RIGHT);
++            bind(key(KEY_X, "X") || key(KEY_SPACE, "SPACE"), PAD_CROSS);
++            bind(key(KEY_C, "C") || key(KEY_ESCAPE, "ESCAPE"), PAD_CIRCLE);
++            bind(key(KEY_Z, "Z") || key(KEY_KP_0, "KP0"), PAD_SQUARE);
++            bind(key(KEY_V, "V") || key(KEY_KP_1, "KP1"), PAD_TRIANGLE);
++            bind(key(KEY_Q, "Q"), PAD_L1);
++            bind(key(KEY_E, "E"), PAD_R1);
++            bind(key(KEY_LEFT_SHIFT, "LEFTSHIFT"), PAD_L2);
++            bind(key(KEY_RIGHT_SHIFT, "RIGHTSHIFT"), PAD_R2);
++            bind(key(KEY_TAB, "TAB"), PAD_SELECT);
++        }
++
++        int gamepad = -1;
++        if (focused && !gScripted)
++        {
++            for (int index = 0; index < 4; ++index)
++                if (IsGamepadAvailable(index)) { gamepad = index; break; }
++        }
++        if (gamepad >= 0)
++        {
++            const std::pair<int, uint16_t> buttons[] = {
++                {GAMEPAD_BUTTON_LEFT_FACE_UP, PAD_UP}, {GAMEPAD_BUTTON_LEFT_FACE_DOWN, PAD_DOWN},
++                {GAMEPAD_BUTTON_LEFT_FACE_LEFT, PAD_LEFT}, {GAMEPAD_BUTTON_LEFT_FACE_RIGHT, PAD_RIGHT},
++                {GAMEPAD_BUTTON_RIGHT_FACE_DOWN, PAD_CROSS}, {GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, PAD_CIRCLE},
++                {GAMEPAD_BUTTON_RIGHT_FACE_LEFT, PAD_SQUARE}, {GAMEPAD_BUTTON_RIGHT_FACE_UP, PAD_TRIANGLE},
++                {GAMEPAD_BUTTON_LEFT_TRIGGER_1, PAD_L1}, {GAMEPAD_BUTTON_RIGHT_TRIGGER_1, PAD_R1},
++                {GAMEPAD_BUTTON_LEFT_TRIGGER_2, PAD_L2}, {GAMEPAD_BUTTON_RIGHT_TRIGGER_2, PAD_R2},
++                {GAMEPAD_BUTTON_MIDDLE_RIGHT, PAD_START}, {GAMEPAD_BUTTON_MIDDLE_LEFT, PAD_SELECT},
++                {GAMEPAD_BUTTON_LEFT_THUMB, PAD_L3}, {GAMEPAD_BUTTON_RIGHT_THUMB, PAD_R3}
++            };
++            for (const auto &button : buttons) bind(IsGamepadButtonDown(gamepad, button.first), button.second);
++            sticks[0] = stickByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X));
++            sticks[1] = stickByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y));
++            sticks[2] = stickByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X));
++            sticks[3] = stickByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y));
++        }
++
++        std::array<bool, 3> mouse{};
++        const char *mouseNames[] = {"MOUSELEFT", "MOUSERIGHT", "MOUSEMIDDLE"};
++        for (int index = 0; index < 3; ++index)
++            mouse[index] = focused && (gScripted ? scriptedDown(mouseNames[index], vsyncTick) : IsMouseButtonDown(index));
++        const bool wasCaptured = captured;
++        bool discardMotion = focused != gPreviousFocus || gameplay != gPreviousGameplay;
++        if (!focused)
++        {
++            captured = false;
++            gResumeCapture = false;
++            gTapUntil.fill(0.0);
++            gSwallowedMouse.fill(false);
++        }
++        else if (verdite)
++        {
++            if (!gameplay)
++            {
++                if (captured) gResumeCapture = true;
++                captured = false;
++            }
++            else
++            {
++                if (!gPreviousGameplay && gResumeCapture)
++                {
++                    captured = true;
++                    gResumeCapture = false;
++                    gSwallowedMouse = mouse;
++                }
++                if (!captured && mouse[0] && !gPreviousMouse[0])
++                {
++                    captured = true;
++                    gSwallowedMouse = mouse;
++                    discardMotion = true;
++                }
++                if ((pressed & PAD_CIRCLE) && !(gPreviousPressed & PAD_CIRCLE))
++                {
++                    if (captured) gResumeCapture = true;
++                    captured = false;
++                }
++            }
++            for (int index = 0; index < 3; ++index)
++                if (!mouse[index]) gSwallowedMouse[index] = false;
++            if (gameplay)
++            {
++                bind(captured && mouse[0] && !gSwallowedMouse[0], PAD_SQUARE);
++                bind(captured && mouse[1] && !gSwallowedMouse[1], PAD_TRIANGLE);
++                bind(captured && mouse[2] && !gSwallowedMouse[2], PAD_CROSS);
++            }
++            else
++            {
++                bind(mouse[0] && !gSwallowedMouse[0], PAD_CROSS);
++                bind(mouse[1] && !gSwallowedMouse[1], PAD_CIRCLE);
++                bind(mouse[2] && !gSwallowedMouse[2], PAD_CROSS);
++                const float wheel = gScripted ? 0.0f : GetMouseWheelMove();
++                bind(wheel > 0.0f, PAD_UP);
++                bind(wheel < 0.0f, PAD_DOWN);
++            }
++        }
++        if (captured != wasCaptured) discardMotion = true;
++        if (!gScripted && captured != gCursorDisabled)
++        {
++            if (captured) DisableCursor(); else EnableCursor();
++            gCursorDisabled = captured;
++        }
++        Vector2 delta = GetMouseDelta();
++        if (gScripted) delta = {0.0f, 0.0f};
++        for (Event &event : gEvents)
++        {
++            if (event.name == "MOUSE" && !event.consumed && vsyncTick >= event.tick)
++            {
++                event.consumed = true;
++                delta.x += event.dx;
++                delta.y += event.dy;
++            }
++        }
++
++        // Brief taps must survive until a slow guest frame samples its pad.
++        // Movement keys are never extended, so releasing W/A/S/D stops promptly.
++        const uint16_t rawPressed = pressed;
++        for (unsigned bit = 0; bit < 16; ++bit)
++        {
++            const uint16_t mask = static_cast<uint16_t>(1u << bit);
++            if ((kTapButtons & mask) && (rawPressed & mask) && !(gPreviousPressed & mask))
++                gTapUntil[bit] = now + 0.1;
++            if (focused && now < gTapUntil[bit]) pressed |= mask;
++        }
++        {
++            std::lock_guard<std::mutex> lock(gMutex);
++            if (traceEnabled() && (gState.pressed != pressed || gState.captured != captured))
++                std::fprintf(stderr, "[host-input] tick=%llu pressed=%04x gameplay=%u captured=%u gamepad=%d\n",
++                    static_cast<unsigned long long>(vsyncTick), pressed, gameplay ? 1u : 0u,
++                    captured ? 1u : 0u, gamepad);
++            gState.pressed = pressed;
++            gState.sticks = sticks;
++            gState.captured = captured;
++            if (discardMotion || !captured || !gameplay) gState.yaw = gState.pitch = 0.0;
++            else if (std::isfinite(delta.x) && std::isfinite(delta.y) && (delta.x != 0.0f || delta.y != 0.0f))
++            {
++                // Do not resurrect old motion after the guest stalls.
++                if (Clock::now() - gState.motionTime > std::chrono::milliseconds(250))
++                    gState.yaw = gState.pitch = 0.0;
++                gState.yaw += static_cast<double>(delta.x) * kRadiansPerPixel;
++                gState.pitch -= static_cast<double>(delta.y) * kRadiansPerPixel;
++                gState.motionTime = Clock::now();
++            }
++        }
++        gPreviousFocus = focused;
++        gPreviousGameplay = gameplay;
++        gPreviousMouse = mouse;
++        gPreviousPressed = rawPressed;
+     }
++}
+ 
+-    btns &= static_cast<uint16_t>(~ps2x_dev::g_padPressedMask.load(std::memory_order_relaxed));
+-    data[2] = static_cast<uint8_t>(btns & 0xFF);
+-    data[3] = static_cast<uint8_t>(btns >> 8);
++bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
++{
++    if (!data || size < 32) return false;
++    std::memset(data, 0, 32);
++    data[0] = 0x01;
++    data[1] = 0x73;
++    uint16_t pressed;
++    {
++        std::lock_guard<std::mutex> lock(gMutex);
++        pressed = gState.pressed;
++        std::memcpy(data + 4, gState.sticks.data(), gState.sticks.size());
++    }
++    pressed |= static_cast<uint16_t>(ps2x_dev::g_padPressedMask.load(std::memory_order_relaxed));
++    const uint16_t buttons = static_cast<uint16_t>(~pressed);
++    data[2] = static_cast<uint8_t>(buttons);
++    data[3] = static_cast<uint8_t>(buttons >> 8);
+     return true;
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index c67a1b3..ee7f674 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -3,6 +3,7 @@
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+ #include "game_overrides.h"
++#include "runtime/host_input.h"
+ #include "ps2_runtime_macros.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "gs/gs_trace.h"
+@@ -2696,6 +2697,10 @@ void PS2Runtime::run()
+     Texture2D frameTex = LoadTextureFromImage(blank);
+     UnloadImage(blank);
+ 
++    // Escape belongs to the game's menu controls. Close the native window with
++    // its close button or Alt+F4 instead of Raylib's default Escape shortcut.
++    SetExitKey(KEY_NULL);
++    ps2_host_input::poll();
+     std::atomic<bool> gameThreadFinished{false};
+ 
+     std::thread gameThread([&]()
+@@ -2726,6 +2731,7 @@ void PS2Runtime::run()
+     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+     {
+         devHarness.step(m_eeScheduler->currentVSyncTick());
++        ps2_host_input::poll(m_eeScheduler->currentVSyncTick());
+         PS2_IF_AGRESSIVE_LOGS({
+             tick++;
+             if ((tick % 120) == 0)

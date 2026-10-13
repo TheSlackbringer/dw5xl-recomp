@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fizban <35464167+Fiztba@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 19:49:09 -0400
+Subject: [PATCH 15/22] Allow large generated runner objects and native Windows
+ stacks
+
+---
+ ps2xRuntime/CMakeLists.txt | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 0f13a5b..41b685e 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -500,7 +500,12 @@ if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
+ endif()
+ 
+ if(MSVC)
+-    target_compile_options(ps2EntryRunner PRIVATE /FS)
++    # The generated game has thousands of functions. Allow large object
++    # files and parallel compilation with the Visual Studio generator.
++    target_compile_options(ps2EntryRunner PRIVATE /FS /bigobj /MP)
++    # Windows defaults to a 1 MiB stack, which overflows during runtime
++    # initialization. Reserve enough space for the native runtime.
++    target_link_options(ps2EntryRunner PRIVATE /STACK:16777216)
+ endif()
+ 
+ target_include_directories(ps2_runtime PUBLIC

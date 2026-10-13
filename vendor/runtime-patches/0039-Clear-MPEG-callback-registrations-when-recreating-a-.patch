@@ -1,0 +1,24 @@
+From be9073e0709e020d71dcac9d906dcb5f1bc3ce49 Mon Sep 17 00:00:00 2001
+From: Fizban <35464167+Fiztba@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 00:20:01 -0400
+Subject: [PATCH] Clear MPEG callback registrations when recreating a handle
+
+---
+ ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index ad5c5df..8ec0571 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -2361,6 +2361,10 @@ namespace ps2_stubs
+             MpegPlaybackState fresh = makeFreshPlaybackState();
+             fresh.guestRdram = rdram;
+             fresh.sdkWorkAddr = uVar3;
++            // Create initializes the SDK callback tables for this handle.
++            // Reset preserves registrations, but recreating an arena must not
++            // append new consumers to those from a previous movie instance.
++            g_mpeg_stub_state.callbacksByMpeg.erase(param_1);
+             getPlaybackState(param_1) = std::move(fresh);
+         }
+         if (runtime)

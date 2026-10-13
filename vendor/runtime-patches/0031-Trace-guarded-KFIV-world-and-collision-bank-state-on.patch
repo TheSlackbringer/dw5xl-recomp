@@ -1,0 +1,129 @@
+From dfa87aef150604e18ef10328ad9b4b8b141c96fb Mon Sep 17 00:00:00 2001
+From: Fizban <35464167+Fiztba@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 22:49:12 -0400
+Subject: [PATCH] Trace guarded KFIV world and collision-bank state on request
+
+---
+ ps2xRuntime/src/lib/kfiv_input.cpp | 88 ++++++++++++++++++++++++++++++
+ 1 file changed, 88 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/kfiv_input.cpp b/ps2xRuntime/src/lib/kfiv_input.cpp
+index 69e628f..4651943 100644
+--- a/ps2xRuntime/src/lib/kfiv_input.cpp
++++ b/ps2xRuntime/src/lib/kfiv_input.cpp
+@@ -53,6 +53,10 @@ namespace
+         std::array<uint32_t, 23> inputTrace{};
+         bool menuTraceKnown = false;
+         std::array<uint32_t, 8> menuTrace{};
++        bool worldTraceKnown = false;
++        bool worldTraceReadFailed = false;
++        uint64_t worldTraceSampleEntry = 0;
++        std::array<uint32_t, 20> worldTrace{};
+     };
+ 
+     // Guest execution and these hooks run on the EE thread. Host input owns its
+@@ -77,6 +81,88 @@ namespace
+         return value;
+     }
+ 
++    bool worldTraceEnabled()
++    {
++        static const bool enabled = []
++        {
++            const char *value = std::getenv("PS2X_WORLD_TRACE");
++            return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
++        }();
++        return enabled;
++    }
++
++    bool isGameplayActive(PS2Runtime &runtime);
++
++    void traceWorldState(PS2Runtime &runtime, const char *reason)
++    {
++        if (!worldTraceEnabled()) return;
++        try
++        {
++            // USA retail collision code at 001BDDC0 examines two 0x60-byte
++            // world banks. Observe their actual ready/header/object fields;
++            // never change a bank, player position or collision result here.
++            std::array<uint32_t, 20> snapshot{};
++            for (uint32_t index = 0; index != 2u; ++index)
++            {
++                const uint32_t bank = 0x0038CD20u + index * 0x60u;
++                const uint32_t slot = index * 6u;
++                snapshot[slot] = runtime.memory().read8(bank);
++                snapshot[slot + 1u] = runtime.memory().read8(bank + 1u);
++                const uint32_t header = runtime.memory().read32(bank + 8u);
++                snapshot[slot + 2u] = header;
++                snapshot[slot + 3u] = runtime.memory().read32(bank + 0x14u);
++                // Cached/uncached aliases may name ordinary EE RAM. Reject
++                // null, MMIO or overflowing pointers before following them.
++                const uint32_t physical = header & 0x1FFFFFFFu;
++                const bool valid = header != 0u && physical <= 0x01FFFFC2u;
++                snapshot[slot + 4u] = valid
++                    ? runtime.memory().read16(physical + 0x3Cu) : 0u;
++                snapshot[slot + 5u] = valid ? 1u : 0u;
++            }
++            snapshot[12] = runtime.memory().read32(0x00446770u);
++            snapshot[13] = runtime.memory().read32(0x004467E0u);
++            snapshot[14] = runtime.memory().read32(0x0044685Cu);
++            snapshot[15] = runtime.memory().read32(0x00446858u);
++            snapshot[16] = runtime.memory().read32(0x0038A130u);
++            snapshot[17] = runtime.memory().read32(0x004469E8u);
++            snapshot[18] = runtime.memory().read32(0x004471D4u);
++            snapshot[19] = isGameplayActive(runtime) ? 1u : 0u;
++            const bool changed = !gState.worldTraceKnown || snapshot != gState.worldTrace;
++            const bool sample = gState.stateEntries != gState.worldTraceSampleEntry &&
++                                (gState.stateEntries <= 4u ||
++                                 gState.stateEntries % 30u == 0u);
++            if (!changed && !sample) return;
++            gState.worldTraceKnown = true;
++            gState.worldTrace = snapshot;
++            gState.worldTraceSampleEntry = gState.stateEntries;
++            std::fprintf(stderr,
++                "[kfiv-world] %s state=%llu active=%u pos=(%.3f,%.3f,%.3f) "
++                "yaw=%.6f vy=%.6f flags=%016llx ground=%08x type=%u/%u "
++                "selector=%u dynamic=%08x "
++                "bank0=(ready=%u byte1=%u header=%08x objects=%08x count=%u valid=%u) "
++                "bank1=(ready=%u byte1=%u header=%08x objects=%08x count=%u valid=%u) "
++                "loader=(ready=%u step=%u request=%08x bank-step=%u bank-info=%08x)\n",
++                reason, static_cast<unsigned long long>(gState.stateEntries), snapshot[19],
++                readFloat(runtime, kPlayer), readFloat(runtime, kPlayer + 4u),
++                readFloat(runtime, kPlayer + 8u), readFloat(runtime, kYaw),
++                readFloat(runtime, kPlayer + 0x1ACu),
++                static_cast<unsigned long long>(runtime.memory().read64(kPlayerFlags)),
++                runtime.memory().read32(kPlayer + 0x208u),
++                runtime.memory().read8(kPlayer + 0x210u),
++                runtime.memory().read8(kPlayer + 0x211u),
++                snapshot[12], snapshot[13],
++                snapshot[0], snapshot[1], snapshot[2], snapshot[3], snapshot[4], snapshot[5],
++                snapshot[6], snapshot[7], snapshot[8], snapshot[9], snapshot[10], snapshot[11],
++                snapshot[14], snapshot[15], snapshot[16], snapshot[17], snapshot[18]);
++        }
++        catch (const std::exception &error)
++        {
++            if (!gState.worldTraceReadFailed)
++                std::fprintf(stderr, "[kfiv-world] observation unavailable: %s\n", error.what());
++            gState.worldTraceReadFailed = true;
++        }
++    }
++
+     void writeFloat(PS2Runtime &runtime, uint32_t address, float value)
+     {
+         uint32_t bits = 0;
+@@ -198,10 +284,12 @@ namespace
+             ++gState.stateEntries;
+             publishGameplayGate(*runtime);
+             traceInputState(*runtime, "state-entry");
++            traceWorldState(*runtime, "state-entry");
+         }
+         gState.originalStateUpdate(rdram, ctx, runtime);
+         publishGameplayGate(*runtime);
+         traceInputState(*runtime, "state-return");
++        traceWorldState(*runtime, "state-return");
+         if (gState.stateEntries <= 4u || gState.stateEntries % 120u == 0u)
+         {
+             traceState(*runtime, "state-sample");
+-- 
+2.55.0.windows.3
+

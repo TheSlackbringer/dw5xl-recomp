@@ -1,0 +1,137 @@
+From 67ec719371cbb372ad725f8a13b00ccc02ca08b6 Mon Sep 17 00:00:00 2001
+From: Fizban <35464167+Fiztba@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 00:14:09 -0400
+Subject: [PATCH] Service starved MPEG input consumers without accepting
+ rejected video
+
+The SDK periodically dispatches NODATA while IPU commands wait for compressed input, independently of picture output. Service the registered consumer for an active empty decoder after a rejected video PES, bounded by VSync. Retain the packet for explicit retry and preserve accepted-byte credit, picture counts and generation cancellation.
+
+Add bounded opt-in generic IPU rejection diagnostics. Native Windows MPEG fixtures pass 1076 production checks and eleven CTests, including a precise missing-input-service control. The VSync bound approximates the original SDK polling cadence.
+---
+ ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp | 61 +++++++++++++++++++----
+ 1 file changed, 51 insertions(+), 10 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 570d405..ad5c5df 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -526,6 +526,8 @@ namespace ps2_stubs
+             size_t retryCallback = 0u;
+             bool retryPacket = false;
+             uint64_t lastOutputServiceTick = std::numeric_limits<uint64_t>::max();
++            uint64_t lastInputServiceTick = std::numeric_limits<uint64_t>::max();
++            uint64_t acceptedVideoPayloadBytes = 0u;
+         };
+ 
+         struct MpegStreamCallbackEvent
+@@ -1570,7 +1572,7 @@ namespace ps2_stubs
+                 finishDemuxTransaction(transaction);
+         }
+ 
+-        void serviceRejectedAudioOutput(const std::shared_ptr<MpegDemuxTransaction> &transaction,
++        void serviceRejectedDecoderConsumer(const std::shared_ptr<MpegDemuxTransaction> &transaction,
+                                         const MpegStreamCallbackEvent &event, size_t index)
+         {
+             if (transaction->finished)
+@@ -1583,14 +1585,14 @@ namespace ps2_stubs
+             if (!dispatchGuestStreamCallback(transaction->rdram, &transaction->caller,
+                     transaction->runtime, event, event.callbacks[index],
+                     [transaction, event, index](int32_t)
+-                    { serviceRejectedAudioOutput(transaction, event, index + 1u); }, transaction))
++                    { serviceRejectedDecoderConsumer(transaction, event, index + 1u); }, transaction))
+                 finishDemuxTransaction(transaction);
+         }
+ 
+         void acceptDemuxCallback(const std::shared_ptr<MpegDemuxTransaction> &transaction, int32_t result)
+         {
+             bool rejected = result <= 0;
+-            MpegStreamCallbackEvent outputService;
++            MpegStreamCallbackEvent consumerService;
+             {
+                 std::lock_guard lock(g_mpeg_stub_mutex);
+                 const auto found = g_mpeg_stub_state.playbackByMpeg.find(transaction->mpegAddr);
+@@ -1607,6 +1609,24 @@ namespace ps2_stubs
+                     playback.retryCallback = transaction->callbackIndex;
+                     const uint32_t type = transaction->events[transaction->eventIndex].streamType;
+                     const uint64_t tick = transaction->runtime->eeScheduler().currentVSyncTick();
++                    if (type == kMpegStrM2V)
++                    {
++                        static std::atomic<uint64_t> inputRejectCount{0u};
++                        if (mpegTraceSample(inputRejectCount.fetch_add(1u, std::memory_order_relaxed)))
++                        {
++                            auto &memory = transaction->runtime->memory();
++                            std::cerr << "[MPEG:VideoInputBlocked] mpeg=0x" << std::hex << transaction->mpegAddr
++                                      << " chcr=0x" << memory.read32(0x1000B400u)
++                                      << " madr=0x" << memory.read32(0x1000B410u)
++                                      << " qwc=0x" << memory.read32(0x1000B420u)
++                                      << " tadr=0x" << memory.read32(0x1000B430u) << std::dec
++                                      << " tick=" << tick << " pictures=" << playback.picturesServed
++                                      << " queued=" << playback.decodedFrames.size()
++                                      << " acceptedPayload=" << playback.acceptedVideoPayloadBytes
++                                      << " rejectedPayload=" << transaction->events[transaction->eventIndex].len
++                                      << " committed=" << transaction->committed << std::endl;
++                        }
++                    }
+                     if ((type == kMpegStrPCM || type == kMpegStrADPCM) &&
+                         playback.picturesServed != 0u && playback.decodedFrames.empty() &&
+                         !playback.streamEnded && !playback.decoderFailed &&
+@@ -1619,23 +1639,41 @@ namespace ps2_stubs
+                         // Service the existing callback without accepting the
+                         // rejected packet or producing another picture. Bound
+                         // additional service to one host VSync per handle.
+-                        outputService.mpegAddr = transaction->mpegAddr;
+-                        outputService.callbackGeneration = playback.callbackGeneration;
+-                        outputService.streamType = 4u;
+-                        outputService.callbacks = matchingOrdinaryCallbacks(transaction->mpegAddr, 4u);
+-                        if (!outputService.callbacks.empty())
++                        consumerService.mpegAddr = transaction->mpegAddr;
++                        consumerService.callbackGeneration = playback.callbackGeneration;
++                        consumerService.streamType = 4u;
++                        consumerService.callbacks = matchingOrdinaryCallbacks(transaction->mpegAddr, 4u);
++                        if (!consumerService.callbacks.empty())
+                             playback.lastOutputServiceTick = tick;
+                     }
++                    if (type == kMpegStrM2V && playback.picturesServed != 0u &&
++                        playback.decoder && playback.decodedFrames.empty() &&
++                        !playback.streamEnded && !playback.decoderFailed &&
++                        playback.lastInputServiceTick != tick)
++                    {
++                        // The SDK's busy IPU input loop also emits NODATA,
++                        // independently of whole-picture output. A native
++                        // decoder waiting for accepted input must still let
++                        // that registered consumer reconcile real DMA progress.
++                        // Preserve this rejected PES until an explicit retry
++                        // accepts it, and bound extra service to one VSync.
++                        consumerService.mpegAddr = transaction->mpegAddr;
++                        consumerService.callbackGeneration = playback.callbackGeneration;
++                        consumerService.streamType = 1u;
++                        consumerService.callbacks = matchingOrdinaryCallbacks(transaction->mpegAddr, 1u);
++                        if (!consumerService.callbacks.empty())
++                            playback.lastInputServiceTick = tick;
++                    }
+                 }
+                 else
+                     ++transaction->callbackIndex;
+             }
+             if (rejected)
+             {
+-                if (outputService.callbacks.empty())
++                if (consumerService.callbacks.empty())
+                     finishDemuxTransaction(transaction);
+                 else
+-                    serviceRejectedAudioOutput(transaction, outputService, 0u);
++                    serviceRejectedDecoderConsumer(transaction, consumerService, 0u);
+             }
+             else
+                 advanceDemuxTransaction(transaction);
+@@ -1689,7 +1727,10 @@ namespace ps2_stubs
+                                 transaction->pts90k, transaction->dts90k);
+                             wakePicture |= before != playback.decodedFrames.size() || playback.decoderFailed;
+                             if (!playback.decoderFailed)
++                            {
+                                 consumedVideoBytes += transaction->packetEnd - transaction->payloadStart;
++                                playback.acceptedVideoPayloadBytes += transaction->packetEnd - transaction->payloadStart;
++                            }
+                         }
+                         playback.retryPacket = false;
+                         transaction->committed = transaction->packetEnd;

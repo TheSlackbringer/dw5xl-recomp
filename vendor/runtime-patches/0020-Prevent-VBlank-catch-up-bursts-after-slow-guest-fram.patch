@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex Local <codex-local@localhost>
+Date: Fri, 9 Oct 2026 17:19:51 -0400
+Subject: [PATCH 20/22] Prevent VBlank catch-up bursts after slow guest frames
+
+---
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..9cbd710 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1847,11 +1847,17 @@ void EeScheduler::processDueDeadlines()
+         {
+             if (scheduled.event.type == EeEventType::VBlankStart)
+             {
++                // A slow guest can reach this field after its host deadline.
++                // Start the next host field from the field we actually emit,
++                // so later VSync waits do not repay that delay in a burst.
++                // Guest-cycle deadlines still advance by their exact offsets.
++                const auto hostFieldStart = std::max(scheduled.hostDeadline,
++                                                     std::chrono::steady_clock::now());
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+-                              scheduled.hostDeadline + kVBlankDuration,
++                              hostFieldStart + kVBlankDuration,
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
+-                              scheduled.hostDeadline + kVBlankPeriod,
++                              hostFieldStart + kVBlankPeriod,
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+             }
+             processEvent(scheduled.event);

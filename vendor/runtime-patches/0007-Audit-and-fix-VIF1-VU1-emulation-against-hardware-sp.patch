@@ -1,0 +1,368 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Priestley <Voicedrew11@gmail.com>
+Date: Sat, 3 Oct 2026 12:09:55 -0400
+Subject: [PATCH 07/14] Audit and fix VIF1/VU1 emulation against hardware specs
+
+Fixed VIF1 UNPACK:
+- V2 now writes v1v0v1v0 pattern; V3/V4 components properly ordered
+- V4-5 format: 5:5:5:1 components at correct bit positions
+- STMOD MODE=3 (ROW=data) support added
+- MPG destination masked to (imm & 0x7FF)*8, wrapping at 16 KB
+
+Fixed VU1:
+- EFU opcodes: ERSQRT=0x79, ESIN=0x7C, EATAN=0x7D, EEXP=0x7E
+- EATAN coefficient precision corrected
+- RSQRT(0,0) produces signed zero, not saturated max
+- XGKICK address mask to (VI & 0x3FF)*16 for 16 KB wrap
+- Removed dead condition wrappers in clip flag tests
+
+Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp | 132 ++++++++++---------
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp      |  13 +-
+ ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp     |  36 ++---
+ 3 files changed, 99 insertions(+), 82 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index b02c7ca..772aa85 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -466,17 +466,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         }
+         else if (opcode == VIF_MPG)
+         {
+-            uint32_t destAddr = (uint32_t)imm * 8u;
++            // VIFcode IMM holds the destination in 8-byte units, masked to the
++            // VU1 micro-memory address space (PCSX2 vifCode_MPG: (code<<3)&0x3fff).
++            uint32_t destAddr = (static_cast<uint32_t>(imm) & 0x7FFu) * 8u;
+             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
+             const uint32_t mpgBytes = instructionCount * 8u;
+-            if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
++            if (m_vu1Code && mpgBytes > 0)
+             {
+                 uint32_t copyBytes = mpgBytes;
+-                if (destAddr + copyBytes > PS2_VU1_CODE_SIZE)
+-                    copyBytes = PS2_VU1_CODE_SIZE - destAddr;
+-                if (pos + copyBytes <= sizeBytes)
++                if (pos + copyBytes > sizeBytes)
++                    copyBytes = sizeBytes - pos;
++                if (copyBytes > 0)
+                 {
+-                    std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
++                    // Micro-memory wraps at PS2_VU1_CODE_SIZE.
++                    uint32_t firstChunk = copyBytes;
++                    if (destAddr + firstChunk > PS2_VU1_CODE_SIZE)
++                        firstChunk = PS2_VU1_CODE_SIZE - destAddr;
++                    std::memcpy(m_vu1Code + destAddr, data + pos, firstChunk);
++                    if (copyBytes > firstChunk)
++                        std::memcpy(m_vu1Code, data + pos + firstChunk, copyBytes - firstChunk);
+                     markVU1CodeModified();
+                 }
+             }
+@@ -631,79 +639,69 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     {
+                         handledFormat = false;
+                     }
+-                    else if (vl == 0u)
++                    else if (vl <= 2u)
+                     {
+-                        if (components == 1)
+-                        {
+-                            uint32_t scalar = 0;
+-                            std::memcpy(&scalar, srcVec, sizeof(scalar));
+-                            decompressed[0] = scalar;
+-                            decompressed[1] = scalar;
+-                            decompressed[2] = scalar;
+-                            decompressed[3] = scalar;
+-                        }
+-                        else
++                        const uint32_t bytesPerComp = (vl == 0u) ? 4u : ((vl == 1u) ? 2u : 1u);
++                        const uint32_t srcStride = srcIndex * bytesPerVector;
++                        const uint32_t srcAvailable = sizeBytes - pos;
++                        const auto readComp = [&](uint32_t c) -> uint32_t
+                         {
+-                            const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
+-                            for (uint32_t c = 0; c < limit; ++c)
++                            const uint32_t off = srcStride + c * bytesPerComp;
++                            if (off + bytesPerComp > srcAvailable)
++                                return 0u;
++                            if (vl == 0u)
+                             {
+-                                uint32_t scalar = 0;
+-                                std::memcpy(&scalar, srcVec + c * 4u, sizeof(scalar));
+-                                decompressed[c] = scalar;
++                                uint32_t raw = 0;
++                                std::memcpy(&raw, srcVec + c * bytesPerComp, sizeof(raw));
++                                return raw;
+                             }
+-                        }
+-                    }
+-                    else if (vl == 1u)
+-                    {
+-                        if (components == 1)
+-                        {
+-                            uint16_t raw = 0;
+-                            std::memcpy(&raw, srcVec, sizeof(raw));
+-                            const uint32_t scalar = extend16(raw);
+-                            decompressed[0] = scalar;
+-                            decompressed[1] = scalar;
+-                            decompressed[2] = scalar;
+-                            decompressed[3] = scalar;
+-                        }
+-                        else
+-                        {
+-                            const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
+-                            for (uint32_t c = 0; c < limit; ++c)
++                            if (vl == 1u)
+                             {
+                                 uint16_t raw = 0;
+-                                std::memcpy(&raw, srcVec + c * 2u, sizeof(raw));
+-                                decompressed[c] = extend16(raw);
++                                std::memcpy(&raw, srcVec + c * bytesPerComp, sizeof(raw));
++                                return extend16(raw);
+                             }
+-                        }
+-                    }
+-                    else if (vl == 2u)
+-                    {
+-                        if (components == 1)
++                            return extend8(srcVec[c]);
++                        };
++
++                        if (components == 1u)
+                         {
+-                            const uint32_t scalar = extend8(srcVec[0]);
++                            const uint32_t scalar = readComp(0u);
+                             decompressed[0] = scalar;
+                             decompressed[1] = scalar;
+                             decompressed[2] = scalar;
+                             decompressed[3] = scalar;
+                         }
++                        else if (components == 2u)
++                        {
++                            // PCSX2 UNPACK_V2: the console writes v1v0v1v0 into
++                            // x/y/z/w (the second pair is "indeterminate" but
++                            // relied on by some games).
++                            decompressed[0] = readComp(0u);
++                            decompressed[1] = readComp(1u);
++                            decompressed[2] = readComp(0u);
++                            decompressed[3] = readComp(1u);
++                        }
+                         else
+                         {
+-                            const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
+-                            for (uint32_t c = 0; c < limit; ++c)
+-                            {
+-                                decompressed[c] = extend8(srcVec[c]);
+-                            }
++                            // PCSX2 uses the V4 unpack logic for V3 too; the 4th
++                            // component reads into the following vector.
++                            decompressed[0] = readComp(0u);
++                            decompressed[1] = readComp(1u);
++                            decompressed[2] = readComp(2u);
++                            decompressed[3] = readComp(3u);
+                         }
+                     }
+                     else if (vl == 3u && vn == 3u)
+                     {
+-                        // V4-5: packed color-like format in a single 16-bit value.
++                        // V4-5: 16-bit 5:5:5:1 value, each component stored in bits
++                        // 7:3 (W in bit 7). PCSX2 xUPK_V4_5; usn/MODE do not apply.
+                         uint16_t packed = 0;
+                         std::memcpy(&packed, srcVec, sizeof(packed));
+-                        decompressed[0] = packed & 0x1Fu;
+-                        decompressed[1] = (packed >> 5) & 0x1Fu;
+-                        decompressed[2] = (packed >> 10) & 0x1Fu;
+-                        decompressed[3] = (packed >> 15) & 0x01u;
++                        decompressed[0] = (static_cast<uint32_t>(packed) & 0x001Fu) << 3;
++                        decompressed[1] = (static_cast<uint32_t>(packed) & 0x03E0u) >> 2;
++                        decompressed[2] = (static_cast<uint32_t>(packed) & 0x7C00u) >> 7;
++                        decompressed[3] = (static_cast<uint32_t>(packed) & 0x8000u) >> 8;
+                     }
+                     else
+                     {
+@@ -742,11 +740,23 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                             if (handledFormat)
+                             {
+                                 writeVal = decompressed[field];
+-                                if (canAdd && (mode == 1u || mode == 2u))
++                                // STMOD MODE: 1 = offset (data+ROW), 2 = difference
++                                // (data+ROW, ROW=result), 3 = set ROW to data.
++                                if (canAdd)
+                                 {
+-                                    writeVal = writeVal + vif1_regs.row[field];
+-                                    if (mode == 2u)
++                                    if (mode == 1u)
++                                    {
++                                        writeVal = writeVal + vif1_regs.row[field];
++                                    }
++                                    else if (mode == 2u)
++                                    {
++                                        writeVal = writeVal + vif1_regs.row[field];
++                                        vif1_regs.row[field] = writeVal;
++                                    }
++                                    else if (mode == 3u)
++                                    {
+                                         vif1_regs.row[field] = writeVal;
++                                    }
+                                 }
+                             }
+                         }
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index bd75bba..f8dd6c8 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -931,7 +931,8 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+     if (m_unit != Unit::VU1 || !m_activeVuData || m_activeVuDataSize < 16u)
+         return;
+ 
+-    const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
++    // XGKICK sources VU data memory at (VI[Is] & 0x3FF) * 16 (16 KB wrap).
++    const uint32_t sourceAddress = ((qwordAddress & 0x3FFu) * 16u) % m_activeVuDataSize;
+     m_xgkick = {};
+     m_xgkick.active = true;
+     m_xgkick.sourceAddress = sourceAddress;
+@@ -1436,12 +1437,12 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(uint32_t lower
+     case 0x74:
+     case 0x75:
+     case 0x76:
+-    case 0x77:
+     case 0x78:
+     case 0x79:
+     case 0x7A:
+     case 0x7C:
+     case 0x7D:
++    case 0x7E:
+         if (m_unit == Unit::VU0)
+         {
+             usage.reserved = true;
+@@ -1455,7 +1456,7 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(uint32_t lower
+             break;
+         case 0x71:
+         case 0x72:
+-        case 0x77:
++        case 0x79:
+             usage.latency = 18u;
+             break;
+         case 0x73:
+@@ -1463,7 +1464,7 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(uint32_t lower
+             break;
+         case 0x74:
+         case 0x75:
+-        case 0x7C:
++        case 0x7D:
+             usage.latency = 54u;
+             break;
+         case 0x76:
+@@ -1471,10 +1472,10 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(uint32_t lower
+         case 0x7A:
+             usage.latency = 12u;
+             break;
+-        case 0x79:
++        case 0x7C:
+             usage.latency = 29u;
+             break;
+-        case 0x7D:
++        case 0x7E:
+             usage.latency = 44u;
+             break;
+         default:
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+index 94be789..f2f94af 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+@@ -16,7 +16,7 @@ namespace
+             0.999999344348907f,
+             -0.333298563957214f,
+             0.199465364217758f,
+-            -0.13085337519646f,
++            -0.139085337519646f,
+             0.096420042216778f,
+             -0.055909886956215f,
+             0.021861229091883f,
+@@ -176,8 +176,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+     case 0x10: // FCEQ
+     {
+         uint32_t imm24 = instr & 0xFFFFFF;
+-        if (1 != 0)
+-            m_state.vi[1] = ((m_state.clip & 0xFFFFFF) == imm24) ? 1 : 0;
++        m_state.vi[1] = ((m_state.clip & 0xFFFFFF) == imm24) ? 1 : 0;
+         return;
+     }
+     case 0x11: // FCSET
+@@ -188,15 +187,13 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+     case 0x12: // FCAND
+     {
+         uint32_t imm24 = instr & 0xFFFFFF;
+-        if (1 != 0)
+-            m_state.vi[1] = ((m_state.clip & imm24) != 0) ? 1 : 0;
++        m_state.vi[1] = ((m_state.clip & imm24) != 0) ? 1 : 0;
+         return;
+     }
+     case 0x13: // FCOR
+     {
+         uint32_t imm24 = instr & 0xFFFFFF;
+-        if (1 != 0)
+-            m_state.vi[1] = ((m_state.clip | imm24) == 0xFFFFFF) ? 1 : 0;
++        m_state.vi[1] = ((m_state.clip | imm24) == 0xFFFFFF) ? 1 : 0;
+         return;
+     }
+     case 0x14: // FSEQ
+@@ -541,10 +538,19 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+                     result = num / den;
+                 else
+                 {
+-                    statusDi = num == 0.0f ? 0x10u : 0x20u;
+-                    result = std::signbit(num)
+-                                 ? -std::numeric_limits<float>::max()
+-                                 : std::numeric_limits<float>::max();
++                    // RSQRT with a zero radicand: D flag set; I flag only when the
++                    // numerator is also zero, in which case Q is a signed zero
++                    // rather than the saturated max (PCSX2 _vuRSQRT).
++                    const bool negative = std::signbit(num) != std::signbit(radicand);
++                    statusDi = 0x20u;
++                    if (num != 0.0f)
++                        result = negative ? -std::numeric_limits<float>::max()
++                                          : std::numeric_limits<float>::max();
++                    else
++                    {
++                        statusDi |= 0x10u;
++                        result = negative ? -0.0f : 0.0f;
++                    }
+                 }
+                 uint32_t ignoredFlags = 0u;
+                 result = normalizeResult(result, ignoredFlags);
+@@ -723,7 +729,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+                 queueP(sum, 12u);
+                 return;
+             }
+-            case 0x77: // ERSQRT
++            case 0x79: // ERSQRT
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+                 const float value = normalizeOperand(m_state.vf[vfS][component]);
+@@ -744,7 +750,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+                 queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
+                 return;
+             }
+-            case 0x79: // ESIN
++            case 0x7C: // ESIN
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+                 const float value = normalizeOperand(m_state.vf[vfS][component]);
+@@ -760,13 +766,13 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+             }
+             case 0x7B: // WAITP
+                 return;
+-            case 0x7C: // EATAN
++            case 0x7D: // EATAN
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+                 queueP(vuEatan(normalizeOperand(m_state.vf[vfS][component])), 54u);
+                 return;
+             }
+-            case 0x7D: // EEXP
++            case 0x7E: // EEXP
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+                 queueP(vuEexp(normalizeOperand(m_state.vf[vfS][component])), 44u);

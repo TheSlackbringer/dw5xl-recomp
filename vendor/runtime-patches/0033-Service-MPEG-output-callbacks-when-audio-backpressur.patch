@@ -1,0 +1,98 @@
+From 764402c77de0589a680c22106cbaf7c737a9f309 Mon Sep 17 00:00:00 2001
+From: Fizban <35464167+Fiztba@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 23:16:45 -0400
+Subject: [PATCH] Service MPEG output callbacks when audio backpressure starves
+ video
+
+---
+ ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp | 48 ++++++++++++++++++++++-
+ 1 file changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index ad50894..dfbd9ef 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -525,6 +525,7 @@ namespace ps2_stubs
+             size_t retryEvent = 0u;
+             size_t retryCallback = 0u;
+             bool retryPacket = false;
++            uint64_t lastOutputServiceTick = std::numeric_limits<uint64_t>::max();
+         };
+ 
+         struct MpegStreamCallbackEvent
+@@ -1569,9 +1570,27 @@ namespace ps2_stubs
+                 finishDemuxTransaction(transaction);
+         }
+ 
++        void serviceRejectedAudioOutput(const std::shared_ptr<MpegDemuxTransaction> &transaction,
++                                        const MpegStreamCallbackEvent &event, size_t index)
++        {
++            if (transaction->finished)
++                return;
++            if (index == event.callbacks.size())
++            {
++                finishDemuxTransaction(transaction);
++                return;
++            }
++            if (!dispatchGuestStreamCallback(transaction->rdram, &transaction->caller,
++                    transaction->runtime, event, event.callbacks[index],
++                    [transaction, event, index](int32_t)
++                    { serviceRejectedAudioOutput(transaction, event, index + 1u); }, transaction))
++                finishDemuxTransaction(transaction);
++        }
++
+         void acceptDemuxCallback(const std::shared_ptr<MpegDemuxTransaction> &transaction, int32_t result)
+         {
+             bool rejected = result <= 0;
++            MpegStreamCallbackEvent outputService;
+             {
+                 std::lock_guard lock(g_mpeg_stub_mutex);
+                 const auto found = g_mpeg_stub_state.playbackByMpeg.find(transaction->mpegAddr);
+@@ -1586,12 +1605,38 @@ namespace ps2_stubs
+                     playback.retryPacketBytes = transaction->packetEnd - transaction->committed;
+                     playback.retryEvent = transaction->eventIndex;
+                     playback.retryCallback = transaction->callbackIndex;
++                    const uint32_t type = transaction->events[transaction->eventIndex].streamType;
++                    const uint64_t tick = transaction->runtime->eeScheduler().currentVSyncTick();
++                    if ((type == kMpegStrPCM || type == kMpegStrADPCM) &&
++                        playback.picturesServed != 0u && playback.decodedFrames.empty() &&
++                        !playback.streamEnded && !playback.decoderFailed &&
++                        playback.lastOutputServiceTick != tick)
++                    {
++                        // The SDK's UPDATE boundary occurs during individual
++                        // IPU output DMA batches, before a whole picture is
++                        // returned. A whole-frame decoder otherwise starves
++                        // an audio consumer after it blocks further video PES.
++                        // Service the existing callback without accepting the
++                        // rejected packet or producing another picture. Bound
++                        // additional service to one host VSync per handle.
++                        outputService.mpegAddr = transaction->mpegAddr;
++                        outputService.callbackGeneration = playback.callbackGeneration;
++                        outputService.streamType = 4u;
++                        outputService.callbacks = matchingOrdinaryCallbacks(transaction->mpegAddr, 4u);
++                        if (!outputService.callbacks.empty())
++                            playback.lastOutputServiceTick = tick;
++                    }
+                 }
+                 else
+                     ++transaction->callbackIndex;
+             }
+             if (rejected)
+-                finishDemuxTransaction(transaction);
++            {
++                if (outputService.callbacks.empty())
++                    finishDemuxTransaction(transaction);
++                else
++                    serviceRejectedAudioOutput(transaction, outputService, 0u);
++            }
+             else
+                 advanceDemuxTransaction(transaction);
+         }
+@@ -2520,6 +2565,7 @@ namespace ps2_stubs
+                 playback.nextPictureTickQ32 = presentationTargetQ32 + frameIntervalQ32;
+                 playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
+                 haveFrame = true;
++                playback.lastOutputServiceTick = currentTick;
+                 // The SDK emits callback type 4 during decoded picture DMA
+                 // output. Its tuple contains the callback type; the registered
+                 // user data is the third argument. Retail movie clients use

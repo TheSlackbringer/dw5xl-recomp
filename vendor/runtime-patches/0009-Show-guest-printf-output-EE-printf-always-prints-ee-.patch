@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Priestley <voicedrew11@gmail.com>
+Date: Sat, 3 Oct 2026 13:32:24 -0400
+Subject: [PATCH 09/14] Show guest printf output: EE printf always prints ([ee]
+ prefix, bounded); IOP printf formats its arguments
+
+---
+ ps2xIOP/src/emulator/imports/iop_stdio.cpp | 72 +++++++++++++++++++++-
+ ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp  | 16 +++++
+ 2 files changed, 86 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/imports/iop_stdio.cpp b/ps2xIOP/src/emulator/imports/iop_stdio.cpp
+index eed2b61..f9a18d7 100644
+--- a/ps2xIOP/src/emulator/imports/iop_stdio.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_stdio.cpp
+@@ -1,3 +1,5 @@
++#include <cstring>
++#include <cstdio>
+ #include "iop_stdio.h"
+ 
+ #include "../core/iop_cpu.h"
+@@ -30,9 +32,75 @@ namespace ps2x::iop::detail
+ 
+         switch (ordinal)
+         {
+-        case 4: // printf
+-            logString("[IOP printf] ", a0);
++        case 4: // printf(fmt, ...): a1-a3 then the stack (o32: 5th arg at sp+16)
++        {
++            const std::string format = m_memory.readString(a0, 2048u);
++            uint32_t argIndex = 0u;
++            const auto nextArg = [&]() -> uint32_t
++            {
++                const uint32_t i = argIndex++;
++                if (i < 3u)
++                    return cpu.gpr[5u + i];
++                return m_memory.read32(cpu.gpr[29] + 16u + (i - 3u) * 4u);
++            };
++            std::string out;
++            for (size_t i = 0; i < format.size(); ++i)
++            {
++                if (format[i] != '%')
++                {
++                    out.push_back(format[i]);
++                    continue;
++                }
++                std::string spec = "%";
++                size_t j = i + 1u;
++                while (j < format.size() && std::strchr("-+ #0123456789.lhz", format[j]))
++                {
++                    if (format[j] != 'l' && format[j] != 'h' && format[j] != 'z')
++                        spec.push_back(format[j]);
++                    ++j;
++                }
++                if (j >= format.size())
++                    break;
++                const char conv = format[j];
++                i = j;
++                char buf[512];
++                switch (conv)
++                {
++                case 'd': case 'i':
++                    std::snprintf(buf, sizeof(buf), (spec + "d").c_str(), static_cast<int32_t>(nextArg()));
++                    out += buf;
++                    break;
++                case 'u': case 'x': case 'X': case 'o':
++                    std::snprintf(buf, sizeof(buf), (spec + conv).c_str(), nextArg());
++                    out += buf;
++                    break;
++                case 'p':
++                    std::snprintf(buf, sizeof(buf), "0x%08x", nextArg());
++                    out += buf;
++                    break;
++                case 'c':
++                    out.push_back(static_cast<char>(nextArg()));
++                    break;
++                case 's':
++                {
++                    const std::string str = m_memory.readString(nextArg(), 400u);
++                    std::snprintf(buf, sizeof(buf), (spec + "s").c_str(), str.c_str());
++                    out += buf;
++                    break;
++                }
++                case '%':
++                    out.push_back('%');
++                    break;
++                default:
++                    out += spec;
++                    out.push_back(conv);
++                    break;
++                }
++            }
++            m_host.log(LogLevel::Info, "[IOP printf] " + out);
++            setV0(static_cast<uint32_t>(out.size()));
+             return true;
++        }
+         case 5: // getchar
+         case 10:
+             setV0(0xFFFFFFFFu);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+index d467c4b..c9aada7 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+@@ -1,3 +1,4 @@
++#include <atomic>
+ #include "Common.h"
+ #include "LibC.h"
+ #include "ps2_log.h"
+@@ -534,6 +535,21 @@ namespace ps2_stubs
+             {
+                 rendered.resize(2048);
+             }
++            {
++                // Guest printf output is the game's own diagnostics; always
++                // show it (prefixed, bounded) instead of only under AGRESSIVE_LOGS.
++                static std::atomic<uint32_t> s_eePrintfLines{0u};
++                const uint32_t n = s_eePrintfLines.fetch_add(1u, std::memory_order_relaxed);
++                if (n < 5000u)
++                {
++                    std::string line = rendered;
++                    while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
++                        line.pop_back();
++                    std::cout << "[ee] " << sanitizeForLog(line) << std::endl;
++                }
++                else if (n == 5000u)
++                    std::cout << "[ee] (further guest printf output suppressed)" << std::endl;
++            }
+             PS2_IF_AGRESSIVE_LOGS({
+                 const std::string logLine = sanitizeForLog(rendered);
+                 uint32_t count = 0;

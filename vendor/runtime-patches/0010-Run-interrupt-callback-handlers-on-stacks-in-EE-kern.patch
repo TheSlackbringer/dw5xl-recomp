@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Priestley <voicedrew11@gmail.com>
+Date: Sat, 3 Oct 2026 14:12:11 -0400
+Subject: [PATCH 10/14] Run interrupt/callback handlers on stacks in EE kernel
+ RAM
+
+reserveAsyncCallbackStack carved handler stacks from the top of RAM,
+where the kernel also places the main thread's stack, so every
+VBlank/DMAC handler overwrote saved registers of the interrupted
+frames (KF4: return to 0x430000 when the movie player starts).
+---
+ ps2xRuntime/src/lib/ps2_runtime.cpp | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 2d94b6e..ccdcc4d 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2259,6 +2259,29 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
+     }
+ 
+     std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
++
++    // Interrupt handlers and async callbacks run on the EE kernel's stacks,
++    // in kernel RAM below 0x80000 that user programs (loaded at 0x100000)
++    // never use. Carving them from the top of RAM put them on top of the
++    // main thread's stack (which the kernel also places at the top of RAM),
++    // so every VBlank/DMAC handler overwrote saved registers of the
++    // interrupted frames.
++    {
++        constexpr uint32_t kKernelStackFloor = 0x00020000u;
++        constexpr uint32_t kKernelStackCeiling = 0x00080000u;
++        static uint32_t s_kernelStackTop = kKernelStackCeiling;
++        const uint32_t kernelTop = s_kernelStackTop & ~(kGuestHeapDefaultAlignment - 1u);
++        if (kernelTop > allocSize)
++        {
++            const uint32_t kernelBase = (kernelTop - allocSize) & ~(normalizedAlignment - 1u);
++            if (kernelBase >= kKernelStackFloor && kernelBase < kernelTop)
++            {
++                s_kernelStackTop = kernelBase;
++                return kernelTop - 0x10u;
++            }
++        }
++    }
++
+     uint32_t top = m_asyncCallbackStackTop;
+     if (top > PS2_RAM_SIZE)
+     {

@@ -1,0 +1,25 @@
+# Game data: user-owned discs and extracted files. Never commit.
+/game/
+/discs/
+# Ghidra databases (derived from the game binaries)
+/ghidra/
+/ghidra_iop/
+# Generated C++ (derived from the game ELF; regenerate with tools/regen.sh) and recompiler logs
+/recomp/*/output/
+/recomp/**/*.log
+/recomp/*.txt
+# Builds and logs
+/app/build*/
+/app/deps/
+*.log
+*.log.*
+/logs/
+*.bak*
+imgui.ini
+
+# Python tooling caches
+__pycache__/
+*.pyc
+
+# Local research and bring-up notes
+/notes/

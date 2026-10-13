@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex Local <codex-local@localhost>
+Date: Fri, 9 Oct 2026 17:10:07 -0400
+Subject: [PATCH 18/22] Report synchronous IOP file completion through ioctl
+ status
+
+---
+ ps2xIOP/src/emulator/imports/iop_ioman.cpp | 28 ++++++++++++++++++++--
+ 1 file changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.cpp b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+index 973d200..d84cb9d 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+@@ -176,9 +176,33 @@ namespace ps2x::iop::detail
+             setV0(static_cast<uint32_t>(std::ftell(file)));
+             return true;
+         }
+-        case 9: // ioctl(fd, cmd, arg): no host-file ioctls; report success
+-            setV0(fileFor(a0) ? 0u : kEBADF);
++        case 9: // ioctl(fd, cmd, arg)
++        {
++            if (!fileFor(a0))
++            {
++                setV0(kEBADF);
++                return true;
++            }
++            // Disc drivers opened with O_NOWAIT use command 1 to query the
++            // pending operation. Host-backed open/read/lseek complete before
++            // returning, so report that completion through the output word.
++            if (a1 == 1u)
++            {
++                const bool ramSegment = a2 < IopMemory::RamSize ||
++                                        (a2 >= 0x80000000u && a2 < 0x80200000u) ||
++                                        (a2 >= 0xA0000000u && a2 < 0xA0200000u);
++                const uint32_t ready = 0u;
++                if (a2 == 0u || !ramSegment ||
++                    !m_memory.ownsRamRange(a2, sizeof(ready)) ||
++                    !m_memory.writeRam(a2, &ready, sizeof(ready)))
++                {
++                    setV0(static_cast<uint32_t>(-14)); // EFAULT
++                    return true;
++                }
++            }
++            setV0(0u);
+             return true;
++        }
+         case 20: // AddDrv
+         {
+             if (a0 == 0u || m_devices.size() >= kMaxDevices)

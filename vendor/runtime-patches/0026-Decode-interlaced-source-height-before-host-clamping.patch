@@ -1,0 +1,56 @@
+From afb1bebc4ccc142d89a9d1a6a74099a03cdb24a6 Mon Sep 17 00:00:00 2001
+From: Fizban <35464167+Fiztba@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 21:10:28 -0400
+Subject: [PATCH] Decode interlaced source height before host clamping
+
+---
+ ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp | 18 ++++++++----------
+ 1 file changed, 8 insertions(+), 10 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index c41e04b..547dc69 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -400,7 +400,7 @@ namespace
+                                      ((a >= 0x40u) ? 0x8000u : 0u));
+     }
+ 
+-    void decodeDisplaySize(uint64_t display64, uint32_t &outWidth, uint32_t &outHeight)
++    void decodeDisplaySize(uint64_t display64, bool frameModeFields, uint32_t &outWidth, uint32_t &outHeight)
+     {
+         const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
+         const uint32_t dh = static_cast<uint32_t>((display64 >> 44) & 0x07FFu);
+@@ -416,6 +416,11 @@ namespace
+             outWidth = kDefaultDisplayWidth;
+             outHeight = kDefaultDisplayHeight;
+         }
++        // Interlaced FRAME mode reads half of the DISPLAY line count. Convert
++        // to source rows before limiting the host size: DH=895 reads all 448
++        // rows, rather than clamping 896 to 512 and then reading only 256.
++        if (frameModeFields)
++            outHeight = (outHeight + 1u) / 2u;
+         outWidth = std::min<uint32_t>(outWidth, kHostFrameWidth);
+         outHeight = std::min<uint32_t>(outHeight, kHostFrameHeight);
+     }
+@@ -2448,16 +2453,9 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+     const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
+     const GSDisplayReadOrigin origin2 = decodeDisplayReadOrigin(request.dispfb2);
+     uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
+-    decodeDisplaySize(request.display1, width1, height1);
+-    decodeDisplaySize(request.display2, width2, height2);
+-    // Interlaced FRAME mode (SMODE2.INT=1, FFMD=1): DISPLAY.DH counts frame
+-    // lines, but each field reads every line of a half-height buffer.
+     const bool frameModeFields = smode2.interlaced && smode2.frameMode;
+-    if (frameModeFields)
+-    {
+-        height1 = std::max<uint32_t>(1u, height1 / 2u);
+-        height2 = std::max<uint32_t>(1u, height2 / 2u);
+-    }
++    decodeDisplaySize(request.display1, frameModeFields, width1, height1);
++    decodeDisplaySize(request.display2, frameModeFields, width2, height2);
+     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
+     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
+     if (!valid1 && !valid2)
+-- 
+2.55.0.windows.3
+

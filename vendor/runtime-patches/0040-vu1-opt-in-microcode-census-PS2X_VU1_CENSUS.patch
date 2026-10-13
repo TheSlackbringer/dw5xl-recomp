@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Priestley <Voicedrew11@gmail.com>
+Date: Fri, 9 Oct 2026 23:43:27 -0400
+Subject: [PATCH 40/41] vu1: opt-in microcode census (PS2X_VU1_CENSUS)
+
+Per (microcode hash, entry PC) run/resume counts and VU1 cycles, plus the
+microcode images, written to a file. Off unless the variable is set.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp | 117 ++++++++++++++++++++++++
+ 1 file changed, 117 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index b87015a..1dcbcac 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -13,6 +13,9 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <limits>
++#include <map>
++#include <string>
++#include <vector>
+ #include <ps2_log.h>
+ 
+ namespace
+@@ -276,6 +279,7 @@ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
+                         fmac.op == FmacOp::Mul || fmac.op == FmacOp::OuterMul;
+     const bool productSum = isProductSum(fmac.op);
+ 
++
+     // Operands as calculateFmacExactResult derives them, from the values
+     // execUpper already normalized.
+     bool haveOperands = false;
+@@ -1645,6 +1649,95 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
+     m_stopRequested = true;
+ }
+ 
++namespace
++{
++    // PS2X_VU1_CENSUS=<file>: at exit, write per-(microcode hash, entry PC)
++    // run counts and VU1 cycles, and the microcode images (<file>.<hash>.bin).
++    struct VuCensus
++    {
++        struct Entry
++        {
++            uint64_t runs = 0;
++            uint64_t resumes = 0;
++            uint64_t cycles = 0;
++        };
++        std::string path;
++        std::map<std::pair<uint64_t, uint32_t>, Entry> entries;
++        std::map<uint64_t, std::vector<uint8_t>> images;
++        uint64_t sinceDump = 0;
++        uint64_t lastHash = 0;
++        uint32_t lastPc = 0;
++        const uint8_t *cachedCode = nullptr;
++        uint64_t cachedGeneration = ~0ull;
++        uint64_t cachedHash = 0;
++
++        VuCensus()
++        {
++            if (const char *env = std::getenv("PS2X_VU1_CENSUS"))
++                path = env;
++        }
++        ~VuCensus() { dump(); }
++        bool enabled() const { return !path.empty(); }
++
++        uint64_t hashOf(const uint8_t *code, uint32_t size, uint64_t generation)
++        {
++            if (code == cachedCode && generation == cachedGeneration)
++                return cachedHash;
++            uint64_t h = 1469598103934665603ull;
++            for (uint32_t i = 0; i < size; ++i)
++                h = (h ^ code[i]) * 1099511628211ull;
++            if (images.find(h) == images.end())
++                images[h].assign(code, code + size);
++            cachedCode = code;
++            cachedGeneration = generation;
++            cachedHash = h;
++            return h;
++        }
++
++        void dump()
++        {
++            if (!enabled() || entries.empty())
++                return;
++            std::vector<std::pair<std::pair<uint64_t, uint32_t>, Entry>> sorted(entries.begin(), entries.end());
++            std::sort(sorted.begin(), sorted.end(),
++                      [](const auto &a, const auto &b) { return a.second.cycles > b.second.cycles; });
++            uint64_t total = 0;
++            for (const auto &e : sorted)
++                total += e.second.cycles;
++            if (FILE *f = std::fopen(path.c_str(), "w"))
++            {
++                std::fprintf(f, "# hash entryPC runs resumes cycles cumulative%%\n");
++                uint64_t running = 0;
++                for (const auto &e : sorted)
++                {
++                    running += e.second.cycles;
++                    std::fprintf(f, "%016llx %04x %llu %llu %llu %.2f\n", (unsigned long long)e.first.first,
++                                 e.first.second, (unsigned long long)e.second.runs,
++                                 (unsigned long long)e.second.resumes, (unsigned long long)e.second.cycles,
++                                 total ? 100.0 * running / total : 0.0);
++                }
++                std::fclose(f);
++            }
++            for (const auto &image : images)
++            {
++                char name[32];
++                std::snprintf(name, sizeof(name), ".%016llx.bin", (unsigned long long)image.first);
++                if (FILE *f = std::fopen((path + name).c_str(), "wb"))
++                {
++                    std::fwrite(image.second.data(), 1, image.second.size(), f);
++                    std::fclose(f);
++                }
++            }
++        }
++    };
++
++    VuCensus &census()
++    {
++        static VuCensus instance;
++        return instance;
++    }
++}
++
+ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+                              uint8_t *vuData, uint32_t dataSize,
+                              GS &gs, PS2Memory *memory,
+@@ -1666,6 +1759,20 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+     m_state.vf[0][1] = 0.0f;
+     m_state.vf[0][2] = 0.0f;
+     m_state.vf[0][3] = 1.0f;
++    if (m_unit == Unit::VU1 && census().enabled() && memory)
++    {
++        VuCensus &c = census();
++        c.lastHash = c.hashOf(vuCode, codeSize, memory->getVU1CodeGeneration());
++        c.lastPc = m_state.pc;
++        const uint64_t before = m_cycle;
++        run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++        VuCensus::Entry &e = c.entries[{c.lastHash, c.lastPc}];
++        ++e.runs;
++        e.cycles += m_cycle - before;
++        if ((++c.sinceDump & 0x3FFFu) == 0u)
++            c.dump();
++        return;
++    }
+     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+ }
+ 
+@@ -1678,6 +1785,16 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
+     m_state.itop = itop;
+     m_state.stoppedByD = false;
+     m_state.stoppedByT = false;
++    if (m_unit == Unit::VU1 && census().enabled())
++    {
++        VuCensus &c = census();
++        const uint64_t before = m_cycle;
++        run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++        VuCensus::Entry &e = c.entries[{c.lastHash, c.lastPc}];
++        ++e.resumes;
++        e.cycles += m_cycle - before;
++        return;
++    }
+     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+ }
+ 

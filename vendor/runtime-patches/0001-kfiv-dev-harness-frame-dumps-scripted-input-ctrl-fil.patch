@@ -1,0 +1,311 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Priestley <voicedrew11@gmail.com>
+Date: Sat, 3 Oct 2026 11:24:30 -0400
+Subject: [PATCH 01/14] kfiv: dev harness (frame dumps, scripted input, ctrl
+ file, hidden window)
+
+---
+ ps2xRuntime/src/lib/ps2_pad.cpp     |   7 +
+ ps2xRuntime/src/lib/ps2_runtime.cpp | 234 +++++++++++++++++++++++++++-
+ 2 files changed, 240 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 8590f14..699e046 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,6 +1,12 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
+ #include <cstring>
++#include <atomic>
++
++namespace ps2x_dev
++{
++    extern std::atomic<uint32_t> g_padPressedMask; // dev harness, ps2_runtime.cpp
++}
+ 
+ namespace
+ {
+@@ -119,6 +125,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+             clearBit(PAD_SELECT);
+     }
+ 
++    btns &= static_cast<uint16_t>(~ps2x_dev::g_padPressedMask.load(std::memory_order_relaxed));
+     data[2] = static_cast<uint8_t>(btns & 0xFF);
+     data[3] = static_cast<uint8_t>(btns >> 8);
+     return true;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..33f9e3f 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -26,6 +26,11 @@
+ #include <thread>
+ #include <unordered_map>
+ #include <sstream>
++#include <cstdio>
++#include <cstdlib>
++#include <cctype>
++#include <vector>
++#include <string>
+ 
+ namespace ps2_stubs
+ {
+@@ -373,6 +378,222 @@ namespace
+     }
+ }
+ 
++// ---------------------------------------------------------------------------
++// KFIV-PC dev harness (env-driven, no header changes):
++//   PS2X_HIDDEN=1            create the window hidden (headless-ish runs)
++//   PS2X_DUMP_DIR=<dir>      where frame PNGs go (default: cwd)
++//   PS2X_DUMP_EVERY=<n>      dump the presented frame every n vsync ticks
++//   PS2X_EXIT_TICK=<n>       dump final.png and _Exit(0) at vsync tick n
++//   PS2X_INPUT="t:BTN[+BTN]:dur,..."  scripted pad presses at vsync tick t
++//   PS2X_CTRL=<file>         command file polled ~10x/s, consumed on read:
++//       press BTN[+BTN] <ticks> | shot <path.png> | quit | tick <path.txt>
++// Buttons: UP DOWN LEFT RIGHT START SELECT CROSS CIRCLE SQUARE TRIANGLE
++//          L1 R1 L2 R2 L3 R3
++// ---------------------------------------------------------------------------
++namespace ps2x_dev
++{
++    std::atomic<uint32_t> g_padPressedMask{0u}; // read by ps2_pad.cpp
++
++    struct PressEvent
++    {
++        uint64_t start;
++        uint64_t duration;
++        uint32_t mask;
++    };
++
++    static std::vector<uint8_t> s_lastFrame;
++    static uint32_t s_lastFrameW = 0u;
++    static uint32_t s_lastFrameH = 0u;
++    static uint32_t s_lastFrameRows = 1u; // rows in s_lastFrame (FB_HEIGHT)
++
++    static uint32_t buttonMask(const std::string &nameIn)
++    {
++        std::string n;
++        for (char c : nameIn)
++            n.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
++        static const std::unordered_map<std::string, uint32_t> k{
++            {"LEFT", 0x0080u}, {"DOWN", 0x0040u}, {"RIGHT", 0x0020u}, {"UP", 0x0010u},
++            {"START", 0x0008u}, {"R3", 0x0004u}, {"L3", 0x0002u}, {"SELECT", 0x0001u},
++            {"SQUARE", 0x8000u}, {"CROSS", 0x4000u}, {"X", 0x4000u}, {"CIRCLE", 0x2000u},
++            {"O", 0x2000u}, {"TRIANGLE", 0x1000u}, {"R1", 0x0800u}, {"L1", 0x0400u},
++            {"R2", 0x0200u}, {"L2", 0x0100u}};
++        const auto it = k.find(n);
++        if (it == k.end())
++        {
++            std::cerr << "[dev] unknown button '" << nameIn << "'" << std::endl;
++            return 0u;
++        }
++        return it->second;
++    }
++
++    static uint32_t parseButtons(const std::string &spec)
++    {
++        uint32_t mask = 0u;
++        std::stringstream ss(spec);
++        std::string part;
++        while (std::getline(ss, part, '+'))
++            mask |= buttonMask(part);
++        return mask;
++    }
++
++    static uint64_t envU64(const char *name, uint64_t def)
++    {
++        const char *v = std::getenv(name);
++        return (v && *v) ? std::strtoull(v, nullptr, 0) : def;
++    }
++
++    static bool writePng(const std::string &path)
++    {
++        if (s_lastFrame.empty() || s_lastFrameW == 0u || s_lastFrameH == 0u)
++            return false;
++        // s_lastFrame rows are FB_WIDTH (640) pixels apart
++        const size_t stride = s_lastFrame.size() / std::max<size_t>(1u, s_lastFrameRows) ;
++        std::vector<uint8_t> px(static_cast<size_t>(s_lastFrameW) * s_lastFrameH * 4u);
++        for (uint32_t y = 0; y < s_lastFrameH; ++y)
++            std::memcpy(px.data() + static_cast<size_t>(y) * s_lastFrameW * 4u,
++                        s_lastFrame.data() + static_cast<size_t>(y) * stride,
++                        static_cast<size_t>(s_lastFrameW) * 4u);
++        for (size_t i = 3; i < px.size(); i += 4)
++            px[i] = 0xFF;
++        Image img{};
++        img.data = px.data();
++        img.width = static_cast<int>(s_lastFrameW);
++        img.height = static_cast<int>(s_lastFrameH);
++        img.mipmaps = 1;
++        img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
++        const bool ok = ExportImage(img, path.c_str());
++        std::cerr << "[dev] shot " << path << (ok ? " ok" : " FAILED") << std::endl;
++        return ok;
++    }
++
++    static std::string dumpDir()
++    {
++        const char *d = std::getenv("PS2X_DUMP_DIR");
++        return (d && *d) ? std::string(d) : std::string(".");
++    }
++
++    struct Harness
++    {
++        std::vector<PressEvent> events;
++        uint64_t dumpEvery = 0u;
++        uint64_t exitTick = 0u;
++        uint64_t lastDumpBucket = std::numeric_limits<uint64_t>::max();
++        std::string ctrlPath;
++        std::chrono::steady_clock::time_point lastCtrlPoll{};
++
++        void init()
++        {
++            dumpEvery = envU64("PS2X_DUMP_EVERY", 0u);
++            exitTick = envU64("PS2X_EXIT_TICK", 0u);
++            if (const char *c = std::getenv("PS2X_CTRL"))
++                ctrlPath = c;
++            if (const char *in = std::getenv("PS2X_INPUT"))
++            {
++                std::stringstream ss(in);
++                std::string item;
++                while (std::getline(ss, item, ','))
++                {
++                    const size_t a = item.find(':');
++                    const size_t b = item.find(':', a == std::string::npos ? a : a + 1);
++                    if (a == std::string::npos)
++                        continue;
++                    PressEvent ev{};
++                    ev.start = std::strtoull(item.substr(0, a).c_str(), nullptr, 0);
++                    ev.mask = parseButtons(item.substr(a + 1, b == std::string::npos ? std::string::npos : b - a - 1));
++                    ev.duration = (b == std::string::npos) ? 6u : std::strtoull(item.substr(b + 1).c_str(), nullptr, 0);
++                    events.push_back(ev);
++                }
++            }
++            std::cerr << "[dev] harness: dumpEvery=" << dumpEvery << " exitTick=" << exitTick
++                      << " events=" << events.size() << " ctrl=" << ctrlPath << std::endl;
++        }
++
++        void pollCtrl(uint64_t tick)
++        {
++            if (ctrlPath.empty())
++                return;
++            const auto now = std::chrono::steady_clock::now();
++            if (now - lastCtrlPoll < std::chrono::milliseconds(100))
++                return;
++            lastCtrlPoll = now;
++            std::ifstream f(ctrlPath);
++            if (!f)
++                return;
++            std::vector<std::string> lines;
++            std::string line;
++            while (std::getline(f, line))
++                lines.push_back(line);
++            f.close();
++            std::remove(ctrlPath.c_str());
++            uint64_t at = tick;
++            for (const std::string &l : lines)
++            {
++                std::stringstream ls(l);
++                std::string cmd;
++                ls >> cmd;
++                if (cmd == "press")
++                {
++                    std::string btns;
++                    uint64_t dur = 6u;
++                    ls >> btns >> dur;
++                    events.push_back(PressEvent{at, dur, parseButtons(btns)});
++                    at += dur + 4u; // queue sequential presses with a release gap
++                }
++                else if (cmd == "shot")
++                {
++                    std::string path;
++                    ls >> path;
++                    writePng(path);
++                }
++                else if (cmd == "tick")
++                {
++                    std::string path;
++                    ls >> path;
++                    std::ofstream o(path);
++                    o << tick << std::endl;
++                }
++                else if (cmd == "quit")
++                {
++                    std::cerr << "[dev] quit at tick " << tick << std::endl;
++                    std::cout.flush();
++                    std::cerr.flush();
++                    std::_Exit(0);
++                }
++            }
++        }
++
++        void step(uint64_t tick)
++        {
++            pollCtrl(tick);
++            uint32_t mask = 0u;
++            for (const PressEvent &ev : events)
++                if (tick >= ev.start && tick < ev.start + ev.duration)
++                    mask |= ev.mask;
++            g_padPressedMask.store(mask, std::memory_order_relaxed);
++
++            if (dumpEvery != 0u)
++            {
++                const uint64_t bucket = tick / dumpEvery;
++                if (bucket != lastDumpBucket)
++                {
++                    lastDumpBucket = bucket;
++                    char name[64];
++                    std::snprintf(name, sizeof(name), "/frame_%06llu.png", static_cast<unsigned long long>(tick));
++                    writePng(dumpDir() + name);
++                }
++            }
++            if (exitTick != 0u && tick >= exitTick)
++            {
++                writePng(dumpDir() + "/final.png");
++                std::cerr << "[dev] exit tick " << tick << " reached" << std::endl;
++                std::cout.flush();
++                std::cerr.flush();
++                std::_Exit(0);
++            }
++        }
++    };
++}
++
+ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
+@@ -472,6 +693,10 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     }
+ 
+     UpdateTexture(tex, s_uploadBuffer.data());
++    ps2x_dev::s_lastFrame.assign(s_uploadBuffer.begin(), s_uploadBuffer.end());
++    ps2x_dev::s_lastFrameW = std::min<uint32_t>(width, FB_WIDTH);
++    ps2x_dev::s_lastFrameH = std::min<uint32_t>(height, FB_HEIGHT);
++    ps2x_dev::s_lastFrameRows = FB_HEIGHT;
+     outWidth = width;
+     outHeight = height;
+     s_hasUploadedFrame = true;
+@@ -731,7 +956,11 @@ bool PS2Runtime::initialize(const char *title)
+ #if defined(PLATFORM_VITA)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+ #else
+-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
++        {
++            const char *hidden = std::getenv("PS2X_HIDDEN");
++            SetConfigFlags(FLAG_WINDOW_RESIZABLE |
++                           ((hidden && *hidden && *hidden != '0') ? FLAG_WINDOW_HIDDEN : 0));
++        }
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+         InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+@@ -2386,8 +2615,11 @@ void PS2Runtime::run()
+         gameThreadFinished.store(true, std::memory_order_release); });
+ 
+     uint64_t tick = 0;
++    ps2x_dev::Harness devHarness;
++    devHarness.init();
+     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+     {
++        devHarness.step(m_eeScheduler->currentVSyncTick());
+         PS2_IF_AGRESSIVE_LOGS({
+             tick++;
+             if ((tick % 120) == 0)

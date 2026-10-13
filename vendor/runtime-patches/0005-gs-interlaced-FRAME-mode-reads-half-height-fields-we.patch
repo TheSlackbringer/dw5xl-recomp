@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Priestley <voicedrew11@gmail.com>
+Date: Sat, 3 Oct 2026 12:29:18 -0400
+Subject: [PATCH 05/14] gs: interlaced FRAME mode reads half-height fields;
+ weave fields on host
+
+With SMODE2.INT=1 and FFMD=1 the PCRTC reads every line of a field
+buffer, so the buffer height is (DH+1)/2. Games that render alternating
+half-height field buffers are woven into a full-height frame for the
+host window (PS2X_NO_WEAVE=1 keeps the raw field).
+---
+ ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp | 55 +++++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 2c3e6c5..f1a8e6b 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -12,6 +12,7 @@
+ #include <cmath>
+ #include <cstdio>
+ #include <cstring>
++#include <cstdlib>
+ #include <fstream>
+ #include <iostream>
+ #include <stdexcept>
+@@ -414,6 +415,48 @@ namespace
+         }
+     }
+ 
++    // Host-side deinterlace for interlaced FRAME-mode output: a game that
++    // renders each field into its own half-height buffer (alternating buffers,
++    // half-line Y offset on odd fields) would be woven by the TV. Weave the
++    // current field with the previous one into a full-height frame. When the
++    // buffer did not change (no swap) the field is line-doubled instead.
++    // PS2X_NO_WEAVE=1 keeps the raw half-height field.
++    void weaveFieldBuffers(std::vector<uint8_t> &pixels, uint32_t width, uint32_t &height, uint32_t fbp, bool oddField)
++    {
++        static const bool s_disabled = []
++        {
++            const char *v = std::getenv("PS2X_NO_WEAVE");
++            return v && *v && *v != '0';
++        }();
++        static std::vector<uint8_t> s_prevField;
++        static uint32_t s_prevFbp = 0xFFFFFFFFu;
++        static uint32_t s_prevWidth = 0u;
++        static uint32_t s_prevHeight = 0u;
++        if (s_disabled || pixels.empty() || width == 0u || height == 0u || height * 2u > kHostFrameHeight)
++            return;
++
++        const size_t rowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
++        std::vector<uint8_t> current(pixels.begin(), pixels.begin() + static_cast<size_t>(height) * rowBytes);
++        const bool havePrev = s_prevFbp != fbp && s_prevWidth == width && s_prevHeight == height &&
++                              s_prevField.size() == current.size();
++        const std::vector<uint8_t> &other = havePrev ? s_prevField : current;
++        for (uint32_t y = 0; y < height; ++y)
++        {
++            const uint32_t curLine = 2u * y + (oddField ? 1u : 0u);
++            const uint32_t otherLine = 2u * y + (oddField ? 0u : 1u);
++            std::memcpy(pixels.data() + curLine * rowBytes, current.data() + y * rowBytes, width * 4u);
++            std::memcpy(pixels.data() + otherLine * rowBytes, other.data() + y * rowBytes, width * 4u);
++        }
++        if (s_prevFbp != fbp)
++        {
++            s_prevField.swap(current);
++            s_prevFbp = fbp;
++            s_prevWidth = width;
++            s_prevHeight = height;
++        }
++        height *= 2u;
++    }
++
+     void normalizePresentationAlpha(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
+     {
+         for (uint32_t y = 0; y < height; ++y)
+@@ -1878,6 +1921,14 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+     uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
+     decodeDisplaySize(request.display1, width1, height1);
+     decodeDisplaySize(request.display2, width2, height2);
++    // Interlaced FRAME mode (SMODE2.INT=1, FFMD=1): DISPLAY.DH counts frame
++    // lines, but each field reads every line of a half-height buffer.
++    const bool frameModeFields = smode2.interlaced && smode2.frameMode;
++    if (frameModeFields)
++    {
++        height1 = std::max<uint32_t>(1u, height1 / 2u);
++        height2 = std::max<uint32_t>(1u, height2 / 2u);
++    }
+     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
+     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
+     if (!valid1 && !valid2)
+@@ -1965,6 +2016,8 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+             normalizePresentationAlpha(result.pixels, result.width, result.height);
+             if (fieldMode)
+                 applyFieldPresentation(result.pixels, result.width, result.height, oddField);
++            if (frameModeFields)
++                weaveFieldBuffers(result.pixels, result.width, result.height, displayFrame1.fbp, oddField);
+             result.displayFbp = displayFrame1.fbp;
+             result.sourceFbp = selected1.fbp;
+             return result;
+@@ -1980,6 +2033,8 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+         return {};
+     if (fieldMode)
+         applyFieldPresentation(result.pixels, result.width, result.height, oddField);
++    if (frameModeFields)
++        weaveFieldBuffers(result.pixels, result.width, result.height, displayFrame.fbp, oddField);
+     normalizePresentationAlpha(result.pixels, result.width, result.height);
+     result.displayFbp = displayFrame.fbp;
+     result.sourceFbp = selected.fbp;

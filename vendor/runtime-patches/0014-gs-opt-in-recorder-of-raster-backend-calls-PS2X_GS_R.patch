@@ -1,0 +1,302 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Priestley <voicedrew11@gmail.com>
+Date: Sat, 3 Oct 2026 18:41:27 -0400
+Subject: [PATCH 14/14] gs: opt-in recorder of raster backend calls
+ (PS2X_GS_RECORD)
+
+PS2X_GS_RECORD=<file> wraps the main GS backend in a decorator that logs
+every call (initial VRAM, primitives with their FP rounding mode, CLUT
+loads, transfers and upload data, flushes, syncs, presentation requests)
+to a binary file. Replaying the file through two backends and comparing
+VRAM at the sync points is a deterministic regression test for renderer
+changes, independent of guest timing; it also allows profiling the
+rasterizer in isolation.
+---
+ ps2xRuntime/CMakeLists.txt             |   1 +
+ ps2xRuntime/src/lib/gs/gs_frontend.cpp |   5 +-
+ ps2xRuntime/src/lib/gs/gs_record.cpp   | 186 +++++++++++++++++++++++++
+ ps2xRuntime/src/lib/gs/gs_record.h     |  40 ++++++
+ 4 files changed, 230 insertions(+), 2 deletions(-)
+ create mode 100644 ps2xRuntime/src/lib/gs/gs_record.cpp
+ create mode 100644 ps2xRuntime/src/lib/gs/gs_record.h
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 646f37f..0f13a5b 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -384,6 +384,7 @@ add_library(ps2_runtime STATIC
+     src/lib/gs/gs_frontend.cpp
+     src/lib/gs/gs_cpu_backend.cpp
+     src/lib/gs/gs_trace.cpp
++    src/lib/gs/gs_record.cpp
+     src/lib/ps2_iop_host.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 346f518..a51c53e 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -3,6 +3,7 @@
+ #include "ps2_log.h"
+ #include "runtime/ps2_memory.h"
+ #include "gs_trace.h"
++#include "gs_record.h"
+ #include <atomic>
+ #include <algorithm>
+ #include <cmath>
+@@ -107,7 +108,7 @@ namespace
+ 
+ 
+ GS::GS()
+-    : m_backend(std::make_unique<GSCpuBackend>())
++    : m_backend(makeGsRasterBackend())
+ {
+     reset();
+ }
+@@ -118,7 +119,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+     m_localMemorySize = vramSize;
+     m_privRegs = privRegs;
+     if (!m_backend)
+-        m_backend = std::make_unique<GSCpuBackend>();
++        m_backend = makeGsRasterBackend();
+     m_backend->Initialize(vram, vramSize);
+     GSTrace::initialize();
+     GSTrace::setLocalMemory(vram, vramSize);
+diff --git a/ps2xRuntime/src/lib/gs/gs_record.cpp b/ps2xRuntime/src/lib/gs/gs_record.cpp
+new file mode 100644
+index 0000000..046f08d
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_record.cpp
+@@ -0,0 +1,186 @@
++#include "gs_record.h"
++
++#include "runtime/gs/gs_cpu_backend.h"
++
++#include <atomic>
++#include <cfenv>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++
++namespace
++{
++    class RecordingBackend final : public GSRasterBackend
++    {
++    public:
++        RecordingBackend(std::unique_ptr<GSRasterBackend> inner, std::FILE *file)
++            : m_inner(std::move(inner)), m_file(file)
++        {
++        }
++
++        ~RecordingBackend() override
++        {
++            std::fclose(m_file);
++        }
++
++        void Initialize(uint8_t *vram, uint32_t vramSize) override
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            op(GSRecord::Op::Initialize);
++            put(vramSize);
++            if (vram && vramSize != 0u)
++                std::fwrite(vram, 1u, vramSize, m_file);
++            m_inner->Initialize(vram, vramSize);
++        }
++
++        void Reset() override
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            op(GSRecord::Op::Reset);
++            m_inner->Reset();
++        }
++
++        void Submit(const GSPrimitiveBatch &batch) override
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            op(GSRecord::Op::Submit);
++            put(static_cast<int32_t>(std::fegetround()));
++            put(batch);
++            m_inner->Submit(batch);
++        }
++
++        void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            op(GSRecord::Op::LoadClut);
++            put(tex0);
++            put(texclut);
++            m_inner->LoadClut(tex0, texclut);
++        }
++
++        void BeginTransfer(const GSTransferCommand &command) override
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            op(GSRecord::Op::BeginTransfer);
++            put(command);
++            m_inner->BeginTransfer(command);
++        }
++
++        void UploadImage(const uint8_t *data, uint32_t sizeBytes) override
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            op(GSRecord::Op::UploadImage);
++            put(sizeBytes);
++            if (data && sizeBytes != 0u)
++                std::fwrite(data, 1u, sizeBytes, m_file);
++            m_inner->UploadImage(data, sizeBytes);
++        }
++
++        void Flush() override
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            op(GSRecord::Op::Flush);
++            m_inner->Flush();
++        }
++
++        void TextureFlush() override
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            op(GSRecord::Op::TextureFlush);
++            m_inner->TextureFlush();
++        }
++
++        void Sync(GSSyncReason reason) override
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            op(GSRecord::Op::Sync);
++            put(static_cast<uint8_t>(reason));
++            m_inner->Sync(reason);
++        }
++
++        PresentationFrame Present(const GSPresentationRequest &request) override
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            op(GSRecord::Op::Present);
++            put(request);
++            return m_inner->Present(request);
++        }
++
++        bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            op(GSRecord::Op::ClearFramebuffer);
++            put(context);
++            put(rgba);
++            return m_inner->ClearFramebuffer(context, rgba);
++        }
++
++        uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            op(GSRecord::Op::ConsumeLocalToHost);
++            put(maxBytes);
++            return m_inner->ConsumeLocalToHostBytes(dst, maxBytes);
++        }
++
++        uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            op(GSRecord::Op::ReadVram);
++            for (uint32_t v : {psm, base, bw, x, y})
++                put(v);
++            return m_inner->ReadVram(psm, base, bw, x, y);
++        }
++
++        void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            op(GSRecord::Op::WriteVram);
++            for (uint32_t v : {psm, base, bw, x, y, value})
++                put(v);
++            m_inner->WriteVram(psm, base, bw, x, y, value);
++        }
++
++        void SnapshotVram(std::vector<uint8_t> &out) const override
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            op(GSRecord::Op::SnapshotVram);
++            m_inner->SnapshotVram(out);
++        }
++
++        GSTransferSnapshot GetTransferSnapshot() const override
++        {
++            return m_inner->GetTransferSnapshot();
++        }
++
++    private:
++        void op(GSRecord::Op value) const { put(static_cast<uint8_t>(value)); }
++
++        template <typename T>
++        void put(const T &value) const
++        {
++            std::fwrite(&value, sizeof(T), 1u, m_file);
++        }
++
++        std::unique_ptr<GSRasterBackend> m_inner;
++        std::FILE *m_file = nullptr;
++        mutable std::mutex m_mutex;
++    };
++}
++
++std::unique_ptr<GSRasterBackend> makeGsRasterBackend()
++{
++    static std::atomic<bool> s_recorded{false};
++    const char *path = std::getenv("PS2X_GS_RECORD");
++    if (path && *path && !s_recorded.exchange(true))
++    {
++        if (std::FILE *file = std::fopen(path, "wb"))
++        {
++            std::setvbuf(file, nullptr, _IOFBF, 1u << 20u);
++            std::fprintf(stderr, "[gs] recording backend calls to %s\n", path);
++            return std::make_unique<RecordingBackend>(std::make_unique<GSCpuBackend>(), file);
++        }
++        std::fprintf(stderr, "[gs] cannot open PS2X_GS_RECORD file %s\n", path);
++    }
++    return std::make_unique<GSCpuBackend>();
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_record.h b/ps2xRuntime/src/lib/gs/gs_record.h
+new file mode 100644
+index 0000000..b79b297
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_record.h
+@@ -0,0 +1,40 @@
++#ifndef PS2X_GS_RECORD_H
++#define PS2X_GS_RECORD_H
++
++#include "runtime/gs/gs_backend.h"
++
++#include <memory>
++
++// Opt-in GS backend command recording, for replaying a session's raster
++// work outside the runtime (renderer regression tests and profiling).
++//
++//   PS2X_GS_RECORD=<file>  record every backend call of the main GS
++//
++// makeGsRasterBackend() returns the default CPU backend, wrapped in a
++// recorder when the variable is set (only the first backend is recorded).
++
++namespace GSRecord
++{
++    enum class Op : uint8_t
++    {
++        Initialize = 1, // u32 size, size bytes of initial VRAM
++        Reset,
++        Submit, // i32 FP rounding mode, GSPrimitiveBatch
++        LoadClut, // GSTex0Reg, GSTexClutReg
++        BeginTransfer, // GSTransferCommand
++        UploadImage, // u32 size, bytes
++        Flush,
++        TextureFlush,
++        Sync, // u8 GSSyncReason
++        Present, // GSPresentationRequest
++        ClearFramebuffer, // GSContext, u32 rgba
++        ConsumeLocalToHost, // u32 maxBytes
++        ReadVram, // u32 psm, base, bw, x, y
++        WriteVram, // u32 psm, base, bw, x, y, value
++        SnapshotVram,
++    };
++}
++
++std::unique_ptr<GSRasterBackend> makeGsRasterBackend();
++
++#endif

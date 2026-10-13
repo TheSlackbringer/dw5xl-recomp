@@ -1,0 +1,87 @@
+From 7f7dc1428bf1cc438dee1afb2b33c17700108a48 Mon Sep 17 00:00:00 2001
+From: Fizban <35464167+Fiztba@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 22:23:59 -0400
+Subject: [PATCH] Bob current Vulkan fields to prevent text ghosting
+
+---
+ ps2xRuntime/src/lib/gs/gs_vulkan_scanout.cpp | 46 +++++++++++++++++---
+ 1 file changed, 41 insertions(+), 5 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_vulkan_scanout.cpp b/ps2xRuntime/src/lib/gs/gs_vulkan_scanout.cpp
+index 8b144fd..b42193a 100644
+--- a/ps2xRuntime/src/lib/gs/gs_vulkan_scanout.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_vulkan_scanout.cpp
+@@ -120,29 +120,65 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
+     VSyncInfo info{};
+     info.phase = static_cast<uint32_t>(request.vsyncTick & 1u);
+     info.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+-    info.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
++    const bool bobFields = movieFields && !noWeave();
++    info.dst_stage = bobFields ? VK_PIPELINE_STAGE_2_BLIT_BIT : VK_PIPELINE_STAGE_2_COPY_BIT;
+     info.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
+     info.force_progressive = !movieFields;
+     info.adapt_to_internal_horizontal_resolution = true;
+     info.raw_circuit_scanout = !movieFields;
+-    info.skip_deinterlace = movieFields && noWeave();
++    // Present calls need not arrive once per alternating field. Temporal weave
++    // assumes that cadence and can combine repeated or stale fields, producing
++    // displaced scanlines in text. Request the current field and bob it on GPU.
++    // PS2X_NO_WEAVE keeps the unscaled field for diagnostics.
++    info.skip_deinterlace = movieFields;
+     gs.flush();
+     auto output = gs.vsync(info);
+     if (!output.image) throw std::runtime_error("ParallelGS GPU scanout returned no image");
+-    const auto width = output.image->get_width(), height = output.image->get_height();
++    const auto width = output.image->get_width();
++    auto height = output.image->get_height();
+     if (!width || !height || width > hostWidth || height > hostHeight)
+         throw VulkanGsScanoutUnsupported("ParallelGS image exceeds the fixed host viewport");
+     if (output.image->get_create_info().format != VK_FORMAT_R8G8B8A8_UNORM)
+         throw std::runtime_error("ParallelGS GPU scanout returned an unexpected pixel format");
+ 
++    auto command = device.request_command_buffer();
++    if (movieFields)
++    {
++        // With skipped deinterlacing, ParallelGS leaves the merged field in
++        // READ_ONLY rather than honoring dst_layout. Make its writes visible
++        // for our blit (or diagnostic raw-field copy) explicitly.
++        command->image_barrier(*output.image, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
++                               VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
++                               info.dst_stage, VK_ACCESS_2_TRANSFER_READ_BIT);
++    }
++    if (bobFields)
++    {
++        if (height != 224)
++            throw std::runtime_error("GPU FRAME-field scanout did not return 224 rows");
++        auto imageInfo = ImageCreateInfo::immutable_2d_image(width, height * 2u, VK_FORMAT_R8G8B8A8_UNORM);
++        imageInfo.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
++        imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++        auto bob = device.create_image(imageInfo);
++        if (!bob) throw std::runtime_error("GPU bob image allocation failed");
++        command->image_barrier(*bob, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                               0, 0, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
++        command->blit_image(*bob, *output.image, {}, {int32_t(width), int32_t(height * 2u), 1},
++                             {}, {int32_t(width), int32_t(height), 1}, 0, 0, 0, 0, 1, VK_FILTER_NEAREST);
++        command->image_barrier(*bob, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                               VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                               VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
++        output.image = std::move(bob);
++        height *= 2u;
++    }
++
+     BufferCreateInfo bufferInfo{};
+     bufferInfo.size = static_cast<VkDeviceSize>(width) * height * 4u;
+     bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+     bufferInfo.domain = BufferDomain::CachedHost;
+     auto readback = device.create_buffer(bufferInfo);
+     if (!readback) throw std::runtime_error("GPU scanout readback allocation failed");
+-    auto command = device.request_command_buffer();
+-    // vsync already transitions this image to TRANSFER_SRC with COPY/read
++    // Progressive vsync or the field transition/blit above supplies COPY/read
+     // visibility. Both operations use Granite's generic queue submission.
+     command->copy_image_to_buffer(*readback, *output.image, 0, {}, {width, height, 1},
+                                  0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
+-- 
+2.55.0.windows.3
+

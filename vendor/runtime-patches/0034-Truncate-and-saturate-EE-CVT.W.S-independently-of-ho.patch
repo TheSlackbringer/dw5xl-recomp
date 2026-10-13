@@ -1,0 +1,43 @@
+From d8ae274313a7f457fe42ea8deae15e112ddd3316 Mon Sep 17 00:00:00 2001
+From: Fizban <35464167+Fiztba@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 23:18:01 -0400
+Subject: [PATCH] Truncate and saturate EE CVT.W.S independently of host
+ rounding
+
+---
+ ps2xRuntime/include/ps2_runtime_macros.h | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 0f19c9f..3e654cd 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -623,7 +623,27 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+ #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
+ #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
+ #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
+-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
++// EE CVT.W.S always truncates toward zero and saturates by sign. It does
++// not use the host rounding mode or change FCR31. Decode the magnitude
++// directly so out-of-range values (including exponent-255 bit patterns)
++// never reach an undefined host float-to-integer conversion.
++static inline int32_t Ps2FpuCvtWS(float value)
++{
++    const uint32_t bits = std::bit_cast<uint32_t>(value);
++    const uint32_t exponent = (bits >> 23) & 0xFFu;
++    if (exponent < 127u)
++        return 0;
++    if (exponent >= 158u)
++        return (bits & 0x80000000u) ? INT32_MIN : INT32_MAX;
++
++    const uint32_t significand = (bits & 0x007FFFFFu) | 0x00800000u;
++    const uint32_t magnitude = exponent >= 150u
++        ? significand << (exponent - 150u)
++        : significand >> (150u - exponent);
++    const int32_t result = static_cast<int32_t>(magnitude);
++    return (bits & 0x80000000u) ? -result : result;
++}
++#define FPU_CVT_W_S(a) Ps2FpuCvtWS((float)(a))
+ #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
+ #define FPU_C_F_S(a, b) (0)
+ #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))

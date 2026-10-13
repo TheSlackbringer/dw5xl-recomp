@@ -1,0 +1,27 @@
+From 818f83b7180a8f0480cc7fd7ef71c41e2e2249ed Mon Sep 17 00:00:00 2001
+From: Fizban <35464167+Fiztba@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 23:57:16 -0400
+Subject: [PATCH] Reclassify resumed IPU input chains from the current CHCR tag
+
+Movie ring clients can promote a suspended REFE tail to REF by changing CHCR while MADR, QWC and TADR stay intact. Drop the cached tag classification on STR starts so nonzero QWC uses current CHCR and zero QWC fetches the next TADR tag. Only accepted decoder-byte credit advances the DMA payload.
+
+Native Windows actual-memory fixtures pass 225 checks and two CTests. A precise source control restoring only the stale cache reproduces premature terminal completion. Cases cover both tag-promotion directions, controller suspension, IRQ/TIE changes, unchanged resume, zero-QWC fresh fetch and exact fractional credits.
+---
+ ps2xRuntime/src/lib/ps2_memory.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 06538db..f8bea67 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1231,6 +1231,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         }
+         if (address == 0x1000B400u && (value & 0x100u) != 0u)
+         {
++            // A resumed chain uses the current CHCR tag, which may have
++            // changed while suspended; QWC zero instead fetches TADR.
++            m_ipuInputTagLoaded = false;
++            m_ipuInputEndAfterPayload = false;
+             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+             processIpuInputConsumption();
+         }
