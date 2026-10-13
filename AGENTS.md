@@ -15,6 +15,9 @@ the original DW5 disc, so both games run in one port. FMV movies must work in th
   and your recommendation, then wait for the owner to choose before acting. Do not assume approval,
   invent requirements, or change agreed requirements. A request to fix an issue is not agreement with
   a particular choice. Routine implementation can proceed within the owner's agreed requirements.
+- **All library, function, and graphics behavior decisions go through the owner first.** Explain the options,
+  give a recommendation, and wait for the owner's decision before implementing it, even within approved scope.
+  Research, diagnosis, tests, and preparation of a proposal can continue while waiting; do not apply the proposed change.
 - **Native over emulation.** Replace hardware use at the game/SDK level with native code where practical (done for
   libpad2 input, IPU still images, libmpeg movies via FFmpeg). Model hardware only where the runtime must.
 - **Survey before reinventing.** Research existing approaches and present options. Keep research
