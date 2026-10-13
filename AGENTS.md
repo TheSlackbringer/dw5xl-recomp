@@ -90,9 +90,9 @@ Broken / unverified – see §6.
    fill); the runtime dropped it because `sceSifInitCmd` is HLE'd. Fix: `SIF.cpp dispatchSifCommand` stores SREGs;
    `sceSifGetSreg@0x122378` / `sceSifSetSreg@0x122390` bound to runtime stubs; IOP `sceCdBreak` (cdvdman 39) and
    `GetSystemTimeLow` (thbase 43) implemented. Test: `PS2X_KSNG_TRACE=1`, main menu → Options → back; expect KSNG 0x96
-   (play), 0x9b fades, 0x97 stop, 0x9d/0x9e around loads. Owner is checking in an emulator whether the real game
-   plays music in Options at all (Options menu FUN_002c7a80 starts no BGM itself; main menu FUN_0025f340 fades out
-   track 0x1b on selection).
+   (play), 0x9b fades, 0x97 stop, 0x9d/0x9e around loads. **Options silence is correct:** the owner confirmed on an
+   emulator (2026-10-13) that the real game plays no music in Options, only the cursor sound when moving up/down. So
+   the SREG fix still needs verifying in another scene with BGM (title/main menu loops, later battles).
 2. **Overlays (biggest blocker).** The Opening Edit GS corruption is FIXED (HLE stub for sceVif1PkOpenDirectCode
    inflated a CNT qwc; the game's own function now runs). Options -> Opening -> PLAY now reaches overlay code and stops:
    `[guest-branch:missing-target]` JALR to 0x692D00, the first OVL00 constructor (table 0x699FD0..0x69A008), called from
