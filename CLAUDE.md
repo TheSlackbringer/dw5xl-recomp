@@ -65,20 +65,26 @@ Headless test pattern (no window, frame dumps you can view):
 (Start at tick 400 skips the intro; the main menu is up by ~tick 750). Keys: Enter=Start, X/Space=Cross, C=Circle,
 Z=Square, V=Triangle, arrows/WASD.
 
-Ghidra: use GUI/MCP for interactive work and headless on a separate project copy for batch analysis. The GUI locks its project. See `notes/PROJECT_SETUP.md` for active paths and commands.
+Ghidra: ONE source project, `ghidra/dw5xl.gpr`. Use it through GUI/MCP for interactive lookups (check MCP first when
+the owner has the GUI open). Headless never runs on the source: every headless use makes a fresh throwaway copy in its
+own scratch dir, runs `-readOnly`, then deletes it. See `notes/PROJECT_SETUP.md` for commands.
+Working split: the main session builds, runs and tests one thing at a time and uses MCP; bigger RE or code-review
+questions go to parallel background agents (each with its own headless copy or code-reading brief).
 
 ## Debug switches (env)
 `PS2X_STATS` vsync/flip rate · `PS2X_GS_TRACE=<file>` + `_FROM/_TO` ticks (REG/DRAW/XFER; pseudo-reg 0x7F marks GIF
 packet path) · `PS2X_VRAM_DUMP=<file>` raw 4 MiB GS memory at exit (CT32 deswizzle: block/column tables) ·
 `PS2X_IPU_DUMP=<dir>` / `PS2X_IPU_TRACE` · `PS2X_SPU2_TRACE` · `PS2X_LIBSD_TRACE` · `PS2X_KSNG_TRACE` / `PS2X_KSNH_TRACE`
 (sound RPCs) · `PS2X_SIFAUDIO_TRACE` · `PS2X_MPEGAUDIO_TRACE` · `PS2X_AUDIO_DUMP=<pcm>` (s16 stereo 48 kHz) ·
-`PS2X_MPG_TRACE` (VU1 uploads) · `PS2X_VIF1_CHAIN_TRACE` · `PS2X_PAD2_TRACE` · `PS2X_DEBUG_ZALWAYS` (force depth pass,
+`PS2X_MPG_TRACE` (VU1 uploads) · `PS2X_VIF1_CHAIN_TRACE` · `PS2X_PAD2_TRACE` · `PS2X_RAM_DUMP_TICKS=t1,t2` / `PS2X_RAM_WATCH=addr:len` (RAM dumps/watch) · `PS2X_DEBUG_ZALWAYS` (force depth pass,
 experiments only) · `PS2X_ZWATCH`. Heavy tracing slows the IOP enough to starve audio streams (sounds like a beep).
 Debug code is tagged `DW5XL-DEBUG` / `DW5XL-TEST` for later cleanup.
 
 ## Hard-won lessons (details in BRINGUP.md)
 - The analyzer's `[patches]` "Potential self-modifying code" entries NOP real stores; keep that list empty.
 - Runtime libgraph HLE stubs were wrong (no clears, fake DISPLAY values) → run DW5's own libgraph instead.
+- The libvif `sceVif1PkOpenDirectCode` HLE stub refreshed the open DMA tag's qwc; the game's close adds to it → CNT
+  qwc 4 instead of 3 (Opening Edit corruption). Unbound; the game's own libvif runs. Check stub side effects first.
 - VIF1 DIRECT carries only its own payload; GIF PATH2 state continues IMAGE transfers (upstream shortcut desynced).
 - PSS movies carry several private-stream-1 sub-streams; only 0xA0–0xAF are audio.
 - DW5 uses libpad2 (DBCMAN), not libpad; KOEISND streams via SPU2 IRQ + PIO (`sceSdVoiceTrans` BY_IO).

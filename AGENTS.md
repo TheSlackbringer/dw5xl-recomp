@@ -93,15 +93,13 @@ Broken / unverified – see §6.
    (play), 0x9b fades, 0x97 stop, 0x9d/0x9e around loads. Owner is checking in an emulator whether the real game
    plays music in Options at all (Options menu FUN_002c7a80 starts no BGM itself; main menu FUN_0025f340 fades out
    track 0x1b on selection).
-2. **3D engine / overlays (biggest blocker).** Options→Opening→Play corrupts at tick ~2019: after a valid SCISSOR
-   packet, PATH2 sends indexed texture bytes as GIF data. A REF setup header at guest ~0x8BD3A0 holds SCISSOR plus
-   nested DMA tags instead of FLUSHA/DIRECTHL/GIF, so VIF reads 0x30000007 as STROW and DIRECTHL sends raw pixels.
-   Packet builders: FUN_00141060, FUN_00140E90, FUN_00143F30. An unreviewed diagnostic
-   (`notes/evidence/dw5xl-gameplay-next/texture-builder-trace.patch`) traces them; FINDINGS.md there has details.
-   Overlays: OVL_00/01/02.BIN have an `MWo3` header (0x80 bytes) and load at 0x61A800 (code at 0x61A880). Wrappers
-   0x2D4DC0..0x2D6010 load them through FUN_00145A50; FUN_00100260 clears BSS and runs constructors. The Opening loop
-   FUN_002C38E0 calls the OVL00 wrapper FUN_002D6010. PS2Recomp has no overlay support: implement per-overlay
-   recompilation with module identity + runtime switching. Expect VU1 microcode / PATH1 work once 3D code runs.
+2. **Overlays (biggest blocker).** The Opening Edit GS corruption is FIXED (HLE stub for sceVif1PkOpenDirectCode
+   inflated a CNT qwc; the game's own function now runs). Options -> Opening -> PLAY now reaches overlay code and stops:
+   `[guest-branch:missing-target]` JALR to 0x692D00, the first OVL00 constructor (table 0x699FD0..0x69A008), called from
+   FUN_00100260 after the loader. Overlays OVL_00/01/02.BIN have an `MWo3` header (0x80 bytes) and load at 0x61A800
+   (code at 0x61A880). Wrappers 0x2D4DC0..0x2D6010 load them through FUN_00145A50; FUN_00100260 clears BSS and runs
+   constructors. PS2Recomp has no overlay support: implement per-overlay recompilation with module identity +
+   runtime switching. Expect VU1 microcode / PATH1 work once 3D code runs.
 3. **Save/Load round-trip test** after the sceMcGetDir count fix: save (LEFT, Cross), check the new save folder
    under `game/dw5xl/mc0/`, then Options→Load and reboot auto-load.
 4. **Load Original** (DW5 disc data/overlays in `game/dw5/`), after 3D works.
@@ -115,7 +113,8 @@ the renderer decodes correctly) · `PS2X_VRAM_DUMP=<file>` (4 MiB GS memory at e
 `tools/debug/gs_vram_ct32.py`) · `PS2X_IPU_DUMP=<dir>`, `PS2X_IPU_TRACE` · `PS2X_SPU2_TRACE` · `PS2X_LIBSD_TRACE` ·
 `PS2X_KSNG_TRACE` / `PS2X_KSNH_TRACE` (sound RPCs) · `PS2X_SIFAUDIO_TRACE` · `PS2X_MPEGAUDIO_TRACE` · `PS2X_MPEG_TRACE` ·
 `PS2X_AUDIO_DUMP=<pcm>` (s16 stereo 48 kHz) · `PS2X_MPG_TRACE` (VU1 uploads) · `PS2X_VIF1_CHAIN_TRACE` ·
-`PS2X_PAD2_TRACE` · `PS2X_ZWATCH` · `PS2X_DEBUG_ZALWAYS` (force depth pass; experiments only) · `PS2X_NO_WEAVE`.
+`PS2X_PAD2_TRACE` · `PS2X_RAM_DUMP_TICKS=t1,t2` (32 MiB RDRAM to `ram_<tick>.bin` in the dump dir) ·
+`PS2X_RAM_WATCH=addr:len` (logs each tick a RAM range changed) · `PS2X_ZWATCH` · `PS2X_DEBUG_ZALWAYS` (force depth pass; experiments only) · `PS2X_NO_WEAVE`.
 Heavy tracing slows the IOP so audio streams starve (sounds like a beep) – judge audio untraced.
 No `perf`: use `tools/debug/gdb_sample_profile.sh`.
 
@@ -185,8 +184,10 @@ Setup on this machine:
   fall back to headless.
 
 **Headless (batch, scripts, when the GUI holds the lock):**
-- The GUI locks the project, and parallel agents must not share one copy: copy the project per user/agent:
-  `cp -r ghidra/dw5xl.gpr ghidra/dw5xl.rep <mydir>/` (KOEISND: `ghidra_iop/koeisnd.*`).
+- ONE source project: `ghidra/dw5xl.gpr` (GUI/MCP; all renames/comments go here). Never run headless on it and never
+  treat a copy as a source. Every headless use starts from a fresh throwaway copy in the user's/agent's own scratch dir:
+  `cp -r ghidra/dw5xl.gpr ghidra/dw5xl.rep <mydir>/` (KOEISND: `ghidra_iop/koeisnd.*`), run `-readOnly` against it, then
+  delete it. Parallel agents each make their own copy.
 - `analyzeHeadless <mydir> dw5xl -process SLES_538.60 -noanalysis -readOnly -scriptPath tools/ghidra_scripts
   -postScript <Script>.java <args>` – KOEISND: `analyzeHeadless <mydir> koeisnd -process -noanalysis -readOnly ...`.
   Scripts: `DecompileAt.java 0xADDR...` (decompile the functions containing the addresses), `CallersOf.java 0xADDR`

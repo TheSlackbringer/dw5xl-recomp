@@ -22,6 +22,8 @@ patch_cache = true
 # Functions to stub (only names with runtime syscall/stub handlers)
 stubs = [
   # libgraph packet builders run as guest code; their HLE stubs break clears/display.
+  # libvif sceVif1PkOpenDirectCode (0x113648) runs as guest code: its HLE stub refreshed the open DMA tag qwc,
+  # and the game's own close adds to it (CNT qwc 4 instead of 3 -> Opening 3D GS corruption).
   # Verified SDK variants and SREG handlers missed by the analyzer.
   "sceSifGetSreg@0x00122378",
   "sceSifSetSreg@0x00122390",
@@ -82,7 +84,6 @@ stubs = [
   "sceDmaSync@0x00113288",
   "sceDmaWatch@0x001132C0",
   "sceDmaPause@0x001132F8",
-  "sceVif1PkOpenDirectCode@0x00113648",
   "sceVu0ApplyMatrix@0x00113890",
   "sceVu0MulMatrix@0x001138C0",
   "sceVu0InnerProduct@0x00113928",

@@ -667,9 +667,72 @@ namespace ps2x_dev
             statsFlips = 0u;
         }
 
+        // DW5XL-DEBUG: PS2X_RAM_DUMP_TICKS="t1,t2" writes ram_<tick>.bin (32 MiB RDRAM) to the dump dir;
+        // PS2X_RAM_WATCH="addr:len" logs every tick on which that RDRAM range changed, with its new bytes.
+        std::vector<uint64_t> ramDumpTicks;
+        uint32_t ramWatchAddr = 0u, ramWatchLen = 0u;
+        std::vector<uint8_t> ramWatchLast;
+        bool ramDebugInit = false;
+
+        void stepRamDebug(uint64_t tick)
+        {
+            if (!runtime)
+                return;
+            if (!ramDebugInit)
+            {
+                ramDebugInit = true;
+                if (const char *t = std::getenv("PS2X_RAM_DUMP_TICKS"))
+                {
+                    std::stringstream ss(t);
+                    std::string item;
+                    while (std::getline(ss, item, ','))
+                        ramDumpTicks.push_back(std::strtoull(item.c_str(), nullptr, 0));
+                }
+                if (const char *w = std::getenv("PS2X_RAM_WATCH"))
+                {
+                    char *end = nullptr;
+                    ramWatchAddr = static_cast<uint32_t>(std::strtoul(w, &end, 0)) & PS2_RAM_MASK;
+                    ramWatchLen = (end && *end == ':') ? static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 0)) : 16u;
+                    ramWatchLen = std::min<uint32_t>(ramWatchLen, PS2_RAM_SIZE - ramWatchAddr);
+                }
+            }
+            const uint8_t *ram = runtime->memory().getRDRAM();
+            for (uint64_t &t : ramDumpTicks)
+            {
+                if (t != 0u && tick >= t)
+                {
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "/ram_%06llu.bin", static_cast<unsigned long long>(tick));
+                    if (FILE *f = std::fopen((dumpDir() + name).c_str(), "wb"))
+                    {
+                        std::fwrite(ram, 1, PS2_RAM_SIZE, f);
+                        std::fclose(f);
+                    }
+                    t = 0u;
+                }
+            }
+            if (ramWatchLen != 0u)
+            {
+                const uint8_t *cur = ram + ramWatchAddr;
+                if (ramWatchLast.size() != ramWatchLen || std::memcmp(ramWatchLast.data(), cur, ramWatchLen) != 0)
+                {
+                    ramWatchLast.assign(cur, cur + ramWatchLen);
+                    std::fprintf(stderr, "[ramwatch] tick=%llu addr=%08x:", static_cast<unsigned long long>(tick), ramWatchAddr);
+                    for (uint32_t i = 0; i + 4u <= ramWatchLen; i += 4u)
+                    {
+                        uint32_t v;
+                        std::memcpy(&v, cur + i, 4u);
+                        std::fprintf(stderr, "%s%08x", (i % 16u) == 0u ? " | " : " ", v);
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+            }
+        }
+
         void step(uint64_t tick)
         {
             GSTrace::onTick(tick);
+            stepRamDebug(tick);
             pollCtrl(tick);
             stepStats(tick);
             uint32_t mask = 0u;
