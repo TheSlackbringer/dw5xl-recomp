@@ -11,7 +11,9 @@ Early development. Linux only for now; Windows is planned.
 
 Working: boot, intro movies with audio (skippable), title screen, main menu and Options, keyboard and gamepad input, menu music and sound effects, and animated still images, all at the PAL 50 Hz rate. Memory card saving and loading are still being verified.
 
-Not working yet: 3D gameplay (the real-time engine and the game's overlay modules), the **Load Original** feature, and a player installer. There is no release build; you currently build from source with your own disc.
+OVL00 now compiles as a separate native module and activates before its constructors. Opening runs its scene loop, but graphics are still corrupted; further engine work is required.
+
+Not working yet: 3D gameplay (the real-time engine), the **Load Original** feature, and a player installer. There is no release build; you currently build from source with your own disc.
 
 ## Supported game versions
 

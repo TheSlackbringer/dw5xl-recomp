@@ -209,7 +209,7 @@ namespace ps2recomp
 
     bool ControlFlowEmitter::emitDirectFunctionJumpIfAvailable(uint32_t target, StaticBranchKind kind, std::string_view indent)
     {
-        if (kind != StaticBranchKind::Jump)
+        if (kind != StaticBranchKind::Jump || !m_gen.m_moduleId.empty())
         {
             return false;
         }

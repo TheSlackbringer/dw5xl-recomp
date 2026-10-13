@@ -1169,6 +1169,8 @@ bool PS2Runtime::initialize(const char *title)
 
 bool PS2Runtime::loadELF(const std::string &elfPath)
 {
+    // Even a failed reload must not retain dispatch for the previous game data.
+    deactivateCompiledModule();
     configureIoPathsFromElf(elfPath);
 
     std::ifstream file(elfPath, std::ios::binary);
@@ -1498,6 +1500,112 @@ namespace
     }
 }
 
+bool PS2Runtime::registerCompiledModule(const RecompiledModule &module)
+{
+    const uint64_t end = static_cast<uint64_t>(module.guestBase) + module.fileSize;
+    auto reject = [&]() {
+        std::cerr << "[compiled-module] invalid descriptor for "
+                  << (module.identity ? module.identity : "<null>") << std::endl;
+        return false;
+    };
+    if (!module.identity || !*module.identity || (module.guestBase & 3u) != 0u ||
+        module.fileSize < sizeof(uint32_t) || end > PS2_RAM_SIZE ||
+        !module.entries || module.entryCount == 0u ||
+        module.entryCount > module.fileSize / sizeof(uint32_t))
+    {
+        return reject();
+    }
+    // A module owns its loaded file envelope. Main ELF dispatch must never be
+    // shadowed, even by addresses without an existing dense-table entry.
+    if (g_ps2RecompiledFunctionTableSlotCount != 0u &&
+        module.guestBase < g_ps2RecompiledFunctionTableEnd &&
+        end > g_ps2RecompiledFunctionTableBase)
+    {
+        return reject();
+    }
+    uint32_t previous = 0u;
+    for (size_t i = 0; i < module.entryCount; ++i)
+    {
+        const RecompiledModuleEntry &entry = module.entries[i];
+        if (!entry.function || (entry.address & 3u) != 0u ||
+            entry.address < module.guestBase ||
+            static_cast<uint64_t>(entry.address) + sizeof(uint32_t) > end ||
+            (i != 0u && entry.address <= previous))
+        {
+            return reject();
+        }
+        previous = entry.address;
+    }
+    for (const RecompiledModule *existing : m_compiledModules)
+    {
+        if (std::string_view(existing->identity) == module.identity)
+        {
+            // Reapplying game overrides to the same static descriptor is safe.
+            return existing == &module;
+        }
+    }
+    m_compiledModules.push_back(&module);
+    return true;
+}
+
+bool PS2Runtime::activateCompiledModule(std::string_view identity)
+{
+    // An unknown identity must not leave an earlier module callable.
+    deactivateCompiledModule();
+    for (const RecompiledModule *module : m_compiledModules)
+    {
+        if (identity == module->identity)
+        {
+            m_activeCompiledModule = module;
+            return true;
+        }
+    }
+    std::cerr << "[compiled-module] unknown identity '" << identity << "'" << std::endl;
+    return false;
+}
+
+void PS2Runtime::deactivateCompiledModule()
+{
+    m_activeCompiledModule = nullptr;
+    ++m_compiledModuleGeneration;
+}
+
+PS2Runtime::RecompiledFunction PS2Runtime::resolveFunctionExact(uint32_t address) const
+{
+    if ((address & 3u) != 0u)
+    {
+        return nullptr;
+    }
+    // All registered module envelopes are reserved, including currently inactive
+    // modules and tails that are longer than the active module's file.
+    bool moduleAddress = false;
+    for (const RecompiledModule *module : m_compiledModules)
+    {
+        if (address >= module->guestBase &&
+            static_cast<uint64_t>(address) < static_cast<uint64_t>(module->guestBase) + module->fileSize)
+        {
+            moduleAddress = true;
+            break;
+        }
+    }
+    if (moduleAddress)
+    {
+        const RecompiledModule *module = m_activeCompiledModule;
+        if (!module || address < module->guestBase ||
+            static_cast<uint64_t>(address) >= static_cast<uint64_t>(module->guestBase) + module->fileSize)
+        {
+            return nullptr;
+        }
+        const RecompiledModuleEntry *const end = module->entries + module->entryCount;
+        const RecompiledModuleEntry *entry = std::lower_bound(
+            module->entries, end, address,
+            [](const RecompiledModuleEntry &candidate, uint32_t pc) { return candidate.address < pc; });
+        return entry != end && entry->address == address ? entry->function : nullptr;
+    }
+    uint32_t slot = 0u;
+    return generatedFunctionTableSlot(address, slot) ? g_ps2RecompiledFunctionTable[slot] : nullptr;
+}
+
 bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
 {
     uint32_t slot = 0u;
@@ -1521,8 +1629,7 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
-    uint32_t slot = 0u;
-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+    return resolveFunctionExact(address) != nullptr;
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -1548,19 +1655,16 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
 
-    uint32_t slot = 0u;
-    if (generatedFunctionTableSlot(address, slot))
+    if (RecompiledFunction fn = resolveFunctionExact(address))
     {
-        RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
-        if (fn != nullptr)
-        {
-            return fn;
-        }
+        return fn;
     }
 
     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
               << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
               << " tableEnd=0x" << g_ps2RecompiledFunctionTableEnd
+              << " module=" << (m_activeCompiledModule ? m_activeCompiledModule->identity : "<none>")
+              << " generation=" << std::dec << m_compiledModuleGeneration
               << " codeRegion=" << (m_memory.isCodeAddress(address) ? "yes" : "no")
               << " trace=" << formatDispatchHistory()
               << std::dec << std::endl;
@@ -1694,6 +1798,8 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             << " ra=0x" << ra
             << " sp=0x" << sp
             << " gp=0x" << gp
+            << " module=" << (m_activeCompiledModule ? m_activeCompiledModule->identity : "<none>")
+            << " generation=" << std::dec << m_compiledModuleGeneration << std::hex
             << " a0=0x" << a0
             << " a1=0x" << a1
             << " a2=0x" << a2

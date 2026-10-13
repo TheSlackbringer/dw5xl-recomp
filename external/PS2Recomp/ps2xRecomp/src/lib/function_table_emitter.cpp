@@ -166,6 +166,28 @@ namespace ps2recomp
         std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b)
                   { return a.first < b.first; });
 
+        if (!cg.m_moduleId.empty())
+        {
+            if (entries.empty()) throw std::runtime_error("Raw module has no generated entries");
+            for (const auto &[address, name] : entries)
+            {
+                if (address < static_cast<uint64_t>(cg.m_moduleBase) + cg.m_moduleCodeOffset ||
+                    static_cast<uint64_t>(address) + 4u > static_cast<uint64_t>(cg.m_moduleBase) + cg.m_moduleFileSize)
+                    throw std::runtime_error("Raw module entry outside payload: " + name);
+            }
+            std::stringstream ss;
+            ss << "#include \"ps2_runtime.h\"\n#include <ps2_recompiled_functions.h>\n";
+            ss << "#include <ps2_recompiled_stubs.h>\n\n";
+            ss << "namespace {\nconst RecompiledModuleEntry entries[] = {\n";
+            for (const auto &[address, name] : entries)
+                ss << "    {0x" << std::hex << address << "u, " << name << "},\n";
+            ss << "};\n}\n";
+            ss << "extern const RecompiledModule g_ps2Module_" << cg.m_moduleId << " = {\n";
+            ss << "    \"" << cg.m_moduleId << "\", 0x" << std::hex << cg.m_moduleBase
+               << "u, 0x" << cg.m_moduleFileSize << "u, entries, " << std::dec << entries.size() << "u\n};\n";
+            return ss.str();
+        }
+
         uint32_t tableBase = 0u;
         uint32_t tableEnd = 0u;
         uint32_t slotCount = 0u;

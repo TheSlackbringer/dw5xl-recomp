@@ -68,6 +68,10 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
         const std::vector<Section>& m_sections;
         BootstrapInfo m_bootstrapInfo;
+        std::string m_moduleId;
+        uint32_t m_moduleBase = 0;
+        uint32_t m_moduleCodeOffset = 0;
+        uint32_t m_moduleFileSize = 0;
         bool m_emitInstructionComments = true;
         RecompilerReporter *m_reporter = nullptr;
         std::string m_currentFunctionName;

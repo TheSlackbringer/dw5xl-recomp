@@ -89,3 +89,7 @@ Debug code is tagged `DW5XL-DEBUG` / `DW5XL-TEST` for later cleanup.
 - PSS movies carry several private-stream-1 sub-streams; only 0xA0–0xAF are audio.
 - DW5 uses libpad2 (DBCMAN), not libpad; KOEISND streams via SPU2 IRQ + PIO (`sceSdVoiceTrans` BY_IO).
 - IOP SPU2/IOP clock follows the host clock; EE vblank pacing must repay lateness and follow the selected CRT mode (using the active display cadence). MPEG frame intervals and PTS conversions must use the same cadence.
+
+Manual visible tests: unset `PS2X_HOST_INPUT` and `PS2X_INPUT`; a host-input script disables real keyboard polling
+for the entire run. Use one game instance. Close the manual test before shared builds/hidden runs; background agents
+prepare analysis/patches in scratch without launching the game while the owner plays.

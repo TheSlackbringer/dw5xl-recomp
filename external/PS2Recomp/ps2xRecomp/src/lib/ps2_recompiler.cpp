@@ -903,15 +903,20 @@ namespace ps2recomp
             m_reporter.progress("parsing ELF");
             m_elfParser = std::make_unique<ElfParser>(m_config.inputPath);
             m_elfParser->setReporter(&m_reporter);
-            if (!m_elfParser->parse())
+            const bool rawModule = m_config.inputFormat == "raw";
+            if (!(rawModule ? m_elfParser->parseRaw(m_config.rawBase, m_config.rawCodeOffset) : m_elfParser->parse()))
             {
                 m_reporter.error("elf", "Failed to parse ELF file: " + m_config.inputPath);
                 return false;
             }
 
+            if (rawModule && m_config.ghidraMapPath.empty())
+                throw std::runtime_error("Raw modules require ghidra_output function map");
             if (!m_config.ghidraMapPath.empty())
             {
-                m_elfParser->loadGhidraFunctionMap(m_config.ghidraMapPath);
+                const bool mapped = m_elfParser->loadGhidraFunctionMap(m_config.ghidraMapPath);
+                if (rawModule && !mapped)
+                    throw std::runtime_error("Raw module function map is missing or empty");
             }
 
             m_functions = m_elfParser->extractFunctions();
@@ -969,7 +974,7 @@ namespace ps2recomp
                     m_reporter.info("elf", msg.str());
                 }
 
-                if (entry != 0)
+                if (!rawModule && entry != 0)
                 {
                     m_bootstrapInfo.valid = true;
                     m_bootstrapInfo.entry = entry;
@@ -1000,6 +1005,13 @@ namespace ps2recomp
             m_decoder = std::make_unique<R5900Decoder>();
             m_codeGenerator = std::make_unique<CodeGenerator>(m_symbols, m_sections);
             m_codeGenerator->setReporter(&m_reporter);
+            if (rawModule)
+            {
+                m_codeGenerator->m_moduleId = m_config.moduleId;
+                m_codeGenerator->m_moduleBase = m_config.rawBase;
+                m_codeGenerator->m_moduleCodeOffset = m_config.rawCodeOffset;
+                m_codeGenerator->m_moduleFileSize = m_elfParser->getRawFileSize();
+            }
             std::unordered_map<uint32_t, std::string> relocationCallNames;
             relocationCallNames.reserve(m_relocations.size());
             for (const auto &reloc : m_relocations)
@@ -1208,11 +1220,12 @@ namespace ps2recomp
                     {
                         std::stringstream entryName;
                         entryName << sanitized << "_0x" << std::hex << function.end;
-                        return entryName.str();
+                        return (m_config.moduleId.empty() ? "" : m_config.moduleId + "_") + entryName.str();
                     }
                 }
 
                 std::stringstream ss;
+                if (!m_config.moduleId.empty()) ss << m_config.moduleId << "_";
                 ss << sanitized << "_0x" << std::hex << function.start;
                 return ss.str();
             };
@@ -1856,8 +1869,10 @@ namespace ps2recomp
         {
             std::stringstream ss;
 
-            ss << "#ifndef PS2_RECOMPILED_FUNCTIONS_H\n";
-            ss << "#define PS2_RECOMPILED_FUNCTIONS_H\n\n";
+            const std::string guard = "PS2_RECOMPILED_FUNCTIONS_H" +
+                (m_config.moduleId.empty() ? "" : "_" + m_config.moduleId);
+            ss << "#ifndef " << guard << "\n";
+            ss << "#define " << guard << "\n\n";
 
             ss << "#include <cstdint>\n\n";
             ss << "struct R5900Context;\n";

@@ -26,6 +26,7 @@ add_executable(dw5xl
     src/dw5xl_pad2.cpp
     src/dw5xl_images.cpp
     src/ipu_idec.cpp
+    src/dw5xl_overlays.cpp
 )
 target_include_directories(dw5xl PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
 target_link_libraries(dw5xl PRIVATE ps2_runtime rlImGui imgui)
@@ -40,6 +41,47 @@ target_precompile_headers(dw5xl PRIVATE
 )
 # 42k small generated files: batch them so the compiler isn't started 42k times.
 set_target_properties(dw5xl PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
-set_source_files_properties(src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
+set_source_files_properties(src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
 # Generated code uses SSE4.1/AVX intrinsics (PS2Recomp only enables them in its own directory).
 target_compile_options(dw5xl PRIVATE -march=x86-64-v3)
+
+# Overlay headers/symbols are isolated from the base executable's generated code.
+set(DW5XL_OVL00_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../recomp/dw5xl/overlays/ovl00/output")
+file(GLOB DW5XL_OVL00_SOURCES CONFIGURE_DEPENDS "${DW5XL_OVL00_DIR}/*.cpp")
+if(NOT DW5XL_OVL00_SOURCES)
+    message(FATAL_ERROR "Missing generated OVL00 code; run tools/regen.sh ovl00")
+endif()
+add_library(dw5xl_ovl00 STATIC ${DW5XL_OVL00_SOURCES})
+target_link_libraries(dw5xl_ovl00 PRIVATE ps2_runtime)
+target_include_directories(dw5xl_ovl00 PRIVATE "${DW5XL_OVL00_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
+target_compile_options(dw5xl_ovl00 PRIVATE -march=x86-64-v3)
+target_precompile_headers(dw5xl_ovl00 PRIVATE
+    "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_runtime_macros.h"
+    "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_runtime.h"
+    "${DW5XL_OVL00_DIR}/ps2_recompiled_functions.h"
+    "${DW5XL_OVL00_DIR}/ps2_recompiled_stubs.h"
+    "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_syscalls.h"
+    "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_stubs.h"
+)
+set_target_properties(dw5xl_ovl00 PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
+target_link_libraries(dw5xl PRIVATE dw5xl_ovl00)
+
+option(DW5XL_BUILD_TESTS "Build game-independent module dispatch tests" OFF)
+if(DW5XL_BUILD_TESTS)
+    enable_testing()
+    add_executable(dw5xl_overlay_dispatch_test tests/overlay_dispatch_test.cpp)
+    target_link_libraries(dw5xl_overlay_dispatch_test PRIVATE ps2_runtime)
+    target_compile_options(dw5xl_overlay_dispatch_test PRIVATE -march=x86-64-v3)
+    add_test(NAME overlay_dispatch COMMAND dw5xl_overlay_dispatch_test)
+    add_executable(dw5xl_field_history_test tests/field_history_test.cpp)
+    target_include_directories(dw5xl_field_history_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME field_history COMMAND dw5xl_field_history_test)
+    add_executable(dw5xl_cd_iop_read_test tests/cd_iop_read_test.cpp)
+    target_link_libraries(dw5xl_cd_iop_read_test PRIVATE ps2_runtime)
+    target_compile_options(dw5xl_cd_iop_read_test PRIVATE -march=x86-64-v3)
+    add_test(NAME cd_iop_read COMMAND dw5xl_cd_iop_read_test)
+    add_executable(dw5xl_vif_unpack_boundary_test tests/vif_unpack_boundary_test.cpp)
+    target_link_libraries(dw5xl_vif_unpack_boundary_test PRIVATE ps2_runtime)
+    target_compile_options(dw5xl_vif_unpack_boundary_test PRIVATE -march=x86-64-v3)
+    add_test(NAME vif_unpack_boundary COMMAND dw5xl_vif_unpack_boundary_test)
+endif()

@@ -666,7 +666,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     else if (vl <= 2u)
                     {
                         const uint32_t bytesPerComp = (vl == 0u) ? 4u : ((vl == 1u) ? 2u : 1u);
-                        const uint32_t srcStride = srcIndex * bytesPerVector;
+                        const uint32_t srcStride = static_cast<uint32_t>(srcVec - srcBase);
                         const uint32_t srcAvailable = sizeBytes - pos;
                         const auto readComp = [&](uint32_t c) -> uint32_t
                         {

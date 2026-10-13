@@ -176,6 +176,10 @@ namespace ps2recomp
     struct RecompilerConfig
     {
         std::string inputPath;
+        std::string inputFormat = "elf";
+        std::string moduleId;
+        uint32_t rawBase = 0;
+        uint32_t rawCodeOffset = 0;
         std::string outputPath;
         std::string ghidraMapPath;
         bool singleFileOutput = false;

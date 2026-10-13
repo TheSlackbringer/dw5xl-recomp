@@ -23,6 +23,9 @@ namespace ps2recomp
                 ~ElfParser();
 
                 bool parse();
+                // File-backed address domain; only vetted map entries define EE code.
+                bool parseRaw(uint32_t guestBase, uint32_t codeOffset);
+                uint32_t getRawFileSize() const { return static_cast<uint32_t>(m_rawImage.size()); }
 
                 bool loadGhidraFunctionMap(const std::string &mapPath);
                 std::vector<Function> extractFunctions() const;
@@ -43,6 +46,8 @@ namespace ps2recomp
 
         private:
                 std::string m_filePath;
+                std::vector<uint8_t> m_rawImage;
+                bool m_rawMode = false;
                 std::unique_ptr<ELFIO::elfio> m_elf;
 
                 std::vector<Section> m_sections;

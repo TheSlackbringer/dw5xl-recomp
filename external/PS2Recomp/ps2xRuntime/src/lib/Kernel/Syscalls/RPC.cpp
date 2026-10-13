@@ -585,6 +585,38 @@ namespace ps2_syscalls
             const bool dw5Ksnh = sid == 0x4B534E48u && sendBuf && std::getenv("PS2X_KSNH_TRACE");
             if (dw5Ksnh)
                 std::memcpy(dw5Pre, getMemPtr(rdram, sendBuf), std::min<uint32_t>(sendSize, 16u));
+            // Optional bounded SFX trace: capture before the IOP reply can
+            // overwrite a shared request buffer. Stream/movie tracing is separate.
+            static const bool sfxTrace = [] {
+                const char *value = std::getenv("PS2X_KSN_SFX_TRACE");
+                return value && *value && std::strcmp(value, "0") != 0;
+            }();
+            if (sfxTrace && (sid == 0x4B534E49u || sid == 0x4B534E4Au))
+            {
+                uint8_t preview[32] = {};
+                uint32_t count = 0u;
+                const uint32_t wanted = std::min<uint32_t>(sendSize, sizeof(preview));
+                if (rdram && sendBuf)
+                    for (; count < wanted; ++count)
+                    {
+                        const uint64_t address = uint64_t(sendBuf) + count;
+                        if (address > UINT32_MAX) break;
+                        const uint8_t *byte = getConstMemPtr(rdram, static_cast<uint32_t>(address));
+                        if (!byte) break;
+                        preview[count] = *byte;
+                    }
+                std::fprintf(stderr, "[dw5xl:sfx-rpc] tick=%llu sid=%08x rpc=%x client=%08x send=%08x size=%u preview=%u pc=%08x ra=%08x words=",
+                             static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()),
+                             sid, rpcNum, clientPtr, sendBuf, sendSize, count,
+                             ctx->pc, getRegU32(ctx, 31));
+                for (uint32_t offset = 0u; offset + 4u <= count; offset += 4u)
+                {
+                    uint32_t word;
+                    std::memcpy(&word, preview + offset, sizeof(word));
+                    std::fprintf(stderr, "%s%08x", offset ? "," : "", word);
+                }
+                std::fputc('\n', stderr);
+            }
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
             if (dw5Ksnh)
             {

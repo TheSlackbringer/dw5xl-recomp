@@ -1,6 +1,7 @@
 #ifndef PS2_RUNTIME_H
 #define PS2_RUNTIME_H
 
+#include <cstddef>
 #include <cstring>
 #include <cstdint>
 #include <vector>
@@ -269,6 +270,25 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
     // TODO we dont need this anymore so on next release it will be deleted
 }
 
+class PS2Runtime;
+
+// Generated module metadata and entries have static lifetime. Registration does
+// not activate a module; the game-specific loader validates loaded bytes first.
+struct RecompiledModuleEntry
+{
+    uint32_t address;
+    void (*function)(uint8_t *, R5900Context *, PS2Runtime *);
+};
+
+struct RecompiledModule
+{
+    const char *identity;
+    uint32_t guestBase;
+    uint32_t fileSize;
+    const RecompiledModuleEntry *entries;
+    size_t entryCount;
+};
+
 class PS2Runtime
 {
 public:
@@ -332,6 +352,14 @@ public:
         // Escape hatch only: skip missing calls by returning to fallthrough (it can hide guest bugs)
         SkipCallDebug = 3,
     };
+
+    // Mutations execute on the EE executor (or before it starts). Descriptors
+    // and their entry arrays must remain immutable for the runtime's lifetime.
+    bool registerCompiledModule(const RecompiledModule &module);
+    bool activateCompiledModule(std::string_view identity);
+    void deactivateCompiledModule();
+    const RecompiledModule *activeCompiledModule() const { return m_activeCompiledModule; }
+    uint64_t compiledModuleGeneration() const { return m_compiledModuleGeneration; }
 
     bool replaceFunction(uint32_t address, RecompiledFunction func);
     // TODO remove this later need to update all tests
@@ -457,6 +485,11 @@ public:
     inline const PS2Vfs &vfs() const { return m_vfs; }
 
 private:
+    RecompiledFunction resolveFunctionExact(uint32_t address) const;
+    std::vector<const RecompiledModule *> m_compiledModules;
+    const RecompiledModule *m_activeCompiledModule = nullptr;
+    uint64_t m_compiledModuleGeneration = 0;
+
     struct GuestHeapBlock
     {
         uint32_t addr = 0;

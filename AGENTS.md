@@ -93,13 +93,10 @@ Broken / unverified – see §6.
    (play), 0x9b fades, 0x97 stop, 0x9d/0x9e around loads. **Options silence is correct:** the owner confirmed on an
    emulator (2026-10-13) that the real game plays no music in Options, only the cursor sound when moving up/down. So
    the SREG fix still needs verifying in another scene with BGM (title/main menu loops, later battles).
-2. **Overlays (biggest blocker).** The Opening Edit GS corruption is FIXED (HLE stub for sceVif1PkOpenDirectCode
-   inflated a CNT qwc; the game's own function now runs). Options -> Opening -> PLAY now reaches overlay code and stops:
-   `[guest-branch:missing-target]` JALR to 0x692D00, the first OVL00 constructor (table 0x699FD0..0x69A008), called from
-   FUN_00100260 after the loader. Overlays OVL_00/01/02.BIN have an `MWo3` header (0x80 bytes) and load at 0x61A800
-   (code at 0x61A880). Wrappers 0x2D4DC0..0x2D6010 load them through FUN_00145A50; FUN_00100260 clears BSS and runs
-   constructors. PS2Recomp has no overlay support: implement per-overlay recompilation with module identity +
-   runtime switching. Expect VU1 microcode / PATH1 work once 3D code runs.
+2. **Overlays (biggest blocker).** Native raw-module generation and active-module dispatch are implemented for
+   the first overlay. Opening PLAY passes constructors and reaches scene initialization. More indirect-call
+   coverage and engine work remain; read the latest `notes/BRINGUP.md` section for the current target and evidence.
+   Exact function-map boundaries matter: oversized named entries can suppress real neighboring functions.
 3. **Save/Load round-trip test** after the sceMcGetDir count fix: save (LEFT, Cross), check the new save folder
    under `game/dw5xl/mc0/`, then Options→Load and reboot auto-load.
 4. **Load Original** (DW5 disc data/overlays in `game/dw5/`), after 3D works.
@@ -221,3 +218,8 @@ owner plays or tests something else (audio overlaps). Check with `pgrep -x dw5xl
 - Dev-harness command file: `PS2X_CTRL=<file>` (polled ~10x/s; `press BTN ticks`, `shot <png>`, `threads <txt>`, `quit`).
 - `PS2X_HOST_INPUT` goes through the real host-input path (keyboard mapping + libpad2 bridge); `PS2X_INPUT` injects
   guest pad masks directly.
+
+- Manual visible playtests must leave `PS2X_HOST_INPUT` and `PS2X_INPUT` unset. A nonempty host-input script disables
+  physical keyboard polling for the entire run, including after its last event.
+- Keep one game instance. The integrator closes manual playtests before builds or hidden runs; agents do scratch
+  analysis and patch preparation without shared builds or launches while the owner plays.

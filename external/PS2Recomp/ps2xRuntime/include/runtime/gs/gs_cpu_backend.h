@@ -1,5 +1,6 @@
 #pragma once
 
+#include "runtime/gs/field_history.h"
 #include "runtime/gs/gs_backend.h"
 #include "runtime/gs/gs_texture_page_cache.h"
 
@@ -31,7 +32,7 @@ public:
     void Sync(GSSyncReason reason) override;
     PresentationFrame Present(const GSPresentationRequest &request) override;
     // Convert an already synchronized memory image without CPU raster jobs.
-    PresentationFrame PresentFromLocalMemory(const GSPresentationRequest &request);
+    PresentationFrame PresentFromLocalMemory(const GSPresentationRequest &request, ReusableFieldWeaver *fieldHistory = nullptr);
 
     bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
     uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
@@ -42,6 +43,8 @@ public:
     GSTransferSnapshot GetTransferSnapshot() const override;
 
 private:
+    ReusableFieldWeaver m_fieldWeaver;
+
     // Rasterization runs asynchronously on a pool of worker threads. The
     // caller (the GS frontend, on the EE thread) only appends commands to a
     // batch; filled batches queue up and the workers run them in order. Every

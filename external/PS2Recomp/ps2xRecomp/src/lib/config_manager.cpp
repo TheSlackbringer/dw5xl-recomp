@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <limits>
 #include <thread>
+#include <cctype>
 
 namespace ps2recomp
 {
@@ -38,6 +39,31 @@ namespace ps2recomp
             const auto &general = toml::find(data, "general");
 
             config.inputPath = toml::find<std::string>(general, "input");
+            config.inputFormat = toml::find_or<std::string>(general, "input_format", "elf");
+            config.moduleId = toml::find_or<std::string>(general, "module_id", "");
+            const int64_t rawBase = toml::find_or<int64_t>(general, "raw_base", 0);
+            if (rawBase < 0 || rawBase > std::numeric_limits<uint32_t>::max())
+                throw std::runtime_error("raw_base is outside the guest address range");
+            config.rawBase = static_cast<uint32_t>(rawBase);
+            const int64_t rawCodeOffset = toml::find_or<int64_t>(general, "raw_code_offset", 0);
+            if (rawCodeOffset < 0 || rawCodeOffset > std::numeric_limits<uint32_t>::max() ||
+                (rawCodeOffset & 3) != 0)
+                throw std::runtime_error("raw_code_offset must be an aligned guest-sized offset");
+            config.rawCodeOffset = static_cast<uint32_t>(rawCodeOffset);
+            if (config.inputFormat != "elf" && config.inputFormat != "raw")
+                throw std::runtime_error("input_format must be elf or raw");
+            if (config.inputFormat == "raw")
+            {
+                if (config.moduleId.empty() || !std::isalpha(static_cast<unsigned char>(config.moduleId.front())) ||
+                    !std::all_of(config.moduleId.begin(), config.moduleId.end(), [](unsigned char c) {
+                        return std::isalnum(c) || c == '_';
+                    }))
+                    throw std::runtime_error("raw module_id must be a C++ identifier starting with a letter");
+                if ((config.rawBase & 3u) != 0u)
+                    throw std::runtime_error("raw_base must be four-byte aligned");
+            }
+            else if (!config.moduleId.empty())
+                throw std::runtime_error("module_id requires raw input_format");
             config.ghidraMapPath = toml::find_or<std::string>(general, "ghidra_output", "");
             config.outputPath = toml::find<std::string>(general, "output");
             config.singleFileOutput = toml::find_or<bool>(general, "single_file_output", false);
@@ -287,6 +313,13 @@ namespace ps2recomp
 
         toml::table general;
         general["input"] = config.inputPath;
+        general["input_format"] = config.inputFormat;
+        if (config.inputFormat == "raw")
+        {
+            general["module_id"] = config.moduleId;
+            general["raw_base"] = static_cast<int64_t>(config.rawBase);
+            general["raw_code_offset"] = static_cast<int64_t>(config.rawCodeOffset);
+        }
         general["ghidra_output"] = config.ghidraMapPath;
         general["output"] = config.outputPath;
         general["single_file_output"] = config.singleFileOutput;

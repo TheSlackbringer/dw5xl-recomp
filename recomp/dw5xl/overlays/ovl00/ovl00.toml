@@ -1,0 +1,19 @@
+# PAL XL OVL00. The header extents are not exhaustive EE code/data boundaries.
+# The vetted function map includes constructors after the embedded VU/data region.
+[general]
+input = "game/dw5xl/OVL_00.BIN"
+input_format = "raw"
+module_id = "dw5xl_ovl00"
+raw_base = 0x61A800
+raw_code_offset = 0x80
+ghidra_output = "recomp/dw5xl/overlays/ovl00/ghidra_functions.code.csv"
+output = "recomp/dw5xl/overlays/ovl00/output"
+single_file_output = false
+patch_syscalls = false
+patch_cop0 = true
+patch_cache = true
+stubs = []
+skip = []
+
+# Original tiny thunks enter these loop tails before their first iteration.
+entry_points = ["0x0064DC98", "0x0064DEA8"]

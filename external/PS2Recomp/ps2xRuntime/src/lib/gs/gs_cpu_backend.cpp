@@ -487,64 +487,6 @@ namespace
         return {(smode2 & 0x1ull) != 0ull, ((smode2 >> 1) & 0x1ull) != 0ull};
     }
 
-    void applyFieldPresentation(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height, bool oddField)
-    {
-        if (pixels.empty() || width == 0u || height < 2u)
-            return;
-        const std::vector<uint8_t> source = pixels;
-        for (uint32_t y = 0; y < height; ++y)
-        {
-            uint32_t sourceY = ((y >> 1u) << 1u) + (oddField ? 1u : 0u);
-            if (sourceY >= height)
-                sourceY = height - 1u;
-            std::memcpy(pixels.data() + y * kHostFrameWidth * 4u,
-                        source.data() + sourceY * kHostFrameWidth * 4u,
-                        width * 4u);
-        }
-    }
-
-    // Host-side deinterlace for interlaced FRAME-mode output: a game that
-    // renders each field into its own half-height buffer (alternating buffers,
-    // half-line Y offset on odd fields) would be woven by the TV. Weave the
-    // current field with the previous one into a full-height frame. When the
-    // buffer did not change (no swap) the field is line-doubled instead.
-    // PS2X_NO_WEAVE=1 keeps the raw half-height field.
-    void weaveFieldBuffers(std::vector<uint8_t> &pixels, uint32_t width, uint32_t &height, uint32_t fbp, bool oddField)
-    {
-        static const bool s_disabled = []
-        {
-            const char *v = std::getenv("PS2X_NO_WEAVE");
-            return v && *v && *v != '0';
-        }();
-        static std::vector<uint8_t> s_prevField;
-        static uint32_t s_prevFbp = 0xFFFFFFFFu;
-        static uint32_t s_prevWidth = 0u;
-        static uint32_t s_prevHeight = 0u;
-        if (s_disabled || pixels.empty() || width == 0u || height == 0u || height * 2u > kHostFrameHeight)
-            return;
-
-        const size_t rowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
-        std::vector<uint8_t> current(pixels.begin(), pixels.begin() + static_cast<size_t>(height) * rowBytes);
-        const bool havePrev = s_prevFbp != fbp && s_prevWidth == width && s_prevHeight == height &&
-                              s_prevField.size() == current.size();
-        const std::vector<uint8_t> &other = havePrev ? s_prevField : current;
-        for (uint32_t y = 0; y < height; ++y)
-        {
-            const uint32_t curLine = 2u * y + (oddField ? 1u : 0u);
-            const uint32_t otherLine = 2u * y + (oddField ? 0u : 1u);
-            std::memcpy(pixels.data() + curLine * rowBytes, current.data() + y * rowBytes, width * 4u);
-            std::memcpy(pixels.data() + otherLine * rowBytes, other.data() + y * rowBytes, width * 4u);
-        }
-        if (s_prevFbp != fbp)
-        {
-            s_prevField.swap(current);
-            s_prevFbp = fbp;
-            s_prevWidth = width;
-            s_prevHeight = height;
-        }
-        height *= 2u;
-    }
-
     void normalizePresentationAlpha(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
     {
         for (uint32_t y = 0; y < height; ++y)
@@ -897,6 +839,7 @@ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 void GSCpuBackend::Reset()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    m_fieldWeaver.reset();
     ResetUnlocked();
 }
 
@@ -2439,10 +2382,10 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
 
     thread_local GSCpuBackend snapshotBackend;
     snapshotBackend.Initialize(snapshot.data(), static_cast<uint32_t>(snapshot.size()));
-    return snapshotBackend.PresentFromLocalMemory(request);
+    return snapshotBackend.PresentFromLocalMemory(request, &m_fieldWeaver);
 }
 
-PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
+PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request, ReusableFieldWeaver *fieldHistory)
 {
     PresentationFrame result{};
     if (m_vram && std::getenv("PS2X_ZWATCH")) // DW5XL-DEBUG: watch the first word of GS page 168 (DW5XL title depth)
@@ -2459,16 +2402,36 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
             s_last = word;
         }
     }
+    ReusableFieldWeaver &weaver = fieldHistory ? *fieldHistory : m_fieldWeaver;
     const GSPmodeState pmode = decodePmode(request.pmode);
     const GSSmode2State smode2 = decodeSMode2(request.smode2);
     const bool fieldMode = smode2.interlaced && !smode2.frameMode;
+    const bool frameModeFields = smode2.interlaced && smode2.frameMode;
     const bool oddField = (request.vsyncTick & 1ull) != 0ull;
+    // The runtime's existing vsync parity is the current field identity. History
+    // must follow consecutive fields, including in-place framebuffer updates.
+    auto presentFields = [&](PresentationFrame &frame) {
+        static const bool noWeave = [] {
+            const char *v = std::getenv("PS2X_NO_WEAVE");
+            return v && *v && *v != '0';
+        }();
+        const auto mode = frameModeFields ? ReusableFieldWeaver::Mode::HalfHeightFrame :
+                          fieldMode ? ReusableFieldWeaver::Mode::FullHeightField :
+                                      ReusableFieldWeaver::Mode::Progressive;
+        // Preserve the diagnostic's raw FRAME output; it never disabled FIELD
+        // processing previously, so FIELD weaving remains enabled.
+        if (frameModeFields && (noWeave || uint64_t(frame.height) * 2u > kHostFrameHeight)) {
+            weaver.reset();
+            return;
+        }
+        weaver.present(frame.pixels, frame.width, frame.height,
+                              kHostFrameWidth * 4u, request.vsyncTick, oddField, mode);
+    };
     const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
     const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
     const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
     const GSDisplayReadOrigin origin2 = decodeDisplayReadOrigin(request.dispfb2);
     uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
-    const bool frameModeFields = smode2.interlaced && smode2.frameMode;
     decodeDisplaySize(request.display1, frameModeFields, width1, height1);
     decodeDisplaySize(request.display2, frameModeFields, width2, height2);
     { // DW5XL-DEBUG: log display registers on change
@@ -2484,8 +2447,10 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     }
     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
-    if (!valid1 && !valid2)
+    if (!valid1 && !valid2) {
+        weaver.reset();
         return result;
+    }
 
     auto copySource = [&](const GSFrameReg &displayFrame,
                           const GSDisplayReadOrigin &origin,
@@ -2567,10 +2532,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
                     dst[3] = pmode.amod ? dst[3] : src[3];
                 }
             normalizePresentationAlpha(result.pixels, result.width, result.height);
-            if (fieldMode)
-                applyFieldPresentation(result.pixels, result.width, result.height, oddField);
-            if (frameModeFields)
-                weaveFieldBuffers(result.pixels, result.width, result.height, displayFrame1.fbp, oddField);
+            presentFields(result);
             result.displayFbp = displayFrame1.fbp;
             result.sourceFbp = selected1.fbp;
             return result;
@@ -2584,10 +2546,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     GSFrameReg selected = displayFrame;
     if (!copySource(displayFrame, origin, result.width, result.height, true, false, selected, result.pixels, result.usedPreferred))
         return {};
-    if (fieldMode)
-        applyFieldPresentation(result.pixels, result.width, result.height, oddField);
-    if (frameModeFields)
-        weaveFieldBuffers(result.pixels, result.width, result.height, displayFrame.fbp, oddField);
+    presentFields(result);
     normalizePresentationAlpha(result.pixels, result.width, result.height);
     result.displayFbp = displayFrame.fbp;
     result.sourceFbp = selected.fbp;

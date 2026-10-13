@@ -1,24 +1,51 @@
 #!/usr/bin/env bash
-# Generate the game code locally from your own disc (SLES_538.60); generated code is never committed.
+# Generate locally from your own disc; never hand-edit or commit generated C++.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-profile=dw5xl
-executable=SLES_538.60
-config="$root/recomp/$profile/$profile.toml"
-if [[ ! -f "$root/game/$profile/$executable" ]]; then
-    echo "Missing your disc executable: game/$profile/$executable" >&2
-    exit 1
-fi
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-awk -v root="$root" -v profile="$profile" -v executable="$executable" -v output="$tmp/output/" '
-    /^input = / { print "input = \"" root "/game/" profile "/" executable "\""; next }
-    /^ghidra_output = / { print "ghidra_output = \"" root "/recomp/" profile "/ghidra_functions.code.csv\""; next }
-    /^output = / { print "output = \"" output "\""; next }
-    { print }
-' "$config" > "$tmp/config.toml"
+selection=${1:-all}
+case "$selection" in
+    main|ovl00|all) ;;
+    *) echo 'Usage: tools/regen.sh [main|ovl00|all]' >&2; exit 2 ;;
+esac
+regen() (
+    local name=$1 profile config executable expected actual tmp
+    if [[ "$name" == main ]]; then
+        profile=dw5xl
+        config="$root/recomp/$profile/dw5xl.toml"
+        executable=SLES_538.60
+    else
+        profile=dw5xl/overlays/ovl00
+        config="$root/recomp/$profile/ovl00.toml"
+        executable=OVL_00.BIN
+    fi
+    if [[ ! -f "$root/game/dw5xl/$executable" ]]; then
+        echo "Missing your disc file: game/dw5xl/$executable" >&2
+        return 1
+    fi
+    if [[ "$name" != main ]]; then
+        expected=$(awk '{print $1}' "$root/recomp/$profile/input.sha256")
+        actual=$(sha256sum "$root/game/dw5xl/$executable" | awk '{print $1}')
+        if [[ "$actual" != "$expected" ]]; then
+            echo 'Unsupported OVL00; input SHA256 does not match the profile' >&2
+            return 1
+        fi
+    fi
+    tmp=$(mktemp -d)
+    trap 'rm -rf -- "$tmp"' EXIT
+    awk -v root="$root" -v profile="$profile" -v executable="$executable" -v output="$tmp/output/" '
+        /^input = / { print "input = \"" root "/game/dw5xl/" executable "\""; next }
+        /^ghidra_output = / { print "ghidra_output = \"" root "/recomp/" profile "/ghidra_functions.code.csv\""; next }
+        /^output = / { print "output = \"" output "\""; next }
+        { print }
+    ' "$config" > "$tmp/config.toml"
+    if ! "$root/external/PS2Recomp/build/ps2xRecomp/ps2_recomp" "$tmp/config.toml" > "$root/recomp/$profile/recomp.log" 2>&1; then
+        echo "Generation failed; see recomp/$profile/recomp.log" >&2
+        return 1
+    fi
+    mkdir -p "$root/recomp/$profile/output"
+    rsync -rc --delete --itemize-changes "$tmp/output/" "$root/recomp/$profile/output/" > "$tmp/changes.txt"
+    head -50 "$tmp/changes.txt"
+ )
 cd "$root"
-"$root/external/PS2Recomp/build/ps2xRecomp/ps2_recomp" "$tmp/config.toml" > "$root/recomp/$profile/recomp.log" 2>&1
-mkdir -p "$root/recomp/$profile/output"
-rsync -rc --delete --itemize-changes "$tmp/output/" "$root/recomp/$profile/output/" > "$tmp/changes.txt"
-head -50 "$tmp/changes.txt"
+if [[ "$selection" == main || "$selection" == all ]]; then regen main; fi
+if [[ "$selection" == ovl00 || "$selection" == all ]]; then regen ovl00; fi

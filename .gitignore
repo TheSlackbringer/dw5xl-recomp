@@ -5,7 +5,7 @@
 /ghidra/
 /ghidra_iop/
 # Generated C++ (derived from the game ELF; regenerate with tools/regen.sh) and recompiler logs
-/recomp/*/output/
+/recomp/**/output/
 /recomp/**/*.log
 /recomp/*.txt
 # Builds and logs
