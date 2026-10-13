@@ -45,6 +45,8 @@ struct GSVulkanBackend::Impl
     mutable std::mutex mutex;
     std::vector<uint8_t> snapshot = std::vector<uint8_t>(vramBytes);
     GSCpuBackend scanout;
+    ReusableFieldWeaver fieldWeaver;
+    VulkanGsScanoutState scanoutState;
     std::array<uint64_t, 128> state{};
     std::array<bool, 128> valid{};
     GSTransferCommand transfer{};
@@ -69,14 +71,30 @@ struct GSVulkanBackend::Impl
             throw std::runtime_error("Vulkan device creation failed");
         device.set_context(context);
         device.init_frame_contexts(4);
-        if (!gs.init(&device, ParallelGS::GSOptions{}))
+
+        ParallelGS::GSOptions opts{};
+        const char *scaleEnv = std::getenv("PS2X_GS_SCALE");
+        if (scaleEnv && *scaleEnv)
+        {
+            int scale = std::atoi(scaleEnv);
+            switch (scale)
+            {
+            case 2: opts.super_sampling = ParallelGS::SuperSampling::X2; break;
+            case 4: opts.super_sampling = ParallelGS::SuperSampling::X4; break;
+            case 8: opts.super_sampling = ParallelGS::SuperSampling::X8; break;
+            case 16: opts.super_sampling = ParallelGS::SuperSampling::X16; break;
+            default: opts.super_sampling = ParallelGS::SuperSampling::X1; break;
+            }
+        }
+
+        if (!gs.init(&device, opts))
             throw std::runtime_error("Vulkan device lacks paraLLEl-GS features");
         scanout.Initialize(snapshot.data(), vramBytes);
         const auto &gpu = device.get_gpu_properties();
         if (gpu.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
             throw std::runtime_error("software Vulkan devices are not a GPU renderer");
-        std::fprintf(stderr, "[gs:vulkan] device=%s vendor=0x%04x device=0x%04x; GPU compute rasterization\n",
-            gpu.deviceName, gpu.vendorID, gpu.deviceID);
+        std::fprintf(stderr, "[gs:vulkan] device=%s vendor=0x%04x device=0x%04x; GPU compute rasterization (scale=%ux)\n",
+            gpu.deviceName, gpu.vendorID, gpu.deviceID, static_cast<unsigned>(opts.super_sampling));
     }
     ~Impl()
     {
@@ -200,6 +218,7 @@ void GSVulkanBackend::Reset()
 {
     auto lock = m_impl->access();
     m_impl->gs.flush(); m_impl->gs.reset_context_state(); m_impl->valid.fill(false);
+    m_impl->scanoutState.reset();
     m_impl->transferState = {}; m_impl->transferState.direction = 3;
     m_impl->fifo.clear(); m_impl->fifoRead = 0; m_impl->uploadTail.clear();
 }
@@ -305,13 +324,13 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
 {
     auto lock = m_impl->access(); auto &p = *m_impl;
     PresentationFrame result;
-    try { result = presentVulkanGs(p.gs, p.device, request); ++p.gpuPresentations; }
-    catch (const VulkanGsScanoutUnsupported &error)
+    try { result = presentVulkanGs(p.gs, p.device, p.scanoutState, request, &p.fieldWeaver); ++p.gpuPresentations; }
+    catch (const std::exception &error)
     {
         // Preserve the fixed host viewport contract for display modes outside
         // the bounded GPU scanout bridge. Rasterization remains Vulkan.
         std::fprintf(stderr, "[gs:vulkan] CPU display conversion: %s\n", error.what());
-        p.readSnapshot(); result = p.scanout.PresentFromLocalMemory(request);
+        p.readSnapshot(); result = p.scanout.PresentFromLocalMemory(request, &p.fieldWeaver);
         ++p.convertedPresentations;
     }
     p.device.next_frame_context();

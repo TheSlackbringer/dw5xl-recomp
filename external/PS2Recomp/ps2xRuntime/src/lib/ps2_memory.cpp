@@ -1575,6 +1575,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                         if (dw5TagTrace && dw5Tags.size() < 64u) // DW5XL-DEBUG
                             dw5Tags.push_back({currentTagAddr, id, tagQwc, addr, loadScalar<uint64_t>(tp, 8, 16, "dma tag upper", tagAddr)});
+                        if (std::getenv("PS2X_VIF_PARSE_DUMP") && channelBase == 0x10009000u &&
+                            gs_regs.vsyncTick.load(std::memory_order_acquire) >= 2008u && gs_regs.vsyncTick.load(std::memory_order_acquire) <= 2020u &&
+                            chainBuf.size() >= 280000u && chainBuf.size() <= 285000u)
+                            std::fprintf(stderr, "[vif:source] offset=%zu tag=%08x id=%u qwc=%u payload=%08x vif=%08x,%08x\n",
+                                         chainBuf.size(), currentTagAddr, id, tagQwc, dataAddr,
+                                         loadScalar<uint32_t>(tp, 8u, 16u, "vif source", currentTagAddr),
+                                         loadScalar<uint32_t>(tp, 12u, 16u, "vif source", currentTagAddr));
                         if (transferTagData)
                             appendVifTagData(currentTagAddr);
 

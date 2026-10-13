@@ -302,6 +302,21 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
     if (sizeBytes == 0u)
         return;
 
+    const uint64_t parseTick = gs_regs.vsyncTick.load(std::memory_order_acquire);
+    static const bool parseEnabled = std::getenv("PS2X_GIF_PARSE_TRACE") != nullptr;
+    static const uint64_t parseFrom = std::getenv("PS2X_GIF_PARSE_FROM") ? std::strtoull(std::getenv("PS2X_GIF_PARSE_FROM"), nullptr, 0) : 2018u;
+    static const uint64_t parseTo = std::getenv("PS2X_GIF_PARSE_TO") ? std::strtoull(std::getenv("PS2X_GIF_PARSE_TO"), nullptr, 0) : 2020u;
+    const bool parseTrace = parseEnabled && parseTick >= parseFrom && parseTick <= parseTo;
+    static bool vifRawDumped = false;
+    if (parseTrace && !vifRawDumped && sizeBytes > 500000u && std::getenv("PS2X_VIF_PARSE_DUMP"))
+    {
+        if (FILE *vifDump = std::fopen(std::getenv("PS2X_VIF_PARSE_DUMP"), "wb"))
+        {
+            std::fwrite(data, 1, sizeBytes, vifDump);
+            std::fclose(vifDump);
+            vifRawDumped = true;
+        }
+    }
     uint32_t pos = 0;
 
     while (pos + 4 <= sizeBytes)
@@ -316,6 +331,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 break;
             }
 
+            if (parseTrace)
+                std::fprintf(stderr, "[vif:continue] tick=%llu pos=%u bytes=%u pending=%u available=%u\n", static_cast<unsigned long long>(parseTick), pos, sizeBytes, m_vif1PendingPath2ImageQwc, availableQw);
             const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
             submitGifPacket(GifPathId::Path2, data + pos, chunkQw * 16u, true, m_vif1PendingPath2DirectHl);
 
@@ -533,6 +550,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             // this DIRECT holds is continued by the GIF's PATH2 state when the next DIRECT arrives;
             // the VIF must keep parsing VIFcodes after this payload (DW5XL sends per-macroblock
             // "DIRECTHL 6 (BITBLT + IMAGE tag)" then "DIRECTHL 64 (pixels)" through TTE tags).
+            if (parseTrace)
+                std::fprintf(stderr, "[vif:direct] tick=%llu cmd=%08x pos=%u bytes=%u requested=%u available=%u truncated=%d\n", static_cast<unsigned long long>(parseTick), cmd, pos, sizeBytes, requestedQw, availableQw, truncated);
             const bool directHl = (opcode == VIF_DIRECTHL);
             if (qwCount > 0)
                 submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);

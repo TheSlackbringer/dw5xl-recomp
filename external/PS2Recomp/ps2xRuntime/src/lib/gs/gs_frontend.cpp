@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -688,6 +689,19 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         const uint64_t traceTick = m_privRegs ? m_privRegs->vsyncTick.load(std::memory_order_acquire) : 0u;
         GSTrace::registerWrite(0x7F, (static_cast<uint64_t>(g_gifArbiterCurrentPath & 0xFF) << 32) | sizeBytes, traceTick);
     }
+    const uint64_t gifParseTick = m_privRegs ? m_privRegs->vsyncTick.load(std::memory_order_acquire) : 0u;
+    static const bool gifParseEnabled = std::getenv("PS2X_GIF_PARSE_TRACE") != nullptr;
+    static const uint64_t gifParseFrom = std::getenv("PS2X_GIF_PARSE_FROM") ? std::strtoull(std::getenv("PS2X_GIF_PARSE_FROM"), nullptr, 0) : 2018u;
+    static const uint64_t gifParseTo = std::getenv("PS2X_GIF_PARSE_TO") ? std::strtoull(std::getenv("PS2X_GIF_PARSE_TO"), nullptr, 0) : 2020u;
+    const bool gifParseTrace = gifParseEnabled && gifParseTick >= gifParseFrom && gifParseTick <= gifParseTo;
+    if (gifParseTrace)
+    {
+        const auto &resume = gifPathState();
+        std::fprintf(stderr, "[gif:parse] tick=%llu path=%d bytes=%u remaining=%u consumed=%u flg=%u nreg=%u first=%016llx,%016llx\n",
+                     static_cast<unsigned long long>(gifParseTick), g_gifArbiterCurrentPath, sizeBytes,
+                     resume.remaining, resume.consumed, resume.flg, resume.nreg,
+                     static_cast<unsigned long long>(loadLE64(data)), static_cast<unsigned long long>(loadLE64(data + 8)));
+    }
     if (!gifPathMidTag() && tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
 
@@ -737,6 +751,10 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             if (st.nreg == 0)
                 st.nreg = 16;
 
+            if (gifParseTrace)
+                std::fprintf(stderr, "[gif:tag] tick=%llu path=%d offset=%u lo=%016llx hi=%016llx nloop=%u flg=%u nreg=%u\n",
+                             static_cast<unsigned long long>(gifParseTick), g_gifArbiterCurrentPath, offset - 16u,
+                             static_cast<unsigned long long>(tagLo), static_cast<unsigned long long>(tagHi), nloop, st.flg, st.nreg);
             recordGifTagDebugEventUnlocked(sizeBytes, nloop, st.flg, st.nreg);
 
             if (((tagLo >> 46) & 1) != 0)

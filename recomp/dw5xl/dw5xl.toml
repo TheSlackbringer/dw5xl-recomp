@@ -22,6 +22,8 @@ patch_cache = true
 # Functions to stub (only names with runtime syscall/stub handlers)
 stubs = [
   # libgraph packet builders run as guest code; their HLE stubs break clears/display.
+  # libvu0 math (0x113890..0x1144E8) runs as guest code: the sceVu0MulMatrix HLE stub multiplied in the wrong
+  # order (arg1*arg2 instead of the game's arg2*arg1), so every composed matrix and all 3D geometry was wrong.
   # libvif sceVif1PkOpenDirectCode (0x113648) runs as guest code: its HLE stub refreshed the open DMA tag qwc,
   # and the game's own close adds to it (CNT qwc 4 instead of 3 -> Opening 3D GS corruption).
   # Verified SDK variants and SREG handlers missed by the analyzer.
@@ -82,35 +84,6 @@ stubs = [
   "sceDmaSync@0x00113288",
   "sceDmaWatch@0x001132C0",
   "sceDmaPause@0x001132F8",
-  "sceVu0ApplyMatrix@0x00113890",
-  "sceVu0MulMatrix@0x001138C0",
-  "sceVu0InnerProduct@0x00113928",
-  "sceVu0Normalize@0x00113950",
-  "sceVu0TransposeMatrix@0x00113990",
-  "sceVu0InversMatrix@0x001139D8",
-  "sceVu0DivVector@0x00113A48",
-  "sceVu0DivVectorXYZ@0x00113A68",
-  "sceVu0InterVector@0x00113A88",
-  "sceVu0TransMatrix@0x00113B10",
-  "sceVu0CopyMatrix@0x00113B50",
-  "sceVu0UnitMatrix@0x00113BB8",
-  "_sceVu0ecossin@0x00113BE0",
-  "sceVu0RotMatrixZ@0x00113C58",
-  "sceVu0RotMatrixX@0x00113D00",
-  "sceVu0RotMatrixY@0x00113DA8",
-  "sceVu0RotMatrix@0x00113E50",
-  "sceVu0ClampVector@0x00113EA0",
-  "sceVu0CameraMatrix@0x00113EC8",
-  "sceVu0NormalLightMatrix@0x00113F78",
-  "sceVu0LightColorMatrix@0x00114038",
-  "sceVu0ViewScreenMatrix@0x001140A0",
-  "sceVu0DropShadowMatrix@0x001141A8",
-  "sceVu0RotTransPersN@0x00114338",
-  "sceVu0RotTransPers@0x00114390",
-  "sceVu0InterVectorXYZ@0x001143F8",
-  "sceVu0ClipScreen@0x00114440",
-  "sceVu0ClipScreen3@0x00114488",
-  "sceVu0ClipAll@0x001144E8",
   "sceVpu0Reset@0x00114578",
   "sceMpegCreate@0x00119478",
   "sceMpegInit@0x0011A020",
