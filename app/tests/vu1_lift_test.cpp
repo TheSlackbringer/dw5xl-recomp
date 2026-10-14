@@ -1,7 +1,5 @@
 // Unit test for lifted VU1 microprograms in DW5XL battle.
-#define private public
 #include "runtime/ps2_vu1.h"
-#undef private
 #include "runtime/ps2_vu1_lift.h"
 #include "ps2_runtime.h"
 #include "runtime/ps2_device_queue.h"
@@ -17,6 +15,10 @@
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#if defined(_WIN32)
+#include <stdlib.h>
+static int setenv(const char *name, const char *value, int) { return _putenv_s(name, value); }
+#endif
 
 extern const uint32_t g_ps2RecompiledFunctionTableBase = 0x1000;
 extern const uint32_t g_ps2RecompiledFunctionTableEnd = 0x1004;

@@ -4,9 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
-#define private public
 #include "runtime/ps2_vu1.h"
-#undef private
 #include "ps2_runtime.h"
 #include <iostream>
 #include <stdexcept>
@@ -16,6 +14,14 @@ extern const uint32_t g_ps2RecompiledFunctionTableEnd=0x1004;
 extern const uint32_t g_ps2RecompiledFunctionTableSlotCount=1;
 PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[]={nullptr};
 namespace {
+// Reach the private upper executor through explicit instantiation instead of
+// "#define private public": the MSVC STL rejects macroized keywords and the
+// MSVC ABI encodes member access in mangled names.
+using ExecUpperPtr=void (VU1Interpreter::*)(uint32_t);
+ExecUpperPtr execUpperPtr();
+template<ExecUpperPtr member> struct ExecUpperAccess {friend ExecUpperPtr execUpperPtr(){return member;}};
+template struct ExecUpperAccess<&VU1Interpreter::execUpper>;
+void execUpper(VU1Interpreter& vu,uint32_t instr){(vu.*execUpperPtr())(instr);}
 float value(uint32_t b){float f;std::memcpy(&f,&b,4);return f;}
 uint32_t bits(float f){uint32_t b;std::memcpy(&b,&f,4);return b;}
 void require(bool condition,const char* reason){if(!condition)throw std::runtime_error(reason);}
@@ -38,7 +44,7 @@ void check(VU1Interpreter& vu,uint32_t opcode,bool maximum,unsigned mask,unsigne
   for(unsigned i=0;i<4;++i){s.vf[18][i]=value(c.left);s.vf[22][i]=value(0x42420000);s.vf[19][i]=value(0xdeadbeef);}
   if(opcode==0x2b||opcode==0x2f)for(float& f:s.vf[22])f=value(c.right);
   else s.vf[22][broadcast]=value(c.right);
-  vu.execUpper((mask<<21)|(22u<<16)|(18u<<11)|(19u<<6)|opcode);
+  execUpper(vu,(mask<<21)|(22u<<16)|(18u<<11)|(19u<<6)|opcode);
   for(unsigned i=0;i<4;++i) {
    const auto expected=(mask&(8u>>i))?(maximum?c.maximum:c.minimum):0xdeadbeef;
    if(bits(s.vf[19][i])!=expected) {
@@ -55,9 +61,9 @@ int main(){try{
  // Synthetic comparison/conversion sequence: RGB become integers while raw
  // alpha128 transported in W survives. No game instruction bytes are used.
  auto& s=vu.state();s.vf[3][0]=63.5f;s.vf[3][1]=83.5f;s.vf[3][2]=94.5f;s.vf[3][3]=value(0x80);s.i=255.0f;
- vu.execUpper((15u<<21)|(3u<<11)|(4u<<6)|0x1fu); // MINIi.xyzw VF4,VF3,I
+ execUpper(vu,(15u<<21)|(3u<<11)|(4u<<6)|0x1fu); // MINIi.xyzw VF4,VF3,I
  require(bits(s.vf[4][3])==0x80,"terrain MINIi must preserve raw alpha128");
- vu.execUpper((14u<<21)|(4u<<16)|(4u<<11)|(5u<<6)|0x3cu); // FTOI0.xyz VF4,VF4
+ execUpper(vu,(14u<<21)|(4u<<16)|(4u<<11)|(5u<<6)|0x3cu); // FTOI0.xyz VF4,VF4
  require(bits(s.vf[4][0])==63&&bits(s.vf[4][1])==83&&bits(s.vf[4][2])==94&&bits(s.vf[4][3])==128,"terrain RGBA conversion sequence");
  for(unsigned mask:{0u,1u,14u,15u}){
   check(vu,0x2f,false,mask,0);check(vu,0x2b,true,mask,0);

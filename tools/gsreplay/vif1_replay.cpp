@@ -28,6 +28,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#if defined(_WIN32)
+#include <stdlib.h>
+// MSVC CRT equivalents; an empty value removes the variable.
+static int setenv(const char *name, const char *value, int) { return _putenv_s(name, value); }
+static int unsetenv(const char *name) { return _putenv_s(name, ""); }
+#endif
 #include <string>
 #include <vector>
 

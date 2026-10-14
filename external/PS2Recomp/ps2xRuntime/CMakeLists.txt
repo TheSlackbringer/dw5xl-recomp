@@ -257,14 +257,21 @@ elseif(WIN32)
     include(ExternalProject)
 
     set(FFMPEG_PREBUILT_TAG "n7.1-241205")
-    set(FFMPEG_PREBUILT_URL
-        "https://github.com/System233/ffmpeg-msvc-prebuilt/releases/download/${FFMPEG_PREBUILT_TAG}/ffmpeg-${FFMPEG_PREBUILT_TAG}-lgpl-amd64-shared.zip")
+    # Overridable so an offline build can point at an already downloaded copy
+    # of the same archive (a local path is accepted).
+    set(PS2X_FFMPEG_PREBUILT_URL
+        "https://github.com/System233/ffmpeg-msvc-prebuilt/releases/download/${FFMPEG_PREBUILT_TAG}/ffmpeg-${FFMPEG_PREBUILT_TAG}-lgpl-amd64-shared.zip"
+        CACHE STRING "Windows FFmpeg prebuilt archive (URL or local .zip path)")
+    set(FFMPEG_PREBUILT_URL "${PS2X_FFMPEG_PREBUILT_URL}")
 
     set(FFMPEG_PREFIX_DIR "${CMAKE_BINARY_DIR}/ThirdParty/ffmpeg-prefix")
     set(FFMPEG_SOURCE_DIR "${FFMPEG_PREFIX_DIR}/src/ffmpeg_external")
     set(FFMPEG_INCLUDE_DIR "${FFMPEG_SOURCE_DIR}/include")
     set(FFMPEG_LIB_DIR "${FFMPEG_SOURCE_DIR}/bin")
     set(FFMPEG_BIN_DIR "${FFMPEG_SOURCE_DIR}/bin")
+    # The archive is extracted at build time, but CMake rejects imported targets
+    # whose include directory does not exist at generate time.
+    file(MAKE_DIRECTORY "${FFMPEG_INCLUDE_DIR}")
 
     ExternalProject_Add(ffmpeg_external
         URL "${FFMPEG_PREBUILT_URL}"
