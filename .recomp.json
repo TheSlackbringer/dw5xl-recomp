@@ -1,9 +1,11 @@
 {
+  "$schema": "https://recomp.fyi/schema/v1.json",
   "game": "Dynasty Warriors 5: Xtreme Legends",
+  "wikidata": "Q247161",
   "system": "PS2",
   "type": "recomp",
-  "toolchain": "PS2Recomp",
   "status": "in-progress",
+  "toolchain": "Ps2recomp",
   "original": { "region": "Europe", "serial": "SLES-53860" },
   "targets": ["Linux", "Windows"]
 }
