@@ -468,6 +468,10 @@ public:
 
     inline GS &gs() { return m_gs; }
     inline const GS &gs() const { return m_gs; }
+    inline void setResolutionScale(uint32_t scale) { m_gs.setResolutionScale(scale); }
+    inline uint32_t getResolutionScale() const { return m_gs.getResolutionScale(); }
+    inline void SetResolutionScale(uint32_t scale) { m_gs.setResolutionScale(scale); }
+    inline uint32_t GetResolutionScale() const { return m_gs.getResolutionScale(); }
     inline GifArbiter &gifArbiter() { return m_gifArbiter; }
     inline const GifArbiter &gifArbiter() const { return m_gifArbiter; }
     inline VU1Interpreter &vu0() { return m_vu0; }

@@ -56,5 +56,12 @@ int main() {
     require(other.present(p,1,h,8,2,false,Mode::FullHeightField)); check(p,{8,8,10});
     h=4;p=rows({1});
     require(!w.present(p,1,h,8,3,true,Mode::FullHeightField));
+    // High-contrast comb teeth in fast motion are adaptively blended towards spatial neighbors.
+    ReusableFieldWeaver combWeaver;
+    h=2;p=rows({200,200});
+    require(combWeaver.present(p,1,h,8,40,false,Mode::HalfHeightFrame));
+    h=2;p=rows({0,0});
+    require(combWeaver.present(p,1,h,8,41,true,Mode::HalfHeightFrame));
+    require(p.at(2*8) < 50);
     std::cout << "Field history tests passed\n";
 }

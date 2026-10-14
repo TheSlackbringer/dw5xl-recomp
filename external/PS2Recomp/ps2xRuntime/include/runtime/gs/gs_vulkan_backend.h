@@ -26,6 +26,8 @@ public:
     void WriteVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override;
     void SnapshotVram(std::vector<uint8_t> &) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
+    void SetResolutionScale(uint32_t scale) override;
+    uint32_t GetResolutionScale() const override;
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;

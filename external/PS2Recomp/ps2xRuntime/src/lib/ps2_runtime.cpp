@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cfenv>
 #include <limits>
 #include <chrono>
 #include <atomic>
@@ -773,6 +774,124 @@ namespace ps2x_dev
     };
 }
 
+namespace
+{
+static uint32_t loadResolutionScaleFromIni()
+{
+    std::ifstream file("dw5xl.ini");
+    if (!file.is_open())
+        return 1;
+    std::string line;
+    while (std::getline(file, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+
+        size_t commentPos = line.find_first_of(";#");
+        if (commentPos != std::string::npos)
+            line.erase(commentPos);
+
+        size_t eqPos = line.find('=');
+        if (eqPos == std::string::npos)
+            continue;
+
+        std::string key = line.substr(0, eqPos);
+        std::string val = line.substr(eqPos + 1);
+
+        auto trim = [](std::string &s) {
+            size_t first = s.find_first_not_of(" \t");
+            if (first == std::string::npos) { s.clear(); return; }
+            size_t last = s.find_last_not_of(" \t");
+            s = s.substr(first, (last - first + 1));
+        };
+        trim(key);
+        trim(val);
+
+        if (key == "resolution_scale")
+        {
+            try {
+                int scale = std::stoi(val);
+                if (scale == 1 || scale == 2 || scale == 4 || scale == 8 || scale == 16)
+                    return static_cast<uint32_t>(scale);
+                return 1;
+            } catch (...) {
+                return 1;
+            }
+        }
+    }
+    return 1;
+}
+
+static void saveResolutionScaleToIni(uint32_t scale)
+{
+    std::vector<std::string> lines;
+    bool found = false;
+    {
+        std::ifstream file("dw5xl.ini");
+        if (file.is_open())
+        {
+            std::string line;
+            while (std::getline(file, line))
+            {
+                std::string rawLine = line;
+                if (!rawLine.empty() && rawLine.back() == '\r')
+                    rawLine.pop_back();
+
+                std::string trimmed = rawLine;
+                std::string comment;
+                size_t commentPos = trimmed.find_first_of(";#");
+                if (commentPos != std::string::npos)
+                {
+                    comment = trimmed.substr(commentPos);
+                    trimmed.erase(commentPos);
+                }
+
+                size_t eqPos = trimmed.find('=');
+                if (eqPos != std::string::npos)
+                {
+                    std::string key = trimmed.substr(0, eqPos);
+                    size_t first = key.find_first_not_of(" \t");
+                    if (first != std::string::npos)
+                    {
+                        size_t last = key.find_last_not_of(" \t");
+                        key = key.substr(first, (last - first + 1));
+                    }
+                    else
+                    {
+                        key.clear();
+                    }
+
+                    if (key == "resolution_scale")
+                    {
+                        std::string newLine = "resolution_scale=" + std::to_string(scale);
+                        if (!comment.empty())
+                            newLine += " " + comment;
+                        lines.push_back(newLine);
+                        found = true;
+                        continue;
+                    }
+                }
+                lines.push_back(rawLine);
+            }
+        }
+    }
+
+    if (!found)
+    {
+        lines.push_back("resolution_scale=" + std::to_string(scale));
+    }
+
+    std::ofstream out("dw5xl.ini");
+    if (out.is_open())
+    {
+        for (const auto &l : lines)
+        {
+            out << l << "\n";
+        }
+    }
+}
+} // namespace
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -1204,6 +1323,16 @@ bool PS2Runtime::initialize(const char *title)
         {
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
             return false;
+        }
+
+        const char *scaleEnv = std::getenv("PS2X_GS_SCALE");
+        if (!scaleEnv || !*scaleEnv)
+        {
+            uint32_t iniScale = loadResolutionScaleFromIni();
+            if (iniScale != 1)
+            {
+                m_gs.setResolutionScale(iniScale);
+            }
         }
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
@@ -2979,9 +3108,27 @@ void PS2Runtime::run()
     ps2_host_input::poll();
     std::atomic<bool> gameThreadFinished{false};
 
+    const char *scaleEnv = std::getenv("PS2X_GS_SCALE");
+    if (!scaleEnv || !*scaleEnv)
+    {
+        uint32_t iniScale = loadResolutionScaleFromIni();
+        if (iniScale != m_gs.getResolutionScale())
+        {
+            m_gs.setResolutionScale(iniScale);
+        }
+    }
+
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        // DW5XL-TEST (opt-in experiment, owner decision pending): PS2 EE FPU and VU0 macro arithmetic
+        // truncate (round toward zero); the host default is round-to-nearest. PS2X_EE_ROUND=zero runs
+        // all guest EE code (one host GameThread) toward zero. Default unchanged.
+        if (const char *eeRound = std::getenv("PS2X_EE_ROUND"); eeRound && std::strcmp(eeRound, "zero") == 0)
+        {
+            std::fesetround(FE_TOWARDZERO);
+            std::fprintf(stderr, "[ee:round] GameThread uses round-toward-zero (PS2X_EE_ROUND=zero)\n");
+        }
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
@@ -3077,6 +3224,13 @@ void PS2Runtime::run()
         {
             s_showFpsOverlay = !s_showFpsOverlay;
         }
+        if (IsKeyPressed(KEY_F4))
+        {
+            uint32_t currentScale = m_gs.getResolutionScale();
+            uint32_t nextScale = (currentScale == 1) ? 2 : ((currentScale == 2) ? 4 : 1);
+            m_gs.setResolutionScale(nextScale);
+            saveResolutionScaleToIni(nextScale);
+        }
 
         static auto s_lastFpsTime = std::chrono::steady_clock::now();
         static uint64_t s_lastVsyncTick = 0;
@@ -3096,7 +3250,7 @@ void PS2Runtime::run()
 
         if (s_showFpsOverlay && !IsWindowHidden())
         {
-            const char *fpsText = TextFormat("FPS: %d  |  VSync: %.1f", s_cachedHostFps, s_vsyncRate);
+            const char *fpsText = TextFormat("FPS: %d  |  VSync: %.1f  |  Scale: %dx", s_cachedHostFps, s_vsyncRate, m_gs.getResolutionScale());
             constexpr int kFontSize = 18;
             const int textW = MeasureText(fpsText, kFontSize);
             DrawRectangle(8, 8, textW + 16, kFontSize + 10, Fade(BLACK, 0.75f));

@@ -1819,3 +1819,22 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
         m_hasPreferredDisplaySource = true;
     }
 }
+
+void GS::setResolutionScale(uint32_t scale)
+{
+    std::lock_guard<std::mutex> lock(m_backendLifetimeMutex);
+    if (m_backend)
+    {
+        m_backend->SetResolutionScale(scale);
+    }
+}
+
+uint32_t GS::getResolutionScale() const
+{
+    std::lock_guard<std::mutex> lock(m_backendLifetimeMutex);
+    if (m_backend)
+    {
+        return m_backend->GetResolutionScale();
+    }
+    return 1;
+}

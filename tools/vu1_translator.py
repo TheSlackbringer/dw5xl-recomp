@@ -523,6 +523,12 @@ if __name__ == '__main__':
         ('baa8e61743cea7a2', 0x0040, 0x00f0, 'lift_battle_init_0040'),
         ('baa8e61743cea7a2', 0x00f0, 0x0230, 'lift_battle_stream_00f0'),
         ('84a67c1d4789e87b', 0x0230, 0x0370, 'lift_battle_clip_0230'),
+        ('60b13c6c3365e06a', 0x0800, 0x0b88, 'lift_battle_shadows_0800'),
+        ('84a67c1d4789e87b', 0x0000, 0x0028, 'lift_battle_stream_0000'),
+        ('3a4f0cd1c30a3aef', 0x0370, 0x04b0, 'lift_battle_clip_0370'),
+        ('3a4f0cd1c30a3aef', 0x04b0, 0x05f0, 'lift_battle_clip_04b0'),
+        ('da28291ffe0b3334', 0x0060, 0x00f0, 'lift_battle_init_0060'),
+        ('87e0189b1bc04e8e', 0x0028, 0x00f0, 'lift_battle_init_0028'),
     ]
 
     out = []
@@ -617,36 +623,52 @@ inline V vuItofV(V a, float scale)
     regs.append("    { 0xfb6ec66cb41b245full, 0x0050, lift_da28_0050, 0u },")
     regs.append("")
     regs.append("    // Image-specific registrations for dynamic battle images:")
-    regs.append("    { 0x3249a2515e770fccull, 0x0800, lift_battle_actor_skinning_0800, 0u },")
-    regs.append("    { 0xc93b67a8d567d56full, 0x0800, lift_battle_actor_skinning_0800, 0u },")
-    regs.append("    { 0xadc8836e4f4da918ull, 0x0800, lift_battle_actor_skinning_0800, 0u },")
-    regs.append("    { 0xbaa8e61743cea7a2ull, 0x0800, lift_battle_mesh_0800, 0u },")
-    regs.append("    { 0xbaa8e61743cea7a2ull, 0x2400, lift_battle_fx_2400, 0u },")
-    regs.append("    { 0xbaa8e61743cea7a2ull, 0x0040, lift_battle_init_0040, 0u },")
-    regs.append("    { 0xbaa8e61743cea7a2ull, 0x00f0, lift_battle_stream_00f0, 0u },")
-    regs.append("    { 0x84a67c1d4789e87bull, 0x2400, lift_battle_fx_2400, 0u },")
-    regs.append("    { 0x84a67c1d4789e87bull, 0x0800, lift_battle_mesh_0800, 0u },")
-    regs.append("    { 0x84a67c1d4789e87bull, 0x0040, lift_battle_init_0040, 0u },")
-    regs.append("    { 0x84a67c1d4789e87bull, 0x0230, lift_battle_clip_0230, 0u },")
-    regs.append("    { 0xb525f25c16e3205full, 0x0800, lift_battle_mesh_0800, 0u },")
-    regs.append("    { 0xb525f25c16e3205full, 0x2400, lift_battle_fx_2400, 0u },")
-    regs.append("    { 0xb525f25c16e3205full, 0x0040, lift_battle_init_0040, 0u },")
-    regs.append("    { 0x64127817c106b85aull, 0x2400, lift_battle_particles_2400, 0u },")
-    regs.append("    { 0x64127817c106b85aull, 0x0040, lift_battle_init_0040, 0u },")
-    regs.append("    { 0x46d6ccb25f6b8d32ull, 0x2400, lift_battle_terrain_2400, 0u },")
-    regs.append("    { 0x46d6ccb25f6b8d32ull, 0x0800, lift_battle_water_0800, 0u },")
-    regs.append("    { 0x49f60042ec1ea159ull, 0x2400, lift_battle_particles_2400, 0u },")
-    regs.append("    { 0x49f60042ec1ea159ull, 0x0040, lift_battle_init_0040, 0u },")
-    regs.append("    { 0xe7d7cb4fef6b9efaull, 0x2400, lift_battle_terrain_2400, 0u },")
-    regs.append("    { 0xe7d7cb4fef6b9efaull, 0x0800, lift_battle_water_0800, 0u },")
-    regs.append("    { 0x563f13c8dedc09e4ull, 0x2400, lift_battle_fx_2400, 0u },")
-    regs.append("    { 0x563f13c8dedc09e4ull, 0x0800, lift_battle_mesh_0800, 0u },")
-    regs.append("    { 0x563f13c8dedc09e4ull, 0x0040, lift_battle_init_0040, 0u },")
-    regs.append("    { 0x60b13c6c3365e06aull, 0x2400, lift_battle_shadows_2400, 0u },")
-    regs.append("    { 0x0085daedcc3e27a7ull, 0x2400, lift_battle_shadows_2400, 0u },")
-    regs.append("    { 0x6e15f776d6fcfae3ull, 0x2400, lift_battle_fx_2400, 0u },")
-    regs.append("    { 0x8475f45d07f11326ull, 0x2400, lift_battle_particles_2400, 0u },")
-    regs.append("    { 0xd2b8165963d8189full, 0x2400, lift_battle_shadows_2400, 0u },")
+
+    # Map subroutines to names for full-image matching
+    sub_map = {}
+    for h, pc, end_pc, name in targets:
+        if h not in bins:
+            print(f"Skipping {name}: no captured microcode for {h}")
+            continue
+        code = bins[h]
+        sub_code = code[pc:end_pc+8]
+        sub_size = len(sub_code)
+        sub_hash = fnv1a_64(sub_code)
+        sub_map[(sub_hash, pc, sub_size)] = name
+
+    flush_0220_code = bins['baa8e61743cea7a2'][0x0220:0x0230]
+    flush_0360_code = bins['baa8e61743cea7a2'][0x0360:0x0370]
+    sub_map[(fnv1a_64(flush_0220_code), 0x0220, 16)] = 'lift_flush_0220'
+    sub_map[(fnv1a_64(flush_0360_code), 0x0360, 16)] = 'lift_flush_0360'
+
+    # Match all dynamic battle images from real census
+    census_regs = {}
+    import os
+    if os.path.exists('notes/evidence/battle_real_census.tsv'):
+        with open('notes/evidence/battle_real_census.tsv') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'): continue
+                parts = line.split()
+                h_str = parts[0]
+                pc = int(parts[1], 16)
+                if h_str not in bins: continue
+                code = bins[h_str]
+                for (sub_h, sub_pc, sz), name in sub_map.items():
+                    if sub_pc == pc:
+                        chunk = code[pc:pc+sz]
+                        if len(chunk) == sz and fnv1a_64(chunk) == sub_h:
+                            ih = int(h_str, 16)
+                            census_regs[(ih, pc)] = name
+                            break
+
+    existing_set = set(regs)
+    for (ih, pc), name in sorted(census_regs.items()):
+        reg_str = f"    {{ 0x{ih:016x}ull, 0x{pc:04x}, {name}, 0u }},"
+        if reg_str not in existing_set:
+            regs.append(reg_str)
+            existing_set.add(reg_str)
+
     regs.append("")
     regs.append("    // Subroutine-level footprint registrations (matches across all dynamic images):")
 

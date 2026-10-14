@@ -214,6 +214,16 @@ namespace
             return m_inner->GetTransferSnapshot();
         }
 
+        void SetResolutionScale(uint32_t scale) override
+        {
+            m_inner->SetResolutionScale(scale);
+        }
+
+        uint32_t GetResolutionScale() const override
+        {
+            return m_inner->GetResolutionScale();
+        }
+
     private:
         // Records are assembled in m_buffer, then written as op | u32 size | payload.
         bool begin(Op value) const

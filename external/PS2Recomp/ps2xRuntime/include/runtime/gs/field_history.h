@@ -83,9 +83,68 @@ public:
         for (uint32_t y = 0; y < outputHeight; ++y)
         {
             const bool currentRow = (y & 1u) == parity;
-            const auto &source = currentRow || !pair ? current : opposite;
-            std::memcpy(pixels.data() + static_cast<size_t>(y) * strideBytes,
-                        source.data() + static_cast<size_t>(y / 2u) * rowBytes, rowBytes);
+            uint8_t *dstRow = pixels.data() + static_cast<size_t>(y) * strideBytes;
+            if (currentRow || !pair)
+            {
+                std::memcpy(dstRow, current.data() + static_cast<size_t>(y / 2u) * rowBytes, rowBytes);
+            }
+            else
+            {
+                const int32_t topIdx = parity == 0u ? static_cast<int32_t>(y / 2u)
+                                                    : static_cast<int32_t>(y / 2u) - 1;
+                const int32_t botIdx = parity == 0u ? static_cast<int32_t>(y / 2u) + 1
+                                                    : static_cast<int32_t>(y / 2u);
+                const uint8_t *oppRow = opposite.data() + static_cast<size_t>(y / 2u) * rowBytes;
+                if (topIdx < 0 || botIdx >= static_cast<int32_t>(fieldHeight))
+                {
+                    std::memcpy(dstRow, oppRow, rowBytes);
+                }
+                else
+                {
+                    const uint8_t *topRow = current.data() + static_cast<size_t>(topIdx) * rowBytes;
+                    const uint8_t *botRow = current.data() + static_cast<size_t>(botIdx) * rowBytes;
+                    for (uint32_t x = 0; x < width; ++x)
+                    {
+                        const size_t px = static_cast<size_t>(x) * 4u;
+                        int combMax = 0;
+                        for (size_t ch = 0; ch < 3u; ++ch)
+                        {
+                            const int vo = oppRow[px + ch];
+                            const int vt = topRow[px + ch];
+                            const int vb = botRow[px + ch];
+                            const int low = std::min(vt, vb);
+                            const int high = std::max(vt, vb);
+                            constexpr int T = 20;
+                            int d = 0;
+                            if (vo > high + T)
+                                d = vo - (high + T);
+                            else if (vo < low - T)
+                                d = (low - T) - vo;
+                            if (d > combMax)
+                                combMax = d;
+                        }
+                        if (combMax == 0)
+                        {
+                            dstRow[px + 0] = oppRow[px + 0];
+                            dstRow[px + 1] = oppRow[px + 1];
+                            dstRow[px + 2] = oppRow[px + 2];
+                        }
+                        else
+                        {
+                            const int w = std::min(32, combMax);
+                            for (size_t ch = 0; ch < 3u; ++ch)
+                            {
+                                const int vo = oppRow[px + ch];
+                                const int vt = topRow[px + ch];
+                                const int vb = botRow[px + ch];
+                                const int avg = (vt + vb + 1) / 2;
+                                dstRow[px + ch] = static_cast<uint8_t>(((32 - w) * vo + w * avg + 16) / 32);
+                            }
+                        }
+                        dstRow[px + 3] = oppRow[px + 3];
+                    }
+                }
+            }
         }
         height = outputHeight;
         m_lastTick = tick;

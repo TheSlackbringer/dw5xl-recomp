@@ -150,6 +150,11 @@ public:
     void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
     uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
 
+    void setResolutionScale(uint32_t scale);
+    uint32_t getResolutionScale() const;
+    void SetResolutionScale(uint32_t scale) { setResolutionScale(scale); }
+    uint32_t GetResolutionScale() const { return getResolutionScale(); }
+
 private:
     void snapshotVRAM();
     void writeRegisterUnlocked(uint8_t regAddr, uint64_t value);

@@ -8,6 +8,7 @@
 #include "thread_id.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -58,6 +59,7 @@ struct GSVulkanBackend::Impl
     bool initialized = false;
     uint64_t draws = 0;
     uint64_t gpuPresentations = 0, convertedPresentations = 0;
+    std::atomic<uint32_t> currentScale{1};
 
     Impl()
     {
@@ -73,17 +75,18 @@ struct GSVulkanBackend::Impl
         device.init_frame_contexts(4);
 
         ParallelGS::GSOptions opts{};
+        opts.dynamic_super_sampling = true;
         const char *scaleEnv = std::getenv("PS2X_GS_SCALE");
         if (scaleEnv && *scaleEnv)
         {
             int scale = std::atoi(scaleEnv);
             switch (scale)
             {
-            case 2: opts.super_sampling = ParallelGS::SuperSampling::X2; break;
-            case 4: opts.super_sampling = ParallelGS::SuperSampling::X4; break;
-            case 8: opts.super_sampling = ParallelGS::SuperSampling::X8; break;
-            case 16: opts.super_sampling = ParallelGS::SuperSampling::X16; break;
-            default: opts.super_sampling = ParallelGS::SuperSampling::X1; break;
+            case 2: opts.super_sampling = ParallelGS::SuperSampling::X2; currentScale.store(2, std::memory_order_relaxed); break;
+            case 4: opts.super_sampling = ParallelGS::SuperSampling::X4; currentScale.store(4, std::memory_order_relaxed); break;
+            case 8: opts.super_sampling = ParallelGS::SuperSampling::X8; currentScale.store(8, std::memory_order_relaxed); break;
+            case 16: opts.super_sampling = ParallelGS::SuperSampling::X16; currentScale.store(16, std::memory_order_relaxed); break;
+            default: opts.super_sampling = ParallelGS::SuperSampling::X1; currentScale.store(1, std::memory_order_relaxed); break;
             }
         }
 
@@ -340,4 +343,27 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
             static_cast<unsigned long long>(p.draws), static_cast<unsigned long long>(p.gpuPresentations),
             static_cast<unsigned long long>(p.convertedPresentations));
     return result;
+}
+
+void GSVulkanBackend::SetResolutionScale(uint32_t scale)
+{
+    auto lock = m_impl->access();
+    ParallelGS::SuperSampling ss = ParallelGS::SuperSampling::X1;
+    switch (scale)
+    {
+    case 2: ss = ParallelGS::SuperSampling::X2; break;
+    case 4: ss = ParallelGS::SuperSampling::X4; break;
+    case 8: ss = ParallelGS::SuperSampling::X8; break;
+    case 16: ss = ParallelGS::SuperSampling::X16; break;
+    default: ss = ParallelGS::SuperSampling::X1; scale = 1; break;
+    }
+    m_impl->gs.flush();
+    m_impl->gs.set_super_sampling_rate(ss, true, false);
+    m_impl->currentScale.store(scale, std::memory_order_relaxed);
+    std::fprintf(stderr, "[gs:vulkan] Dynamic resolution scale changed to %ux\n", scale);
+}
+
+uint32_t GSVulkanBackend::GetResolutionScale() const
+{
+    return m_impl->currentScale.load(std::memory_order_relaxed);
 }
