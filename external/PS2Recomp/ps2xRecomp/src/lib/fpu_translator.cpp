@@ -53,22 +53,12 @@ namespace ps2recomp
             case COP1_S_MUL:
                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_DIV:
-                return fmt::format("if (ctx->f[{}] == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
-                                   "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
-                                   "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
-                                   ft, fd, fs, fd, fs, ft);
+                // The EE has no Inf/NaN: x/0 gives +-max (sign of fs xor ft), see ps2_fdiv.
+                return fmt::format("{{ if (ctx->f[{}] == 0.0f) ctx->fcr31 |= 0x100000; /* DZ flag */ "
+                                   "ctx->f[{}] = FPU_DIV_S(ctx->f[{}], ctx->f[{}]); }}",
+                                   ft, fd, fs, ft);
             case COP1_S_SQRT:
-                // Unlike standard MIPS SQRT.S, the EE reads Ft (bits 16..20).
-                // Capture it before writing Fd, which may alias either source.
-                return fmt::format(
-                    "{{ uint32_t bits; std::memcpy(&bits, &ctx->f[{}], sizeof(bits)); "
-                    "ctx->fcr31 &= ~0x00030000u; "
-                    "if ((bits & 0x7F800000u) == 0u) {{ bits &= 0x80000000u; "
-                    "std::memcpy(&ctx->f[{}], &bits, sizeof(bits)); }} "
-                    "else {{ if (bits & 0x80000000u) ctx->fcr31 |= 0x00020040u; "
-                    "bits &= 0x7FFFFFFFu; if ((bits & 0x7F800000u) == 0x7F800000u) bits = 0x7F7FFFFFu; "
-                    "float input; std::memcpy(&input, &bits, sizeof(input)); "
-                    "ctx->f[{}] = FPU_SQRT_S(input); }} }}", ft, fd, fd);
+                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
             case COP1_S_ABS:
                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
             case COP1_S_MOV:
@@ -86,30 +76,8 @@ namespace ps2recomp
             case COP1_S_CVT_W:
                 return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
             case COP1_S_RSQRT:
-                // EE RSQRT.S computes Fs / sqrt(abs(Ft)), not 1 / sqrt(Fs).
-                return fmt::format(
-                    "{{ uint32_t numeratorBits, denominatorBits; "
-                    "std::memcpy(&numeratorBits, &ctx->f[{}], sizeof(numeratorBits)); "
-                    "std::memcpy(&denominatorBits, &ctx->f[{}], sizeof(denominatorBits)); "
-                    "ctx->fcr31 &= ~0x00030000u; "
-                    "if ((denominatorBits & 0x7F800000u) == 0u) {{ "
-                    "ctx->fcr31 |= 0x00010020u; "
-                    "uint32_t resultBits = (denominatorBits & 0x80000000u) | 0x7F7FFFFFu; "
-                    "std::memcpy(&ctx->f[{}], &resultBits, sizeof(resultBits)); }} "
-                    "else {{ if (denominatorBits & 0x80000000u) ctx->fcr31 |= 0x00020040u; "
-                    "denominatorBits &= 0x7FFFFFFFu; "
-                    "if ((denominatorBits & 0x7F800000u) == 0x7F800000u) denominatorBits = 0x7F7FFFFFu; "
-                    "if ((numeratorBits & 0x7F800000u) == 0u) numeratorBits &= 0x80000000u; "
-                    "else if ((numeratorBits & 0x7F800000u) == 0x7F800000u) "
-                    "numeratorBits = (numeratorBits & 0x80000000u) | 0x7F7FFFFFu; "
-                    "float numerator, denominator; std::memcpy(&numerator, &numeratorBits, sizeof(numerator)); "
-                    "std::memcpy(&denominator, &denominatorBits, sizeof(denominator)); "
-                    "float result = numerator / FPU_SQRT_S(denominator); uint32_t resultBits; "
-                    "std::memcpy(&resultBits, &result, sizeof(resultBits)); "
-                    "if ((resultBits & 0x7F800000u) == 0u) resultBits &= 0x80000000u; "
-                    "else if ((resultBits & 0x7F800000u) == 0x7F800000u) "
-                    "resultBits = (resultBits & 0x80000000u) | 0x7F7FFFFFu; "
-                    "std::memcpy(&ctx->f[{}], &resultBits, sizeof(resultBits)); }} }}", fs, ft, fd, fd);
+                // RSQRT.S fd, fs, ft computes fs / sqrt(ft), not 1 / sqrt(fs).
+                return fmt::format("ctx->f[{}] = FPU_RSQRT_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_ADDA:
                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
             case COP1_S_SUBA:

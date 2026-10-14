@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cctype>
+#include "runtime/ps2_device_queue.h"
 
 namespace
 {
