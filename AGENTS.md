@@ -2,6 +2,26 @@
 
 This file contains general guidance for coding agents. Read `notes/PROJECT_SETUP.md` for current target and setup requirements, `notes/BRINGUP.md` for investigation history, and `notes/SHIPPING_RESEARCH.md` before changing player setup. `CLAUDE.md` holds the general rules in shorter form.
 
+## Durable project memory
+
+- At session start, after context loss/compaction, and before resuming another agent's
+  work, read `notes/PROJECT.md`, the newest `notes/CLAUDE_HANDOFF.md` section and relevant
+  evidence, then verify Git status/diff and build settings. The chat is not the project
+  state. Current verified project memory supersedes older status summaries, not rules.
+- Keep `notes/PROJECT.md` concise and current: architecture, agreed requirements and
+  decisions, implemented behavior with validation limits, known bugs, current dirty
+  files/build settings, pending approvals, next steps and evidence links. Keep detailed
+  plans/specs/investigations in separate local notes and link them from PROJECT.md.
+- Update it after meaningful discoveries, tests, fixes or user decisions, and before
+  long work batches or handing off. Preserve unfinished agent reports/proposals and
+  essential evidence in `notes/evidence/`; never rely solely on chat or `/tmp`.
+- Check usage when available before expensive batches and periodically during long
+  work. At 10% remaining or less, checkpoint promptly before more work; do not wait
+  for zero. Regular checkpoints remain required even without usage information.
+- Clearly distinguish approved/applied/tested from proposed/unverified work. Record
+  exact reproduction commands, remaining decisions and a short restart prompt.
+  Ignore rules remain in force: notes are local and are not transferred by Git push.
+
 ## 1. Goal
 Native Linux port of **Dynasty Warriors 5 Xtreme Legends** via static recompilation with
 **PS2Recomp** (MIPS R5900 → C++). Target: XL fully playable natively, including XL's **Load Original** feature that reads

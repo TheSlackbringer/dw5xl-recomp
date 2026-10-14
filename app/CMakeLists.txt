@@ -125,6 +125,16 @@ if(DW5XL_BUILD_TESTS)
     target_link_libraries(dw5xl_vif_unpack_boundary_test PRIVATE ps2_runtime)
     target_compile_options(dw5xl_vif_unpack_boundary_test PRIVATE -march=x86-64-v3)
     add_test(NAME vif_unpack_boundary COMMAND dw5xl_vif_unpack_boundary_test)
+    add_executable(dw5xl_vu_minmax_test tests/vu_minmax_test.cpp)
+    target_link_libraries(dw5xl_vu_minmax_test PRIVATE ps2_runtime)
+    target_compile_options(dw5xl_vu_minmax_test PRIVATE -march=x86-64-v3)
+    add_test(NAME vu_minmax COMMAND dw5xl_vu_minmax_test)
+    add_executable(dw5xl_ee_poll_sema_test tests/ee_poll_sema_test.cpp
+        "${DW5XL_GENERATED_DIR}/FUN_00144c70_0x144c70.cpp")
+    target_link_libraries(dw5xl_ee_poll_sema_test PRIVATE ps2_runtime)
+    target_include_directories(dw5xl_ee_poll_sema_test PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
+    target_compile_options(dw5xl_ee_poll_sema_test PRIVATE -march=x86-64-v3)
+    add_test(NAME ee_poll_sema COMMAND dw5xl_ee_poll_sema_test)
     add_executable(dw5xl_original_gs_helper_test tests/original_gs_helper_test.cpp
         "${DW5XL_GENERATED_DIR}/FUN_00110c78_0x110c78.cpp"
         "${DW5XL_GENERATED_DIR}/FUN_001111d8_0x1111d8.cpp")

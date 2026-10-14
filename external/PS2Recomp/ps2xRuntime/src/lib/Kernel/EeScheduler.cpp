@@ -940,14 +940,15 @@ int EeScheduler::signalSemaphore(int id, bool interruptSafe)
 int EeScheduler::pollSemaphore(int id)
 {
     assertExecutor();
+    // EE PollSema/iPollSema return -1 on failure, unlike IOP error codes.
     EeSemaphore *object = semaphore(id);
     if (!object)
     {
-        return KE_UNKNOWN_SEMID;
+        return -1;
     }
     if (object->count == 0)
     {
-        return KE_SEMA_ZERO;
+        return -1;
     }
     --object->count;
     publishSnapshot();

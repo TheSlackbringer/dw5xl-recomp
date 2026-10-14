@@ -41,6 +41,16 @@ struct VulkanGsScanoutState
     std::array<RbSlot, 3> slots{};
     uint32_t ringIndex = 0;
     PresentationFrame lastFrame{};
+    // Opt-in observation only. Does not select slots or alter fence handling.
+    struct Metrics
+    {
+        uint64_t requests = 0, consumed = 0, consumeBackwards = 0;
+        uint64_t duplicates = 0, returnedBackwards = 0, notReady = 0;
+        uint64_t fullRingWaits = 0, waitTimeouts = 0;
+        uint64_t waitNs = 0, maxWaitNs = 0, ageSum = 0, ageMax = 0;
+        uint64_t consumedTick = 0, returnedTick = 0, lastLogNs = 0;
+        bool hasConsumed = false, hasReturned = false;
+    } metrics{};
 
     void reset()
     {
@@ -55,6 +65,7 @@ struct VulkanGsScanoutState
         }
         ringIndex = 0;
         lastFrame = {};
+        metrics = {};
     }
 };
 

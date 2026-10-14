@@ -10,6 +10,26 @@ Read `notes/PROJECT_SETUP.md` for current target and setup requirements, and `no
 Read `notes/BRINGUP.md` first: it is the running log of every fix, the current blocker and the "NEXT" list.
 Keep it up to date (append dated sections; record causes, fixes, debug switches and lessons).
 
+## Durable project memory
+
+- At session start, after context loss/compaction, and before resuming another agent's
+  work, read `notes/PROJECT.md`, the newest `notes/CLAUDE_HANDOFF.md` section and relevant
+  evidence, then verify Git status/diff and build settings. The chat is not the project
+  state. Current verified project memory supersedes older status summaries, not rules.
+- Keep `notes/PROJECT.md` concise and current: architecture, agreed requirements and
+  decisions, implemented behavior with validation limits, known bugs, current dirty
+  files/build settings, pending approvals, next steps and evidence links. Keep detailed
+  plans/specs/investigations in separate local notes and link them from PROJECT.md.
+- Update it after meaningful discoveries, tests, fixes or user decisions, and before
+  long work batches or handing off. Preserve unfinished agent reports/proposals and
+  essential evidence in `notes/evidence/`; never rely solely on chat or `/tmp`.
+- Check usage when available before expensive batches and periodically during long
+  work. At 10% remaining or less, checkpoint promptly before more work; do not wait
+  for zero. Regular checkpoints remain required even without usage information.
+- Clearly distinguish approved/applied/tested from proposed/unverified work. Record
+  exact reproduction commands, remaining decisions and a short restart prompt.
+  Ignore rules remain in force: notes are local and are not transferred by Git push.
+
 ## RULES
 - **Scope changes require explicit approval.** Present the proposed scope before
   acting; do not expand it or infer approval from a general request. After approval, carry out the work

@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 
 
 namespace
@@ -62,6 +63,16 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
 {
     using namespace ParallelGS;
     using namespace Vulkan;
+    static const bool metricsEnabled = [] {
+        const char *value = std::getenv("PS2X_GS_FRAME_METRICS");
+        return value && *value && *value != '0';
+    }();
+    auto nowNs = []() -> uint64_t {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    };
+    auto &metrics = state.metrics;
+    if (metricsEnabled) ++metrics.requests;
     auto pmode = Reg64<PMODEBits>(request.pmode).desc;
     const bool interlaced = (request.smode2 & 1u) != 0;
     const bool frameMode = (request.smode2 & 2u) != 0;
@@ -145,6 +156,14 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
             return;
         }
 
+        if (metricsEnabled)
+        {
+            ++metrics.consumed;
+            if (metrics.hasConsumed && slot.vsyncTick < metrics.consumedTick)
+                ++metrics.consumeBackwards;
+            metrics.consumedTick = slot.vsyncTick;
+            metrics.hasConsumed = true;
+        }
         state.lastFrame.width = slot.w;
         state.lastFrame.height = slot.h;
         state.lastFrame.displayFbp = slot.displayFbp;
@@ -196,6 +215,7 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
             {
                 consumeSlot(oldSlot);
             }
+            else if (metricsEnabled) ++metrics.notReady;
         }
     }
 
@@ -210,7 +230,18 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
         else
         {
             if (curSlot.fence)
-                curSlot.fence->wait_timeout(20'000'000ull);
+            {
+                const uint64_t before = metricsEnabled ? nowNs() : 0;
+                const bool completed = curSlot.fence->wait_timeout(20'000'000ull);
+                if (metricsEnabled)
+                {
+                    ++metrics.fullRingWaits;
+                    if (!completed) ++metrics.waitTimeouts;
+                    const uint64_t elapsed = nowNs() - before;
+                    metrics.waitNs += elapsed;
+                    metrics.maxWaitNs = std::max(metrics.maxWaitNs, elapsed);
+                }
+            }
             if (curSlot.pending)
                 consumeSlot(curSlot);
         }
@@ -264,6 +295,37 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
                      (unsigned long long)request.vsyncTick, width, height, state.lastFrame.width, state.lastFrame.height);
     }
 
+    if (metricsEnabled && metrics.hasConsumed)
+    {
+        if (metrics.hasReturned && metrics.consumedTick == metrics.returnedTick)
+            ++metrics.duplicates;
+        if (metrics.hasReturned && metrics.consumedTick < metrics.returnedTick)
+            ++metrics.returnedBackwards;
+        metrics.returnedTick = metrics.consumedTick;
+        metrics.hasReturned = true;
+        const uint64_t age = request.vsyncTick >= metrics.returnedTick ?
+                             request.vsyncTick - metrics.returnedTick : 0;
+        metrics.ageSum += age;
+        metrics.ageMax = std::max(metrics.ageMax, age);
+        const uint64_t now = nowNs();
+        if (metrics.lastLogNs == 0) metrics.lastLogNs = now;
+        if (now - metrics.lastLogNs >= 1'000'000'000ull)
+        {
+            std::fprintf(stderr,
+                "[gs:frame-metrics] request=%llu source=%llu age=%llu requests=%llu "
+                "consumed=%llu duplicate=%llu consumeBack=%llu returnBack=%llu "
+                "notReady=%llu fullWait=%llu timeout=%llu waitMs=%.3f maxWaitMs=%.3f "
+                "ageMean=%.3f ageMax=%llu\n",
+                (unsigned long long)request.vsyncTick, (unsigned long long)metrics.returnedTick,
+                (unsigned long long)age, (unsigned long long)metrics.requests,
+                (unsigned long long)metrics.consumed, (unsigned long long)metrics.duplicates,
+                (unsigned long long)metrics.consumeBackwards, (unsigned long long)metrics.returnedBackwards,
+                (unsigned long long)metrics.notReady, (unsigned long long)metrics.fullRingWaits,
+                (unsigned long long)metrics.waitTimeouts, metrics.waitNs / 1e6, metrics.maxWaitNs / 1e6,
+                metrics.ageSum / static_cast<double>(metrics.requests), (unsigned long long)metrics.ageMax);
+            metrics.lastLogNs = now;
+        }
+    }
     return state.lastFrame;
 }
 
