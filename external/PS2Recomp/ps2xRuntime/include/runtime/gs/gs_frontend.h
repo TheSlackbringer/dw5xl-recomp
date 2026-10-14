@@ -104,6 +104,8 @@ public:
 
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
     void reset();
+    // GIF_CTRL.RST resets packet input, not GS registers or VRAM.
+    void resetGifInput();
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
@@ -174,6 +176,19 @@ private:
     void updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch);
     GSPresentationRequest buildPresentationRequestUnlocked() const;
 
+
+    struct GifPathResumeState
+    {
+        uint32_t remaining = 0;
+        uint32_t consumed = 0;
+        uint32_t nreg = 0;
+        uint8_t flg = 0;
+        bool reglistPad = false;
+        uint8_t regs[16] = {};
+    };
+    std::array<GifPathResumeState, 4> m_gifPathStates{};
+    GifPathResumeState &gifPathState();
+    bool gifPathMidTag();
 
     GSContext &activeContext();
 

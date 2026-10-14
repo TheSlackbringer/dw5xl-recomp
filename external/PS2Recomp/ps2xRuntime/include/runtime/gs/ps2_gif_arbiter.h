@@ -33,6 +33,8 @@ public:
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
     void drain();
+    // Drop only input not yet emitted; completed GS draws remain intact.
+    void reset() { m_queue.clear(); }
     bool empty() const { return m_queue.empty(); }
 
 private:

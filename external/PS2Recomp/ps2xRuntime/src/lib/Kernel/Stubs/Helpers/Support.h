@@ -1383,7 +1383,12 @@ namespace
         mem.processPendingTransfers();
 
         std::vector<uint32_t> completedCauses = mem.consumeCompletedDmacCauses();
-        if (completedCauses.empty() && (mem.readIORegister(channelBase + 0x00u) & 0x100u) == 0u)
+        // A kick queued on the async device completes later; its cause is
+        // queued when the EE applies that completion. Reading CHCR here would
+        // only drain the kick we just issued.
+        const bool completionDeferred = ps2x::device::hasDeferredChannel(mem, channelBase);
+        if (completedCauses.empty() && !completionDeferred &&
+            (mem.readIORegister(channelBase + 0x00u) & 0x100u) == 0u)
         {
             if (channelBase == 0x10008000u)
             {
@@ -1480,6 +1485,8 @@ namespace
             }
         }
 
+        if (mode == 0u)
+            ps2x::device::syncDmaChannel(runtime->memory(), channelBase);
         const uint32_t chcr = runtime->memory().readIORegister(channelBase + 0x00u);
         const bool hwBusy = (chcr & 0x100u) != 0;
         return ((modelBusy || hwBusy) && mode != 0) ? 1 : 0;
@@ -1883,6 +1890,9 @@ namespace
     {
         if (!runtime || !runtime->syncCoreSubsystems())
             return;
+        // Display registers are also written by queued GIF packets (pseudo
+        // registers 0x59..0x5F); keep program order.
+        ps2x::device::drainAll(runtime->memory(), ps2x::device::DrainReason::GsDisplayEnv);
         auto &regs = runtime->memory().gs();
         regs.pmode = env.pmode;
         regs.smode2 = env.smode2;
@@ -1897,9 +1907,15 @@ namespace
     {
         if (!runtime || !pairs || !runtime->syncCoreSubsystems())
             return;
+        std::vector<ps2x::device::GsRegWrite> writes;
+        writes.reserve(pairCount);
         for (size_t i = 0; i < pairCount; ++i)
+            writes.emplace_back(static_cast<uint8_t>(pairs[i].reg & 0xFFu), pairs[i].value);
+        if (ps2x::device::submitGsRegWrites(runtime->memory(), writes))
+            return;
+        for (const auto &write : writes)
         {
-            runtime->gs().writeRegister(static_cast<uint8_t>(pairs[i].reg & 0xFFu), pairs[i].value);
+            runtime->gs().writeRegister(write.first, write.second);
         }
     }
 

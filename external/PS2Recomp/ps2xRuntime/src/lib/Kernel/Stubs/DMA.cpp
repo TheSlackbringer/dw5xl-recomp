@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "DMA.h"
+#include "runtime/ps2_device_queue.h"
 
 namespace ps2_stubs
 {
@@ -79,6 +80,12 @@ namespace ps2_stubs
         if (!runtime || channelBase == 0u)
         {
             setReturnU32(ctx, 0u);
+            return;
+        }
+        uint32_t oldChcr = 0u;
+        if (ps2x::device::pauseDmaChannel(runtime->memory(), channelBase, oldChcr))
+        {
+            setReturnU32(ctx, oldChcr);
             return;
         }
         const uint32_t chcr = runtime->memory().read32(channelBase);
@@ -206,7 +213,20 @@ namespace ps2_stubs
 
     void sceDmaRestart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDmaRestart", rdram, ctx, runtime);
+        const uint32_t channelBase = resolveDmaChannelBase(rdram, getRegU32(ctx, 4));
+        const uint32_t savedChcr = getRegU32(ctx, 5);
+        uint32_t previousStr = 0u;
+        if (!runtime || channelBase == 0u)
+        {
+            setReturnU32(ctx, 0u);
+            return;
+        }
+        if (!ps2x::device::restartDmaChannel(runtime->memory(), channelBase, savedChcr, previousStr))
+        {
+            previousStr = (runtime->memory().read32(channelBase) >> 8) & 1u;
+            runtime->memory().write32(channelBase, savedChcr);
+        }
+        setReturnU32(ctx, previousStr);
     }
 
     void sceDmaSend(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

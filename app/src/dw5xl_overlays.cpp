@@ -3,7 +3,9 @@
 #include "game_overrides.h"
 #include "dw5xl_disc_validation.h"
 #include "runtime/ee_scheduler.h"
+#include "ps2_runtime_macros.h"
 #include <string>
+#include <cstring>
 #include <cstdio>
 
 extern const RecompiledModule g_ps2Module_dw5xl_ovl00;
@@ -168,6 +170,33 @@ void finalizeOverlay(uint8_t* ram,R5900Context* ctx,PS2Runtime* runtime) {
     originalFinalizer(ram,ctx,runtime);
 }
 
+// SLES_538.60 has three contiguous 32-byte predicate functions at 0x1c24f0, 0x1c2510, 0x1c2530
+// that Ghidra grouped into a single entry_001c24f0. The battle scene dispatches to 0x1c2510 via
+// function pointer ($s2), so 0x1c2510 and 0x1c2530 need their own entries in the function table.
+void entry_001c2510(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+    (void)runtime;
+    const uint32_t a0 = GPR_U32(ctx, 4);
+    uint32_t v1 = 0;
+    std::memcpy(&v1, getMemPtr(rdram, a0 + 136), sizeof(v1));
+    SET_GPR_S32(ctx, 3, static_cast<int32_t>(v1));
+    const uint32_t srl = (v1 & 0x60000u) >> 17;
+    const uint64_t sltiu = (srl < 2u) ? 1u : 0u;
+    SET_GPR_U64(ctx, 2, sltiu ^ 1u);
+    ctx->pc = GPR_U32(ctx, 31);
+}
+
+void entry_001c2530(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+    (void)runtime;
+    const uint32_t a0 = GPR_U32(ctx, 4);
+    uint32_t v1 = 0;
+    std::memcpy(&v1, getMemPtr(rdram, a0 + 136), sizeof(v1));
+    SET_GPR_S32(ctx, 3, static_cast<int32_t>(v1));
+    const uint32_t srl = (v1 & 0x60000u) >> 17;
+    const uint64_t xori = srl ^ 2u;
+    SET_GPR_U64(ctx, 2, (xori < 1u) ? 1u : 0u);
+    ctx->pc = GPR_U32(ctx, 31);
+}
+
 void installOverlays(PS2Runtime& runtime) {
     if(runtime.memory().read32(kFinalizer)!=0x27BDFFB0u || !runtime.hasFunction(kFinalizer) ||
        runtime.memory().read32(kQueueLoad)!=0x27BDFFA0u || !runtime.hasFunction(kQueueLoad)) {
@@ -194,6 +223,12 @@ void installOverlays(PS2Runtime& runtime) {
         return;
     }
     installDiscHooks(runtime);
+    if (runtime.memory().read32(0x001C2510u) == 0x8C830088u) {
+        runtime.replaceFunction(0x001C2510u, &entry_001c2510);
+    }
+    if (runtime.memory().read32(0x001C2530u) == 0x8C830088u) {
+        runtime.replaceFunction(0x001C2530u, &entry_001c2530);
+    }
     std::fprintf(stderr,"[dw5xl:overlay] installed verified OVL00/OVL01/OVL02 loader and finalizer hooks\n");
 }
 }

@@ -4,9 +4,12 @@
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/ps2_device_queue.h"
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
+#include <map>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -181,6 +184,11 @@ void EeScheduler::run()
 {
     assertExecutor();
     m_running.store(true, std::memory_order_release);
+    const char *dispatchEnv = std::getenv("PS2X_EE_DISPATCH_TRACE");
+    const bool dispatchTrace = dispatchEnv && *dispatchEnv && *dispatchEnv != '0';
+    struct DispatchStats { uint64_t calls = 0, ns = 0, dmaCalls = 0, dmaNs = 0, dmaMaxNs = 0; };
+    std::map<std::pair<int, bool>, DispatchStats> dispatchStats;
+    auto dispatchWindow = std::chrono::steady_clock::now();
 
     while (!m_stopRequested.load(std::memory_order_acquire))
     {
@@ -188,6 +196,13 @@ void EeScheduler::run()
         if (m_stopRequested.load(std::memory_order_acquire))
         {
             break;
+        }
+        // Async VIF1/VU1/GIF device: apply DMA completions the worker already
+        // published (CHCR.STR, D_STAT.CIS) and deliver their DMAC causes, the
+        // way a finished transfer raises its interrupt between EE instructions.
+        if (ps2x::device::pollCompletions(m_runtime.memory()))
+        {
+            m_runtime.drainCompletedDmacHandlers(m_rdram);
         }
 
         if (m_currentThreadId == 0)
@@ -317,6 +332,11 @@ void EeScheduler::run()
             continue;
         }
 
+        const int dispatchTid = running->id;
+        const bool dispatchCallback = !running->invocations.empty();
+        const uint32_t dispatchPc = context.pc;
+        const bool dispatchDma = dispatchPc == 0x112FE8u || dispatchPc == 0x113050u || dispatchPc == 0x1130C8u;
+        const auto dispatchBegin = dispatchTrace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         try
         {
             if (!running->invocations.empty() && running->invocations.back().shouldExecute)
@@ -352,6 +372,31 @@ void EeScheduler::run()
             throw;
         }
 
+        if (dispatchTrace)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - dispatchBegin).count();
+            auto &stats = dispatchStats[{dispatchTid, dispatchCallback}];
+            ++stats.calls;
+            stats.ns += ns;
+            if (dispatchDma)
+            {
+                ++stats.dmaCalls;
+                stats.dmaNs += ns;
+                stats.dmaMaxNs = std::max(stats.dmaMaxNs, ns);
+            }
+            if (now - dispatchWindow >= std::chrono::seconds(1))
+            {
+                const auto windowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - dispatchWindow).count();
+                for (const auto &[key, value] : dispatchStats)
+                    std::fprintf(stderr, "[ee:dispatch-time] field=%llu windowMs=%lld tid=%d callback=%d calls=%llu hostNs=%llu dmaCalls=%llu dmaNs=%llu dmaMaxNs=%llu\n",
+                        (unsigned long long)m_vsyncTick, (long long)windowMs, key.first, key.second ? 1 : 0,
+                        (unsigned long long)value.calls, (unsigned long long)value.ns,
+                        (unsigned long long)value.dmaCalls, (unsigned long long)value.dmaNs, (unsigned long long)value.dmaMaxNs);
+                dispatchStats.clear();
+                dispatchWindow = now;
+            }
+        }
         processPendingEvents();
         if (m_rescheduleRequested && m_currentThreadId != 0)
         {
@@ -2030,6 +2075,9 @@ void EeScheduler::processEvent(const EeEvent &event)
                 std::fprintf(stderr, " T%d{st=%d w=%d id=%d inv=%zu pc=%x ra=%x}", tid, static_cast<int>(t.status),
                              static_cast<int>(t.wait.reason), (std::holds_alternative<EeSemaphoreWait>(t.wait.payload) ? static_cast<int>(std::get<EeSemaphoreWait>(t.wait.payload).id) : -1), t.invocations.size(), ac.pc,
                              static_cast<uint32_t>(getRegU32(&ac, 31)));
+                if (const char *trace = std::getenv("PS2X_THREAD_BASE_TRACE"); trace && *trace && *trace != '0')
+                    std::fprintf(stderr, " base{pc=%x ra=%x sp=%x pri=%d}", t.context.pc,
+                                 getRegU32(&t.context, 31), getRegU32(&t.context, 29), t.currentPriority);
             }
             std::fprintf(stderr, " demux=%u getpic=%u pictures=%u ev[v=%u a2=%u a3=%u]\n", g_dw5xlMpegDemux.load(),
                          g_dw5xlMpegGetPic.load(), g_dw5xlMpegPictures.load(), g_dw5xlStrEvents[0].load(),

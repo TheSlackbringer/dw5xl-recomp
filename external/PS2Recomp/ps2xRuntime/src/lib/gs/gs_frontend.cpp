@@ -170,6 +170,7 @@ void GS::reset()
     m_trxdir = 3;
     m_vtxCount = 0;
     m_vtxIndex = 0;
+    m_gifPathStates = {};
     m_preferredDisplaySourceFrame = {};
     m_preferredDisplayDestFbp = 0;
     m_hasPreferredDisplaySource = false;
@@ -652,30 +653,26 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
-// Per-PATH GIF tag continuation state (see GS::processGIFPacket).
-struct GifPathResumeState
-{
-    uint32_t remaining = 0; // qwords (IMAGE) or register writes (PACKED/REGLIST) left in the current tag
-    uint32_t consumed = 0;
-    uint32_t nreg = 0;
-    uint8_t flg = 0;
-    bool reglistPad = false;
-    uint8_t regs[16] = {};
-};
-
 // Set by GifArbiter::drain() for the packet being processed; 0 = direct call.
 extern thread_local int g_gifArbiterCurrentPath;
 
-static GifPathResumeState &gifPathState()
+GS::GifPathResumeState &GS::gifPathState()
 {
-    static GifPathResumeState s_states[4];
     const int path = g_gifArbiterCurrentPath;
-    return s_states[(path >= 0 && path < 4) ? path : 0];
+    return m_gifPathStates[(path >= 0 && path < 4) ? path : 0];
 }
 
-static bool gifPathMidTag()
+bool GS::gifPathMidTag()
 {
     return gifPathState().remaining != 0;
+}
+
+void GS::resetGifInput()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    // Discard incomplete GIF tags only. GS contexts, vertex attributes,
+    // transfer registers, VRAM and already emitted draws are untouched.
+    m_gifPathStates = {};
 }
 
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)

@@ -2,6 +2,8 @@
 #include <cstdio>
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_device_queue.h"
+#include "vif1_capture.h"
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -301,6 +303,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
         return;
+    Vif1Capture::kick(*this, data, sizeBytes); // DW5XL-DEBUG: PS2X_VIF1_CAPTURE replay input
 
     const uint64_t parseTick = gs_regs.vsyncTick.load(std::memory_order_acquire);
     static const bool parseEnabled = std::getenv("PS2X_GIF_PARSE_TRACE") != nullptr;
@@ -321,6 +324,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
     while (pos + 4 <= sizeBytes)
     {
+        ps2x::device::workerCheckpointVif1Input(pos);
         if (m_vif1PendingPath2ImageQwc != 0u)
         {
             // The rest of a DIRECT/DIRECTHL whose payload was cut off at the end of the previous

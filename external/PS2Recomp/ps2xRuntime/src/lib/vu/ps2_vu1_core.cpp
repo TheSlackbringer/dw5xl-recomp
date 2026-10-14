@@ -2,12 +2,14 @@
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_device_queue.h"
 #include "ps2_vu1_detail.h"
 
 #include <algorithm>
 #include <bit>
 #include <cfenv>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -192,6 +194,22 @@ void VU1Interpreter::reset()
     m_state.r = 0x3F800000u;
     m_cycle = 0;
     resetScheduler();
+}
+
+void VU1Interpreter::resetMicroExecution()
+{
+    // FBRST stops micro execution; it does not initialise the VU register file.
+    // Retain PC and cycle so this differs from a machine/power-on reset.
+    resetScheduler();
+    m_state.branchPending = false;
+    m_state.branchTarget = 0;
+    m_state.branchDelay = 0;
+    m_state.ebit = false;
+    m_state.haltAfterDelaySlot = false;
+    m_state.stoppedByD = false;
+    m_state.stoppedByT = false;
+    m_state.dBitEnabled = false;
+    m_state.tBitEnabled = false;
 }
 
 float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
@@ -1057,6 +1075,8 @@ void VU1Interpreter::advanceTo(uint64_t targetCycle)
 {
     while (m_cycle < targetCycle)
     {
+        if (m_unit == Unit::VU1 && ps2x::device::workerShouldCancelVu1())
+            break;
         // With no XGKICK in flight a cycle does nothing until the next
         // pipeline commit, so skip straight to the cycle before it.
         if (!m_xgkick.active)
@@ -1079,6 +1099,8 @@ void VU1Interpreter::flushPipelines()
 {
     while (pipelinesPending())
     {
+        if (m_unit == Unit::VU1 && ps2x::device::workerShouldCancelVu1())
+            break;
         if (!m_xgkick.active)
         {
             uint64_t next = m_nextCommitCycle;
@@ -1702,13 +1724,21 @@ namespace
             uint64_t runs = 0;
             uint64_t resumes = 0;
             uint64_t cycles = 0;
+            uint64_t hostNs = 0;
+            uint64_t maxHostNs = 0;
+            uint64_t budgetExhaustions = 0;
+            uint64_t abnormalStops = 0;
+            uint32_t lastFinalPc = 0;
         };
         std::string path;
         std::map<std::pair<uint64_t, uint32_t>, Entry> entries;
         std::map<uint64_t, std::vector<uint8_t>> images;
         uint64_t sinceDump = 0;
+        std::chrono::steady_clock::time_point lastDumpTime = std::chrono::steady_clock::now();
         uint64_t lastHash = 0;
         uint32_t lastPc = 0;
+        bool lastRunBudgetExhausted = false;
+        bool lastRunAbnormalStop = false;
         const uint8_t *cachedCode = nullptr;
         uint64_t cachedGeneration = ~0ull;
         uint64_t cachedHash = 0;
@@ -1720,6 +1750,16 @@ namespace
         }
         ~VuCensus() { dump(); }
         bool enabled() const { return !path.empty(); }
+
+        void maybeDump()
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if ((++sinceDump & 0x3FFFu) == 0u || now - lastDumpTime >= std::chrono::seconds(1))
+            {
+                dump();
+                lastDumpTime = now;
+            }
+        }
 
         uint64_t hashOf(const uint8_t *code, uint32_t size, uint64_t generation)
         {
@@ -1748,15 +1788,20 @@ namespace
                 total += e.second.cycles;
             if (FILE *f = std::fopen(path.c_str(), "w"))
             {
-                std::fprintf(f, "# hash entryPC runs resumes cycles cumulative%%\n");
+                std::fprintf(f, "# hash entryPC runs resumes cycles cumulative%% hostNs maxHostNs budgetExhaustions abnormalStops lastFinalPC\n");
                 uint64_t running = 0;
                 for (const auto &e : sorted)
                 {
                     running += e.second.cycles;
-                    std::fprintf(f, "%016llx %04x %llu %llu %llu %.2f\n", (unsigned long long)e.first.first,
+                    std::fprintf(f, "%016llx %04x %llu %llu %llu %.2f %llu %llu %llu %llu %04x\n", (unsigned long long)e.first.first,
                                  e.first.second, (unsigned long long)e.second.runs,
                                  (unsigned long long)e.second.resumes, (unsigned long long)e.second.cycles,
-                                 total ? 100.0 * running / total : 0.0);
+                                 total ? 100.0 * running / total : 0.0,
+                                 (unsigned long long)e.second.hostNs,
+                                 (unsigned long long)e.second.maxHostNs,
+                                 (unsigned long long)e.second.budgetExhaustions,
+                                 (unsigned long long)e.second.abnormalStops,
+                                 e.second.lastFinalPc);
                 }
                 std::fclose(f);
             }
@@ -1807,12 +1852,19 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
         c.lastHash = c.hashOf(vuCode, codeSize, memory->getVU1CodeGeneration());
         c.lastPc = m_state.pc;
         const uint64_t before = m_cycle;
+        const auto hostBefore = std::chrono::steady_clock::now();
         run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+        const uint64_t hostNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - hostBefore).count());
         VuCensus::Entry &e = c.entries[{c.lastHash, c.lastPc}];
         ++e.runs;
         e.cycles += m_cycle - before;
-        if ((++c.sinceDump & 0x3FFFu) == 0u)
-            c.dump();
+        e.hostNs += hostNs;
+        e.maxHostNs = std::max(e.maxHostNs, hostNs);
+        e.budgetExhaustions += c.lastRunBudgetExhausted ? 1u : 0u;
+        e.abnormalStops += c.lastRunAbnormalStop ? 1u : 0u;
+        e.lastFinalPc = m_state.pc;
+        c.maybeDump();
         return;
     }
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
@@ -1831,10 +1883,19 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     {
         VuCensus &c = census();
         const uint64_t before = m_cycle;
+        const auto hostBefore = std::chrono::steady_clock::now();
         run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+        const uint64_t hostNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - hostBefore).count());
         VuCensus::Entry &e = c.entries[{c.lastHash, c.lastPc}];
         ++e.resumes;
         e.cycles += m_cycle - before;
+        e.hostNs += hostNs;
+        e.maxHostNs = std::max(e.maxHostNs, hostNs);
+        e.budgetExhaustions += c.lastRunBudgetExhausted ? 1u : 0u;
+        e.abnormalStops += c.lastRunAbnormalStop ? 1u : 0u;
+        e.lastFinalPc = m_state.pc;
+        c.maybeDump();
         return;
     }
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
@@ -1849,6 +1910,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_activeGs = &gs;
     m_activeMemory = memory;
 
+    if (m_unit == Unit::VU1 && census().enabled())
+    {
+        census().lastRunBudgetExhausted = false;
+        census().lastRunAbnormalStop = false;
+    }
     const int previousRoundingMode = std::fegetround();
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     // A lifted segment runs to its end; the cycle budget only bounds the
@@ -1861,8 +1927,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     }
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
+    bool resetCanceled = false;
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
+        if (m_unit == Unit::VU1 && ps2x::device::workerShouldCancelVu1())
+        {
+            resetCanceled = true;
+            break;
+        }
         commitReadyPipelines();
         if (m_state.pc + 8u > codeSize)
             break;
@@ -1877,6 +1949,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         uint64_t readyCycle = calculatePairReadyCycle(decoded);
         while (readyCycle > m_cycle)
         {
+            if (m_unit == Unit::VU1 && ps2x::device::workerShouldCancelVu1())
+                break;
             if (readyCycle >= budgetEnd)
             {
                 advanceTo(budgetEnd);
@@ -1887,6 +1961,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
         if (m_cycle >= budgetEnd)
             break;
+        if (m_unit == Unit::VU1 && ps2x::device::workerShouldCancelVu1())
+        {
+            resetCanceled = true;
+            break;
+        }
 
         const uint8_t writtenVi = decoded.firstViWrite;
         const int32_t oldVi = writtenVi != 0u ? m_state.vi[writtenVi] : 0;
@@ -1991,7 +2070,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             break;
     }
 
-    if (programEnded)
+    if (m_unit == Unit::VU1 && census().enabled())
+    {
+        census().lastRunBudgetExhausted = !programEnded && m_cycle >= budgetEnd;
+        census().lastRunAbnormalStop = !programEnded && m_cycle < budgetEnd && !m_stopRequested;
+    }
+    if (programEnded && !resetCanceled)
     {
         flushPipelines();
         m_state.ebit = false;

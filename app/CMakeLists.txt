@@ -27,6 +27,7 @@ add_executable(dw5xl
     src/dw5xl_images.cpp
     src/ipu_idec.cpp
     src/dw5xl_overlays.cpp
+    src/dw5xl_vu1_lifted.cpp
 )
 target_include_directories(dw5xl PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
 target_link_libraries(dw5xl PRIVATE ps2_runtime rlImGui imgui)
@@ -41,7 +42,8 @@ target_precompile_headers(dw5xl PRIVATE
 )
 # 42k small generated files: batch them so the compiler isn't started 42k times.
 set_target_properties(dw5xl PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
-set_source_files_properties(src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
+set_source_files_properties(src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp src/dw5xl_vu1_lifted.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
+set_property(SOURCE src/dw5xl_vu1_lifted.cpp APPEND PROPERTY COMPILE_OPTIONS -frounding-math -ffp-contract=off)
 # Generated code uses SSE4.1/AVX intrinsics (PS2Recomp only enables them in its own directory).
 target_compile_options(dw5xl PRIVATE -march=x86-64-v3)
 
@@ -151,4 +153,51 @@ if(DW5XL_BUILD_TESTS)
     target_link_libraries(dw5xl_overlay_lifecycle_test PRIVATE ps2_runtime)
     target_compile_options(dw5xl_overlay_lifecycle_test PRIVATE -march=x86-64-v3)
     add_test(NAME overlay_lifecycle COMMAND dw5xl_overlay_lifecycle_test)
+
+    add_executable(dw5xl_vu1_async_queue_test tests/vu1_async_queue_test.cpp)
+    target_link_libraries(dw5xl_vu1_async_queue_test PRIVATE ps2_runtime)
+    target_compile_options(dw5xl_vu1_async_queue_test PRIVATE -march=x86-64-v3)
+    add_test(NAME vu1_async_queue COMMAND dw5xl_vu1_async_queue_test)
+    set_tests_properties(vu1_async_queue PROPERTIES TIMEOUT 20)
+    # ThreadSanitizer variant: the queue, PS2Memory, VIF1 parser and GIF arbiter
+    # are recompiled instrumented; their archive copies are then never pulled in.
+    option(DW5XL_TSAN_TESTS "Build the ThreadSanitizer variant of the VU1 async queue test" ON)
+    if(DW5XL_TSAN_TESTS AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        set(DW5XL_RUNTIME_SRC "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
+        add_executable(dw5xl_vu1_async_queue_tsan_test
+            tests/vu1_async_queue_test.cpp
+            "${DW5XL_RUNTIME_SRC}/ps2_device_queue.cpp"
+            "${DW5XL_RUNTIME_SRC}/ps2_memory.cpp"
+            "${DW5XL_RUNTIME_SRC}/ps2_vif1_interpreter.cpp"
+            "${DW5XL_RUNTIME_SRC}/gs/ps2_gif_arbiter.cpp")
+        target_link_libraries(dw5xl_vu1_async_queue_tsan_test PRIVATE ps2_runtime)
+        target_compile_options(dw5xl_vu1_async_queue_tsan_test PRIVATE -march=x86-64-v3 -fsanitize=thread -g -O1)
+        target_link_options(dw5xl_vu1_async_queue_tsan_test PRIVATE -fsanitize=thread)
+        add_test(NAME vu1_async_queue_tsan COMMAND dw5xl_vu1_async_queue_tsan_test)
+        set_tests_properties(vu1_async_queue_tsan PROPERTIES TIMEOUT 20 ENVIRONMENT "TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1")
+    endif()
+
+    # DW5XL-TEST: GS stream recording comparison and offline VIF1 replay (tools/gsreplay).
+    set(DW5XL_GSREPLAY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tools/gsreplay")
+    add_executable(dw5xl_gsrec "${DW5XL_GSREPLAY_DIR}/gsrec.cpp")
+    target_include_directories(dw5xl_gsrec PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_executable(dw5xl_vif1_replay "${DW5XL_GSREPLAY_DIR}/vif1_replay.cpp")
+    target_link_libraries(dw5xl_vif1_replay PRIVATE ps2_runtime)
+    target_include_directories(dw5xl_vif1_replay PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${DW5XL_GSREPLAY_DIR}")
+    target_compile_options(dw5xl_vif1_replay PRIVATE -march=x86-64-v3)
+    add_executable(dw5xl_gsreplay_test tests/gsreplay_test.cpp)
+    target_link_libraries(dw5xl_gsreplay_test PRIVATE ps2_runtime)
+    target_include_directories(dw5xl_gsreplay_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${DW5XL_GSREPLAY_DIR}")
+    target_compile_options(dw5xl_gsreplay_test PRIVATE -march=x86-64-v3)
+    add_test(NAME gsreplay_synthetic COMMAND dw5xl_gsreplay_test $<TARGET_FILE:dw5xl_vif1_replay>
+             $<TARGET_FILE:dw5xl_gsrec> "${CMAKE_CURRENT_BINARY_DIR}/gsreplay_test")
+
+    add_executable(dw5xl_vu1_lift_test tests/vu1_lift_test.cpp src/dw5xl_vu1_lifted.cpp)
+    target_link_libraries(dw5xl_vu1_lift_test PRIVATE ps2_runtime)
+    target_include_directories(dw5xl_vu1_lift_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    target_compile_options(dw5xl_vu1_lift_test PRIVATE -march=x86-64-v3 -frounding-math -ffp-contract=off)
+    add_test(NAME vu1_lift COMMAND dw5xl_vu1_lift_test)
+    add_test(NAME vu1_dma_reset_interpreter COMMAND dw5xl_vu1_lift_test dma-cancel-interpreter)
+    add_test(NAME vu1_dma_reset_lift COMMAND dw5xl_vu1_lift_test dma-cancel-lift)
+    set_tests_properties(vu1_dma_reset_interpreter vu1_dma_reset_lift PROPERTIES TIMEOUT 20)
 endif()

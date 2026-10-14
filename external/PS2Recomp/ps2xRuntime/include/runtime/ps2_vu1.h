@@ -49,6 +49,9 @@ public:
     explicit VU1Interpreter(Unit unit = Unit::VU1);
 
     void reset();
+    // Hardware micro-execution reset: preserve architectural registers/code/data.
+    // Call only on the device executor after cooperative cancellation.
+    void resetMicroExecution();
 
     void execute(uint8_t *vuCode, uint32_t codeSize,
                  uint8_t *vuData, uint32_t dataSize,

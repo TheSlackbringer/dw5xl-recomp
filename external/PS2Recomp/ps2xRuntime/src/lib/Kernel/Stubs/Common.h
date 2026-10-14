@@ -27,4 +27,5 @@
 #include <limits>
 
 #include "ps2_host_backend.h"
+#include "runtime/ps2_device_queue.h"
 #include "Helpers/Support.h"

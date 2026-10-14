@@ -56,9 +56,10 @@ namespace vl
 
     struct Registration
     {
-        uint64_t hash; // FNV-1a of the 16 KB micro memory
+        uint64_t hash; // FNV-1a of the 16 KB micro memory, or subroutine hash if subSize > 0
         uint32_t pc;
         Segment fn;
+        uint32_t subSize = 0; // if > 0, hash is hashCode(vuCode + pc, subSize)
     };
 
     struct Registrar
@@ -66,8 +67,14 @@ namespace vl
         Registrar(const Registration *registrations, size_t count);
     };
 
-    Segment find(uint64_t hash, uint32_t pc);
+    Segment find(uint64_t hash, uint32_t pc, const uint8_t *vuCode = nullptr);
     uint64_t hashCode(const uint8_t *code, uint32_t size);
+
+    // A hard VU reset cancels execution at a lifted instruction boundary.
+    // DMA pause alone never cancels a program that VIF already accepted.
+    struct ResetCanceled {};
+    bool resetRequested() noexcept;
+    void checkReset(Run &c);
 
     // PATH1 ------------------------------------------------------------------
     void kickCatchUpSlow(Run &c, uint64_t cycle);
@@ -82,6 +89,7 @@ namespace vl
 
     inline void kickStart(Run &c, uint32_t qwordAddress, uint64_t cycle)
     {
+        checkReset(c);
         c.kickBegin(c.vu, qwordAddress, cycle);
         c.kickCycle = cycle;
     }
@@ -398,6 +406,7 @@ namespace vl
     template <int Imm, bool Kick>
     inline void sq(Run &c, uint8_t *mem, int32_t a, V v, uint64_t cycle)
     {
+        checkReset(c);
         if constexpr (Kick)
             kickCatchUp(c, cycle);
         storeLanes<Imm>(mem + qaddr(a), _mm_castps_si128(v));
@@ -406,6 +415,7 @@ namespace vl
     template <int Imm, bool Kick>
     inline void isw(Run &c, uint8_t *mem, int32_t a, int32_t value, uint64_t cycle)
     {
+        checkReset(c);
         if constexpr (Kick)
             kickCatchUp(c, cycle);
         storeLanes<Imm>(mem + qaddr(a), _mm_set1_epi32(static_cast<int32_t>(static_cast<uint16_t>(value))));

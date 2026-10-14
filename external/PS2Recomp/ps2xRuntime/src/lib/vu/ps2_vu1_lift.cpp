@@ -1,7 +1,9 @@
 #include "runtime/ps2_vu1_lift.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_device_queue.h"
 
 #include <algorithm>
+#include <array>
 #include <cfenv>
 #include <cstdio>
 #include <cstdlib>
@@ -9,6 +11,8 @@
 
 namespace vl
 {
+    bool resetRequested() noexcept { return ps2x::device::workerShouldCancelVu1(); }
+    void checkReset(Run &) { if (resetRequested()) throw ResetCanceled{}; }
     namespace
     {
         std::vector<Registration> &registry()
@@ -63,12 +67,22 @@ namespace vl
         registry().insert(registry().end(), registrations, registrations + count);
     }
 
-    Segment find(uint64_t hash, uint32_t pc)
+    Segment find(uint64_t hash, uint32_t pc, const uint8_t *vuCode)
     {
         for (const Registration &r : registry())
         {
-            if (r.hash == hash && r.pc == pc)
-                return r.fn;
+            if (r.pc != pc)
+                continue;
+            if (r.subSize == 0)
+            {
+                if (r.hash == hash)
+                    return r.fn;
+            }
+            else
+            {
+                if (vuCode && hashCode(vuCode + pc, r.subSize) == r.hash)
+                    return r.fn;
+            }
         }
         return nullptr;
     }
@@ -85,6 +99,7 @@ namespace vl
     {
         while (*c.kickActive && c.kickCycle < cycle)
         {
+            checkReset(c);
             ++c.kickCycle;
             c.kickProgress(c.vu);
         }
@@ -95,6 +110,7 @@ namespace vl
         kickCatchUp(c, cycle);
         while (*c.kickActive)
         {
+            checkReset(c);
             ++c.kickCycle;
             c.kickProgress(c.vu);
         }
@@ -146,15 +162,22 @@ namespace vl
 
 bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_t dataSize, PS2Memory *memory)
 {
-    // PS2X_VU1_LIFT=1: run registered lifted segments instead of interpreting.
+    // PS2X_VU1_LIFT: enabled by default, unset or != "0" -> true. PS2X_VU1_LIFT=0 -> false.
     static const bool enabled = []
     {
         const char *env = std::getenv("PS2X_VU1_LIFT");
-        const bool on = env && *env && *env != '0';
+        const bool on = !(env && env[0] == '0' && env[1] == '\0');
         if (on)
             std::fprintf(stderr, "[vu1lift] enabled\n");
         return on;
     }();
+    static uint64_t s_totalCalls = 0;
+    static uint64_t s_guardBail = 0;
+    static uint64_t s_findMiss = 0;
+    static uint64_t s_findHit = 0;
+
+    ++s_totalCalls;
+
     if (!enabled || m_unit != Unit::VU1 || !memory || codeSize != 0x4000u || dataSize != 0x4000u ||
         vuCode != memory->getVU1Code() || !m_activeVuData)
         return false;
@@ -163,21 +186,63 @@ bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_
     if (m_stopRequested || m_state.branchPending || m_state.ebit || m_state.haltAfterDelaySlot ||
         m_viBranchBackupValid || m_xgkick.active ||
         m_nextCommitCycle != std::numeric_limits<uint64_t>::max() || m_writebackHorizon > m_cycle)
+    {
+        ++s_guardBail;
         return false;
+    }
 
     thread_local const uint8_t *cachedCode = nullptr;
     thread_local uint64_t cachedGeneration = ~0ull;
     thread_local uint64_t cachedHash = 0;
+    thread_local std::array<vl::Segment, 2048> s_pcCache{};
+    thread_local std::array<bool, 2048> s_pcCacheValid{};
     const uint64_t generation = memory->getVU1CodeGeneration();
     if (vuCode != cachedCode || generation != cachedGeneration)
     {
         cachedHash = vl::hashCode(vuCode, codeSize);
         cachedCode = vuCode;
         cachedGeneration = generation;
+        s_pcCacheValid.fill(false);
     }
-    const vl::Segment segment = vl::find(cachedHash, m_state.pc);
+    const uint32_t pcSlot = (m_state.pc >> 3) & 0x7FFu;
+    vl::Segment segment = nullptr;
+    if (s_pcCacheValid[pcSlot])
+    {
+        segment = s_pcCache[pcSlot];
+    }
+    else
+    {
+        segment = vl::find(cachedHash, m_state.pc, vuCode);
+        s_pcCache[pcSlot] = segment;
+        s_pcCacheValid[pcSlot] = true;
+    }
     if (!segment)
+    {
+        ++s_findMiss;
+        if ((s_findMiss & 0x3FFF) == 1)
+        {
+            std::fprintf(stderr, "[vu1lift:miss] calls=%llu bail=%llu miss=%llu hit=%llu hash=0x%016llx pc=0x%04x\n",
+                         static_cast<unsigned long long>(s_totalCalls),
+                         static_cast<unsigned long long>(s_guardBail),
+                         static_cast<unsigned long long>(s_findMiss),
+                         static_cast<unsigned long long>(s_findHit),
+                         static_cast<unsigned long long>(cachedHash),
+                         m_state.pc);
+        }
         return false;
+    }
+
+    ++s_findHit;
+    if ((s_findHit & 0x3FFF) == 1)
+    {
+        std::fprintf(stderr, "[vu1lift:hit] calls=%llu bail=%llu miss=%llu hit=%llu hash=0x%016llx pc=0x%04x\n",
+                     static_cast<unsigned long long>(s_totalCalls),
+                     static_cast<unsigned long long>(s_guardBail),
+                     static_cast<unsigned long long>(s_findMiss),
+                     static_cast<unsigned long long>(s_findHit),
+                     static_cast<unsigned long long>(cachedHash),
+                     m_state.pc);
+    }
 
     vl::Run c{m_state, m_activeVuData, m_cycle, m_cycle, m_efuResourceReady, this,
               [](void *vu) { static_cast<VU1Interpreter *>(vu)->progressXgkick(); },
@@ -188,12 +253,26 @@ bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_
                   self->startXgkick(qwordAddress);
               },
               &m_xgkick.active, m_cycle};
-    segment(c);
+    try
+    {
+        vl::checkReset(c);
+        segment(c);
+    }
+    catch (const vl::ResetCanceled &)
+    {
+        // The ordered reset command clears pending pipelines next. Do not
+        // interpret/replay this already partially accepted microprogram.
+        m_cycle = std::max(m_cycle, c.cycle);
+        m_state.cycles = m_cycle;
+        return true;
+    }
 
     // flushPipelines: the program ends once every write has landed and the
     // PATH1 transfer has finished.
     while (m_xgkick.active)
     {
+        if (vl::resetRequested())
+            return true;
         ++c.kickCycle;
         progressXgkick();
     }

@@ -8,6 +8,8 @@
 #include "runtime/gs/gs_frontend.h"
 #include "gs/gs_trace.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_device_queue.h"
+#include "vif1_capture.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -34,6 +36,7 @@
 #include <cctype>
 #include <vector>
 #include <string>
+#include <cmath>
 
 namespace ps2_stubs
 {
@@ -606,6 +609,7 @@ namespace ps2x_dev
                 else if (cmd == "quit")
                 {
                     std::cerr << "[dev] quit at tick " << tick << std::endl;
+                    ps2x::device::quiesceAll(std::chrono::milliseconds(2000));
                     GSTrace::shutdown();
                     if (runtime) runtime->audioBackend().stopPcmStream();
                     std::cout.flush();
@@ -758,6 +762,7 @@ namespace ps2x_dev
                 if (const char *t = std::getenv("PS2X_THREADS_AT_EXIT"); t && *t && *t != '0')
                     writeThreads(std::cerr, runtime);
                 std::cerr << "[dev] exit tick " << tick << " reached" << std::endl;
+                ps2x::device::quiesceAll(std::chrono::milliseconds(2000));
                 GSTrace::shutdown();
                 if (runtime) runtime->audioBackend().stopPcmStream();
                 std::cout.flush();
@@ -928,6 +933,8 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        // Join the device worker before the GS/VU1/arbiter members it drives go away.
+        ps2x::device::detach(m_memory);
         m_iopSubsystem.reset();
         m_iopHost.reset();
         m_audioBackend.stopPcmStream();
@@ -1069,52 +1076,117 @@ bool PS2Runtime::syncCoreSubsystems()
         return true;
     }
 
+    // Re-binding replaces the GS/VU1 state the device worker drives: stop it first.
+    ps2x::device::detach(m_memory);
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
-    m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
-                                 {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
-                                     {
-                                         cpuContext = &m_cpuContext;
-                                     }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
-                                     m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                   m_gs, &m_memory, startPC, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
-    m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
-                                 {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
-                                     {
-                                         cpuContext = &m_cpuContext;
-                                     }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
-                                     m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                  m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                  m_gs, &m_memory, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+    // VIF1 MSCAL/MSCNT. On the async device worker the VU1 D/T enables come from
+    // the kick-time FBRST snapshot and the D/T stop bits go to the command's
+    // completion record (VPU-STAT is device state; the EE applies it after the
+    // drain). Elsewhere (PS2X_VU1_ASYNC=0, VIF1_FIFO) the legacy path is used:
+    // the current guest context is read and written directly.
+    auto runVu1 = [this](bool resume, uint32_t startPC, uint32_t top, uint32_t itop)
+    {
+        R5900Context *cpuContext = nullptr;
+        uint32_t fbrst = 0u;
+        if (ps2x::device::onDeviceWorker())
+        {
+            fbrst = ps2x::device::workerVu0Fbrst();
+        }
+        else
+        {
+            cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+            if (!cpuContext)
+            {
+                cpuContext = &m_cpuContext;
+            }
+            fbrst = cpuContext->vu0_fbrst;
+        }
+        m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+        m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
+        if (resume)
+        {
+            m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                         m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                         m_gs, &m_memory, top, itop, 65536);
+        }
+        else
+        {
+            m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                          m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                          m_gs, &m_memory, startPC, top, itop, 65536);
+        }
+        const uint32_t stopBits = (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                  (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+        if (cpuContext)
+        {
+            cpuContext->vu0_vpu_stat = (cpuContext->vu0_vpu_stat & ~0x0600u) | stopBits;
+        }
+        else
+        {
+            ps2x::device::workerRecordVu1StopBits(stopBits);
+        }
+    };
+    m_memory.setVu1MscalCallback([runVu1](uint32_t startPC, uint32_t top, uint32_t itop)
+                                 { runVu1(false, startPC, top, itop); });
+    m_memory.setVu1MscntCallback([runVu1](uint32_t top, uint32_t itop)
+                                 { runVu1(true, 0u, top, itop); });
+    // DW5XL-DEBUG: PS2X_VIF1_CAPTURE records VU1 state and the D/T enable bits.
+    Vif1Capture::attach(&m_vu1, [this]() -> uint32_t
+                        {
+                            const R5900Context *context = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                            return (context ? context : &m_cpuContext)->vu0_fbrst; });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
 
     m_boundRdram = rdram;
     m_boundGSVram = gsVram;
+
+    {
+        auto currentContext = [this]() -> R5900Context *
+        {
+            R5900Context *ctx = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+            return ctx ? ctx : &m_cpuContext;
+        };
+        ps2x::device::Config deviceConfig;
+        deviceConfig.async = ps2x::device::asyncRequestedByEnv();
+        deviceConfig.trace = ps2x::device::traceRequestedByEnv();
+        deviceConfig.gsWriteRegister = [this](uint8_t reg, uint64_t value)
+        { m_gs.writeRegister(reg, value); };
+        deviceConfig.controlWrite = [this](uint32_t address, uint32_t value)
+        {
+            m_memory.writeIORegister(address, value);
+            if (address == 0x10003000u && (value & 1u))
+            {
+                m_gifArbiter.reset();
+                m_gs.resetGifInput();
+            }
+        };
+        deviceConfig.controlQwordWrite = [this](uint32_t address, uint64_t lo, uint64_t hi)
+        { m_memory.write128(address, _mm_set_epi64x(hi, lo)); };
+        deviceConfig.resetVu1 = [this] { m_vu1.resetMicroExecution(); };
+        deviceConfig.currentVu0Fbrst = [currentContext]() -> uint32_t
+        { return currentContext()->vu0_fbrst; };
+        deviceConfig.applyVu1StopBits = [currentContext](uint32_t stopBits)
+        {
+            R5900Context *ctx = currentContext();
+            ctx->vu0_vpu_stat = (ctx->vu0_vpu_stat & ~0x0600u) | (stopBits & 0x0600u);
+        };
+        deviceConfig.localToHost = [this](uint8_t *dst, uint32_t maxBytes) -> uint32_t
+        { return m_gs.consumeLocalToHostBytes(dst, maxBytes); };
+        deviceConfig.workerIdle = [this]()
+        {
+            if (m_eeScheduler)
+                m_eeScheduler->postEvent(EeEvent{EeEventType::ExternalWake, ps2x::device::kDeviceIdleWaitType,
+                                                 ps2x::device::kDeviceIdleWaitToken});
+        };
+        deviceConfig.callerRa = [currentContext]() -> uint32_t
+        { return getRegU32(currentContext(), 31); };
+        ps2x::device::attach(m_memory, std::move(deviceConfig));
+    }
     return true;
 }
 
@@ -2995,6 +3067,44 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         devHarness.captureHostFrame();
+
+        // On-screen FPS & VSync rate overlay for playtesting (disabled by default for release; enabled via PS2X_FPS=1 or toggled with F3)
+        static bool s_showFpsOverlay = []() {
+            const char *env = std::getenv("PS2X_FPS");
+            return env && *env && *env != '0';
+        }();
+        if (IsKeyPressed(KEY_F3))
+        {
+            s_showFpsOverlay = !s_showFpsOverlay;
+        }
+
+        static auto s_lastFpsTime = std::chrono::steady_clock::now();
+        static uint64_t s_lastVsyncTick = 0;
+        static float s_vsyncRate = 0.0f;
+        static int s_cachedHostFps = 0;
+
+        const auto nowFps = std::chrono::steady_clock::now();
+        const float elapsedFps = std::chrono::duration<float>(nowFps - s_lastFpsTime).count();
+        const uint64_t currentVsync = eeScheduler().currentVSyncTick();
+        if (elapsedFps >= 0.5f)
+        {
+            s_vsyncRate = (currentVsync >= s_lastVsyncTick) ? (float(currentVsync - s_lastVsyncTick) / elapsedFps) : 0.0f;
+            s_cachedHostFps = GetFPS();
+            s_lastVsyncTick = currentVsync;
+            s_lastFpsTime = nowFps;
+        }
+
+        if (s_showFpsOverlay && !IsWindowHidden())
+        {
+            const char *fpsText = TextFormat("FPS: %d  |  VSync: %.1f", s_cachedHostFps, s_vsyncRate);
+            constexpr int kFontSize = 18;
+            const int textW = MeasureText(fpsText, kFontSize);
+            DrawRectangle(8, 8, textW + 16, kFontSize + 10, Fade(BLACK, 0.75f));
+            const Color statColor = (s_cachedHostFps >= 45 && s_vsyncRate >= 45.0f) ? GREEN :
+                                    (s_cachedHostFps >= 25 && s_vsyncRate >= 25.0f) ? YELLOW : RED;
+            DrawText(fpsText, 16, 13, kFontSize, statColor);
+        }
+
         EndDrawing();
 
         if (WindowShouldClose())
@@ -3010,6 +3120,8 @@ void PS2Runtime::run()
     {
         gameThread.join();
     }
+    // The EE is gone: let the device worker finish queued GS work, then stop it.
+    ps2x::device::detach(m_memory);
     GSTrace::shutdown();
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)

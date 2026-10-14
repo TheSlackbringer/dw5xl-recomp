@@ -1,6 +1,8 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_address.h"
+#include "runtime/ps2_device_queue.h"
 #include "runtime/gs/gs_frontend.h"
+#include "vif1_capture.h"
 #include "ps2_log.h"
 #include <atomic>
 #include <cstring>
@@ -246,6 +248,9 @@ PS2Memory::PS2Memory()
 
 PS2Memory::~PS2Memory()
 {
+    // The device worker may still be executing VIF1/VU1/GIF work on our buffers.
+    ps2x::device::detach(*this);
+
     if (m_rdram)
     {
         delete[] m_rdram;
@@ -316,6 +321,8 @@ bool PS2Memory::initialize(size_t ramSize)
         m_vu1Data = nullptr;
     };
 
+    // Re-initialisation reallocates every buffer the device worker uses.
+    ps2x::device::resetForReinitialize(*this);
     cleanup();
     m_seenGifCopy = false;
     m_dmaStartCount.store(0, std::memory_order_relaxed);
@@ -559,11 +566,15 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
     {
         return ptr;
     }
-    if (const uint8_t *ptr = mapRange(PS2_VU1_CODE_BASE, PS2_VU1_CODE_SIZE, m_vu1Code))
+    const uint8_t *vu1 = mapRange(PS2_VU1_CODE_BASE, PS2_VU1_CODE_SIZE, m_vu1Code);
+    if (!vu1)
+        vu1 = mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
+    if (vu1)
     {
-        return ptr;
+        // VU1 memory is device owned: let queued VIF1/VU1 work finish first.
+        ps2x::device::observeVu1Memory(const_cast<PS2Memory &>(*this));
     }
-    return mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
+    return vu1;
 }
 
 uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
@@ -752,6 +763,7 @@ uint32_t PS2Memory::read32(uint32_t address)
             uint64_t val = gs_regs.csr.load();
             return (uint32_t)(val >> (off * 8));
         }
+        ps2x::device::observeIo(*this, PS2_GS_PRIV_REG_BASE);
         uint64_t *reg = gsRegPtr(gs_regs, address);
         if (!reg)
             return 0;
@@ -798,6 +810,7 @@ uint64_t PS2Memory::read64(uint32_t address)
         {
             return gs_regs.csr.load();
         }
+        ps2x::device::observeIo(*this, PS2_GS_PRIV_REG_BASE);
         uint64_t *reg = gsRegPtr(gs_regs, address);
         return reg ? *reg : 0;
     }
@@ -824,6 +837,8 @@ uint64_t PS2Memory::read64(uint32_t address)
     // to avoid any side-effects from read32 handlers.
     if (isIoRegister(address))
     {
+        ps2x::device::observeIo(*this, address);
+        ps2x::device::observeIo(*this, address + 4u);
         uint32_t lo = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
         uint32_t hi = m_ioRegisters.count(address + 4) ? m_ioRegisters[address + 4] : 0u;
         return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
@@ -858,6 +873,10 @@ __m128i PS2Memory::read128(uint32_t address)
         inRange(vuOffset, sizeof(__m128i), vuLimit, "read128 vu", address);
         return _mm_loadu_si128(reinterpret_cast<const __m128i *>(vuMem + vuOffset));
     }
+
+    // VIF1_FIFO reads (reverse VIF1 / readback) observe device state.
+    if (!scratch && physAddr >= 0x10005000u && physAddr < 0x10006000u)
+        ps2x::device::observeIo(*this, physAddr);
 
     // 128-bit reads are primarily for quad-word loads in the EE, which are only valid for RAM areas
     // Return zeroes for unsupported areas
@@ -896,6 +915,7 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
     {
         // IO registers - handle byte writes by modifying the appropriate byte in the word
         uint32_t regAddr = physAddr & ~0x3;
+        ps2x::device::observeIo(*this, regAddr);
         uint32_t shift = (physAddr & 3) * 8;
         uint32_t mask = ~(0xFF << shift);
         uint32_t newValue = (m_ioRegisters[regAddr] & mask) | ((uint32_t)value << shift);
@@ -938,6 +958,7 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
     if (isIoRegister(physAddr))
     {
         uint32_t regAddr = physAddr & ~0x3;
+        ps2x::device::observeIo(*this, regAddr);
         uint32_t shift = (physAddr & 2) * 8;
         uint32_t mask = ~(0xFFFF << shift);
         uint32_t newValue = (m_ioRegisters[regAddr] & mask) | ((uint32_t)value << shift);
@@ -954,6 +975,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
+        ps2x::device::observeIo(*this, PS2_GS_PRIV_REG_BASE);
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -1014,6 +1036,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
 
     if (isGsPrivReg(address))
     {
+        ps2x::device::observeIo(*this, PS2_GS_PRIV_REG_BASE);
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -1080,6 +1103,11 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     }
     if (!scratch && physAddr == 0x10005000u) // VIF1_FIFO
     {
+        if (ps2x::device::submitControlQword(*this, physAddr,
+                static_cast<uint64_t>(_mm_extract_epi64(value, 0)),
+                static_cast<uint64_t>(_mm_extract_epi64(value, 1))))
+            return;
+        ps2x::device::observeIo(*this, physAddr);
         alignas(16) uint8_t fifoData[16];
         _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
         processVIF1Data(fifoData, sizeof(fifoData));
@@ -1125,6 +1153,32 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    if ((address == 0x10009000u || address == 0x1000A000u) &&
+        !(value & 0x100u) && !ps2x::device::executingCommand())
+    {
+        const auto old = m_ioRegisters.find(address);
+        if (old != m_ioRegisters.end() && (old->second & 0x100u) &&
+            ps2x::device::hasDeferredChannel(*this, address))
+        {
+            uint32_t oldChcr = 0;
+            ps2x::device::pauseDmaChannel(*this, address, oldChcr);
+        }
+    }
+    ps2x::device::noteDmaRegisterWrite(*this, address);
+    // Device-owned control effects run in order on the worker; only the EE
+    // mirrors their register values. Never let that worker mutate the owner map.
+    const bool deviceControl = (address >= 0x10003C00u && address < 0x10003E00u) ||
+        (address >= 0x10005000u && address < 0x10006000u) || address == 0x10003000u;
+    if (ps2x::device::submitControlWrite(*this, address, value))
+    {
+        m_ioRegisters[address] = value;
+        if (address >= 0x10003C00u && address < 0x10003E00u)
+            Vif1Capture::regWrite(*this, address, value);
+        return true;
+    }
+    // D1/D2/D_STAT/VIF1/GIF/GS register writes wait for queued device work and
+    // apply its DMA completion first, exactly as if it had run inline.
+    ps2x::device::observeIo(*this, address);
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -1231,7 +1285,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         }
     }
 
-    m_ioRegisters[address] = value;
+    if (!(deviceControl && ps2x::device::executingCommand()))
+        m_ioRegisters[address] = value;
 
     if (address >= 0x1000B400u && address < 0x1000B500u)
     {
@@ -1259,6 +1314,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     if (address >= 0x10003C00u && address < 0x10003E00u)
     {
         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
+        if (!ps2x::device::executingCommand())
+            Vif1Capture::regWrite(*this, address, value); // capture owner input once
 
         switch (address)
         {
@@ -1370,6 +1427,50 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                 uint32_t chcr = value;
                 uint32_t mode = (chcr >> 2) & 0x3;
+
+                // DW5XL (owner-approved 2026-10-14): VIF1 CHCR.DIR=0 is a GS -> memory
+                // readback (sceGsExecStoreImage after TRXDIR=1, VIF1_STAT.FDR, BUSDIR=1).
+                // Never feed the destination buffer to the VIF1 parser. Copy the GS
+                // local->host output into MADR; complete when QWC is satisfied, else
+                // keep STR set (the DMA waits for more data; the game's timeout applies).
+                if (channelBase == 0x10009000u && mode == 0u && (chcr & 0x1u) == 0u)
+                {
+                    if (qwc > 0u)
+                    {
+                        std::vector<uint8_t> data(static_cast<size_t>(qwc) * 16u);
+                        const uint32_t got = ps2x::device::readLocalToHost(*this, data.data(),
+                                                                           static_cast<uint32_t>(data.size()));
+                        const uint32_t gotQw = got / 16u;
+                        for (uint32_t i = 0; i < gotQw; ++i)
+                        {
+                            const uint32_t dst = madr + i * 16u;
+                            const bool scratch = isScratchpad(dst);
+                            const uint32_t phys = translateAddress(dst);
+                            uint8_t *base = scratch ? m_scratchpad : m_rdram;
+                            const uint32_t limit = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                            if (phys + 16u <= limit)
+                                std::memcpy(base + phys, data.data() + static_cast<size_t>(i) * 16u, 16u);
+                        }
+                        m_ioRegisters[channelBase + 0x10] = madr + gotQw * 16u;
+                        m_ioRegisters[channelBase + 0x20] = qwc - gotQw;
+                        static const bool readbackTrace = std::getenv("PS2X_READBACK_TRACE") != nullptr; // DW5XL-DEBUG
+                        if (readbackTrace)
+                            std::fprintf(stderr, "[vif1:readback] madr=0x%x qwc=%u gotBytes=%u\n", madr, qwc, got);
+                        if (gotQw == qwc)
+                        {
+                            m_ioRegisters[channelBase + 0x00] &= ~0x100u;
+                            uint32_t dstat = m_ioRegisters.count(0x1000E010u) ? m_ioRegisters[0x1000E010u] : 0u;
+                            dstat |= (1u << 1u);
+                            if (((dstat & 0x3FFu) & ((dstat >> 16) & 0x3FFu)) != 0u)
+                                dstat |= (1u << 31);
+                            else
+                                dstat &= ~(1u << 31);
+                            m_ioRegisters[0x1000E010u] = dstat;
+                            queueCompletedDmacCause(1u);
+                        }
+                    }
+                    return true;
+                }
 
                 if (mode == 0 && qwc > 0)
                 {
@@ -1896,8 +1997,126 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
     queueCompletedDmacCause(cause);
 }
 
+namespace
+{
+    // Walks one pending transfer in exactly the chunks the legacy loops used:
+    // a chain transfer is one kick-time snapshot, a normal transfer is split at
+    // the RAM/scratchpad wrap. GIF stops below one quadword, VIF at zero bytes.
+    template <typename Fn>
+    void forEachPendingTransferChunk(PS2Memory &mem, PS2Memory::PendingTransfer &p, uint32_t minChunkBytes, Fn &&fn)
+    {
+        if (!p.chainData.empty())
+        {
+            fn(p, true, static_cast<const uint8_t *>(nullptr), 0u);
+            return;
+        }
+        if (p.qwc == 0u)
+            return;
+
+        const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
+        uint32_t bytesLeft = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
+        uint32_t srcPhys = 0;
+        try
+        {
+            srcPhys = mem.translateAddress(p.srcAddr);
+        }
+        catch (const std::exception &)
+        {
+            return;
+        }
+        const uint8_t *base = p.fromScratchpad ? mem.m_scratchpad : mem.m_rdram;
+        const uint32_t limit = p.fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+        while (bytesLeft > 0u && bytesLeft >= minChunkBytes)
+        {
+            if (srcPhys >= limit)
+                srcPhys = 0;
+            uint32_t chunk = bytesLeft;
+            if (srcPhys + chunk > limit)
+                chunk = limit - srcPhys;
+            if (chunk == 0)
+                break;
+            fn(p, false, base + srcPhys, chunk);
+            bytesLeft -= chunk;
+            srcPhys += chunk;
+        }
+    }
+
+    void appendChunk(std::vector<std::vector<uint8_t>> &out, PS2Memory::PendingTransfer &p, bool chain,
+                     const uint8_t *data, uint32_t size)
+    {
+        if (chain)
+            out.push_back(std::move(p.chainData));
+        else
+            out.emplace_back(data, data + size);
+    }
+
+    // Device-queue variant of processPendingTransfers(): the EE keeps GIF_STAT.FQC,
+    // the VIF0 path and the kick-time snapshots; the GIF (PATH3) and VIF1 work
+    // becomes one ordered Transfer command whose DMA completion the device applies.
+    void processPendingTransfersViaDevice(PS2Memory &mem)
+    {
+        uint32_t observedGifQwc = 0u;
+        for (const auto &transfer : mem.m_pendingGifTransfers)
+        {
+            const uint64_t transferQwc = !transfer.chainData.empty()
+                                             ? (transfer.chainData.size() / 16u)
+                                             : transfer.qwc;
+            observedGifQwc = static_cast<uint32_t>(std::min<uint64_t>(16u, static_cast<uint64_t>(observedGifQwc) + transferQwc));
+        }
+        if (observedGifQwc != 0u)
+        {
+            constexpr uint32_t kGifStat = 0x10003020u;
+            constexpr uint32_t kGifFqcMask = 0x1F000000u;
+            uint32_t &gifStat = mem.m_ioRegisters[kGifStat];
+            gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
+        }
+
+        ps2x::device::TransferSnapshot snapshot;
+        snapshot.hadGif = !mem.m_pendingGifTransfers.empty();
+        snapshot.hadVif1 = !mem.m_pendingVif1Transfers.empty();
+        const bool hadVif0 = !mem.m_pendingVif0Transfers.empty();
+
+        for (auto &p : mem.m_pendingGifTransfers)
+        {
+            forEachPendingTransferChunk(mem, p, 16u, [&](PS2Memory::PendingTransfer &t, bool chain, const uint8_t *data, uint32_t size)
+                                        {
+                                            mem.m_seenGifCopy = true;
+                                            mem.m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+                                            appendChunk(snapshot.gifChunks, t, chain, data, size); });
+        }
+        mem.m_pendingGifTransfers.clear();
+
+        // VIF0/VU0 is EE owned and never reaches the GIF: keep it inline.
+        for (auto &p : mem.m_pendingVif0Transfers)
+        {
+            forEachPendingTransferChunk(mem, p, 1u, [&](PS2Memory::PendingTransfer &t, bool chain, const uint8_t *data, uint32_t size)
+                                        {
+                                            if (chain)
+                                                mem.processVIF0Data(t.chainData.data(), static_cast<uint32_t>(t.chainData.size()));
+                                            else
+                                                mem.processVIF0Data(data, size); });
+        }
+        mem.m_pendingVif0Transfers.clear();
+
+        for (auto &p : mem.m_pendingVif1Transfers)
+        {
+            forEachPendingTransferChunk(mem, p, 1u, [&](PS2Memory::PendingTransfer &t, bool chain, const uint8_t *data, uint32_t size)
+                                        { appendChunk(snapshot.vif1Chunks, t, chain, data, size); });
+        }
+        mem.m_pendingVif1Transfers.clear();
+
+        ps2x::device::submitTransfers(mem, std::move(snapshot), hadVif0);
+    }
+}
+
 void PS2Memory::processPendingTransfers()
 {
+    if (ps2x::device::isAttached(*this))
+    {
+        processPendingTransfersViaDevice(*this);
+        return;
+    }
+
     const bool hadGif = !m_pendingGifTransfers.empty();
     uint32_t observedGifQwc = 0u;
     for (const auto &transfer : m_pendingGifTransfers)
@@ -2205,6 +2424,8 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 
 void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
 {
+    if (!ps2x::device::executingCommand())
+        ps2x::device::drainAll(*this, ps2x::device::DrainReason::DirectPath);
     if (!m_rdram || qwCount == 0)
         return;
     const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
@@ -2231,6 +2452,8 @@ void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
 
 void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    if (!ps2x::device::executingCommand())
+        ps2x::device::drainAll(*this, ps2x::device::DrainReason::DirectPath);
     if (m_gifArbiter)
         submitGifPacket(GifPathId::Path3, data, sizeBytes);
     else if (m_gifPacketCallback && data && sizeBytes >= 16)
@@ -2239,6 +2462,7 @@ void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr)
 {
+    ps2x::device::drainAll(*this, ps2x::device::DrainReason::NativeGifChain);
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
@@ -2431,6 +2655,7 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
 
 bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t chcr)
 {
+    ps2x::device::drainAll(*this, ps2x::device::DrainReason::NativeGifChain);
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
@@ -2516,6 +2741,7 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    ps2x::device::observeIo(*this, address);
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -2595,7 +2821,8 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     {
         if (address >= 0x10008000 && address < 0x1000F000)
         {
-            if (address == 0x1000B400u)
+            if (address == 0x1000B400u ||
+                ((address == 0x10009000u || address == 0x1000A000u) && ps2x::device::isAsync(*this)))
                 return m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
             if ((address & 0xFF) == 0x00)
             {

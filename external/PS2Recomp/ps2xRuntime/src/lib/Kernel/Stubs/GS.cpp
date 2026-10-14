@@ -4,6 +4,7 @@
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_device_queue.h"
 
 namespace ps2_stubs
 {
@@ -114,12 +115,18 @@ namespace ps2_stubs
                 return;
             }
 
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.testa.reg & 0xFFu), clear.testa.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.prim.reg & 0xFFu), clear.prim.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.rgbaq.reg & 0xFFu), clear.rgbaq.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.xyz2a.reg & 0xFFu), clear.xyz2a.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.xyz2b.reg & 0xFFu), clear.xyz2b.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.testb.reg & 0xFFu), clear.testb.value);
+            std::vector<ps2x::device::GsRegWrite> writes = {
+                {static_cast<uint8_t>(clear.testa.reg & 0xFFu), clear.testa.value},
+                {static_cast<uint8_t>(clear.prim.reg & 0xFFu), clear.prim.value},
+                {static_cast<uint8_t>(clear.rgbaq.reg & 0xFFu), clear.rgbaq.value},
+                {static_cast<uint8_t>(clear.xyz2a.reg & 0xFFu), clear.xyz2a.value},
+                {static_cast<uint8_t>(clear.xyz2b.reg & 0xFFu), clear.xyz2b.value},
+                {static_cast<uint8_t>(clear.testb.reg & 0xFFu), clear.testb.value},
+            };
+            if (ps2x::device::submitGsRegWrites(runtime->memory(), writes))
+                return;
+            for (const auto &write : writes)
+                runtime->gs().writeRegister(write.first, write.second);
         }
 
         void refreshPacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr);
@@ -744,6 +751,8 @@ namespace ps2_stubs
         mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
         mem.processPendingTransfers();
 
+        // GS -> host readback: the BITBLT/TRXDIR packet above may still be queued.
+        ps2x::device::drainAll(mem, ps2x::device::DrainReason::StoreImage);
         ps2TraceGuestRangeWrite(rdram, dstAddr, totalImageBytes, "sceGsExecStoreImage", ctx);
         runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
         runtime->guestFree(pktAddr);
@@ -857,6 +866,45 @@ namespace ps2_stubs
 
     void sceGsResetPath(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        (void)rdram;
+        if (!runtime) { setReturnS32(ctx, -1); return; }
+        auto &memory = runtime->memory();
+        constexpr uint32_t kVif1Fbrst = 0x10003C10u;
+        constexpr uint32_t kVif1Err = 0x10003C20u;
+        constexpr uint32_t kVif1Fifo = 0x10005000u;
+        constexpr uint32_t kGifCtrl = 0x10003000u;
+        const auto control = [&](uint32_t address, uint32_t value)
+        {
+            memory.writeIORegister(address, value);
+            if (address == kGifCtrl && !ps2x::device::isAsync(memory))
+            {
+                runtime->gifArbiter().reset();
+                runtime->gs().resetGifInput();
+            }
+        };
+        const auto fifo = [&](uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3)
+        {
+            const uint64_t lo = uint64_t(w0) | (uint64_t(w1) << 32);
+            const uint64_t hi = uint64_t(w2) | (uint64_t(w3) << 32);
+            memory.write128(kVif1Fifo, _mm_set_epi64x(hi, lo));
+        };
+        const auto vifCommand = [](uint32_t command, uint32_t immediate = 0u)
+        {
+            return (command << 24) | immediate;
+        };
+
+        ctx->vu0_vpu_stat &= ~0x0700u;
+        control(kVif1Fbrst, 1u);
+        control(kVif1Err, 2u);
+        if (!ps2x::device::submitVu1Reset(memory))
+            runtime->vu1().resetMicroExecution();
+        // First qword: STCYCL 4/4, STMASK with zero mask, STMOD 0.
+        fifo(vifCommand(0x01u, 0x0404u), vifCommand(0x20u), 0u,
+             vifCommand(0x05u));
+        // Second qword: unmask PATH3, BASE/OFFSET/ITOP 0.
+        fifo(vifCommand(0x06u), vifCommand(0x03u), vifCommand(0x02u),
+             vifCommand(0x04u));
+        control(kGifCtrl, 1u);
         setReturnS32(ctx, 0);
     }
 
@@ -1169,7 +1217,11 @@ namespace ps2_stubs
             if (hasSeededGsClearPacket(db.clear0))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear0.prim.value >> 9) & 0x1u);
-                runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear0.rgbaq.value));
+                const uint32_t clearRgba = static_cast<uint32_t>(db.clear0.rgbaq.value);
+                GS *gs = &runtime->gs();
+                if (!ps2x::device::submitGsCall(runtime->memory(), [gs, clearContext, clearRgba]
+                                                { gs->clearFramebufferContext(clearContext, clearRgba); }))
+                    gs->clearFramebufferContext(clearContext, clearRgba);
             }
             applyGsClearPacket(runtime, db.clear0);
         }
@@ -1180,7 +1232,11 @@ namespace ps2_stubs
             if (hasSeededGsClearPacket(db.clear1))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear1.prim.value >> 9) & 0x1u);
-                runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear1.rgbaq.value));
+                const uint32_t clearRgba = static_cast<uint32_t>(db.clear1.rgbaq.value);
+                GS *gs = &runtime->gs();
+                if (!ps2x::device::submitGsCall(runtime->memory(), [gs, clearContext, clearRgba]
+                                                { gs->clearFramebufferContext(clearContext, clearRgba); }))
+                    gs->clearFramebufferContext(clearContext, clearRgba);
             }
             applyGsClearPacket(runtime, db.clear1);
         }
@@ -1220,7 +1276,14 @@ namespace ps2_stubs
 
         if (mode == 0)
         {
-            mem.processPendingTransfers();
+            if (ps2x::device::isAsync(mem))
+            {
+                ps2x::device::drainAll(mem, ps2x::device::DrainReason::Explicit);
+            }
+            else
+            {
+                mem.processPendingTransfers();
+            }
 
             uint32_t count = 0;
             constexpr uint32_t kTimeout = 0x1000000;
@@ -1267,14 +1330,61 @@ namespace ps2_stubs
         {
             uint32_t result = 0;
 
-            if ((mem.readIORegister(0x10009000) & 0x100) != 0)
-                result |= 1;
-            if ((mem.readIORegister(0x1000A000) & 0x100) != 0)
-                result |= 2;
-            if ((mem.readIORegister(0x10003C00) & 0x1F000003) != 0)
-                result |= 4;
-            if ((mem.readIORegister(0x10003020) & 0xC00) != 0)
-                result |= 0x10;
+            if (ps2x::device::isAsync(mem))
+            {
+                ps2x::device::pollCompletions(mem);
+
+                const bool vif1Busy = ps2x::device::hasDeferredChannel(mem, 0x10009000u);
+                const bool gifBusy = ps2x::device::hasDeferredChannel(mem, 0x1000A000u);
+
+                // Owner decision 2026-10-14: real hardware always finishes the
+                // previous frame's packet before the next vblank check, so the
+                // game never sees "busy" here (it would abort the packet and lose
+                // the HUD drawn at its tail). Suspend only this guest thread until
+                // the device worker is idle, then re-evaluate (reports idle).
+                if ((vif1Busy || gifBusy) && !runtime->eeScheduler().currentThread())
+                {
+                    // No blockable guest thread (should not happen in DW5): fall
+                    // back to a blocking drain, then report the drained state.
+                    ps2x::device::drainAll(mem, ps2x::device::DrainReason::Explicit);
+                    sceGsSyncPath(rdram, ctx, runtime);
+                    return;
+                }
+                else if (vif1Busy || gifBusy)
+                {
+                    runtime->eeScheduler().waitExternal(
+                        EeWaitReason::External,
+                        ps2x::device::kDeviceIdleWaitType,
+                        ps2x::device::kDeviceIdleWaitToken,
+                        [rdram, runtime](R5900Context &resumeContext)
+                        { sceGsSyncPath(rdram, &resumeContext, runtime); });
+                }
+
+                const uint32_t d1 = mem.m_ioRegisters.count(0x10009000u) ? mem.m_ioRegisters.at(0x10009000u) : 0u;
+                const uint32_t d2 = mem.m_ioRegisters.count(0x1000A000u) ? mem.m_ioRegisters.at(0x1000A000u) : 0u;
+                const uint32_t vif1Stat = mem.m_ioRegisters.count(0x10003C00u) ? mem.m_ioRegisters.at(0x10003C00u) : 0u;
+                const uint32_t gifStat = mem.m_ioRegisters.count(0x10003020u) ? mem.m_ioRegisters.at(0x10003020u) : 0u;
+
+                if (vif1Busy || (d1 & 0x100u) != 0)
+                    result |= 1;
+                if (gifBusy || (d2 & 0x100u) != 0)
+                    result |= 2;
+                if (vif1Busy || (vif1Stat & 0x1F000003u) != 0)
+                    result |= 4;
+                if (gifBusy || (gifStat & 0xC00u) != 0)
+                    result |= 0x10;
+            }
+            else
+            {
+                if ((mem.readIORegister(0x10009000) & 0x100) != 0)
+                    result |= 1;
+                if ((mem.readIORegister(0x1000A000) & 0x100) != 0)
+                    result |= 2;
+                if ((mem.readIORegister(0x10003C00) & 0x1F000003) != 0)
+                    result |= 4;
+                if ((mem.readIORegister(0x10003020) & 0xC00) != 0)
+                    result |= 0x10;
+            }
 
             static const bool traceSync = [] {
                 const char *flag = std::getenv("PS2X_GS_SYNC_TRACE");
