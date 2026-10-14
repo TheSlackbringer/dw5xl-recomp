@@ -27,7 +27,6 @@ add_executable(dw5xl
     src/dw5xl_images.cpp
     src/ipu_idec.cpp
     src/dw5xl_overlays.cpp
-    src/dw5xl_vu1_lifted.cpp
 )
 target_include_directories(dw5xl PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
 target_link_libraries(dw5xl PRIVATE ps2_runtime rlImGui imgui)
@@ -42,8 +41,18 @@ target_precompile_headers(dw5xl PRIVATE
 )
 # 42k small generated files: batch them so the compiler isn't started 42k times.
 set_target_properties(dw5xl PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
-set_source_files_properties(src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp src/dw5xl_vu1_lifted.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
-set_property(SOURCE src/dw5xl_vu1_lifted.cpp APPEND PROPERTY COMPILE_OPTIONS -frounding-math -ffp-contract=off)
+set_source_files_properties(src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
+# Lifted VU1 microprograms are translated from the game's own microcode (tools/vu1_translator.py, run by
+# tools/regen.sh) into the ignored recomp/dw5xl/vu1/ folder. Game-derived: never committed. Without it,
+# VU1 microcode runs in the interpreter.
+set(DW5XL_VU1_LIFTED_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../recomp/dw5xl/vu1/dw5xl_vu1_lifted.cpp")
+if(EXISTS "${DW5XL_VU1_LIFTED_SRC}")
+    target_sources(dw5xl PRIVATE "${DW5XL_VU1_LIFTED_SRC}")
+    set_source_files_properties("${DW5XL_VU1_LIFTED_SRC}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
+    set_property(SOURCE "${DW5XL_VU1_LIFTED_SRC}" APPEND PROPERTY COMPILE_OPTIONS -frounding-math -ffp-contract=off)
+else()
+    message(STATUS "No lifted VU1 code (run tools/regen.sh); VU1 microcode will be interpreted")
+endif()
 # Generated code uses SSE4.1/AVX intrinsics (PS2Recomp only enables them in its own directory).
 target_compile_options(dw5xl PRIVATE -march=x86-64-v3)
 
@@ -192,12 +201,14 @@ if(DW5XL_BUILD_TESTS)
     add_test(NAME gsreplay_synthetic COMMAND dw5xl_gsreplay_test $<TARGET_FILE:dw5xl_vif1_replay>
              $<TARGET_FILE:dw5xl_gsrec> "${CMAKE_CURRENT_BINARY_DIR}/gsreplay_test")
 
-    add_executable(dw5xl_vu1_lift_test tests/vu1_lift_test.cpp src/dw5xl_vu1_lifted.cpp)
-    target_link_libraries(dw5xl_vu1_lift_test PRIVATE ps2_runtime)
-    target_include_directories(dw5xl_vu1_lift_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
-    target_compile_options(dw5xl_vu1_lift_test PRIVATE -march=x86-64-v3 -frounding-math -ffp-contract=off)
-    add_test(NAME vu1_lift COMMAND dw5xl_vu1_lift_test)
-    add_test(NAME vu1_dma_reset_interpreter COMMAND dw5xl_vu1_lift_test dma-cancel-interpreter)
-    add_test(NAME vu1_dma_reset_lift COMMAND dw5xl_vu1_lift_test dma-cancel-lift)
-    set_tests_properties(vu1_dma_reset_interpreter vu1_dma_reset_lift PROPERTIES TIMEOUT 20)
+    if(EXISTS "${DW5XL_VU1_LIFTED_SRC}")
+        add_executable(dw5xl_vu1_lift_test tests/vu1_lift_test.cpp "${DW5XL_VU1_LIFTED_SRC}")
+        target_link_libraries(dw5xl_vu1_lift_test PRIVATE ps2_runtime)
+        target_include_directories(dw5xl_vu1_lift_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
+        target_compile_options(dw5xl_vu1_lift_test PRIVATE -march=x86-64-v3 -frounding-math -ffp-contract=off)
+        add_test(NAME vu1_lift COMMAND dw5xl_vu1_lift_test)
+        add_test(NAME vu1_dma_reset_interpreter COMMAND dw5xl_vu1_lift_test dma-cancel-interpreter)
+        add_test(NAME vu1_dma_reset_lift COMMAND dw5xl_vu1_lift_test dma-cancel-lift)
+        set_tests_properties(vu1_dma_reset_interpreter vu1_dma_reset_lift PROPERTIES TIMEOUT 20)
+    endif()
 endif()

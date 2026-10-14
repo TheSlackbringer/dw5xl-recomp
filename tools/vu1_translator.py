@@ -1,4 +1,4 @@
-import struct, sys
+import os, struct, sys
 
 BC = ['x', 'y', 'z', 'w']
 def dest_name(d): return ''.join(c for i, c in enumerate('xyzw') if d & (8 >> i))
@@ -499,9 +499,12 @@ if __name__ == '__main__':
 
     bins = {}
     import glob
-    for p in glob.glob('notes/evidence/battle_real_census.tsv.*.bin'):
+    for p in glob.glob(os.environ.get('DW5XL_VU1_CENSUS_GLOB', 'notes/evidence/battle_real_census.tsv.*.bin')):
         h = p.split('.')[-2]
         bins[h] = load(p)
+    if not bins:
+        print("No captured VU1 microcode found (DW5XL_VU1_CENSUS_GLOB); lifted VU1 code not generated.")
+        sys.exit(0)
 
     targets = [
         ('1ad6eefff0c2e7e5', 0x0800, 0x0a78, 'lift_1ad6_0800'),
@@ -648,6 +651,9 @@ inline V vuItofV(V a, float scale)
     regs.append("    // Subroutine-level footprint registrations (matches across all dynamic images):")
 
     for h, pc, end_pc, name in targets:
+        if h not in bins:
+            print(f"Skipping {name}: no captured microcode for {h}")
+            continue
         code = bins[h]
         sub_code = code[pc:end_pc+8]
         sub_size = len(sub_code)
@@ -679,7 +685,10 @@ void lift_flush_0360(vl::Run &c)
     out.append("static const vl::Registration s_battle_registrations[] = {\n" + "\n".join(regs) + "\n};\n" +
                "static vl::Registrar s_battle_registrar(s_battle_registrations, sizeof(s_battle_registrations) / sizeof(s_battle_registrations[0]));\n")
 
-    with open('app/src/dw5xl_vu1_lifted.cpp', 'w') as f:
+    # Output is translated game code: keep it in the ignored recomp/ tree, never in Git.
+    out_path = os.environ.get('DW5XL_VU1_LIFTED_OUT', 'recomp/dw5xl/vu1/dw5xl_vu1_lifted.cpp')
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, 'w') as f:
         f.write("\n\n".join(out))
-    print("Wrote app/src/dw5xl_vu1_lifted.cpp successfully!")
+    print(f"Wrote {out_path}")
 

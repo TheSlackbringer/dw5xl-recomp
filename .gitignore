@@ -23,3 +23,8 @@ __pycache__/
 
 # Local research and bring-up notes
 /notes/
+
+# Game-derived generated code and frame dumps: never commit
+/recomp/*/vu1/
+/final.png
+/frame_*.png
