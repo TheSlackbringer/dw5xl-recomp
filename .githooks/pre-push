@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Blocks pushing any commit that contains the lifted VU1 code (game-derived; see pre-commit).
+pattern='(^|/)dw5xl_vu1_lifted\.cpp$|^recomp/[^/]+/vu1/'
+zero=0000000000000000000000000000000000000000
+status=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue  # branch deletion
+    if [ "$remote_sha" = "$zero" ]; then
+        range=$(git rev-list "$local_sha" --not --remotes)
+    else
+        range=$(git rev-list "$remote_sha..$local_sha")
+    fi
+    for commit in $range; do
+        bad=$(git diff-tree --no-commit-id --name-only -r --root --diff-filter=ACMR "$commit" | grep -E "$pattern")
+        if [ -n "$bad" ]; then
+            echo "Push blocked: commit $commit contains game-derived lifted VU1 code:" >&2
+            echo "$bad" >&2
+            status=1
+        fi
+    done
+done
+exit $status

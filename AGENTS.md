@@ -49,6 +49,11 @@ the original DW5 disc, so both games run in one port. FMV movies must work in th
 - Legitimate original discs only. **Never commit or distribute game data** (`game/`, `discs/`), Ghidra DBs or generated code.
 - **GPU renderer only: use Vulkan/paraLLEl-GS for development, game runs, debugging and performance testing.** Do not run CPU renderer comparisons, develop CPU-renderer fixes, or propose switching back to CPU unless explicitly requested. Existing CPU backend code may remain; its presence does not authorize CPU work.
 - **No automatic Git staging or commits.** Leave changes unstaged; create commits only upon explicit command.
+- **Never commit or push anything derived from the game's code or data**: no generated or lifted C++ (the lifted
+  VU1 code lives only in the ignored `recomp/dw5xl/vu1/`; never `dw5xl_vu1_lifted.cpp` anywhere in Git), frame dumps
+  (`final.png`, `frame_*.png`), RAM/VRAM/VU captures or microcode `.bin` files. Repo hooks in `.githooks/` block the
+  lifted VU1 code on commit and push (enable once per clone: `git config core.hooksPath .githooks`). Never bypass
+  hooks (`--no-verify`, `-n`), and never push without the owner's explicit command.
 - Prefer the game's own SDK library code over runtime HLE stubs when a function only builds packets/structs.
   HLE only what touches hardware the runtime cannot model.
 - Parallelise independent tasks (separate worktrees/build dirs per task, see §4); verify every fix with a test run.

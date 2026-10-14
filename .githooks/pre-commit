@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Blocks committing the lifted VU1 code: it is translated from the game's own microcode
+# (game-derived) and must only exist locally in the ignored recomp/<profile>/vu1/ folder.
+pattern='(^|/)dw5xl_vu1_lifted\.cpp$|^recomp/[^/]+/vu1/'
+bad=$(git diff --cached --name-only --diff-filter=ACMR | grep -E "$pattern")
+if [ -n "$bad" ]; then
+    echo "Commit blocked: game-derived lifted VU1 code must never be committed:" >&2
+    echo "$bad" >&2
+    exit 1
+fi
+exit 0
