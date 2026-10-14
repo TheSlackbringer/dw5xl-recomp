@@ -1,109 +1,134 @@
-# dw5xl-recomp
+# DW5XL Recomp
 
-A native PC port of **Dynasty Warriors 5: Xtreme Legends** (PS2), built by statically recompiling the game's own code into C++ with PS2Recomp. There is no emulator at runtime: the game logic runs as native code, and the parts that touched PS2 hardware are replaced with native implementations where possible.
+A native PC port of **Dynasty Warriors 5: Xtreme Legends** for the PlayStation 2, built with PS2Recomp. The game's logic is statically translated into C++; the runtime provides the PS2 hardware services it still needs. Graphics use **Vulkan through paraLLEl-GS**.
+
+**In development.** Linux is the current development and testing platform. Windows is planned. There is no packaged player release yet, and full playability has not been established.
 
 > [!IMPORTANT]
-> This repository contains no game files: no disc images, executables, IRX modules, assets, or C++ generated from the game. You need your own copy of **Dynasty Warriors 5: Xtreme Legends** (English PAL, `SLES_538.60`). The planned **Load Original** support will also need your own copy of **Dynasty Warriors 5** (English PAL, `SLES_533.39`). This project does not provide or download either game.
+> You need your own legal copy of **Dynasty Warriors 5: Xtreme Legends** (English PAL, `SLES_538.60`). This repository does not provide disc images, game executables, IRX modules or game assets. The main executable and overlay C++ translations are generated locally from your disc. It does not provide or download either game.
 
-## Status
+## Current progress
 
-Early development. Linux only for now; Windows is planned.
+| Area | Status |
+| --- | --- |
+| Boot and menus | Boot, title screen, Options and mode selection work. |
+| Input | Keyboard and gamepad input work. |
+| Audio and movies | Intro and selected event movies play with audio; menu music and sound effects work. |
+| Saves | Saving and loading have been confirmed in manual testing. |
+| Legend Mode | Scenario selection, briefing and preparation render; battles run with movement and attacks in current tests. |
+| Other modes | Edit Mode works. Destiny, Challenge and Xtreme reach battle, but need further gameplay testing after the shared battle fixes. |
+| Load Original | Local original-disc validation and the original prompts are implemented; broader mode testing remains. |
+| Opening | Reaches real-time 3D scenes, with outstanding visual defects. |
 
-Working: boot, intro movies with audio (skippable), title screen, main menu and Options, keyboard and gamepad input, menu music and sound effects, and animated still images, all at the PAL 50 Hz rate. Memory card saving and loading are still being verified.
+Rendering defects and combat performance drops remain under investigation. These results describe tested scenes, not a complete playthrough or a guarantee that every mode works.
 
-OVL00 now compiles as a separate native module and activates before its constructors. Opening runs its scene loop, but graphics are still corrupted; further engine work is required.
+## Supported discs
 
-Not working yet: 3D gameplay (the real-time engine), the **Load Original** feature, and a player installer. There is no release build; you currently build from source with your own disc.
-
-## Supported game versions
-
-| Game | Region | Executable | Use |
+| Game | Version | Executable | Required? |
 | --- | --- | --- | --- |
-| Dynasty Warriors 5: Xtreme Legends | English PAL | `SLES_538.60` | Required |
-| Dynasty Warriors 5 | English PAL | `SLES_533.39` | Future Load Original support |
+| Dynasty Warriors 5: Xtreme Legends | English PAL | `SLES_538.60` | Yes |
+| Dynasty Warriors 5 | English PAL | `SLES_533.39` | Optional, for Load Original |
 
-Other regions and revisions are not supported. The recompiler profile is made for `SLES_538.60`, and the port's fixes only apply when the disc serial and the code they replace match.
+Other regions and revisions are unsupported. You can use XL alone. To unlock the original game's Musou and Free modes, supply the supported original DW5 files and select **Load Original** in the game. Having both games present does not unlock those modes at startup; verification fails when the original DW5 copy is missing or invalid.
 
-## Building
+The planned player release will provide a prebuilt application and native disc importer. That installer is not implemented; the workflow below is for developers.
 
-You need Linux with clang, lld, CMake and Ninja, plus the usual development packages for X11/Wayland, OpenGL and audio. CMake downloads the remaining library dependencies the first time you configure.
+## Building on Linux
 
-1. Extract your own XL disc image into `game/dw5xl/`, keeping its folder structure. `SLES_538.60` and `SYSTEM.CNF` must be directly inside that folder. With `bsdtar`:
+Run the following from the repository root. You need an x86-64 CPU supporting x86-64-v3, Clang, lld, CMake 3.21 or newer, Ninja, Git, rsync, pkg-config, Vulkan drivers, and development packages for FFmpeg, the window system and audio. FFmpeg must provide `libavcodec`, `libavformat`, `libavutil`, `libswresample` and `libswscale`. CMake may download other build dependencies during configuration.
 
-   ```sh
-   mkdir -p game/dw5xl
-   bsdtar -xf "/path/to/your/Dynasty Warriors 5 Xtreme Legends.iso" -C game/dw5xl
-   ```
+### 1. Prepare your disc files
 
-   If you have the original DW5 disc, extract it into `game/dw5/` the same way. It is not used yet.
+Extract your XL disc into `game/dw5xl/`, preserving its directory structure. For example, using `bsdtar`:
 
-2. Build the recompiler and generate the game code from your executable:
+```sh
+mkdir -p game/dw5xl
+bsdtar -xf "/path/to/your/XL-disc.iso" -C game/dw5xl
+```
 
-   ```sh
-   CC=clang CXX=clang++ cmake -S external/PS2Recomp -B external/PS2Recomp/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-   cmake --build external/PS2Recomp/build --target ps2_recomp
-   tools/regen.sh
-   ```
+`SLES_538.60`, `SYSTEM.CNF` and the overlay files must be in that directory. Optionally extract your original DW5 disc into `game/dw5/`, with `SLES_533.39` directly inside it. Keep all extracted assets; the executable alone is insufficient.
 
-3. Build the game:
+### 2. Generate the native game code
 
-   ```sh
-   CC=clang CXX=clang++ cmake -S app -B app/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_LINKER_TYPE=LLD
-   cmake --build app/build --target dw5xl
-   ```
+```sh
+CC=clang CXX=clang++ cmake -S external/PS2Recomp -B external/PS2Recomp/build -G Ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DPS2X_BUILD_RUNTIME=OFF -DPS2X_BUILD_ANALYZER=OFF \
+  -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF
+cmake --build external/PS2Recomp/build --target ps2_recomp
+tools/regen.sh all
+```
 
-## Running
+This generates the main executable and OVL00–OVL02 translations locally. Ghidra is used for reverse engineering; the existing function maps support this generation step without creating a new Ghidra project.
+
+### 3. Prepare the Vulkan renderer
+
+The wrapper currently expects the pinned paraLLEl-GS revision below and its required submodules:
+
+```sh
+git clone https://github.com/Themaister/parallel-gs.git app/deps/parallel-gs
+git -C app/deps/parallel-gs checkout cc6184af7e0c03da603045ca371ffa5dae9b0655
+git -C app/deps/parallel-gs submodule update --init Granite
+git -C app/deps/parallel-gs/Granite submodule update --init \
+  third_party/volk third_party/khronos/vulkan-headers
+```
+
+If that checkout already exists, reuse it after verifying the revision.
+
+### 4. Build the application
+
+```sh
+CC=clang CXX=clang++ cmake -S app -B app/build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_LINKER_TYPE=LLD \
+  -DPS2X_ENABLE_VULKAN_GS=ON \
+  -DPS2X_PARALLEL_GS_SOURCE_DIR="$PWD/app/deps/parallel-gs" \
+  -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF
+cmake --build app/build --target dw5xl
+```
+
+The verbose per-function logging option is disabled here because it substantially slows gameplay. This is a development build; the complete setup has not yet been validated as a clean-install release workflow.
+
+## Running and controls
 
 ```sh
 cd game/dw5xl
-PS2X_GS_BACKEND=cpu ../../app/build/dw5xl ./SLES_538.60
+PS2X_GS_BACKEND=vulkan ../../app/build/dw5xl ./SLES_538.60
 ```
 
-The CPU renderer is the tested one for now. Saves go to `game/dw5xl/mc0/`.
+Saves are stored in `game/dw5xl/mc0/`. Keep that directory when updating your build.
 
-Keyboard: Enter = Start, Tab = Select, X or Space = Cross, C or Esc = Circle, Z = Square, V = Triangle, arrow keys or WASD = D-pad, Q / E = L1 / R1, Left / Right Shift = L2 / R2. Gamepads work as well.
+| Keyboard | PS2 input |
+| --- | --- |
+| Enter / Tab | Start / Select |
+| X or Space / C or Esc | Cross / Circle |
+| Z / V | Square / Triangle |
+| Arrow keys or WASD | D-pad |
+| Q / E | L1 / R1 |
+| Left Shift / Right Shift | L2 / R2 |
 
-## How it works
+Gamepads are also supported. Press **F3** to toggle the FPS counter, or start with `PS2X_FPS=1`. Optional supersampling is controlled by `PS2X_GS_SCALE=1|2|4|8|16`; start at `1` when testing performance.
 
-`tools/regen.sh` runs the recompiler over your `SLES_538.60` using the profile in `recomp/dw5xl/` (function map, SDK stubs, hardware register map). It writes about 43,000 C++ files to `recomp/dw5xl/output/`, one per game function, which stay on your machine and are never committed.
+## Development
 
-The executable links that generated code with the runtime in `external/PS2Recomp/` and our own code in `app/src/`. At startup every game function is registered under its original PS2 address, and the game calls functions through that table. For a known disc, our code replaces specific entries with native functions:
-
-- **Controller input:** the game's controller library calls go to a native input bridge (`dw5xl_pad2.cpp`).
-- **Still images:** the game's image decoder is replaced by our own MPEG-2 intra decoder (`dw5xl_images.cpp`, `ipu_idec.cpp`).
-
-Movie playback and timing fixes live in the runtime.
-
-A replacement can take over a function completely, or call the original and adjust its result. That is how planned improvements such as camera controls will be added.
-
-Your disc files are only read. Fixes live in handwritten C++, the recompiler profile and the runtime, never in the game files or the generated code.
-
-## Repository layout
+Fixes live in handwritten app/runtime code, recompiler profiles and generation tools. Original disc files remain unchanged; generated translations are regenerated rather than edited by hand.
 
 | Path | Contents |
 | --- | --- |
-| `app/` | The executable: build files and our native code (`src/`) |
-| `recomp/dw5xl/` | Recompiler profile and function map for `SLES_538.60` |
-| `tools/` | Code generation script, Ghidra scripts, decoder tests, debug helpers |
-| `external/PS2Recomp/` | Third-party: modified copy of PS2Recomp (runtime and recompiler) |
-| `vendor/runtime-patches/` | Third-party: the runtime patch series applied to that copy, kept for provenance |
-| `licenses/` | Third-party license notices |
-| `game/` | Your extracted disc files (ignored by Git) |
+| `app/` | Application, native bridges and regression tests |
+| `recomp/dw5xl/` | PAL profiles, function maps and overlay configuration |
+| `tools/` | Code generation, Ghidra scripts and debugging tools |
+| `external/PS2Recomp/` | Vendored runtime and recompiler with maintained modifications |
+| `vendor/runtime-patches/` | Runtime patch provenance |
+| `licenses/` | Third-party notices |
 
-`AGENTS.md` and `CLAUDE.md` describe the development workflow for contributors and coding agents.
+Game data, analysis databases, generated main/overlay output, builds and local research notes are excluded from Git. Contributor and coding-agent workflows are described in `AGENTS.md` and `CLAUDE.md`.
 
-## Roadmap
-
-1. 3D engine: fix the rendering corruption in the real-time Opening, then add recompilation and switching for the game's overlay modules.
-2. Verify saving and loading, and sound in all menus.
-3. **Load Original** with the original DW5 disc.
-4. Player release: a prebuilt application with a first-run importer that checks your disc, for Linux and Windows.
-5. Improvements such as camera controls.
+Current priorities are rendering correctness, combat performance, broader gameplay testing, and preparing the native importer and Linux/Windows release packaging.
 
 ## License and attribution
 
 The port's own source and tools are licensed under GPL-3.0; see [LICENSE](LICENSE). This license grants no rights to the original games or their assets.
 
-Everything under `external/` is third-party code that keeps its own license. `external/PS2Recomp/` is a modified copy of [PS2Recomp](https://github.com/ran-j/PS2Recomp) by ran-j and contributors (GPL-3.0), not an unmodified upstream release. Its base revision and changes are recorded in `external/PS2Recomp/DW5XL_VENDORED.md`. [THIRD_PARTY.md](THIRD_PARTY.md) lists all third-party sources and notices.
+The vendored [PS2Recomp](https://github.com/ran-j/PS2Recomp) runtime and recompiler are modified versions of the upstream project by ran-j and contributors. Revision and maintenance details are in [DW5XL_VENDORED.md](external/PS2Recomp/DW5XL_VENDORED.md). Third-party code retains its applicable licenses; see [THIRD_PARTY.md](THIRD_PARTY.md) and the accompanying notices.
 
 Dynasty Warriors is a trademark of KOEI TECMO. This project is not affiliated with or endorsed by KOEI TECMO.
