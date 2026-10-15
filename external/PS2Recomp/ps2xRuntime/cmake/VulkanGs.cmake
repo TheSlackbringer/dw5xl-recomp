@@ -8,7 +8,10 @@ if(PS2X_ENABLE_VULKAN_GS)
     # DW5XL: the scanout output-scale / native SSAA resolve patch must be applied.
     file(READ "${PS2X_PARALLEL_GS_SOURCE_DIR}/gs/gs_interface.hpp" PS2X_PARALLEL_GS_INTERFACE)
     string(FIND "${PS2X_PARALLEL_GS_INTERFACE}" "high_resolution_scale_log2" PS2X_PARALLEL_GS_PATCHED)
-    if(PS2X_PARALLEL_GS_PATCHED EQUAL -1)
+    # DW5XL: and the sprite texel-edge rounding patch (terrain seams).
+    file(READ "${PS2X_PARALLEL_GS_SOURCE_DIR}/gs/shaders/triangle_setup.comp" PS2X_PARALLEL_GS_TRIANGLE_SETUP)
+    string(FIND "${PS2X_PARALLEL_GS_TRIANGLE_SETUP}" "samples exactly on texel edges" PS2X_PARALLEL_GS_SPRITE_PATCHED)
+    if(PS2X_PARALLEL_GS_PATCHED EQUAL -1 OR PS2X_PARALLEL_GS_SPRITE_PATCHED EQUAL -1)
         message(FATAL_ERROR "paraLLEl-GS checkout lacks vendor/parallel-gs-patches; apply them with: git -C <checkout> apply <repo>/vendor/parallel-gs-patches/*.patch")
     endif()
     set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
