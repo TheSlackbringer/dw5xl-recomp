@@ -42,6 +42,10 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
         constexpr uint64_t kCdvdCompletionCycles = 128u;
         constexpr uint64_t kIopClockHz = 36'864'000u;
+        // DW5XL: generated EE code accounts 32 cycles per checkpoint. Reading the host clock and
+        // running an IOP scheduler pass at each one cost more than the IOP work itself, so the
+        // host-clocked IOP catches up once per this many EE cycles (~14 us of PS2 time).
+        constexpr uint64_t kHostClockPollEeCycles = 4096u;
         constexpr uint64_t kNanosecondsPerSecond = 1'000'000'000u;
 
         uint32_t physicalAddress(uint32_t address)
@@ -145,6 +149,7 @@ namespace ps2x::iop::detail
             servicingSoundInterrupt = false;
             totalInstructions = 0;
             eeCycleCarry = 0;
+            hostClockPendingEe = 0;
             hostClockEpochNs = host.monotonicNanoseconds();
             hostClockLastNs = hostClockEpochNs.value_or(0u);
             hostClockBaseCycles = 0u;
@@ -852,6 +857,7 @@ namespace ps2x::iop::detail
         bool servicingSoundInterrupt = false;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
+        uint64_t hostClockPendingEe = 0;
         std::optional<uint64_t> hostClockEpochNs;
         uint64_t hostClockLastNs = 0u, hostClockBaseCycles = 0u, hostClockLastTraceNs = 0u;
         bool hostClockTrace = false;
@@ -894,6 +900,13 @@ namespace ps2x::iop::detail
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
+        if (m_impl->hostClockEpochNs)
+        {
+            m_impl->hostClockPendingEe += eeCycles;
+            if (m_impl->hostClockPendingEe < kHostClockPollEeCycles)
+                return;
+        }
+        m_impl->hostClockPendingEe = 0;
         if (const auto now = m_impl->host.monotonicNanoseconds())
         {
             m_impl->runHostClock(*now);
