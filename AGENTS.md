@@ -28,6 +28,10 @@ Native Linux port of **Dynasty Warriors 5 Xtreme Legends** via static recompilat
 the original DW5 disc, so both games run in one port. FMV movies must work in the final version.
 
 ## 2. RULES
+- **NEVER ASSUME — ask the owner, with a recommendation.** If you need something opened, switched, installed,
+  checked or done (e.g. a different Ghidra program loaded in the GUI, PCSX2 at a certain screen, a setting changed,
+  a file provided), or you are unsure what the owner has or wants, ask: say what you need, why, and what you
+  recommend. Do not assume what is open, installed or intended, and do not route around a missing piece silently.
 - **Scope changes require explicit approval.** Present the proposed scope before
   acting; do not expand it or infer approval from a general request. After approval, carry out the work
   within that scope and bring any proposed changes back for confirmation.
@@ -114,7 +118,7 @@ Recompiled C++ for any function: `recomp/dw5xl/output/*_0x<addr>.cpp` (each inst
   - **Movies & Video:** PSS intro movies with audio demuxing, natural end (0xB7), and Start skipping; title screen sky animation decoded via native IDEC decoder (`ipu_idec.cpp`).
   - **Audio:** KOEISND running on IOP interpreter with real LIBSD + SPU2 model; menu BGM, streaming movie audio, and cursor SFX (Options menu silence authentic).
   - **3D Graphics:** Real-time 3D rendering (Opening scene 3D character models, castle gates, sky) using native libvu0 (unbound `sceVu0*` stubs).
-  - **Vulkan GPU Renderer:** paraLLEl-GS GPU compute backend (`PS2X_GS_BACKEND=vulkan`) with authentic PAL scanout (640x512 full viewport), comb-free `ReusableFieldWeaver` deinterlacing, SSAA 1x–16x upscaling (`PS2X_GS_SCALE=1|2|4|8|16`), and a 3-slot asynchronous readback ring buffer running at solid 50 fps (CPU backend fallback).
+  - **Vulkan GPU Renderer:** paraLLEl-GS GPU compute backend (`PS2X_GS_BACKEND=vulkan`) with authentic PAL scanout (640x512 full viewport), comb-free `ReusableFieldWeaver` deinterlacing, native, 2x and 4x output (`PS2X_GS_SCALE=1|2|4`, F4) with separate anti-aliasing samples (`PS2X_GS_SSAA=1|2|4|8|16`, F5; renderer patch in `vendor/parallel-gs-patches/`), and a 3-slot asynchronous readback ring buffer running at solid 50 fps (CPU backend fallback).
   - **Memory Card:** Saving and loading via HLE libmc (default prompt is No – press LEFT then Cross).
   - **Overlays:** Native module generation and active-module dispatch (`dw5xl_overlays.cpp`) for OVL00 (Opening) and OVL01 (Xtreme Mode), constructor execution, and indirect vtable dispatch.
 - **Broken / Unverified:** See §6.
@@ -221,6 +225,25 @@ visible playtest or other test is active (audio overlaps). Check with `pgrep -x 
 4. Locate code in Ghidra (MCP or headless), find the root cause, patch, `tools/regen.sh` if the toml changed, rebuild,
    re-run the SAME script and compare frames/logs.
 5. Milestone → offer visible run testing → update BRINGUP.md. Commit only upon explicit command.
+**When unsure how the original looks or behaves, compare against PCSX2 before guessing or asking:**
+- `tools/pcsx2_reference.py --out <scratch dir> --seconds <n> [--interval 0.5] [--keys "<sec>:<keysym>,..."]` runs the
+  owner's PCSX2 (`~/Games/psx2/*.AppImage`, PAL disc in `discs/dw5xl/`) headless on a private Xvfb display with a
+  throwaway copy of the owner's PCSX2 config, and takes F8 screenshots into `<out>/snaps`. It uses PCSX2's software
+  renderer: the accurate GS reference (its Vulkan/GL renderers approximate). Keys: Cross=x, Start=Return, Circle=c,
+  Square=z, Triangle=v, D-pad=arrows. Without input the disc plays intro → title → demo → title → real-time Opening.
+- Capture the same moment from the port (`PS2X_DUMP_DIR`/`PS2X_DUMP_EVERY`) and compare contact sheets side by side.
+- Never send synthetic input to the real desktop (KDE pops a "remote control" prompt for the owner); never edit the
+  owner's `~/.config/PCSX2`. Screenshots are game-derived: scratch or `notes/evidence/` only, never git.
+- Still ask the owner when PCSX2 itself may be wrong, or for things screenshots cannot show (feel, audio timing).
+
+**Rendering bugs: record and replay one frame offline.** `PS2X_GS_RECORD=<file> PS2X_GS_RECORD_FROM=<tick>
+PS2X_GS_RECORD_TO=<tick>` records every renderer call (window starts with a VRAM snapshot; ~2 MB per tick in battle).
+`app/build/dw5xl_gsrender <rec> <cpu|vulkan> <outdir> <ticks> [--fb fbp,fbw,w,h] [--stop-at <record>]
+[--probe "x,y;..." --z zbp,zpsm]` renders it with either renderer; bisect with `--stop-at` on the Vulkan-vs-CPU
+difference to find the exact draw. `dw5xl_gsrec dump <rec> --from N --count M --fields` shows the draws.
+Vulkan renderer fixes go to `app/deps/parallel-gs` as runtime patches in `vendor/parallel-gs-patches/` (shader SPIR-V
+via `tools/parallel_gs_splice_shader.py`).
+
 - Dev-harness command file: `PS2X_CTRL=<file>` (polled ~10x/s; `press BTN ticks`, `shot <png>`, `threads <txt>`, `quit`).
 - `PS2X_HOST_INPUT` goes through the real host-input path (keyboard mapping + libpad2 bridge); `PS2X_INPUT` injects
   guest pad masks directly.

@@ -31,6 +31,10 @@ Keep it up to date (append dated sections; record causes, fixes, debug switches 
   Ignore rules remain in force: notes are local and are not transferred by Git push.
 
 ## RULES
+- **NEVER ASSUME — ask the owner, with a recommendation.** If you need something opened, switched, installed,
+  checked or done (e.g. a different Ghidra program loaded in the GUI, PCSX2 at a certain screen, a setting changed,
+  a file provided), or you are unsure what the owner has or wants, ask: say what you need, why, and what you
+  recommend. Do not assume what is open, installed or intended, and do not route around a missing piece silently.
 - **Scope changes require explicit approval.** Present the proposed scope before
   acting; do not expand it or infer approval from a general request. After approval, carry out the work
   within that scope and bring any proposed changes back for confirmation.
@@ -81,7 +85,7 @@ Keep it up to date (append dated sections; record causes, fixes, debug switches 
   DecompileAll, ExportPS2Functions), `ipu/` (decoder self-test, FFmpeg comparison).
 
 ## Current status & next tasks
-- **Working:** Full boot & menu navigation (all modes); libpad2 host input; PSS intro movies with audio demuxing, natural 0xB7 end, and skip; native IDEC still-image decoding; KOEISND sound/BGM + cursor SFX (Options silence authentic); real-time 3D rendering (Opening scene models/castles/sky) via native libvu0; Vulkan paraLLEl-GS GPU compute backend with authentic PAL scanout (640x512 full viewport), comb-free `ReusableFieldWeaver` deinterlacing, SSAA 1x–16x upscaling, and 3-slot asynchronous readback ring buffer at solid 50 fps (CPU backend fallback); HLE libmc memory card; native overlay lifecycle and active-module dispatch (`dw5xl_overlays.cpp`) for OVL00 and OVL01.
+- **Working:** Full boot & menu navigation (all modes); libpad2 host input; PSS intro movies with audio demuxing, natural 0xB7 end, and skip; native IDEC still-image decoding; KOEISND sound/BGM + cursor SFX (Options silence authentic); real-time 3D rendering (Opening scene models/castles/sky) via native libvu0; Vulkan paraLLEl-GS GPU compute backend with authentic PAL scanout (640x512 full viewport), comb-free `ReusableFieldWeaver` deinterlacing, native/2x/4x output with separate anti-aliasing (renderer patch in `vendor/parallel-gs-patches/`), and 3-slot asynchronous readback ring buffer at solid 50 fps (CPU backend fallback); HLE libmc memory card; native overlay lifecycle and active-module dispatch (`dw5xl_overlays.cpp`) for OVL00 and OVL01.
 - **Next tasks:** (1) In-game 3D scenes & Legend Mode battle loading stall (tick 853); (2) Overlay coverage & indirect vtable dispatch expansion; (3) Legend Mode submenus and font rendering; (4) Save/Load round-trip test; (5) Load Original DW5 disc integration; (6) Strip temporary debug instrumentation and prepare upstreamable fixes.
 
 ## Version control
@@ -105,6 +109,11 @@ the GUI is open). Headless never runs on the source: every headless use makes a 
 own scratch dir, runs `-readOnly`, then deletes it. See `notes/PROJECT_SETUP.md` for commands.
 Working split: the main session builds, runs and tests one thing at a time and uses MCP; bigger RE or code-review
 questions go to parallel background agents (each with its own headless copy or code-reading brief).
+
+Unsure how the original looks? Compare with PCSX2 first: `tools/pcsx2_reference.py` (headless, private Xvfb, copy of
+the owner's config, accurate software renderer; details in AGENTS.md §11). Rendering bug in one frame? Record with
+`PS2X_GS_RECORD` (+`_FROM/_TO`) and replay/bisect it with `dw5xl_gsrender` (Vulkan vs CPU). Never send synthetic input
+to the real desktop or edit `~/.config/PCSX2`.
 
 ## Debug switches (env)
 `PS2X_STATS` vsync/flip rate · `PS2X_GS_BACKEND=vulkan` · `PS2X_GS_SCALE=1|2|4|8|16` (SSAA) · `PS2X_GS_SYNCREADBACK=1` · `PS2X_NO_WEAVE=1` ·
