@@ -17,12 +17,16 @@
 
 #include "runtime/ps2_vu1.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <smmintrin.h>
+#include <immintrin.h>
 
 namespace vl
 {
@@ -33,6 +37,8 @@ namespace vl
         uint32_t cur;    // status bits 0-3 (Z S U O) of the latest FMAC result
         uint32_t mac;    // MAC flags of the latest FMAC result
         uint32_t sticky; // status bits 6-11
+        uint32_t extra = 0;    // product sticky bits of the latest FMAC op (MADD/MSUB)
+        bool pending = false;  // the latest op produced flags not yet queued
     };
 
     // One run of a lifted segment.
@@ -50,9 +56,502 @@ namespace vl
         void (*kickBegin)(void *vu, uint32_t qwordAddress, uint64_t cycle);
         const bool *kickActive;
         uint64_t kickCycle;      // cycle through which the transfer has advanced
+        // The interpreter's decoded timing table for the current microcode
+        // (see LiftAccess::prepare), and the old value of the VI register the
+        // current pair writes (branch-read delay).
+        const void *decoded = nullptr;
+        int32_t oldVi = 0;
+        // Set by a segment whose embedded timing does not match the
+        // interpreter's decode: runLifted then interprets the program.
+        bool declined = false;
     };
 
     using Segment = void (*)(Run &);
+
+    // A hard VU reset cancels execution at a lifted instruction boundary.
+    struct ResetCanceled {};
+    bool resetRequested() noexcept;
+
+    // Lifted code computes values natively but keeps time on the interpreter's
+    // scheduler, so stalls, flag/clip/Q visibility, the branch VI delay and
+    // PATH1 progress match an interpreted run exactly. These mirror
+    // VU1Interpreter::run's per-pair steps.
+    struct LiftAccess
+    {
+        using Timing = VU1Interpreter::LiftTiming;
+
+        static VU1Interpreter &vu(Run &c) { return *static_cast<VU1Interpreter *>(c.vu); }
+        static const Timing &timing(Run &c, uint32_t pc)
+        {
+            if (!c.decoded)
+                prepareActive(c);
+            return static_cast<const Timing *>(c.decoded)[pc >> 3];
+        }
+
+        // Validates the interpreter's decode cache (and its lift timing) for
+        // the current microcode.
+        static void prepare(Run &c, const uint8_t *vuCode, PS2Memory *memory)
+        {
+            VU1Interpreter &v = vu(c);
+            v.getDecodedInstructionPairForPc(vuCode, 0x4000u, memory, 0u);
+            if (!v.m_liftTimingValid)
+            {
+                for (size_t i = 0; i < v.m_liftTiming.size(); ++i)
+                    v.m_liftTiming[i] = VU1Interpreter::makeLiftTiming(v.m_decodedCodeCache[i]);
+                v.m_liftTimingValid = true;
+            }
+            c.decoded = v.m_liftTiming.data();
+        }
+
+        // prepare() for the running program's microcode (ps2_vu1_lift.cpp).
+        static void prepareActive(Run &c);
+        static void noteDeclined();
+
+        static void commit(VU1Interpreter &v)
+        {
+            if (v.m_cycle >= v.m_nextCommitCycle)
+                v.commitDuePipelines();
+        }
+
+        // progressXgkick: one cycle of PATH1 credit; a qword moves every
+        // second cycle, so only those cycles need the out-of-line copy.
+        static void kickCycle(VU1Interpreter &v)
+        {
+            if (!v.m_xgkick.active)
+                return;
+            if (v.m_xgkick.cycleCredit + 1u >= 2u)
+                v.progressXgkick();
+            else
+                ++v.m_xgkick.cycleCredit;
+        }
+
+        // advanceOneCycle.
+        static void step(VU1Interpreter &v)
+        {
+            ++v.m_cycle;
+            commit(v);
+            kickCycle(v);
+        }
+
+        // advanceTo: idle cycles (no PATH1 transfer, no due commit) are skipped.
+        static void advance(VU1Interpreter &v, uint64_t target)
+        {
+            while (v.m_cycle < target)
+            {
+                if (!v.m_xgkick.active)
+                {
+                    const uint64_t idleEnd = std::min(target, v.m_nextCommitCycle) - 1u;
+                    if (idleEnd > v.m_cycle)
+                        v.m_cycle = idleEnd;
+                }
+                step(v);
+            }
+            v.m_state.cycles = v.m_cycle;
+        }
+
+#if defined(__AVX2__)
+        // Lane mask bit 3 is x (component 0), the lowest slot of a register.
+        static const __m256i &laneMask(uint8_t lanes)
+        {
+            static const __m256i kLaneMasks[16] = {
+#define VL_M(l) _mm256_setr_epi64x((l) & 8 ? -1 : 0, (l) & 4 ? -1 : 0, (l) & 2 ? -1 : 0, (l) & 1 ? -1 : 0)
+                VL_M(0), VL_M(1), VL_M(2), VL_M(3), VL_M(4), VL_M(5), VL_M(6), VL_M(7),
+                VL_M(8), VL_M(9), VL_M(10), VL_M(11), VL_M(12), VL_M(13), VL_M(14), VL_M(15)
+#undef VL_M
+            };
+            return kLaneMasks[lanes & 15u];
+        }
+#endif
+
+#if defined(__AVX2__)
+        // VI slots: mask bit i selects lane i.
+        static const __m256i &viMask(uint32_t bits)
+        {
+            static const __m256i kViMasks[16] = {
+#define VL_V(l) _mm256_setr_epi64x((l) & 1 ? -1 : 0, (l) & 2 ? -1 : 0, (l) & 4 ? -1 : 0, (l) & 8 ? -1 : 0)
+                VL_V(0), VL_V(1), VL_V(2), VL_V(3), VL_V(4), VL_V(5), VL_V(6), VL_V(7),
+                VL_V(8), VL_V(9), VL_V(10), VL_V(11), VL_V(12), VL_V(13), VL_V(14), VL_V(15)
+#undef VL_V
+            };
+            return kViMasks[bits & 15u];
+        }
+#endif
+
+        // Sets the ready cycle of a register's written lanes. Written as one
+        // 4-lane store so the next pair's 4-lane load can forward from it.
+        static void markLanes(uint64_t *readyAt, uint32_t base, uint8_t lanes, uint64_t cycle)
+        {
+#if defined(__AVX2__)
+            __m256i *p = reinterpret_cast<__m256i *>(readyAt + base);
+            _mm256_store_si256(p, _mm256_blendv_epi8(_mm256_load_si256(p), _mm256_set1_epi64x(static_cast<long long>(cycle)), laneMask(lanes)));
+#else
+            for (uint32_t c = 0; c < 4u; ++c)
+                if (lanes & (8u >> c))
+                    readyAt[base + c] = cycle;
+#endif
+        }
+
+        // max(m_ready[slot]) over the pair's read slots: each VF register read
+        // is its four adjacent lane slots, masked; then ACC and the 16 VI
+        // slots. Branch-free: unused groups have an empty lane mask.
+        static uint64_t readSlotsReady(const VU1Interpreter &v, const Timing &t)
+        {
+            const uint64_t *readyAt = v.m_ready.data();
+#if defined(__AVX2__)
+            const auto lanes = [&](uint32_t base, uint8_t mask)
+            {
+                return _mm256_and_si256(_mm256_load_si256(reinterpret_cast<const __m256i *>(readyAt + base)), laneMask(mask));
+            };
+            const auto viLanes = [&](uint32_t chunk)
+            {
+                return _mm256_and_si256(
+                    _mm256_load_si256(reinterpret_cast<const __m256i *>(readyAt + VU1Interpreter::kReadyViBase + chunk * 4u)),
+                    viMask((t.viRead >> (chunk * 4u)) & 15u));
+            };
+            const auto vmax = [](__m256i a, __m256i b) { return _mm256_blendv_epi8(a, b, _mm256_cmpgt_epi64(b, a)); };
+            __m256i best = vmax(vmax(lanes(t.vfReg[0] * 4u, t.vfLanes[0]), lanes(t.vfReg[1] * 4u, t.vfLanes[1])),
+                                vmax(lanes(t.vfReg[2] * 4u, t.vfLanes[2]), lanes(t.vfReg[3] * 4u, t.vfLanes[3])));
+            best = vmax(best, lanes(VU1Interpreter::kReadyAccBase, t.accRead));
+            best = vmax(best, vmax(vmax(viLanes(0), viLanes(1)), vmax(viLanes(2), viLanes(3))));
+            const __m128i hi = _mm256_extracti128_si256(best, 1), lo = _mm256_castsi256_si128(best);
+            const __m128i m2 = _mm_blendv_epi8(lo, hi, _mm_cmpgt_epi64(hi, lo));
+            const uint64_t a = static_cast<uint64_t>(_mm_cvtsi128_si64(m2));
+            const uint64_t b = static_cast<uint64_t>(_mm_extract_epi64(m2, 1));
+            return std::max(a, b);
+#else
+            uint64_t best = 0;
+            for (uint32_t i = 0; i < 4u; ++i)
+                for (uint32_t c = 0; c < 4u; ++c)
+                    if (t.vfLanes[i] & (8u >> c))
+                        best = std::max(best, readyAt[t.vfReg[i] * 4u + c]);
+            for (uint32_t c = 0; c < 4u; ++c)
+                if (t.accRead & (8u >> c))
+                    best = std::max(best, readyAt[VU1Interpreter::kReadyAccBase + c]);
+            for (uint32_t bits = t.viRead; bits != 0u; bits &= bits - 1u)
+                best = std::max(best, readyAt[VU1Interpreter::kReadyViBase + static_cast<uint32_t>(__builtin_ctz(bits))]);
+            return best;
+#endif
+        }
+
+        // calculatePairReadyCycle.
+        static uint64_t readyCycle(const VU1Interpreter &v, const Timing &t)
+        {
+            uint64_t ready = std::max(v.m_cycle, readSlotsReady(v, t));
+            if (t.flags == 0u)
+                return ready;
+            if ((t.flags & (VU1Interpreter::kLiftFdiv | VU1Interpreter::kLiftWaitQ)) && v.m_fdiv.valid)
+                ready = std::max(ready, v.m_fdiv.readyCycle);
+            if (t.flags & VU1Interpreter::kLiftEfu)
+                ready = std::max(ready, v.m_efuResourceReady);
+            if (t.flags & VU1Interpreter::kLiftWaitP)
+                for (const auto &entry : v.m_efu)
+                    if (entry.valid)
+                        ready = std::max(ready, entry.readyCycle);
+            if ((t.flags & VU1Interpreter::kLiftXgkick) && v.m_xgkick.active)
+                ready = std::max(ready, v.m_cycle + 1u);
+            return ready;
+        }
+
+        // Before a pair executes: commit due results, stall until its operands
+        // and units are ready, and remember the VI value it may overwrite.
+        static void begin(Run &c, uint32_t pc, const int32_t *vi)
+        {
+            VU1Interpreter &v = vu(c);
+            commit(v);
+            const Timing &t = timing(c, pc);
+            uint64_t ready = readyCycle(v, t);
+            if (ready > v.m_cycle)
+            {
+                if (resetRequested())
+                    throw ResetCanceled{};
+                advance(v, ready);
+                // Register ready times and the FDIV/EFU completion cycles do not
+                // move while stalling; only a busy PATH1 extends an XGKICK's
+                // wait, one cycle at a time until the transfer ends.
+                if (t.flags & VU1Interpreter::kLiftXgkick)
+                {
+                    while (v.m_xgkick.active)
+                        step(v);
+                    v.m_state.cycles = v.m_cycle;
+                }
+            }
+            c.oldVi = t.firstVi != 0u ? vi[t.firstVi] : 0;
+        }
+
+        // After a pair executes (markPairWrites, the branch VI delay, then
+        // advanceOneCycle).
+        static void end(Run &c, uint32_t pc)
+        {
+            VU1Interpreter &v = vu(c);
+            const Timing &t = timing(c, pc);
+            v.m_viBranchBackupValid = false;
+            uint64_t *readyAt = v.m_ready.data();
+            const uint64_t now = v.m_cycle;
+            // Unused write groups have an empty lane mask (wReg 0 is VF0, whose
+            // slots are never read).
+            markLanes(readyAt, VU1Interpreter::kReadyVfBase + t.wReg[0] * 4u, t.wLanes[0], now + t.wLat[0]);
+            markLanes(readyAt, VU1Interpreter::kReadyVfBase + t.wReg[1] * 4u, t.wLanes[1], now + t.wLat[1]);
+            markLanes(readyAt, VU1Interpreter::kReadyAccBase, t.accWrite, now + VU1Interpreter::kAccForwardLatency);
+#if defined(__AVX2__)
+            if (t.viWrite != 0u)
+            {
+                const __m256i value = _mm256_set1_epi64x(static_cast<long long>(now + t.viLat));
+                for (uint32_t chunk = 0; chunk < 4u; ++chunk)
+                {
+                    __m256i *p = reinterpret_cast<__m256i *>(readyAt + VU1Interpreter::kReadyViBase + chunk * 4u);
+                    _mm256_store_si256(p, _mm256_blendv_epi8(_mm256_load_si256(p), value, viMask((t.viWrite >> (chunk * 4u)) & 15u)));
+                }
+            }
+#else
+            for (uint32_t bits = t.viWrite; bits != 0u; bits &= bits - 1u)
+                readyAt[VU1Interpreter::kReadyViBase + static_cast<uint32_t>(__builtin_ctz(bits))] = now + t.viLat;
+#endif
+            if (t.maxLat != 0u)
+                v.m_writebackHorizon = std::max(v.m_writebackHorizon, now + t.maxLat);
+            if (t.firstVi != 0u && (t.flags & VU1Interpreter::kLiftBranchDelay))
+                v.recordViWriteForBranch(t.firstVi, c.oldVi);
+            step(v);
+            v.m_state.cycles = v.m_cycle;
+        }
+
+        // A branch reads the pre-write value of a VI register written by the
+        // immediately preceding integer instruction.
+        static int32_t branchVi(Run &c, const int32_t *vi, uint8_t reg)
+        {
+            const VU1Interpreter &v = vu(c);
+            if (reg == 0u)
+                return 0;
+            if (v.m_viBranchBackupValid && v.m_viBranchBackupReg == reg)
+                return v.m_viBranchBackupValue;
+            return vi[reg];
+        }
+
+        static void fmacFlags(Run &c, uint32_t mac, uint32_t status, uint32_t extraSticky)
+        {
+            vu(c).queueFmacFlags(mac, status, extraSticky);
+        }
+        static void clip(Run &c, uint32_t flags) { vu(c).queueClip(flags); }
+        static void fcset(Run &c, uint32_t value) { vu(c).queueFcset(value); }
+        static void fsset(Run &c, uint16_t value) { vu(c).queueFsset(value); }
+        static void queueQ(Run &c, float value, uint32_t latency, uint32_t statusDi)
+        {
+            vu(c).queueQ(value, latency, statusDi);
+        }
+        static void xgkick(Run &c, uint32_t qwordAddress)
+        {
+            if (resetRequested())
+                throw ResetCanceled{};
+            vu(c).startXgkick(qwordAddress);
+        }
+        static void finish(Run &c) { vu(c).flushPipelines(); }
+
+        // ---- Constant-timing interface for generated segments ----------------
+        // The segment keeps the cycle in a local (cyc) and the ready table
+        // pointer; helpers that reach the interpreter's pipelines sync m_cycle.
+
+        // Once per segment: its embedded per-pair timing must equal the
+        // interpreter's decode of the same microcode (state: 0 unknown, 1 ok, 2 no).
+        static bool validate(Run &c, const VuLiftTiming *table, const uint16_t *pcs, uint32_t count,
+                             std::atomic<int> &state, const char *name)
+        {
+            const int known = state.load(std::memory_order_relaxed);
+            if (known != 0)
+                return known == 1;
+            if (!c.decoded)
+                prepareActive(c);
+            const VU1Interpreter &v = vu(c);
+            bool ok = v.m_decodedCodeCacheValid;
+            for (uint32_t i = 0; ok && i < count; ++i)
+                ok = v.m_liftTiming[pcs[i] >> 3] == table[i];
+            state.store(ok ? 1 : 2, std::memory_order_relaxed);
+            if (!ok)
+                noteDeclined();
+            if (!ok)
+                std::fprintf(stderr, "[vu1lift] %s: timing differs from the interpreter, interpreting it\n", name);
+            return ok;
+        }
+
+        static uint64_t *readyTable(Run &c) { return vu(c).m_ready.data(); }
+        static uint64_t cycle(Run &c) { return vu(c).m_cycle; }
+
+        // Stall to `target` (operands or units not ready).
+        static void stall(Run &c, uint64_t &cyc, uint64_t target)
+        {
+            VU1Interpreter &v = vu(c);
+            v.m_cycle = cyc;
+            if (resetRequested())
+                throw ResetCanceled{};
+            advance(v, target);
+            cyc = v.m_cycle;
+        }
+
+        // FDIV busy (DIV/SQRT/RSQRT) or WAITQ.
+        static void fdivWait(Run &c, uint64_t &cyc)
+        {
+            const VU1Interpreter &v = vu(c);
+            if (v.m_fdiv.valid && v.m_fdiv.readyCycle > cyc)
+                stall(c, cyc, v.m_fdiv.readyCycle);
+        }
+
+        // An XGKICK waits for the previous PATH1 transfer to finish.
+        static void kickWait(Run &c, uint64_t &cyc)
+        {
+            VU1Interpreter &v = vu(c);
+            if (!v.m_xgkick.active)
+                return;
+            v.m_cycle = cyc;
+            while (v.m_xgkick.active)
+                step(v);
+            cyc = v.m_cycle;
+        }
+
+        // advanceOneCycle after each pair.
+        static void tick(Run &c, uint64_t &cyc)
+        {
+            VU1Interpreter &v = vu(c);
+            ++cyc;
+            if (cyc >= v.m_nextCommitCycle || v.m_xgkick.active)
+            {
+                v.m_cycle = cyc;
+                commit(v);
+                kickCycle(v);
+            }
+        }
+
+        static void clipAt(Run &c, uint64_t cyc, uint32_t flags) { vu(c).m_cycle = cyc; vu(c).queueClip(flags); }
+        static void fcsetAt(Run &c, uint64_t cyc, uint32_t value) { vu(c).m_cycle = cyc; vu(c).queueFcset(value); }
+        static void queueQAt(Run &c, uint64_t cyc, float value, uint32_t latency, uint32_t statusDi)
+        {
+            vu(c).m_cycle = cyc;
+            vu(c).queueQ(value, latency, statusDi);
+        }
+        static void fmacFlagsAt(Run &c, uint64_t cyc, uint32_t mac, uint32_t status, uint32_t extraSticky)
+        {
+            vu(c).m_cycle = cyc;
+            vu(c).queueFmacFlags(mac, status, extraSticky);
+        }
+        // Segments that read MAC flags (FMAND) keep their FMAC flag results in
+        // this in-order queue instead of the interpreter's flag pipeline, which
+        // otherwise forces a commit pass on nearly every cycle. Results are
+        // committed with the interpreter's rules (readyCycle <= cycle, issue
+        // order) before each reader and handed back on exit.
+        struct FlagQueue
+        {
+            static constexpr uint32_t kSize = 16u;
+            uint64_t ready[kSize];
+            uint32_t mac[kSize], cur[kSize], extra[kSize];
+            uint32_t head = 0, tail = 0;
+            bool local = false;
+        };
+
+        // Takes the interpreter's pending FMAC flag results. A pending FSSET
+        // must stay ordered with them, so that case keeps the shared pipeline.
+        static void flagsEnter(Run &c, FlagQueue &q)
+        {
+            VU1Interpreter &v = vu(c);
+            uint32_t taken = 0u;
+            for (uint32_t bits = v.m_flagMask; bits != 0u; bits &= bits - 1u)
+            {
+                const uint32_t slot = static_cast<uint32_t>(__builtin_ctz(bits));
+                const VU1Interpreter::FlagPipelineEntry &e = v.m_flagPipeline[slot];
+                if (e.writesSticky || e.writesMac != e.writesStatus || (e.writesMac && e.writesClip))
+                    return;
+                if (e.writesMac)
+                    taken |= 1u << slot;
+            }
+            q.local = true;
+            while (taken != 0u)
+            {
+                uint32_t first = static_cast<uint32_t>(__builtin_ctz(taken));
+                for (uint32_t bits = taken & (taken - 1u); bits != 0u; bits &= bits - 1u)
+                {
+                    const uint32_t slot = static_cast<uint32_t>(__builtin_ctz(bits));
+                    if (v.m_flagPipeline[slot].readyCycle < v.m_flagPipeline[first].readyCycle)
+                        first = slot;
+                }
+                VU1Interpreter::FlagPipelineEntry &e = v.m_flagPipeline[first];
+                const uint32_t i = q.tail++ % FlagQueue::kSize;
+                q.ready[i] = e.readyCycle;
+                q.mac[i] = e.mac;
+                q.cur[i] = e.status;
+                q.extra[i] = e.extraSticky;
+                e = {};
+                v.m_flagMask &= ~(1u << first);
+                taken &= ~(1u << first);
+            }
+        }
+
+        static void flagsSync(Run &c, FlagQueue &q, uint64_t cyc)
+        {
+            while (q.head != q.tail)
+            {
+                const uint32_t i = q.head % FlagQueue::kSize;
+                if (q.ready[i] > cyc)
+                    break;
+                const uint32_t current = q.cur[i] & 0xFu;
+                c.st.mac = q.mac[i];
+                c.st.status = (c.st.status & 0xFF0u) | current | ((current | q.extra[i]) << 6);
+                ++q.head;
+            }
+        }
+
+        // Hands the results still in flight back to the interpreter's pipeline.
+        static void flagsLeave(Run &c, FlagQueue &q, uint64_t cyc)
+        {
+            if (!q.local)
+                return;
+            flagsSync(c, q, cyc);
+            VU1Interpreter &v = vu(c);
+            for (; q.head != q.tail; ++q.head)
+            {
+                const uint32_t i = q.head % FlagQueue::kSize;
+                v.m_cycle = q.ready[i] - VU1Interpreter::kFmacLatency;
+                v.queueFmacFlags(q.mac[i], q.cur[i], q.extra[i]);
+            }
+            v.m_cycle = cyc;
+            q.local = false;
+        }
+
+        static void flagsPush(Run &c, FlagQueue &q, uint64_t cyc, uint32_t mac, uint32_t status, uint32_t extraSticky)
+        {
+            if (q.local)
+            {
+                flagsSync(c, q, cyc);
+                if (q.tail - q.head >= FlagQueue::kSize)
+                    flagsLeave(c, q, cyc);
+            }
+            if (!q.local)
+            {
+                fmacFlagsAt(c, cyc, mac, status, extraSticky);
+                return;
+            }
+            const uint32_t i = q.tail++ % FlagQueue::kSize;
+            q.ready[i] = cyc + VU1Interpreter::kFmacLatency;
+            q.mac[i] = mac;
+            q.cur[i] = status;
+            q.extra[i] = extraSticky;
+        }
+
+        static void xgkickAt(Run &c, uint64_t cyc, uint32_t qwordAddress)
+        {
+            if (resetRequested())
+                throw ResetCanceled{};
+            vu(c).m_cycle = cyc;
+            vu(c).startXgkick(qwordAddress);
+        }
+
+        // Hands the segment's local timing state back to the interpreter.
+        static void leave(Run &c, uint64_t cyc, uint64_t horizon, bool branchValid, uint8_t branchReg, int32_t branchValue)
+        {
+            VU1Interpreter &v = vu(c);
+            v.m_cycle = cyc;
+            v.m_state.cycles = cyc;
+            v.m_writebackHorizon = std::max(v.m_writebackHorizon, horizon);
+            v.m_viBranchBackupValid = branchValid;
+            v.m_viBranchBackupReg = branchReg;
+            v.m_viBranchBackupValue = branchValue;
+        }
+    };
 
     struct Registration
     {
@@ -68,11 +567,16 @@ namespace vl
     };
 
     Segment find(uint64_t hash, uint32_t pc, const uint8_t *vuCode = nullptr);
+    // Number of lifted segments whose embedded timing did not match the
+    // interpreter's decode (they run interpreted).
+    uint32_t declinedSegments();
+    // Tests only: -1 follows PS2X_VU1_LIFT, 0 forces interpretation, 1 forces lifting.
+    void setEnabledOverride(int value);
+    int enabledOverride();
     uint64_t hashCode(const uint8_t *code, uint32_t size);
 
     // A hard VU reset cancels execution at a lifted instruction boundary.
     // DMA pause alone never cancels a program that VIF already accepted.
-    struct ResetCanceled {};
     bool resetRequested() noexcept;
     void checkReset(Run &c);
 
@@ -293,6 +797,8 @@ namespace vl
         fl.mac = macNibble(z) | (macNibble(s) << 4) | (macNibble(u) << 8) | (macNibble(o) << 12);
         fl.cur = (z ? 1u : 0u) | (s ? 2u : 0u) | (u ? 4u : 0u) | (o ? 8u : 0u);
         fl.sticky |= (fl.cur | static_cast<uint32_t>(productSticky)) << 6;
+        fl.extra = static_cast<uint32_t>(productSticky);
+        fl.pending = true;
         return r;
     }
 

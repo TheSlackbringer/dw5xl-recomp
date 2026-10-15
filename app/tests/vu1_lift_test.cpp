@@ -8,6 +8,7 @@
 #include <string>
 
 #include <cfenv>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -264,8 +265,16 @@ void testSegment(const std::string &binPath, uint64_t hash, uint32_t entryPc, ui
 
     VU1State sLift = sInterp;
 
-    // Run interpreter (LIFT=0)
-    setenv("PS2X_VU1_LIFT", "0", 1);
+    // Lifted code runs on the interpreter's scheduler: execute the same
+    // program twice through the real dispatch, interpreted and lifted.
+    PS2Runtime rtLift;
+    require(rtLift.memory().initialize(), "rtLift.memory().initialize()");
+    std::memcpy(rtLift.memory().getVU1Code(), code.data(), 16384);
+    std::memcpy(rtLift.memory().getVU1Data(), dataLift, 16384);
+    rtLift.vu1().state() = sLift;
+
+    // Run interpreter
+    vl::setEnabledOverride(0);
     rtInterp.vu1().execute(rtInterp.memory().getVU1Code(), 16384,
                            rtInterp.memory().getVU1Data(), 16384,
                            rtInterp.gs(), &rtInterp.memory(),
@@ -275,21 +284,21 @@ void testSegment(const std::string &binPath, uint64_t hash, uint32_t entryPc, ui
               << " cycles=" << std::dec << sInterp.cycles
               << " VI[1]=" << sInterp.vi[1] << std::endl;
 
-    // Run lifted segment
-    bool kickActive = false;
-    vl::Run c{sLift, dataLift, 1000, 1000, 1000, &rtInterp.vu1(),
-              [](void *) {},
-              [](void *, uint32_t, uint64_t) {},
-              &kickActive, 1000};
-    const int prevRound = std::fegetround();
-    std::fesetround(FE_TOWARDZERO);
-    fn(c);
-    std::fesetround(prevRound);
+    // Run lifted (the registered segment is dispatched by runLifted)
+    vl::setEnabledOverride(1);
+    rtLift.vu1().execute(rtLift.memory().getVU1Code(), 16384,
+                         rtLift.memory().getVU1Data(), 16384,
+                         rtLift.gs(), &rtLift.memory(),
+                         entryPc, 0, 0, 100000);
+    vl::setEnabledOverride(-1);
+    const VU1State &sLiftOut = rtLift.vu1().state();
 
-    std::cout << "[DEBUG] Lifted PC=0x" << std::hex << sLift.pc
-              << " VI[1]=" << sLift.vi[1] << std::endl;
+    std::cout << "[DEBUG] Lifted PC=0x" << std::hex << sLiftOut.pc
+              << " cycles=" << std::dec << sLiftOut.cycles
+              << " VI[1]=" << sLiftOut.vi[1] << std::endl;
+    require(sLiftOut.cycles == sInterp.cycles, "lifted run must take the interpreter's cycle count");
 
-    verifyEquivalence(binPath.c_str(), sInterp, dataInterp, sLift, dataLift, expectedFinalPc);
+    verifyEquivalence(binPath.c_str(), sInterp, dataInterp, sLiftOut, rtLift.memory().getVU1Data(), expectedFinalPc);
 }
 
 // Synthetic SDK-independent microcode: XGKICK A, NOP runway, SQ sentinel,
@@ -321,14 +330,19 @@ void syntheticCancelLift(vl::Run &c)
 {
     ++syntheticLiftCalls;
     vl::checkReset(c);
-    const uint64_t begin=c.cycle;
-    vl::kickStart(c,static_cast<uint32_t>(c.st.vi[1]),begin);
-    vl::kickCatchUp(c,begin+32);
-    vl::checkReset(c);
-    vl::sq<15,true>(c,c.mem,64,vl::load(c.st.vf[1]),begin+32);
-    const uint64_t second=vl::kickWait(c,begin+33);
-    vl::kickStart(c,static_cast<uint32_t>(c.st.vi[2]),second);
-    c.cycle=second+3; c.endCycle=c.cycle; c.st.pc=288;
+    // XGKICK vi1 at 0, SQ vf1 at 256, XGKICK vi2 at 264, E bit at 272 + delay slot.
+    for (uint32_t pc = 0; pc <= 280; pc += 8)
+    {
+        vl::LiftAccess::begin(c, pc, c.st.vi);
+        if (pc == 0)
+            vl::LiftAccess::xgkick(c, static_cast<uint32_t>(c.st.vi[1]) & 0x3FFu);
+        else if (pc == 256)
+            vl::sq<15, false>(c, c.mem, 64, vl::load(c.st.vf[1]), 0u);
+        else if (pc == 264)
+            vl::LiftAccess::xgkick(c, static_cast<uint32_t>(c.st.vi[2]) & 0x3FFu);
+        vl::LiftAccess::end(c, pc);
+    }
+    c.st.pc = 288;
 }
 
 void testRealVuDmaCancellation(bool lifted)
@@ -398,12 +412,59 @@ void testRealVuDmaCancellation(bool lifted)
     }
 }
 
+// Timing benchmark (not run by CTest): repeatedly executes one captured
+// program through the real dispatch, lifted and interpreted.
+void benchSegment(const std::string &binPath, uint32_t entryPc, int iterations, bool liftedOnly)
+{
+    auto code = loadFile(binPath);
+    require(code.size() == 16384, "Code size 16KB");
+    for (int lifted : {1, 0})
+    {
+        if (liftedOnly && !lifted)
+            break;
+        PS2Runtime rt;
+        require(rt.memory().initialize(), "bench memory init");
+        std::memcpy(rt.memory().getVU1Code(), code.data(), 16384);
+        uint8_t *data = rt.memory().getVU1Data();
+        for (size_t i = 0; i < 16384; ++i)
+            data[i] = static_cast<uint8_t>((i * 101 + 37) & 0xFF);
+        uint32_t *dw = reinterpret_cast<uint32_t *>(data);
+        dw[0] = 1; dw[4] = 4; dw[12] = 48; dw[19] = 1; // 48 vertices
+        const std::vector<uint8_t> image(data, data + 16384);
+        auto &vu = rt.vu1();
+        const VU1State initial = vu.state();
+        vl::setEnabledOverride(lifted);
+        uint64_t cycles = 0, last = 0;
+        double ns = 0;
+        for (int n = -1; n < iterations; ++n)
+        {
+            std::memcpy(data, image.data(), 16384);
+            vu.state() = initial;
+            vu.state().vi[8] = 0x7fff; vu.state().vi[14] = 0x1111; vu.state().vi[15] = 0x7fff;
+            const auto t0 = std::chrono::steady_clock::now();
+            vu.execute(rt.memory().getVU1Code(), 16384, data, 16384, rt.gs(), &rt.memory(), entryPc, 0, 0, 100000);
+            if (n >= 0) ns += std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
+            // The interpreter's cycle counter keeps running across programs.
+            if (n >= 0) cycles += vu.state().cycles - last;
+            last = vu.state().cycles;
+        }
+        vl::setEnabledOverride(-1);
+        std::cout << (lifted ? "lifted" : "interp") << ": " << ns / cycles << " ns/cycle over " << cycles << " cycles\n";
+    }
+}
+
 } // namespace
 
 int main(int argc, char **argv)
 {
     try
     {
+        if (argc >= 2 && std::string(argv[1]) == "bench")
+        {
+            benchSegment("notes/evidence/battle-black-agent-20261014/dispatch-observations/vu-census.tsv.da28291ffe0b3334.bin", 0x0010,
+                         argc >= 3 ? std::atoi(argv[2]) : 20000, argc >= 4);
+            return 0;
+        }
         if(argc==2 && (std::string(argv[1])=="dma-cancel-interpreter" || std::string(argv[1])=="dma-cancel-lift")) {
             testRealVuDmaCancellation(std::string(argv[1])=="dma-cancel-lift");
             std::cout << "Real VU DMA cancellation tests passed\n";
@@ -423,6 +484,9 @@ int main(int argc, char **argv)
         testSegment("notes/evidence/battle-black-agent-20261014/dispatch-observations/vu-census.tsv.da28291ffe0b3334.bin",
                     0xda28291ffe0b3334ull, 0x0010, 0x0950);
 
+        // The translator's timing mirror must match the interpreter's decode,
+        // or segments silently fall back to interpretation.
+        require(vl::declinedSegments() == 0, "lifted segment timing differs from the interpreter decode");
         std::cout << "\n>>> ALL VU1 LIFT EQUIVALENCE TESTS PASSED! <<<\n" << std::endl;
         return 0;
     }

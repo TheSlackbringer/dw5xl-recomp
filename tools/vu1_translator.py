@@ -1,4 +1,6 @@
 import os, struct, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vu1_timing
 
 BC = ['x', 'y', 'z', 'w']
 def dest_name(d): return ''.join(c for i, c in enumerate('xyzw') if d & (8 >> i))
@@ -112,10 +114,10 @@ def translate_upper(u):
             
     for base in ('ADD', 'SUB', 'MUL', 'MADD', 'MSUB'):
         if name == base + 'q':
-            val = f"fmac<{fmac_map[base]}, {d}>(norm(vf[{fs}]), splat(cycle >= q_ready ? (q = pending_q) : q), acc, fl)"
+            val = f"fmac<{fmac_map[base]}, {d}>(norm(vf[{fs}]), splat(c.st.q), acc, fl)"
             return blend_wrap(f"vf[{fd}]", val, d)
         if name == base + 'Aq':
-            val = f"fmac<{fmac_map[base]}, {d}>(norm(vf[{fs}]), splat(cycle >= q_ready ? (q = pending_q) : q), acc, fl)"
+            val = f"fmac<{fmac_map[base]}, {d}>(norm(vf[{fs}]), splat(c.st.q), acc, fl)"
             return blend_wrap("acc", val, d)
             
     for base in ('ADD', 'SUB', 'MUL', 'MADD', 'MSUB'):
@@ -143,7 +145,7 @@ def translate_upper(u):
             return blend_wrap(f"vf[{fd}]", f"vuMinMaxV(vf[{fs}], bc<{i}>(vf[{ft}]), false)", d)
             
     if name == 'CLIP':
-        return f"clip = ((clip << 6) | (vl::clipFlags(vf[{fs}], bc<3>(vf[{ft}])) & 0x3F)) & 0xFFFFFF;"
+        return f"vl::LiftAccess::clipAt(c, cyc, vl::clipFlags(vf[{fs}], bc<3>(vf[{ft}])) & 0x3F);"
         
     if name == 'FTOI0':
         return blend_wrap(f"vf[{ft}]", f"vuFtoiV(norm(vf[{fs}]), 1.0f)", d)
@@ -194,7 +196,7 @@ def translate_lower(l, lo, i_bit, pc):
             stmts.append(f"if ({fs} != 0) vi[{fs}] = vl::i16(vi[{fs}] + 1);")
             return " ".join(stmts)
         if sp == 0x35: # SQI
-            stmts = [f"vl::sq<0x{lm:x}, false>(c, mem, vi[{ft}], vf[{fs}], cycle);"]
+            stmts = [f"vl::sq<0x{lm:x}, false>(c, mem, vi[{ft}], vf[{fs}], 0u);"]
             stmts.append(f"if ({ft} != 0) vi[{ft}] = vl::i16(vi[{ft}] + 1);")
             return " ".join(stmts)
         if sp == 0x36: # LQD
@@ -204,12 +206,12 @@ def translate_lower(l, lo, i_bit, pc):
             return " ".join(stmts)
         if sp == 0x37: # SQD
             stmts = [f"if ({ft} != 0) vi[{ft}] = vl::i16(vi[{ft}] - 1);"]
-            stmts.append(f"vl::sq<0x{lm:x}, false>(c, mem, vi[{ft}], vf[{fs}], cycle);")
+            stmts.append(f"vl::sq<0x{lm:x}, false>(c, mem, vi[{ft}], vf[{fs}], 0u);")
             return " ".join(stmts)
         if sp == 0x38: # DIV
-            return f"if (cycle >= q_ready) q = pending_q; {{ uint32_t di = 0; pending_q = vl::div(vl::lane<{l['fsf']}>(vf[{fs}]), vl::lane<{l['ftf']}>(vf[{ft}]), di); q_ready = cycle + 6; }}"
+            return f"{{ uint32_t di = 0; const float qv = vl::div(vl::lane<{l['fsf']}>(vf[{fs}]), vl::lane<{l['ftf']}>(vf[{ft}]), di); vl::LiftAccess::queueQAt(c, cyc, qv, 7u, di); }}"
         if sp == 0x3b: # WAITQ
-            return f"if (cycle >= q_ready) q = pending_q;"
+            return ""  # WAITQ: the stall is applied by LiftAccess::begin
         if sp == 0x3c: # MTIR
             return f"if ({ft} != 0) vi[{ft}] = static_cast<int32_t>(static_cast<int16_t>(vl::bits<{l['fsf']}>(vf[{fs}]) & 0xFFFF));"
         if sp == 0x3d: # MFIR
@@ -220,13 +222,13 @@ def translate_lower(l, lo, i_bit, pc):
             return f"if ({ft} != 0) vi[{ft}] = vl::ilw(mem, vi[{fs}], {comp});"
         if sp == 0x3f: # ISWR
             lm = dest_mask(dd)
-            return f"vl::isw<0x{lm:x}, false>(c, mem, vi[{fs}], vi[{ft}], cycle);"
+            return f"vl::isw<0x{lm:x}, false>(c, mem, vi[{fs}], vi[{ft}], 0u);"
         if sp == 0x68: # XTOP
             return f"if ({ft} != 0) vi[{ft}] = static_cast<int32_t>(c.st.top & 0x3FFu);"
         if sp == 0x69: # XITOP
             return f"if ({ft} != 0) vi[{ft}] = static_cast<int32_t>(c.st.itop & 0x3FFu);"
         if sp == 0x6c: # XGKICK
-            return f"vl::kickStart(c, vi[{fs}] & 0x3FF, cycle);"
+            return f"vl::LiftAccess::xgkickAt(c, cyc, vi[{fs}] & 0x3FF);"
         if sp == 0x7b: # WAITP
             return ""
             
@@ -238,12 +240,12 @@ def translate_lower(l, lo, i_bit, pc):
         if op == 0x00: # LQ
             return blend_wrap(f"vf[{ft}]", f"vl::lq(mem, vi[{fs}] + ({imm}))", dd)
         if op == 0x01: # SQ
-            return f"vl::sq<0x{lm:x}, false>(c, mem, vi[{ft}] + ({imm}), vf[{fs}], cycle);"
+            return f"vl::sq<0x{lm:x}, false>(c, mem, vi[{ft}] + ({imm}), vf[{fs}], 0u);"
         if op == 0x04: # ILW
             comp = 0 if dd & 8 else (1 if dd & 4 else (2 if dd & 2 else 3))
             return f"if ({ft} != 0) vi[{ft}] = vl::ilw(mem, vi[{fs}] + ({imm}), {comp});"
         if op == 0x05: # ISW
-            return f"vl::isw<0x{lm:x}, false>(c, mem, vi[{fs}] + ({imm}), vi[{ft}], cycle);"
+            return f"vl::isw<0x{lm:x}, false>(c, mem, vi[{fs}] + ({imm}), vi[{ft}], 0u);"
         if op == 0x08: # IADDIU
             imm15 = (lo & 0x7FF) | ((lo >> 10) & 0x7800)
             return f"if ({ft} != 0) vi[{ft}] = vl::i16(vi[{fs}] + ({imm15}));"
@@ -251,14 +253,14 @@ def translate_lower(l, lo, i_bit, pc):
             imm15 = (lo & 0x7FF) | ((lo >> 10) & 0x7800)
             return f"if ({ft} != 0) vi[{ft}] = vl::i16(vi[{fs}] - ({imm15}));"
         if op == 0x11: # FCSET
-            return f"clip = 0x{lo & 0xFFFFFF:06x}u;"
+            return f"vl::LiftAccess::fcsetAt(c, cyc, 0x{lo & 0xFFFFFF:06x}u);"
         if op == 0x12: # FCAND
-            return f"vi[1] = ((clip & 0x{lo & 0xFFFFFF:06x}u) != 0) ? 1 : 0;"
+            return f"vi[1] = ((c.st.clip & 0x{lo & 0xFFFFFF:06x}u) != 0) ? 1 : 0;"
         if op == 0x13: # FCOR
             imm24 = lo & 0xFFFFFF
-            return f"vi[1] = ((clip | 0x{imm24:06x}u) == 0xFFFFFFu) ? 1 : 0;"
+            return f"vi[1] = ((c.st.clip | 0x{imm24:06x}u) == 0xFFFFFFu) ? 1 : 0;"
         if op == 0x1a: # FMAND
-            return f"if ({ft} != 0) vi[{ft}] = fl.mac & (vi[{fs}] & 0xFFFF);"
+            return f"vl::LiftAccess::flagsSync(c, fq, cyc); if ({ft} != 0) vi[{ft}] = static_cast<int32_t>(c.st.mac & (vi[{fs}] & 0xFFFF));"
             
     raise ValueError(f"Unknown lower op at pc {pc:04x}: lo={lo:08x}")
 
@@ -301,42 +303,118 @@ def is_acc_op(name):
     return False
 
 def upper_writes_vf(u):
+    """VF register an upper instruction writes (None for ACC, CLIP and NOP)."""
     if u['type'] not in ('UP', 'UPS'):
         return None
     name = u['name']
-    if is_acc_op(name):
+    if is_acc_op(name) or u['d'] == 0:
         return None
-    if u['d'] == 0 or u['fd'] == 0:
+    if u['type'] == 'UPS':
+        # ITOF/FTOI/ABS write ft; the fd field is part of the opcode.
+        if name.startswith(('ITOF', 'FTOI', 'ABS')):
+            return u['ft'] or None
         return None
-    return u['fd']
+    return u['fd'] or None
 
 def lower_reads_vf(l):
     if l['type'] == 'SPEC':
         sp = l['sp']
-        if sp in (0x30, 0x31, 0x35, 0x3c): # MOVE, MR32, SQI, MTIR
+        if sp in (0x30, 0x31, 0x35, 0x37, 0x3c): # MOVE, MR32, SQI, SQD, MTIR
             return [l['fs']]
-        if sp == 0x38: # DIV
+        if sp in (0x38, 0x3a): # DIV, RSQRT
             return [l['fs'], l['ft']]
+        if sp == 0x39: # SQRT
+            return [l['ft']]
     elif l['type'] == 'NORM':
         if l['op'] == 0x01: # SQ
             return [l['fs']]
     return []
 
+def lower_writes_vf(l):
+    if l['type'] == 'SPEC':
+        if l['sp'] in (0x30, 0x31, 0x34, 0x36, 0x3d) and l['dd'] != 0: # MOVE, MR32, LQI, LQD, MFIR
+            return l['ft'] or None
+    elif l['type'] == 'NORM':
+        if l['op'] == 0x00 and l['dd'] != 0: # LQ
+            return l['ft'] or None
+    return None
+
+# MAC/status flags are only observable through these lower instructions:
+# FSEQ FSSET FSAND FSOR FMEQ FMAND FMOR. A segment without them only needs the
+# final committed flags, which it accumulates locally (same result as queueing
+# every FMAC result: FMAC and FDIV commits touch disjoint status bits).
+MAC_STATUS_READERS = (0x14, 0x15, 0x16, 0x17, 0x18, 0x1a, 0x1b)
+QUEUE_FMAC_FLAGS = True
+
+def fmac_flag_code():
+    if QUEUE_FMAC_FLAGS:
+        return "    if (fl.pending) { fl.pending = false; vl::LiftAccess::flagsPush(c, fq, cyc, fl.mac, fl.cur, fl.extra); }"
+    return "    if (fl.pending) { fl.pending = false; lastMac = fl.mac; lastCur = fl.cur; sticky6 |= fl.cur | fl.extra; anyFmac = true; }"
+
 def emit_pair(u, l, lo, i_bit, pc, out):
     shadow = None
     w = upper_writes_vf(u)
-    if w is not None and w in lower_reads_vf(l):
+    # Like the interpreter's upperVfShadowReg: when the lower instruction reads
+    # or writes the register the upper writes, it sees the old value and the
+    # upper result wins.
+    if w is not None and (w in lower_reads_vf(l) or w == lower_writes_vf(l)):
         shadow = w
         out.append(f"    shadow_vf = vf[{shadow}];")
     up_code = translate_upper(u)
     lo_code = translate_lower(l, lo, i_bit, pc)
     if shadow is not None:
         lo_code = lo_code.replace(f"vf[{shadow}]", "shadow_vf")
-    if up_code: out.append(f"    {up_code}")
+    if up_code:
+        out.append(f"    {up_code}")
+        if 'fmac<' in up_code:
+            out.append(fmac_flag_code())
     if lo_code: out.append(f"    {lo_code}")
 
+def timing_begin(code, pc, timings):
+    """Stall checks before a pair, with the pair's read slots as constants."""
+    lo, up = struct.unpack_from('<II', code, pc)
+    t = vu1_timing.pair_timing(lo, up)
+    timings.append((pc, t))
+    lines = []
+    if t['reads']:
+        checks = ' '.join(f"r_ = rdy[{slot}] > r_ ? rdy[{slot}] : r_;" for slot in t['reads'])
+        lines.append(f"    {{ uint64_t r_ = cyc; {checks} if (r_ > cyc) vl::LiftAccess::stall(c, cyc, r_); }}")
+    if t['flags'] & (vu1_timing.FLAG_FDIV | vu1_timing.FLAG_WAITQ):
+        lines.append("    vl::LiftAccess::fdivWait(c, cyc);")
+    if t['flags'] & (vu1_timing.FLAG_EFU | vu1_timing.FLAG_WAITP):
+        raise ValueError(f'EFU timing at {pc:04x} is not supported by the lifter')
+    if t['flags'] & vu1_timing.FLAG_XGKICK:
+        lines.append("    vl::LiftAccess::kickWait(c, cyc);")
+    if t['firstVi'] and t['flags'] & vu1_timing.FLAG_BRANCH_DELAY:
+        lines.append(f"    ov = vi[{t['firstVi']}];")
+    return lines
+
+def timing_end(code, pc):
+    """Write latencies, branch VI delay and the cycle step after a pair."""
+    lo, up = struct.unpack_from('<II', code, pc)
+    t = vu1_timing.pair_timing(lo, up)
+    lines = []
+    if t['writes']:
+        lines.append("    " + " ".join(f"rdy[{slot}] = cyc + {lat};" for slot, lat in t['writes']))
+        lines.append(f"    if (cyc + {t['maxLat']} > hz) hz = cyc + {t['maxLat']};")
+    if t['firstVi'] and t['flags'] & vu1_timing.FLAG_BRANCH_DELAY:
+        lines.append(f"    bbValid = true; bbReg = {t['firstVi']}; bbVal = ov;")
+    else:
+        lines.append("    bbValid = false;")
+    lines.append("    vl::LiftAccess::tick(c, cyc);")
+    return lines
+
 def translate_segment(code, entry_pc, fn_name):
+    global QUEUE_FMAC_FLAGS
     reachable = find_reachable(code, entry_pc)
+    QUEUE_FMAC_FLAGS = False
+    for rpc in reachable:
+        rlo, rup = struct.unpack_from('<II', code, rpc)
+        if (rup >> 31) & 1:
+            continue
+        rl = decode_lower(rlo, rpc)
+        if rl['type'] == 'NORM' and rl['op'] in MAC_STATUS_READERS:
+            QUEUE_FMAC_FLAGS = True
     
     branch_info = {}
     branch_delay_slots = set()
@@ -350,12 +428,12 @@ def translate_segment(code, entry_pc, fn_name):
             tgt = l['tgt']
             ft, fs = l['ft'], l['fs']
             if op == 0x20: cond = "true"
-            elif op == 0x28: cond = f"(vi[{ft}] == vi[{fs}])"
-            elif op == 0x29: cond = f"(vi[{ft}] != vi[{fs}])"
-            elif op == 0x2c: cond = f"(vi[{fs}] < 0)"
-            elif op == 0x2d: cond = f"(vi[{fs}] > 0)"
-            elif op == 0x2e: cond = f"(vi[{fs}] <= 0)"
-            elif op == 0x2f: cond = f"(vi[{fs}] >= 0)"
+            elif op == 0x28: cond = f"(brvi({ft}) == brvi({fs}))"
+            elif op == 0x29: cond = f"(brvi({ft}) != brvi({fs}))"
+            elif op == 0x2c: cond = f"(brvi({fs}) < 0)"
+            elif op == 0x2d: cond = f"(brvi({fs}) > 0)"
+            elif op == 0x2e: cond = f"(brvi({fs}) <= 0)"
+            elif op == 0x2f: cond = f"(brvi({fs}) >= 0)"
             branch_info[pc] = (tgt, cond)
             branch_delay_slots.add(pc + 8)
             targets.add(tgt)
@@ -372,9 +450,11 @@ def translate_segment(code, entry_pc, fn_name):
         blocks.append(curr_block)
         
     out = []
+    timings = []
     out.append(f"void {fn_name}(vl::Run &c)")
     out.append("{")
     out.append("    using namespace vl;")
+    out.append("@@TIMING_TABLE@@")
     out.append("    vl::checkReset(c);")
     out.append("    alignas(16) V vf[32];")
     out.append("    for (int i = 0; i < 32; ++i) vf[i] = _mm_loadu_ps(c.st.vf[i]);")
@@ -382,23 +462,28 @@ def translate_segment(code, entry_pc, fn_name):
     out.append("    for (int i = 0; i < 16; ++i) vi[i] = c.st.vi[i];")
     out.append("    V acc = _mm_loadu_ps(c.st.acc);")
     out.append("    V shadow_vf = _mm_setzero_ps();")
-    out.append("    float q = c.st.q;")
-    out.append("    float pending_q = q;")
-    out.append("    uint64_t q_ready = 0;")
     out.append("    float i_reg = c.st.i;")
-    out.append("    uint32_t clip = c.st.clip;")
     out.append("    Flags fl{ c.st.status & 0xFu, c.st.mac, (c.st.status >> 6) & 0x3Fu };")
+    if not QUEUE_FMAC_FLAGS:
+        out.append("    uint32_t lastMac = 0, lastCur = 0, sticky6 = 0; bool anyFmac = false;")
     out.append("    uint8_t *mem = c.mem;")
-    out.append("    uint64_t cycle = c.cycle;")
+    out.append("    uint64_t *rdy = vl::LiftAccess::readyTable(c);")
+    out.append("    uint64_t cyc = vl::LiftAccess::cycle(c), hz = 0;")
+    if QUEUE_FMAC_FLAGS:
+        out.append("    vl::LiftAccess::FlagQueue fq; vl::LiftAccess::flagsEnter(c, fq);")
+    out.append("    bool bbValid = false; uint8_t bbReg = 0; int32_t bbVal = 0, ov = 0;")
+    out.append("    auto brvi = [&](int r) -> int32_t { return r == 0 ? 0 : ((bbValid && bbReg == r) ? bbVal : vi[r]); };")
     for bpc in sorted(branch_info.keys()):
         out.append(f"    bool taken_{bpc:04x} = false;")
     out.append("    auto checkpoint = [&] { if (!vl::resetRequested()) return;")
     out.append("        for (int n = 1; n < 32; ++n) _mm_storeu_ps(c.st.vf[n], vf[n]);")
     out.append("        for (int n = 1; n < 16; ++n) c.st.vi[n] = vi[n];")
-    out.append("        _mm_storeu_ps(c.st.acc, acc); c.st.q = cycle >= q_ready ? pending_q : q;")
-    out.append("        c.st.i = i_reg; c.st.clip = clip; c.st.mac = fl.mac;")
-    out.append("        c.st.status = (c.st.status & 0xFF0u) | (fl.cur & 0xFu) | ((fl.sticky & 0x3Fu) << 6);")
-    out.append("        c.cycle = cycle; throw vl::ResetCanceled{}; };")
+    out.append("        _mm_storeu_ps(c.st.acc, acc);")
+    if not QUEUE_FMAC_FLAGS:
+        out.append("        if (anyFmac) { c.st.mac = lastMac; c.st.status = (c.st.status & 0xFF0u) | lastCur | (sticky6 << 6); }")
+    if QUEUE_FMAC_FLAGS:
+        out.append("        vl::LiftAccess::flagsLeave(c, fq, cyc);")
+    out.append("        c.st.i = i_reg; vl::LiftAccess::leave(c, cyc, hz, bbValid, bbReg, bbVal); throw vl::ResetCanceled{}; };")
     out.append("    bool resetCanceled = false;")
     out.append("    try {")
     out.append("")
@@ -420,10 +505,14 @@ def translate_segment(code, entry_pc, fn_name):
             if pc in branch_info:
                 tgt, cond = branch_info[pc]
                 out.append(f"    // {pc:04x}: branch to {tgt:04x}")
+                out.extend(timing_begin(code, pc, timings))
                 up_code = translate_upper(u)
                 if up_code:
                     out.append(f"    {up_code}")
+                    if 'fmac<' in up_code:
+                        out.append(fmac_flag_code())
                 out.append(f"    taken_{pc:04x} = {cond};")
+                out.extend(timing_end(code, pc))
                 
                 i += 1
                 d_pc = block[i]
@@ -436,15 +525,17 @@ def translate_segment(code, entry_pc, fn_name):
                     out.append(f"loc_{d_pc:04x}:;")
                     out.append("    checkpoint();")
                 out.append(f"    // {d_pc:04x}: delay slot for {pc:04x}")
+                out.extend(timing_begin(code, d_pc, timings))
                 emit_pair(d_u, d_l, d_lo, d_i_bit, d_pc, out)
-                out.append("    cycle += 2;")
+                out.extend(timing_end(code, d_pc))
                 out.append(f"    if (taken_{pc:04x}) goto loc_{tgt:04x};")
                 i += 1
                 continue
                 
             out.append(f"    // {pc:04x}")
+            out.extend(timing_begin(code, pc, timings))
             emit_pair(u, l, lo, i_bit, pc, out)
-            out.append("    ++cycle;")
+            out.extend(timing_end(code, pc))
             
             if e_bit:
                 i += 1
@@ -457,8 +548,9 @@ def translate_segment(code, entry_pc, fn_name):
                     out.append(f"loc_{d_pc:04x}:;")
                     out.append("    checkpoint();")
                 out.append(f"    // {d_pc:04x}: delay slot for e-bit at {pc:04x}")
+                out.extend(timing_begin(code, d_pc, timings))
                 emit_pair(d_u, d_l, d_lo, d_i_bit, d_pc, out)
-                out.append("    ++cycle;")
+                out.extend(timing_end(code, d_pc))
                 final_pc = d_pc + 8
                 out.append(f"    c.st.pc = 0x{final_pc:04x};")
                 out.append("    goto done;")
@@ -469,21 +561,29 @@ def translate_segment(code, entry_pc, fn_name):
 
     out.append("done:;")
     out.append("    } catch (const vl::ResetCanceled &) { resetCanceled = true; }")
+    if QUEUE_FMAC_FLAGS:
+        out.append("    vl::LiftAccess::flagsLeave(c, fq, cyc);")
+    out.append("    vl::LiftAccess::leave(c, cyc, hz, bbValid, bbReg, bbVal);")
     out.append("    for (int i = 1; i < 32; ++i) _mm_storeu_ps(c.st.vf[i], vf[i]);")
     out.append("    c.st.vf[0][0] = 0.0f; c.st.vf[0][1] = 0.0f; c.st.vf[0][2] = 0.0f; c.st.vf[0][3] = 1.0f;")
     out.append("    for (int i = 1; i < 16; ++i) c.st.vi[i] = vi[i];")
     out.append("    c.st.vi[0] = 0;")
     out.append("    _mm_storeu_ps(c.st.acc, acc);")
-    out.append("    if (cycle >= q_ready) q = pending_q;")
-    out.append("    c.st.q = q;")
     out.append("    c.st.i = i_reg;")
-    out.append("    c.st.clip = clip;")
-    out.append("    c.st.mac = fl.mac;")
-    out.append("    c.st.status = (c.st.status & 0xFF0u) | (fl.cur & 0xFu) | ((fl.sticky & 0x3Fu) << 6);")
-    out.append("    c.endCycle = cycle;")
-    out.append("    c.cycle = cycle;")
+    if not QUEUE_FMAC_FLAGS:
+        out.append("    if (anyFmac) { c.st.mac = lastMac; c.st.status = (c.st.status & 0xFF0u) | lastCur | (sticky6 << 6); }")
     out.append("    if (resetCanceled) throw vl::ResetCanceled{};")
     out.append("}")
+    # The embedded timing must equal the interpreter's decode, else the
+    # program is interpreted (vl::LiftAccess::validate).
+    table = [f"    static const uint16_t kPcs[] = {{{', '.join(f'0x{p:04x}' for p, _ in timings)}}};",
+             "    static const VuLiftTiming kTiming[] = {",
+             ",\n".join(f"        {vu1_timing.timing_initializer(t)}" for _, t in timings),
+             "    };",
+             "    static std::atomic<int> s_timingState{0};",
+             f"    if (!vl::LiftAccess::validate(c, kTiming, kPcs, {len(timings)}u, s_timingState, \"{fn_name}\")) {{ c.declined = true; return; }}"]
+    i = out.index("@@TIMING_TABLE@@")
+    out[i:i + 1] = table
     return "\n".join(out)
 
 if __name__ == '__main__':
@@ -704,16 +804,20 @@ inline V vuItofV(V a, float scale)
 void lift_flush_0220(vl::Run &c)
 {
     vl::checkReset(c);
-    c.cycle += 2;
-    c.endCycle = c.cycle;
+    vl::LiftAccess::begin(c, 0x0220, c.st.vi);
+    vl::LiftAccess::end(c, 0x0220);
+    vl::LiftAccess::begin(c, 0x0228, c.st.vi);
+    vl::LiftAccess::end(c, 0x0228);
     c.st.pc = 0x0230;
 }
 
 void lift_flush_0360(vl::Run &c)
 {
     vl::checkReset(c);
-    c.cycle += 2;
-    c.endCycle = c.cycle;
+    vl::LiftAccess::begin(c, 0x0360, c.st.vi);
+    vl::LiftAccess::end(c, 0x0360);
+    vl::LiftAccess::begin(c, 0x0368, c.st.vi);
+    vl::LiftAccess::end(c, 0x0368);
     c.st.pc = 0x0370;
 }
 """)

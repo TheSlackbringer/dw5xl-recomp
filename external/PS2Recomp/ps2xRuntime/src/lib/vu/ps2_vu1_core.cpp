@@ -169,7 +169,7 @@ void VU1Interpreter::resetScheduler()
     m_fdiv = {};
     m_efu = {};
     m_storePipeline = {};
-    m_xgkick = {};
+    m_xgkick.reset();
     m_ready = {};
     m_efuResourceReady = 0;
     m_nextCommitCycle = std::numeric_limits<uint64_t>::max();
@@ -658,7 +658,11 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
             mac |= static_cast<uint32_t>(lane) << 12;
         status |= flags;
     }
+    queueFmacFlags(mac, status, extraSticky);
+}
 
+void VU1Interpreter::queueFmacFlags(uint32_t mac, uint32_t status, uint32_t extraSticky)
+{
     const int slot = claimSlot<kMaxFlagEntries>(m_flagMask);
     if (slot < 0)
     {
@@ -1054,7 +1058,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
 
     // XGKICK sources VU data memory at (VI[Is] & 0x3FF) * 16 (16 KB wrap).
     const uint32_t sourceAddress = ((qwordAddress & 0x3FFu) * 16u) % m_activeVuDataSize;
-    m_xgkick = {};
+    m_xgkick.reset();
     m_xgkick.active = true;
     m_xgkick.sourceAddress = sourceAddress;
     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
@@ -1660,12 +1664,61 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
     return decoded;
 }
 
+// The same slots and latencies as decodeInstructionPair's readSlots /
+// writeSlots, grouped per register for the lifted code's scheduler.
+VU1Interpreter::LiftTiming VU1Interpreter::makeLiftTiming(const DecodedInstructionPair &decoded)
+{
+    LiftTiming t{};
+    uint32_t groups = 0;
+    for (const InstructionUsage *usage : {&decoded.upperUsage, &decoded.lowerUsage})
+    {
+        for (uint32_t index = 0; index < usage->vfReadCount; ++index)
+        {
+            const VfAccess &access = usage->vfRead[index];
+            if (access.reg == 0u || access.lanes == 0u)
+                continue;
+            t.vfReg[groups] = access.reg;
+            t.vfLanes[groups] = access.lanes;
+            ++groups;
+        }
+        t.viRead = static_cast<uint16_t>(t.viRead | (usage->viRead & 0xFFFEu));
+        t.accRead = static_cast<uint8_t>(t.accRead | usage->accRead);
+    }
+    const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
+    if (lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg)
+    {
+        t.wReg[0] = lowerWrite.reg;
+        t.wLanes[0] = lowerWrite.lanes;
+        t.wLat[0] = decoded.lowerUsage.vfLatency != 0u ? decoded.lowerUsage.vfLatency : decoded.lowerUsage.latency;
+    }
+    const VfAccess upperWrite = decoded.upperUsage.vfWrite;
+    if (upperWrite.reg != 0u)
+    {
+        t.wReg[1] = upperWrite.reg;
+        t.wLanes[1] = upperWrite.lanes;
+        t.wLat[1] = decoded.upperUsage.vfLatency != 0u ? decoded.upperUsage.vfLatency : decoded.upperUsage.latency;
+    }
+    t.viWrite = static_cast<uint16_t>(decoded.lowerUsage.viWrite & 0xFFFEu);
+    t.viLat = decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency;
+    t.accWrite = decoded.upperUsage.accWrite;
+    t.maxLat = decoded.writeSlotCount != 0u ? decoded.maxWriteLatency : 0u;
+    t.firstVi = decoded.firstViWrite;
+    t.flags = static_cast<uint8_t>((decoded.lowerUsage.pipeline == PipelineFdiv ? kLiftFdiv : 0u) |
+                                   (decoded.lowerUsage.pipeline == PipelineEfu ? kLiftEfu : 0u) |
+                                   (decoded.lowerUsage.waitQ ? kLiftWaitQ : 0u) |
+                                   (decoded.lowerUsage.waitP ? kLiftWaitP : 0u) |
+                                   (decoded.lowerUsage.pipeline == PipelineXgkick ? kLiftXgkick : 0u) |
+                                   (decoded.lowerUsage.delaysNextBranchRead ? kLiftBranchDelay : 0u));
+    return t;
+}
+
 void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,
                                              const PS2Memory *memory, uint64_t generation)
 {
     const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
     for (uint32_t i = 0; i < pairCount; ++i)
         m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+    m_liftTimingValid = false; // derived on demand by vl::LiftAccess::prepare
 
     m_cachedVuCode = vuCode;
     m_cachedMemory = memory;

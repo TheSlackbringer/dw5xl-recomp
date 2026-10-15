@@ -37,8 +37,40 @@ struct VU1State
     uint32_t branchDelay;
 };
 
+namespace vl
+{
+    struct LiftAccess;
+}
+
+// Per-pair timing of a VU microcode pair: the slots and latencies of
+// VU1Interpreter::decodeInstructionPair, grouped per register. Lifted
+// microprograms embed their own table and are only used when it equals the
+// interpreter's decode of the loaded microcode.
+struct VuLiftTiming
+{
+    uint8_t vfReg[4];   // VF read groups (0 = unused)
+    uint8_t vfLanes[4]; // lane masks, bit 3 = x
+    uint16_t viRead;    // VI read mask without VI0
+    uint16_t viWrite;   // VI write mask without VI0
+    uint8_t accRead;
+    uint8_t accWrite;
+    uint8_t wReg[2];    // VF writes (lower, upper)
+    uint8_t wLanes[2];
+    uint8_t wLat[2];
+    uint8_t viLat;
+    uint8_t maxLat;     // writeback horizon, 0 without writes
+    uint8_t firstVi;
+    uint8_t flags;
+    static constexpr uint8_t kFdiv = 1u, kEfu = 2u, kWaitQ = 4u, kWaitP = 8u, kXgkick = 16u, kBranchDelay = 32u;
+    bool operator==(const VuLiftTiming &) const = default;
+};
+
 class VU1Interpreter
 {
+    // Lifted microprograms run on this interpreter's scheduler: its decoded
+    // timing tables, register ready times and flag/Q/PATH1 pipelines.
+    friend struct vl::LiftAccess;
+
 public:
     enum class Unit : uint8_t
     {
@@ -182,6 +214,14 @@ private:
         uint64_t issueCycle = 0;
         bool active = false;
         bool currentTagEop = false;
+
+        // Only bytes below copiedBytes are ever read, so the 64 KB buffer is not cleared.
+        void reset()
+        {
+            sourceAddress = totalBytes = copiedBytes = currentTagEnd = cycleCredit = 0u;
+            issueCycle = 0u;
+            active = currentTagEop = false;
+        }
     };
 
     static constexpr uint32_t kFmacLatency = 4u;
@@ -193,6 +233,13 @@ private:
     Unit m_unit;
     VU1State m_state;
     std::array<DecodedInstructionPair, kMaxDecodedPairs> m_decodedCodeCache{};
+    using LiftTiming = VuLiftTiming;
+    static constexpr uint8_t kLiftFdiv = VuLiftTiming::kFdiv, kLiftEfu = VuLiftTiming::kEfu,
+                             kLiftWaitQ = VuLiftTiming::kWaitQ, kLiftWaitP = VuLiftTiming::kWaitP,
+                             kLiftXgkick = VuLiftTiming::kXgkick, kLiftBranchDelay = VuLiftTiming::kBranchDelay;
+    std::array<LiftTiming, kMaxDecodedPairs> m_liftTiming{};
+    bool m_liftTimingValid = false;
+    static LiftTiming makeLiftTiming(const DecodedInstructionPair &decoded);
     const uint8_t *m_cachedVuCode = nullptr;
     const PS2Memory *m_cachedMemory = nullptr;
     uint32_t m_cachedCodeSize = 0;
@@ -206,7 +253,7 @@ private:
     XgkickPipeline m_xgkick{};
     // Cycle at which each VF lane / VI register / ACC lane write becomes
     // readable by a following instruction.
-    std::array<uint64_t, kReadySlotCount> m_ready{};
+    alignas(32) std::array<uint64_t, kReadySlotCount> m_ready{};
 
     uint64_t m_cycle = 0;
     uint64_t m_efuResourceReady = 0;
@@ -272,6 +319,7 @@ private:
     template <typename Real>
     uint8_t normalizeFmacExactResult(float &value, Real exactResult) const;
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
+    void queueFmacFlags(uint32_t mac, uint32_t status, uint32_t extraSticky);
     void queueFsset(uint16_t immediate);
     void queueClip(uint32_t clip);
     void queueFcset(uint32_t clip);

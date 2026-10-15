@@ -3,6 +3,7 @@
 #include "runtime/ps2_device_queue.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cfenv>
 #include <cstdio>
@@ -12,6 +13,18 @@
 namespace vl
 {
     bool resetRequested() noexcept { return ps2x::device::workerShouldCancelVu1(); }
+    namespace { std::atomic<uint32_t> g_declined{0}; }
+    void LiftAccess::noteDeclined() { g_declined.fetch_add(1, std::memory_order_relaxed); }
+    uint32_t declinedSegments() { return g_declined.load(std::memory_order_relaxed); }
+
+    void LiftAccess::prepareActive(Run &c)
+    {
+        VU1Interpreter &v = vu(c);
+        prepare(c, v.m_activeMemory->getVU1Code(), v.m_activeMemory);
+    }
+    namespace { std::atomic<int> g_enabledOverride{-1}; }
+    void setEnabledOverride(int value) { g_enabledOverride.store(value, std::memory_order_relaxed); }
+    int enabledOverride() { return g_enabledOverride.load(std::memory_order_relaxed); }
     void checkReset(Run &) { if (resetRequested()) throw ResetCanceled{}; }
     namespace
     {
@@ -150,6 +163,8 @@ namespace vl
         fl.mac = macNibble(z) | (macNibble(s) << 4) | (macNibble(u) << 8) | (macNibble(o) << 12);
         fl.cur = (z ? 1u : 0u) | (s ? 2u : 0u) | (u ? 4u : 0u) | (o ? 8u : 0u);
         fl.sticky |= (fl.cur | productSticky) << 6;
+        fl.extra = productSticky;
+        fl.pending = true;
         return _mm_load_ps(value);
     }
 
@@ -178,7 +193,8 @@ bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_
 
     ++s_totalCalls;
 
-    if (!enabled || m_unit != Unit::VU1 || !memory || codeSize != 0x4000u || dataSize != 0x4000u ||
+    const int forced = vl::enabledOverride();
+    if (forced == 0 || (forced < 0 && !enabled) || m_unit != Unit::VU1 || !memory || codeSize != 0x4000u || dataSize != 0x4000u ||
         vuCode != memory->getVU1Code() || !m_activeVuData)
         return false;
 
@@ -256,30 +272,26 @@ bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_
     try
     {
         vl::checkReset(c);
+        // The segment keeps time on this interpreter's scheduler (m_cycle,
+        // register ready times, flag/Q/PATH1 pipelines); see vl::LiftAccess.
+        // Generated segments carry constant timing; the decode table is only
+        // built on demand (timing validation, hand-written segments).
         segment(c);
+        if (c.declined)
+            return false; // embedded timing differs: interpret this program
     }
     catch (const vl::ResetCanceled &)
     {
         // The ordered reset command clears pending pipelines next. Do not
         // interpret/replay this already partially accepted microprogram.
-        m_cycle = std::max(m_cycle, c.cycle);
         m_state.cycles = m_cycle;
         return true;
     }
 
-    // flushPipelines: the program ends once every write has landed and the
-    // PATH1 transfer has finished.
-    while (m_xgkick.active)
-    {
-        if (vl::resetRequested())
-            return true;
-        ++c.kickCycle;
-        progressXgkick();
-    }
-    m_cycle = std::max(c.endCycle, c.kickCycle);
+    // As at the end of an interpreted program: every write lands and the
+    // PATH1 transfer finishes.
+    flushPipelines();
     m_state.cycles = m_cycle;
-    m_efuResourceReady = c.efuReady;
-    m_workingClip = m_state.clip;
     m_state.ebit = false;
     m_state.haltAfterDelaySlot = false;
     m_pendingHaltD = false;
