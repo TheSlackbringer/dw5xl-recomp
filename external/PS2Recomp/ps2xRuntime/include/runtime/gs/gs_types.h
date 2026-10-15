@@ -293,6 +293,12 @@ struct GSPresentationRequest
 struct PresentationFrame
 {
     std::vector<uint8_t> pixels;
+    // Zero stride retains the legacy 640-pixel presentation contract.
+    uint32_t strideBytes = 0;
+    // Logical dimensions preserve display aspect when high-res field output
+    // already reconstructs the full vertical image. Zero means width/height.
+    uint32_t displayWidth = 0;
+    uint32_t displayHeight = 0;
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t displayFbp = 0;

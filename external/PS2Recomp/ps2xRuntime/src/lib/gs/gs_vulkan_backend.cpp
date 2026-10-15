@@ -60,6 +60,46 @@ struct GSVulkanBackend::Impl
     uint64_t draws = 0;
     uint64_t gpuPresentations = 0, convertedPresentations = 0;
     std::atomic<uint32_t> currentScale{1};
+    std::atomic<uint32_t> aaSamples{1};
+    // The player's anti-aliasing choice (F5): samples per output pixel, on top
+    // of the samples the output scale needs to build the larger image.
+    uint32_t requestedSamples = 1;
+    uint32_t maxAASamples() const
+    {
+        // Same device capability predicate used by the pinned renderer.
+        if (device.supports_subgroup_size_log2(true, 4, 6)) return 16;
+        if (device.supports_subgroup_size_log2(true, 3, 6)) return 8;
+        return 4;
+    }
+    // 2x output reads a 2x2 sample grid, 4x output a 4x4 grid.
+    static uint32_t minSamplesFor(uint32_t scale) { return scale == 4u ? 16u : scale == 2u ? 4u : 1u; }
+    uint32_t supportedScale(uint32_t scale) const
+    {
+        if (scale == 4u && maxAASamples() >= 16u) return 4u;
+        return scale >= 2u ? 2u : 1u;
+    }
+    uint32_t effectiveSamples(uint32_t scale) const
+    {
+        return std::min(requestedSamples * minSamplesFor(scale), maxAASamples());
+    }
+    // Caller holds access(). Retire pending readbacks before resetting
+    // geometry/history; slots own image and fence until the copy completes.
+    void applyOutput(uint32_t scale)
+    {
+        const uint32_t samples = effectiveSamples(scale);
+        if (scale == currentScale.load(std::memory_order_relaxed) &&
+            samples == aaSamples.load(std::memory_order_relaxed))
+            return;
+        gs.flush();
+        for (auto &slot : scanoutState.slots)
+            if (slot.pending && slot.fence) slot.fence->wait();
+        scanoutState.reset();
+        fieldWeaver.reset();
+        gs.set_super_sampling_rate(static_cast<ParallelGS::SuperSampling>(samples), true, true);
+        aaSamples.store(samples, std::memory_order_relaxed);
+        currentScale.store(scale, std::memory_order_relaxed);
+        std::fprintf(stderr, "[gs:vulkan] Output=%ux AA=%ux (%u samples)\n", scale, samples / minSamplesFor(scale), samples);
+    }
 
     Impl()
     {
@@ -77,18 +117,20 @@ struct GSVulkanBackend::Impl
         ParallelGS::GSOptions opts{};
         opts.dynamic_super_sampling = true;
         const char *scaleEnv = std::getenv("PS2X_GS_SCALE");
-        if (scaleEnv && *scaleEnv)
+        if (const char *aa = std::getenv("PS2X_GS_SSAA"))
         {
-            int scale = std::atoi(scaleEnv);
-            switch (scale)
-            {
-            case 2: opts.super_sampling = ParallelGS::SuperSampling::X2; currentScale.store(2, std::memory_order_relaxed); break;
-            case 4: opts.super_sampling = ParallelGS::SuperSampling::X4; currentScale.store(4, std::memory_order_relaxed); break;
-            case 8: opts.super_sampling = ParallelGS::SuperSampling::X8; currentScale.store(8, std::memory_order_relaxed); break;
-            case 16: opts.super_sampling = ParallelGS::SuperSampling::X16; currentScale.store(16, std::memory_order_relaxed); break;
-            default: opts.super_sampling = ParallelGS::SuperSampling::X1; currentScale.store(1, std::memory_order_relaxed); break;
-            }
+            const uint32_t requested = std::strtoul(aa, nullptr, 10);
+            if (requested == 1 || requested == 2 || requested == 4 || requested == 8 || requested == 16)
+                requestedSamples = requested;
         }
+        const uint32_t outputScale = supportedScale(scaleEnv ? std::strtoul(scaleEnv, nullptr, 10) : 1u);
+        currentScale.store(outputScale, std::memory_order_relaxed);
+        const uint32_t samples = effectiveSamples(outputScale);
+        opts.super_sampling = static_cast<ParallelGS::SuperSampling>(samples);
+        // Preserve supported sample-aware texture copies, including the game's
+        // render-to-display blit; no backbuffer-promotion heuristic is enabled.
+        opts.super_sampled_textures = true;
+        aaSamples.store(samples, std::memory_order_relaxed);
 
         if (!gs.init(&device, opts))
             throw std::runtime_error("Vulkan device lacks paraLLEl-GS features");
@@ -96,7 +138,7 @@ struct GSVulkanBackend::Impl
         const auto &gpu = device.get_gpu_properties();
         if (gpu.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
             throw std::runtime_error("software Vulkan devices are not a GPU renderer");
-        std::fprintf(stderr, "[gs:vulkan] device=%s vendor=0x%04x device=0x%04x; GPU compute rasterization (scale=%ux)\n",
+        std::fprintf(stderr, "[gs:vulkan] device=%s vendor=0x%04x device=0x%04x; GPU compute rasterization (AA=%u samples)\n",
             gpu.deviceName, gpu.vendorID, gpu.deviceID, static_cast<unsigned>(opts.super_sampling));
     }
     ~Impl()
@@ -327,11 +369,16 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
 {
     auto lock = m_impl->access(); auto &p = *m_impl;
     PresentationFrame result;
-    try { result = presentVulkanGs(p.gs, p.device, p.scanoutState, request, &p.fieldWeaver); ++p.gpuPresentations; }
+    try
+    {
+        result = presentVulkanGs(p.gs, p.device, p.scanoutState, request, &p.fieldWeaver,
+                                 p.currentScale.load(std::memory_order_relaxed));
+        ++p.gpuPresentations;
+    }
     catch (const std::exception &error)
     {
         // Preserve the fixed host viewport contract for display modes outside
-        // the bounded GPU scanout bridge. Rasterization remains Vulkan.
+        // the bounded GPU scanout bridge (native size). Rasterization remains Vulkan.
         std::fprintf(stderr, "[gs:vulkan] CPU display conversion: %s\n", error.what());
         p.readSnapshot(); result = p.scanout.PresentFromLocalMemory(request, &p.fieldWeaver);
         ++p.convertedPresentations;
@@ -348,22 +395,26 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
 void GSVulkanBackend::SetResolutionScale(uint32_t scale)
 {
     auto lock = m_impl->access();
-    ParallelGS::SuperSampling ss = ParallelGS::SuperSampling::X1;
-    switch (scale)
-    {
-    case 2: ss = ParallelGS::SuperSampling::X2; break;
-    case 4: ss = ParallelGS::SuperSampling::X4; break;
-    case 8: ss = ParallelGS::SuperSampling::X8; break;
-    case 16: ss = ParallelGS::SuperSampling::X16; break;
-    default: ss = ParallelGS::SuperSampling::X1; scale = 1; break;
-    }
-    m_impl->gs.flush();
-    m_impl->gs.set_super_sampling_rate(ss, true, false);
-    m_impl->currentScale.store(scale, std::memory_order_relaxed);
-    std::fprintf(stderr, "[gs:vulkan] Dynamic resolution scale changed to %ux\n", scale);
+    m_impl->applyOutput(m_impl->supportedScale(scale));
 }
 
 uint32_t GSVulkanBackend::GetResolutionScale() const
 {
     return m_impl->currentScale.load(std::memory_order_relaxed);
+}
+
+void GSVulkanBackend::SetAASamples(uint32_t samples)
+{
+    if (samples != 1 && samples != 2 && samples != 4 && samples != 8 && samples != 16) return;
+    auto lock = m_impl->access();
+    auto &p = *m_impl;
+    p.requestedSamples = samples;
+    p.applyOutput(p.currentScale.load(std::memory_order_relaxed));
+}
+
+uint32_t GSVulkanBackend::GetAASamples() const
+{
+    // Effective AA per output pixel (samples beyond what the output scale needs).
+    return std::max(1u, m_impl->aaSamples.load(std::memory_order_relaxed) /
+                            Impl::minSamplesFor(m_impl->currentScale.load(std::memory_order_relaxed)));
 }

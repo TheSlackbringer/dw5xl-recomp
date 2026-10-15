@@ -73,6 +73,12 @@ git -C app/deps/parallel-gs/Granite submodule update --init \
   third_party/volk third_party/khronos/vulkan-headers
 ```
 
+Then apply this project's renderer patches (2x/4x output and anti-aliasing at native resolution):
+
+```sh
+git -C app/deps/parallel-gs apply "$PWD"/vendor/parallel-gs-patches/*.patch
+```
+
 If that checkout already exists, reuse it after verifying the revision.
 
 ### 4. Build the application

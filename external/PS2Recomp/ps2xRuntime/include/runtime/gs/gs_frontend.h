@@ -137,7 +137,9 @@ public:
                                           uint32_t &outHeight,
                                           uint32_t *outDisplayFbp = nullptr,
                                           uint32_t *outSourceFbp = nullptr,
-                                          bool *outUsedPreferred = nullptr) const;
+                                          bool *outUsedPreferred = nullptr,
+                                          uint32_t *outDisplayWidth = nullptr,
+                                          uint32_t *outDisplayHeight = nullptr) const;
     bool clearFramebufferContext(uint32_t contextIndex, uint32_t rgba);
     bool clearActiveFramebuffer(uint32_t rgba);
     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
@@ -152,6 +154,8 @@ public:
 
     void setResolutionScale(uint32_t scale);
     uint32_t getResolutionScale() const;
+    void setAASamples(uint32_t samples);
+    uint32_t getAASamples() const;
     void SetResolutionScale(uint32_t scale) { setResolutionScale(scale); }
     uint32_t GetResolutionScale() const { return getResolutionScale(); }
 
@@ -245,6 +249,9 @@ private:
     std::vector<uint8_t> m_hostPresentationFrame;
     uint32_t m_hostPresentationWidth = 0;
     uint32_t m_hostPresentationHeight = 0;
+    uint32_t m_hostPresentationStride = 0;
+    uint32_t m_hostDisplayWidth = 0;
+    uint32_t m_hostDisplayHeight = 0;
     uint32_t m_hostPresentationDisplayFbp = 0;
     uint32_t m_hostPresentationSourceFbp = 0;
     bool m_hostPresentationUsedPreferred = false;

@@ -28,6 +28,8 @@ public:
     GSTransferSnapshot GetTransferSnapshot() const override;
     void SetResolutionScale(uint32_t scale) override;
     uint32_t GetResolutionScale() const override;
+    void SetAASamples(uint32_t samples) override;
+    uint32_t GetAASamples() const override;
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;

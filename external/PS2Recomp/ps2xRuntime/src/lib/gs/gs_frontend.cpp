@@ -185,6 +185,7 @@ void GS::reset()
         m_hostPresentationFrame.clear();
         m_hostPresentationWidth = 0u;
         m_hostPresentationHeight = 0u;
+        m_hostPresentationStride = m_hostDisplayWidth = m_hostDisplayHeight = 0u;
         m_hostPresentationDisplayFbp = 0u;
         m_hostPresentationSourceFbp = 0u;
         m_hostPresentationUsedPreferred = false;
@@ -550,6 +551,7 @@ void GS::latchHostPresentationFrame()
             m_hostPresentationFrame.clear();
             m_hasHostPresentationFrame = false;
             m_hostPresentationWidth = m_hostPresentationHeight = 0u;
+            m_hostPresentationStride = m_hostDisplayWidth = m_hostDisplayHeight = 0u;
             return;
         }
         request = buildPresentationRequestUnlocked();
@@ -577,6 +579,9 @@ void GS::latchHostPresentationFrame()
         m_hostPresentationFrame = std::move(frame.pixels);
         m_hostPresentationWidth = width;
         m_hostPresentationHeight = height;
+        m_hostPresentationStride = frame.strideBytes ? frame.strideBytes : kHostFrameWidth * 4u;
+        m_hostDisplayWidth = frame.displayWidth ? frame.displayWidth : width;
+        m_hostDisplayHeight = frame.displayHeight ? frame.displayHeight : height;
         m_hostPresentationDisplayFbp = displayFbp;
         m_hostPresentationSourceFbp = sourceFbp;
         m_hostPresentationUsedPreferred = usedPreferred;
@@ -595,7 +600,9 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outHeight,
                                           uint32_t *outDisplayFbp,
                                           uint32_t *outSourceFbp,
-                                          bool *outUsedPreferred) const
+                                          bool *outUsedPreferred,
+                                          uint32_t *outDisplayWidth,
+                                          uint32_t *outDisplayHeight) const
 {
     std::lock_guard<std::mutex> lock(m_presentationMutex);
     if (!m_hasHostPresentationFrame || m_hostPresentationFrame.empty())
@@ -603,6 +610,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
         outPixels.clear();
         outWidth = 0u;
         outHeight = 0u;
+        if (outDisplayWidth) *outDisplayWidth = 0u;
+        if (outDisplayHeight) *outDisplayHeight = 0u;
         if (outDisplayFbp)
             *outDisplayFbp = 0u;
         if (outSourceFbp)
@@ -614,6 +623,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 
     outWidth = m_hostPresentationWidth;
     outHeight = m_hostPresentationHeight;
+    if (outDisplayWidth) *outDisplayWidth = m_hostDisplayWidth;
+    if (outDisplayHeight) *outDisplayHeight = m_hostDisplayHeight;
     if (outDisplayFbp)
         *outDisplayFbp = m_hostPresentationDisplayFbp;
     if (outSourceFbp)
@@ -622,10 +633,18 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
         *outUsedPreferred = m_hostPresentationUsedPreferred;
 
     const size_t packedRowBytes = static_cast<size_t>(outWidth) * 4u;
+    if (packedRowBytes > m_hostPresentationStride ||
+        uint64_t(m_hostPresentationStride) * outHeight > m_hostPresentationFrame.size())
+    {
+        outPixels.clear(); outWidth = outHeight = 0u;
+        if (outDisplayWidth) *outDisplayWidth = 0u;
+        if (outDisplayHeight) *outDisplayHeight = 0u;
+        return false;
+    }
     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
     if (outWidth != 0u && outHeight != 0u)
     {
-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
+        const size_t sourceRowBytes = m_hostPresentationStride;
         for (uint32_t y = 0; y < outHeight; ++y)
         {
             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
@@ -1837,4 +1856,16 @@ uint32_t GS::getResolutionScale() const
         return m_backend->GetResolutionScale();
     }
     return 1;
+}
+
+void GS::setAASamples(uint32_t samples)
+{
+    std::lock_guard<std::mutex> lock(m_backendLifetimeMutex);
+    if (m_backend) m_backend->SetAASamples(samples);
+}
+
+uint32_t GS::getAASamples() const
+{
+    std::lock_guard<std::mutex> lock(m_backendLifetimeMutex);
+    return m_backend ? m_backend->GetAASamples() : 1u;
 }

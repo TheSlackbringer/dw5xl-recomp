@@ -34,6 +34,9 @@ struct VulkanGsScanoutState
         uint32_t displayFbp = 0;
         uint32_t sourceFbp = 0;
         uint64_t vsyncTick = 0;
+        uint32_t displayWidth = 0;
+        uint32_t displayHeight = 0;
+        bool highResolution = false;
         bool frameFields = false;
         bool fieldMode = false;
         bool pending = false;
@@ -75,6 +78,7 @@ struct VulkanGsScanoutState
 PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
                                   VulkanGsScanoutState &state,
                                   const GSPresentationRequest &request,
-                                  ReusableFieldWeaver *weaver = nullptr);
+                                  ReusableFieldWeaver *weaver = nullptr,
+                                  uint32_t outputScale = 1);
 
 

@@ -219,6 +219,9 @@ namespace
             m_inner->SetResolutionScale(scale);
         }
 
+        void SetAASamples(uint32_t samples) override { m_inner->SetAASamples(samples); }
+        uint32_t GetAASamples() const override { return m_inner->GetAASamples(); }
+
         uint32_t GetResolutionScale() const override
         {
             return m_inner->GetResolutionScale();

@@ -26,6 +26,7 @@
 #include <array>
 #include <cstring>
 #include <cfenv>
+#include <initializer_list>
 #include <limits>
 #include <chrono>
 #include <atomic>
@@ -777,11 +778,13 @@ namespace ps2x_dev
 
 namespace
 {
-static uint32_t loadResolutionScaleFromIni()
+// Unknown or missing values return fallback. Older SSAA-based scale values are
+// treated as native output (anti-aliasing is configured separately).
+static uint32_t loadIniValue(const char *wantedKey, std::initializer_list<uint32_t> allowed, uint32_t fallback)
 {
     std::ifstream file("dw5xl.ini");
     if (!file.is_open())
-        return 1;
+        return fallback;
     std::string line;
     while (std::getline(file, line))
     {
@@ -808,22 +811,26 @@ static uint32_t loadResolutionScaleFromIni()
         trim(key);
         trim(val);
 
-        if (key == "resolution_scale")
+        if (key == wantedKey)
         {
             try {
-                int scale = std::stoi(val);
-                if (scale == 1 || scale == 2 || scale == 4 || scale == 8 || scale == 16)
-                    return static_cast<uint32_t>(scale);
-                return 1;
+                const int value = std::stoi(val);
+                for (uint32_t a : allowed)
+                    if (value >= 0 && static_cast<uint32_t>(value) == a)
+                        return a;
+                return fallback;
             } catch (...) {
-                return 1;
+                return fallback;
             }
         }
     }
-    return 1;
+    return fallback;
 }
 
-static void saveResolutionScaleToIni(uint32_t scale)
+static uint32_t loadResolutionScaleFromIni() { return loadIniValue("resolution_scale", {1u, 2u, 4u}, 1u); }
+static uint32_t loadAASamplesFromIni() { return loadIniValue("aa_samples", {1u, 2u, 4u, 8u, 16u}, 0u); }
+
+static void saveIniValue(const std::string &wantedKey, uint32_t value)
 {
     std::vector<std::string> lines;
     bool found = false;
@@ -862,9 +869,9 @@ static void saveResolutionScaleToIni(uint32_t scale)
                         key.clear();
                     }
 
-                    if (key == "resolution_scale")
+                    if (key == wantedKey)
                     {
-                        std::string newLine = "resolution_scale=" + std::to_string(scale);
+                        std::string newLine = wantedKey + "=" + std::to_string(value);
                         if (!comment.empty())
                             newLine += " " + comment;
                         lines.push_back(newLine);
@@ -879,7 +886,7 @@ static void saveResolutionScaleToIni(uint32_t scale)
 
     if (!found)
     {
-        lines.push_back("resolution_scale=" + std::to_string(scale));
+        lines.push_back(wantedKey + "=" + std::to_string(value));
     }
 
     std::ofstream out("dw5xl.ini");
@@ -891,9 +898,37 @@ static void saveResolutionScaleToIni(uint32_t scale)
         }
     }
 }
+
+// The player's F5 anti-aliasing choice (kept when F4 changes the output scale).
+static uint32_t s_aaChoice = 1u;
+
+// Environment variables override the saved F4 settings for test runs.
+static void applySavedOutputSettings(GS &gs)
+{
+    const char *scaleEnv = std::getenv("PS2X_GS_SCALE");
+    if (!scaleEnv || !*scaleEnv)
+    {
+        const uint32_t iniScale = loadResolutionScaleFromIni();
+        if (iniScale != gs.getResolutionScale())
+            gs.setResolutionScale(iniScale);
+    }
+    const char *aaEnv = std::getenv("PS2X_GS_SSAA");
+    if (!aaEnv || !*aaEnv)
+    {
+        if (const uint32_t iniSamples = loadAASamplesFromIni())
+        {
+            s_aaChoice = iniSamples;
+            gs.setAASamples(iniSamples);
+        }
+    }
+}
 } // namespace
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+
+// The texture grows to the largest presented image (2x output); smaller frames
+// occupy its top-left corner. Display dimensions keep the logical aspect ratio.
+static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight,
+                        uint32_t &outDisplayWidth, uint32_t &outDisplayHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
@@ -902,6 +937,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static bool s_lastPreferred = false;
     static uint32_t s_lastWidth = 0u;
     static uint32_t s_lastHeight = 0u;
+    static uint32_t s_lastDisplayWidth = 0u;
+    static uint32_t s_lastDisplayHeight = 0u;
     static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
@@ -918,6 +955,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+        outDisplayWidth = (s_lastDisplayWidth != 0u) ? s_lastDisplayWidth : outWidth;
+        outDisplayHeight = (s_lastDisplayHeight != 0u) ? s_lastDisplayHeight : outHeight;
         return;
     }
 
@@ -927,20 +966,28 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     uint32_t displayFbp = 0u;
     uint32_t sourceFbp = 0u;
     bool usedPreferredDisplaySource = false;
+    uint32_t displayWidth = 0u;
+    uint32_t displayHeight = 0u;
     if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch,
                                                    width,
                                                    height,
                                                    &displayFbp,
                                                    &sourceFbp,
-                                                   &usedPreferredDisplaySource))
+                                                   &usedPreferredDisplaySource,
+                                                   &displayWidth,
+                                                   &displayHeight))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+        Image blank = GenImageColor(tex.width, tex.height, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
+        outDisplayWidth = outWidth;
+        outDisplayHeight = outHeight;
         s_lastWidth = outWidth;
         s_lastHeight = outHeight;
+        s_lastDisplayWidth = outDisplayWidth;
+        s_lastDisplayHeight = outDisplayHeight;
         s_hasUploadedFrame = true;
         return;
     }
@@ -969,14 +1016,26 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastPreferred = usedPreferredDisplaySource;
     s_lastWidth = width;
     s_lastHeight = height;
+    s_lastDisplayWidth = displayWidth ? displayWidth : width;
+    s_lastDisplayHeight = displayHeight ? displayHeight : height;
 
-    std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
+    // 4x output is at most four times the native framebuffer in each direction.
+    const uint32_t texWidth = std::max<uint32_t>(FB_WIDTH, std::min<uint32_t>(width, FB_WIDTH * 4u));
+    const uint32_t texHeight = std::max<uint32_t>(FB_HEIGHT, std::min<uint32_t>(height, FB_HEIGHT * 4u));
+    if (texWidth != static_cast<uint32_t>(tex.width) || texHeight != static_cast<uint32_t>(tex.height))
+    {
+        UnloadTexture(tex);
+        Image blank = GenImageColor(static_cast<int>(texWidth), static_cast<int>(texHeight), BLANK);
+        tex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+    }
+    s_uploadBuffer.assign(static_cast<size_t>(texWidth) * texHeight * 4u, 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
     {
-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
+        const uint32_t copyWidth = std::min<uint32_t>(width, texWidth);
+        const uint32_t copyHeight = std::min<uint32_t>(height, texHeight);
         const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
+        const size_t dstRowBytes = static_cast<size_t>(texWidth) * 4u;
         const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
         for (uint32_t y = 0; y < copyHeight; ++y)
         {
@@ -993,11 +1052,13 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
 
     UpdateTexture(tex, s_uploadBuffer.data());
     ps2x_dev::s_lastFrame.assign(s_uploadBuffer.begin(), s_uploadBuffer.end());
-    ps2x_dev::s_lastFrameW = std::min<uint32_t>(width, FB_WIDTH);
-    ps2x_dev::s_lastFrameH = std::min<uint32_t>(height, FB_HEIGHT);
-    ps2x_dev::s_lastFrameRows = FB_HEIGHT;
-    outWidth = width;
-    outHeight = height;
+    ps2x_dev::s_lastFrameW = std::min<uint32_t>(width, texWidth);
+    ps2x_dev::s_lastFrameH = std::min<uint32_t>(height, texHeight);
+    ps2x_dev::s_lastFrameRows = texHeight;
+    outWidth = std::min<uint32_t>(width, texWidth);
+    outHeight = std::min<uint32_t>(height, texHeight);
+    outDisplayWidth = s_lastDisplayWidth;
+    outDisplayHeight = s_lastDisplayHeight;
     s_hasUploadedFrame = true;
 }
 
@@ -1326,15 +1387,7 @@ bool PS2Runtime::initialize(const char *title)
             return false;
         }
 
-        const char *scaleEnv = std::getenv("PS2X_GS_SCALE");
-        if (!scaleEnv || !*scaleEnv)
-        {
-            uint32_t iniScale = loadResolutionScaleFromIni();
-            if (iniScale != 1)
-            {
-                m_gs.setResolutionScale(iniScale);
-            }
-        }
+        applySavedOutputSettings(m_gs);
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
@@ -3119,15 +3172,7 @@ void PS2Runtime::run()
     ps2_host_input::poll();
     std::atomic<bool> gameThreadFinished{false};
 
-    const char *scaleEnv = std::getenv("PS2X_GS_SCALE");
-    if (!scaleEnv || !*scaleEnv)
-    {
-        uint32_t iniScale = loadResolutionScaleFromIni();
-        if (iniScale != m_gs.getResolutionScale())
-        {
-            m_gs.setResolutionScale(iniScale);
-        }
-    }
+    applySavedOutputSettings(m_gs);
 
     std::thread gameThread([&]()
                            {
@@ -3201,17 +3246,22 @@ void PS2Runtime::run()
         });
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        uint32_t displayWidth = FB_WIDTH;
+        uint32_t displayHeight = DEFAULT_DISPLAY_HEIGHT;
+        UploadFrame(frameTex, this, presentWidth, presentHeight, displayWidth, displayHeight);
 
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+        // Letterbox by the logical display size, not the stored image size.
+        const float aspectWidth = static_cast<float>(std::max<uint32_t>(1u, displayWidth));
+        const float aspectHeight = static_cast<float>(std::max<uint32_t>(1u, displayHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        const float scale = std::min(screenWidth / aspectWidth, screenHeight / aspectHeight);
+        const float dstWidth = aspectWidth * scale;
+        const float dstHeight = aspectHeight * scale;
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
@@ -3235,12 +3285,22 @@ void PS2Runtime::run()
         {
             s_showFpsOverlay = !s_showFpsOverlay;
         }
+        // F4 cycles native/2x/4x output; F5 cycles the anti-aliasing choice (1-16 samples
+        // per output pixel). The two are independent: 2x/4x use 4/16 samples to build the
+        // larger image and AA multiplies that, up to the 16-sample limit (4x: no extra AA).
         if (IsKeyPressed(KEY_F4))
         {
-            uint32_t currentScale = m_gs.getResolutionScale();
-            uint32_t nextScale = (currentScale == 1) ? 2 : ((currentScale == 2) ? 4 : 1);
-            m_gs.setResolutionScale(nextScale);
-            saveResolutionScaleToIni(nextScale);
+            const uint32_t current = m_gs.getResolutionScale();
+            m_gs.setResolutionScale(current == 1u ? 2u : current == 2u ? 4u : 1u);
+            if (m_gs.getResolutionScale() == current)
+                m_gs.setResolutionScale(1u);
+            saveIniValue("resolution_scale", m_gs.getResolutionScale());
+        }
+        if (IsKeyPressed(KEY_F5))
+        {
+            s_aaChoice = s_aaChoice >= 16u ? 1u : s_aaChoice * 2u;
+            m_gs.setAASamples(s_aaChoice);
+            saveIniValue("aa_samples", s_aaChoice);
         }
 
         static auto s_lastFpsTime = std::chrono::steady_clock::now();
@@ -3261,7 +3321,10 @@ void PS2Runtime::run()
 
         if (s_showFpsOverlay && !IsWindowHidden())
         {
-            const char *fpsText = TextFormat("FPS: %d  |  VSync: %.1f  |  Scale: %dx", s_cachedHostFps, s_vsyncRate, m_gs.getResolutionScale());
+            const uint32_t aaNow = m_gs.getAASamples();
+            const char *fpsText = TextFormat("FPS: %d  |  VSync: %.1f  |  Output: %ux (%ux%u)  |  AA: %ux%s",
+                s_cachedHostFps, s_vsyncRate, m_gs.getResolutionScale(), presentWidth, presentHeight, aaNow,
+                aaNow < s_aaChoice ? TextFormat(" (set %ux, max at this output)", s_aaChoice) : "");
             constexpr int kFontSize = 18;
             const int textW = MeasureText(fpsText, kFontSize);
             DrawRectangle(8, 8, textW + 16, kFontSize + 10, Fade(BLACK, 0.75f));

@@ -59,7 +59,7 @@ bool noWeave()
 PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
                                   VulkanGsScanoutState &state,
                                   const GSPresentationRequest &request,
-                                  ReusableFieldWeaver *weaver)
+                                  ReusableFieldWeaver *weaver, uint32_t outputScale)
 {
     using namespace ParallelGS;
     using namespace Vulkan;
@@ -125,17 +125,21 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
     info.adapt_to_internal_horizontal_resolution = false;
     info.raw_circuit_scanout = true;
     info.skip_deinterlace = true;
+    info.high_resolution_scanout = outputScale >= 2;
+    info.high_resolution_scale_log2 = outputScale >= 4 ? 2u : 1u;
+    // Native output averages every anti-aliasing sample into each pixel.
+    info.resolve_super_samples = true;
 
     gs.flush();
     auto output = gs.vsync(info);
     if (!output.image) throw std::runtime_error("ParallelGS GPU scanout returned no image");
     const auto width = output.image->get_width();
     auto height = output.image->get_height();
-    if (!width || !height || width > hostWidth || height > hostHeight)
+    if (!width || !height || width > hostWidth * outputScale || height > hostHeight * outputScale)
     {
         char msg[128];
         std::snprintf(msg, sizeof(msg), "ParallelGS image (%ux%u) exceeds the fixed host viewport (%ux%u)",
-                      width, height, hostWidth, hostHeight);
+                      width, height, hostWidth * outputScale, hostHeight * outputScale);
         throw VulkanGsScanoutUnsupported(msg);
     }
     if (output.image->get_create_info().format != VK_FORMAT_R8G8B8A8_UNORM)
@@ -168,11 +172,14 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
         state.lastFrame.height = slot.h;
         state.lastFrame.displayFbp = slot.displayFbp;
         state.lastFrame.sourceFbp = slot.sourceFbp;
-        state.lastFrame.pixels.assign(hostWidth * hostHeight * 4u, 0);
+        state.lastFrame.strideBytes = slot.w * 4u;
+        state.lastFrame.displayWidth = slot.displayWidth;
+        state.lastFrame.displayHeight = slot.displayHeight;
+        state.lastFrame.pixels.assign(static_cast<size_t>(slot.w) * slot.h * 4u, 0);
 
         for (unsigned y = 0; y < slot.h; ++y)
         {
-            auto *row = state.lastFrame.pixels.data() + static_cast<size_t>(y) * hostWidth * 4u;
+            auto *row = state.lastFrame.pixels.data() + static_cast<size_t>(y) * slot.w * 4u;
             std::memcpy(row, mapped + static_cast<size_t>(y) * slot.w * 4u, slot.w * 4u);
             for (unsigned x = 0; x < slot.w; ++x) row[x * 4u + 3u] = 255;
         }
@@ -181,17 +188,20 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
         if (weaver)
         {
             const bool oddField = (slot.vsyncTick & 1ull) != 0ull;
-            const auto weaveMode = slot.frameFields ? ReusableFieldWeaver::Mode::HalfHeightFrame :
+            // paraLLEl high-res output already reconstructs field-aware vertical
+            // samples. Applying our half-height weave would double it again.
+            const auto weaveMode = slot.highResolution ? ReusableFieldWeaver::Mode::Progressive :
+                                   slot.frameFields ? ReusableFieldWeaver::Mode::HalfHeightFrame :
                                    slot.fieldMode   ? ReusableFieldWeaver::Mode::FullHeightField :
                                                       ReusableFieldWeaver::Mode::Progressive;
-            if (slot.frameFields && (noWeave() || uint64_t(state.lastFrame.height) * 2u > hostHeight))
+            if (!slot.highResolution && slot.frameFields && (noWeave() || uint64_t(state.lastFrame.height) * 2u > hostHeight))
             {
                 weaver->reset();
             }
             else
             {
                 weaver->present(state.lastFrame.pixels, state.lastFrame.width, state.lastFrame.height,
-                                hostWidth * 4u, slot.vsyncTick, oddField, weaveMode);
+                                slot.w * 4u, slot.vsyncTick, oddField, weaveMode);
             }
         }
 
@@ -262,6 +272,13 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
     curSlot.displayFbp = first.enabled ? first.framebuffer.FBP : second.framebuffer.FBP;
     curSlot.sourceFbp = curSlot.displayFbp;
     curSlot.vsyncTick = request.vsyncTick;
+    curSlot.highResolution = output.high_resolution_scanout;
+    const uint32_t outputShift = output.high_resolution_scanout ? output.high_resolution_scale_log2 : 0u;
+    curSlot.displayWidth = width >> outputShift;
+    const auto &nativeCircuit = first.enabled ? first : second;
+    curSlot.displayHeight = frameFields ? nativeCircuit.height * 2u :
+                           fieldMode ? nativeCircuit.height :
+                           height >> outputShift;
     curSlot.frameFields = frameFields;
     curSlot.fieldMode = fieldMode;
 

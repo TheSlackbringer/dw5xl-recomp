@@ -34,6 +34,9 @@ public:
 
     virtual void SetResolutionScale(uint32_t scale) { (void)scale; }
     virtual uint32_t GetResolutionScale() const { return 1; }
+    // Anti-aliasing samples per output pixel, independent of the output scale.
+    virtual void SetAASamples(uint32_t samples) { (void)samples; }
+    virtual uint32_t GetAASamples() const { return 1; }
     void setResolutionScale(uint32_t scale) { SetResolutionScale(scale); }
     uint32_t getResolutionScale() const { return GetResolutionScale(); }
 };
