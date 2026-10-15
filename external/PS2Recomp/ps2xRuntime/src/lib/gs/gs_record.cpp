@@ -137,7 +137,23 @@ namespace
                 std::lock_guard<std::mutex> lock(m_mutex);
                 // The PS2X_GS_RECORD_FROM/TO window opens and closes on presentation ticks.
                 if (!m_active && !m_closed && request.vsyncTick >= m_fromTick)
+                {
                     m_active = true;
+                    // A windowed recording starts from the current VRAM so it can be replayed.
+                    if (m_fromTick != 0u)
+                    {
+                        std::vector<uint8_t> vram;
+                        m_inner->SnapshotVram(vram);
+                        if (begin(Op::Initialize))
+                        {
+                            const uint32_t size = static_cast<uint32_t>(vram.size());
+                            put(size);
+                            put(GSRecord::fnv1a(vram.data(), size));
+                            m_writer.bytes(vram.data(), size);
+                            end();
+                        }
+                    }
+                }
                 if (begin(Op::Present))
                 {
                     put(request);
