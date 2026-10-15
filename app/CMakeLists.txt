@@ -19,6 +19,8 @@ set(PS2X_BUILD_STUDIO OFF CACHE BOOL "" FORCE)
 # MSVC/clang-cl only: keep the runtime's floating point like the Linux build.
 set(PS2X_MSVC_FAST_FLOAT OFF CACHE BOOL "" FORCE)
 add_subdirectory("${PS2RECOMP_DIR}" ps2recomp EXCLUDE_FROM_ALL)
+# Runtime stubs also instantiate guest arithmetic helpers.
+target_compile_options(ps2_runtime PRIVATE ${DW5XL_STRICT_FP_FLAGS})
 
 file(GLOB DW5XL_GENERATED_SOURCES CONFIGURE_DEPENDS "${DW5XL_GENERATED_DIR}/*.cpp")
 
@@ -57,7 +59,7 @@ else()
     message(STATUS "No lifted VU1 code (run tools/regen.sh); VU1 microcode will be interpreted")
 endif()
 # Generated code uses SSE4.1/AVX intrinsics (PS2Recomp only enables them in its own directory).
-target_compile_options(dw5xl PRIVATE ${DW5XL_ARCH_FLAGS})
+target_compile_options(dw5xl PRIVATE ${DW5XL_ARCH_FLAGS} ${DW5XL_STRICT_FP_FLAGS})
 
 # Overlay headers/symbols are isolated from the base executable's generated code.
 set(DW5XL_OVL00_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../recomp/dw5xl/overlays/ovl00/output")
@@ -68,7 +70,7 @@ endif()
 add_library(dw5xl_ovl00 STATIC ${DW5XL_OVL00_SOURCES})
 target_link_libraries(dw5xl_ovl00 PRIVATE ps2_runtime)
 target_include_directories(dw5xl_ovl00 PRIVATE "${DW5XL_OVL00_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
-target_compile_options(dw5xl_ovl00 PRIVATE ${DW5XL_ARCH_FLAGS})
+target_compile_options(dw5xl_ovl00 PRIVATE ${DW5XL_ARCH_FLAGS} ${DW5XL_STRICT_FP_FLAGS})
 target_precompile_headers(dw5xl_ovl00 PRIVATE
     "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_runtime_macros.h"
     "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_runtime.h"
@@ -89,7 +91,7 @@ endif()
 add_library(dw5xl_ovl01 STATIC ${DW5XL_OVL01_SOURCES})
 target_link_libraries(dw5xl_ovl01 PRIVATE ps2_runtime)
 target_include_directories(dw5xl_ovl01 PRIVATE "${DW5XL_OVL01_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
-target_compile_options(dw5xl_ovl01 PRIVATE ${DW5XL_ARCH_FLAGS})
+target_compile_options(dw5xl_ovl01 PRIVATE ${DW5XL_ARCH_FLAGS} ${DW5XL_STRICT_FP_FLAGS})
 target_precompile_headers(dw5xl_ovl01 PRIVATE
     "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_runtime_macros.h"
     "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_runtime.h"
@@ -109,7 +111,7 @@ endif()
 add_library(dw5xl_ovl02 STATIC ${DW5XL_OVL02_SOURCES})
 target_link_libraries(dw5xl_ovl02 PRIVATE ps2_runtime)
 target_include_directories(dw5xl_ovl02 PRIVATE "${DW5XL_OVL02_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
-target_compile_options(dw5xl_ovl02 PRIVATE ${DW5XL_ARCH_FLAGS})
+target_compile_options(dw5xl_ovl02 PRIVATE ${DW5XL_ARCH_FLAGS} ${DW5XL_STRICT_FP_FLAGS})
 target_precompile_headers(dw5xl_ovl02 PRIVATE
     "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_runtime_macros.h"
     "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_runtime.h"
@@ -139,6 +141,10 @@ if(DW5XL_BUILD_TESTS)
     target_link_libraries(dw5xl_vif_unpack_boundary_test PRIVATE ps2_runtime)
     target_compile_options(dw5xl_vif_unpack_boundary_test PRIVATE ${DW5XL_ARCH_FLAGS})
     add_test(NAME vif_unpack_boundary COMMAND dw5xl_vif_unpack_boundary_test)
+    add_executable(dw5xl_ee_rounding_test tests/ee_rounding_test.cpp)
+    target_link_libraries(dw5xl_ee_rounding_test PRIVATE ps2_runtime)
+    target_compile_options(dw5xl_ee_rounding_test PRIVATE ${DW5XL_ARCH_FLAGS} ${DW5XL_STRICT_FP_FLAGS})
+    add_test(NAME ee_rounding COMMAND dw5xl_ee_rounding_test)
     add_executable(dw5xl_vu_minmax_test tests/vu_minmax_test.cpp)
     target_link_libraries(dw5xl_vu_minmax_test PRIVATE ps2_runtime)
     target_compile_options(dw5xl_vu_minmax_test PRIVATE ${DW5XL_ARCH_FLAGS})

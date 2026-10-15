@@ -3121,16 +3121,16 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
-        // DW5XL-TEST (opt-in experiment, owner decision pending): PS2 EE FPU and VU0 macro arithmetic
-        // truncate (round toward zero); the host default is round-to-nearest. PS2X_EE_ROUND=zero runs
-        // all guest EE code (one host GameThread) toward zero. Default unchanged.
-        if (const char *eeRound = std::getenv("PS2X_EE_ROUND"); eeRound && std::strcmp(eeRound, "zero") == 0)
-        {
-            std::fesetround(FE_TOWARDZERO);
-            std::fprintf(stderr, "[ee:round] GameThread uses round-toward-zero (PS2X_EE_ROUND=zero)\n");
-        }
         try
         {
+            // General EE/VU0 arithmetic uses chop; COP1 DIV/SQRT/RSQRT helpers
+            // select nearest locally. The comparison switch affects only the
+            // general EE mode and never leaks to another host thread.
+            const char *eeRound = std::getenv("PS2X_EE_ROUND");
+            const bool compareNearest = eeRound && std::strcmp(eeRound, "nearest") == 0;
+            const Ps2ScopedHostRounding guestRounding(compareNearest ? FE_TONEAREST : FE_TOWARDZERO);
+            std::fprintf(stderr, "[ee:round] general EE arithmetic uses %s; COP1 divide/root uses nearest\n",
+                compareNearest ? "nearest (comparison)" : "round-toward-zero");
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
             m_eeScheduler->run();
             uint32_t pc = m_debugPc.load(std::memory_order_relaxed);
