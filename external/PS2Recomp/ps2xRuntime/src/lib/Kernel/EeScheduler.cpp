@@ -109,6 +109,46 @@ bool EeScheduler::palVideoMode() const noexcept
     return m_palVideoMode.load(std::memory_order_relaxed);
 }
 
+namespace
+{
+// The VU0 macro-mode registers, VU0 control registers and COP2 control
+// registers form two contiguous blocks of the guest context.
+constexpr size_t kCop2Begin = offsetof(R5900Context, vu0_vf);
+constexpr size_t kCop2End = offsetof(R5900Context, vu0_cf) + sizeof(R5900Context::vu0_cf);
+constexpr size_t kCop2CcrBegin = offsetof(R5900Context, cop2_ccr);
+constexpr size_t kCop2CcrSize = sizeof(R5900Context::cop2_ccr);
+}
+
+void EeScheduler::loadSharedCop2(R5900Context &context) const
+{
+    if (m_sharedCop2.empty())
+        return;
+    auto *bytes = reinterpret_cast<uint8_t *>(&context);
+    std::memcpy(bytes + kCop2Begin, m_sharedCop2.data(), kCop2End - kCop2Begin);
+    std::memcpy(bytes + kCop2CcrBegin, m_sharedCop2.data() + (kCop2End - kCop2Begin), kCop2CcrSize);
+}
+
+void EeScheduler::storeSharedCop2(const R5900Context &context)
+{
+    m_sharedCop2.resize(kCop2End - kCop2Begin + kCop2CcrSize);
+    const auto *bytes = reinterpret_cast<const uint8_t *>(&context);
+    std::memcpy(m_sharedCop2.data(), bytes + kCop2Begin, kCop2End - kCop2Begin);
+    std::memcpy(m_sharedCop2.data() + (kCop2End - kCop2Begin), bytes + kCop2CcrBegin, kCop2CcrSize);
+}
+
+void EeScheduler::storeDispatchedCop2(int threadId, const R5900Context *context)
+{
+    const auto it = m_threads.find(threadId);
+    if (it == m_threads.end())
+        return;
+    const GuestThread &thread = it->second;
+    bool alive = &thread.context == context;
+    for (const GuestInvocation &invocation : thread.invocations)
+        alive = alive || &invocation.context == context;
+    if (alive)
+        storeSharedCop2(*context);
+}
+
 void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
 {
     m_executorThread = std::this_thread::get_id();
@@ -354,15 +394,18 @@ void EeScheduler::run()
                 }
             }
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+            loadSharedCop2(context);
             m_guestExecuting.store(true, std::memory_order_release);
             function(m_rdram, &context, &m_runtime);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
+            storeDispatchedCop2(dispatchTid, &context);
         }
         catch (const EeDispatcherTransfer &)
         {
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
+            storeDispatchedCop2(dispatchTid, &context);
         }
         catch (...)
         {

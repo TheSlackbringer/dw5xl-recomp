@@ -31,6 +31,7 @@
 #include <atomic>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <sstream>
 #include <cstdio>
 #include <cstdlib>
@@ -2156,10 +2157,20 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
 
     m_vu0.reset();
     copyVu0ContextToState(ctx, m_vu0.state());
+    constexpr uint32_t kVu0MicroprogramCycles = 4096u;
     m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
                   vu0Data, PS2_VU0_DATA_SIZE,
                   m_gs, &m_memory,
-                  startPC, 0u, ctx->vu0_itop, 4096);
+                  startPC, 0u, ctx->vu0_itop, kVu0MicroprogramCycles);
+    // Hardware runs a microprogram to completion; one cut off by the budget
+    // leaves partial results. Report each entry point once.
+    if (m_vu0.state().cycles >= kVu0MicroprogramCycles)
+    {
+        static std::unordered_set<uint32_t> s_reported;
+        if (s_reported.insert(startPC).second)
+            std::cerr << "[vu0] microprogram at 0x" << std::hex << startPC << " stopped at pc 0x"
+                      << m_vu0.state().pc << std::dec << " after the cycle budget" << std::endl;
+    }
     copyVu0StateToContext(m_vu0.state(), ctx);
 }
 

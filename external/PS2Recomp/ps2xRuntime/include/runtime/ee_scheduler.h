@@ -408,6 +408,15 @@ private:
     uint8_t *m_rdram = nullptr;
     std::array<std::deque<int>, kPriorityCount> m_readyQueues{};
     std::unordered_map<int, GuestThread> m_threads;
+    // VU0 (COP2) is one hardware unit shared by every EE thread; the kernel
+    // never switches its registers. Guest contexts are per thread here, so the
+    // scheduler carries one VU0 register file across dispatches.
+    std::vector<uint8_t> m_sharedCop2;
+    void loadSharedCop2(R5900Context &context) const;
+    void storeSharedCop2(const R5900Context &context);
+    // Stores only when the dispatched context still exists: a dispatch can end
+    // with its thread deleted or its invocation already completed.
+    void storeDispatchedCop2(int threadId, const R5900Context *context);
     std::unordered_map<int, EeSemaphore> m_semaphores;
     std::unordered_map<int, EeEventFlag> m_eventFlags;
     std::unordered_map<int, EeAlarm> m_alarms;
