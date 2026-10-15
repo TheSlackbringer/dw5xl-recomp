@@ -56,7 +56,8 @@ if [[ "$selection" == ovl00 || "$selection" == all ]]; then regen ovl00; fi
 if [[ "$selection" == ovl01 || "$selection" == all ]]; then regen ovl01; fi
 if [[ "$selection" == ovl02 || "$selection" == all ]]; then regen ovl02; fi
 if [[ "$selection" == main || "$selection" == all ]]; then
-    # Lifted VU1 code is translated from microcode captured from your own game runs (game-derived):
-    # it is written to the ignored recomp/dw5xl/vu1/ folder and never committed.
-    python3 "$root/tools/vu1_translator.py" || echo "VU1 lifting skipped; VU1 microcode runs interpreted" >&2
+    # Translate verified VU1 payloads from your own PAL executable into ignored local C++.
+    # DW5XL_VU1_INPUT=capture retains explicit research inputs; never commit generated code.
+    # Stop on input/translation errors rather than silently compiling stale lifted output.
+    python3 "$root/tools/vu1_translator.py"
 fi

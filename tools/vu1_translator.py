@@ -497,14 +497,21 @@ if __name__ == '__main__':
             h = ((h ^ b) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
         return h
 
-    bins = {}
-    import glob
-    for p in glob.glob(os.environ.get('DW5XL_VU1_CENSUS_GLOB', 'notes/evidence/battle_real_census.tsv.*.bin')):
-        h = p.split('.')[-2]
-        bins[h] = load(p)
-    if not bins:
-        print("No captured VU1 microcode found (DW5XL_VU1_CENSUS_GLOB); lifted VU1 code not generated.")
-        sys.exit(0)
+    input_mode = os.environ.get('DW5XL_VU1_INPUT', 'disc')
+    if input_mode not in ('disc', 'capture'):
+        raise ValueError('DW5XL_VU1_INPUT must be disc or capture')
+    disc_mode = input_mode == 'disc'
+    if disc_mode:
+        from disc_vu_inputs import load_disc_bins, IMAGE_REGISTRATIONS
+        bins, covered = load_disc_bins(os.environ.get('DW5XL_VU1_ELF', 'game/dw5xl/SLES_538.60'))
+    else:
+        bins = {}
+        import glob
+        for p in glob.glob(os.environ.get('DW5XL_VU1_CENSUS_GLOB', 'notes/evidence/battle_real_census.tsv.*.bin')):
+            h = p.split('.')[-2]
+            bins[h] = load(p)
+        if not bins:
+            raise ValueError('No captured VU1 microcode found')
 
     targets = [
         ('1ad6eefff0c2e7e5', 0x0800, 0x0a78, 'lift_1ad6_0800'),
@@ -601,28 +608,33 @@ inline V vuItofV(V a, float scale)
 """)
 
     regs = []
-    # Full-image registrations (preparation / menus / unit tests):
-    regs.append("    // Full-image registrations (preparation / menus / unit tests):")
-    regs.append("    { 0x1ad6eefff0c2e7e5ull, 0x0800, lift_1ad6_0800, 0u },")
-    regs.append("    { 0x1ad6eefff0c2e7e5ull, 0x1000, lift_1ad6_1000, 0u },")
-    regs.append("    { 0x1b91674603e323f2ull, 0x0800, lift_1b91_0800, 0u },")
-    regs.append("    { 0xda28291ffe0b3334ull, 0x0000, lift_da28_0000, 0u },")
-    regs.append("    { 0xda28291ffe0b3334ull, 0x0010, lift_da28_0010, 0u },")
-    regs.append("    { 0xda28291ffe0b3334ull, 0x0050, lift_da28_0050, 0u },")
-    regs.append("    { 0x8d905f87f3bcba9dull, 0x0000, lift_da28_0000, 0u },")
-    regs.append("    { 0x8d905f87f3bcba9dull, 0x0010, lift_da28_0010, 0u },")
-    regs.append("    { 0x8d905f87f3bcba9dull, 0x0050, lift_da28_0050, 0u },")
-    regs.append("    { 0x215297790907252aull, 0x0000, lift_da28_0000, 0u },")
-    regs.append("    { 0x215297790907252aull, 0x0010, lift_da28_0010, 0u },")
-    regs.append("    { 0x215297790907252aull, 0x0050, lift_da28_0050, 0u },")
-    regs.append("    { 0x635ca7be952ce796ull, 0x0000, lift_da28_0000, 0u },")
-    regs.append("    { 0x635ca7be952ce796ull, 0x0010, lift_da28_0010, 0u },")
-    regs.append("    { 0x635ca7be952ce796ull, 0x0050, lift_da28_0050, 0u },")
-    regs.append("    { 0xfb6ec66cb41b245full, 0x0000, lift_da28_0000, 0u },")
-    regs.append("    { 0xfb6ec66cb41b245full, 0x0010, lift_da28_0010, 0u },")
-    regs.append("    { 0xfb6ec66cb41b245full, 0x0050, lift_da28_0050, 0u },")
-    regs.append("")
-    regs.append("    // Image-specific registrations for dynamic battle images:")
+    if disc_mode:
+        regs.append("    // Preserved observed full-image registrations (metadata only):")
+        for image_hash, pc, name in IMAGE_REGISTRATIONS:
+            regs.append(f"    {{ 0x{image_hash:016x}ull, 0x{pc:04x}, {name}, 0u }},")
+    else:
+        # Full-image registrations (preparation / menus / unit tests):
+        regs.append("    // Full-image registrations (preparation / menus / unit tests):")
+        regs.append("    { 0x1ad6eefff0c2e7e5ull, 0x0800, lift_1ad6_0800, 0u },")
+        regs.append("    { 0x1ad6eefff0c2e7e5ull, 0x1000, lift_1ad6_1000, 0u },")
+        regs.append("    { 0x1b91674603e323f2ull, 0x0800, lift_1b91_0800, 0u },")
+        regs.append("    { 0xda28291ffe0b3334ull, 0x0000, lift_da28_0000, 0u },")
+        regs.append("    { 0xda28291ffe0b3334ull, 0x0010, lift_da28_0010, 0u },")
+        regs.append("    { 0xda28291ffe0b3334ull, 0x0050, lift_da28_0050, 0u },")
+        regs.append("    { 0x8d905f87f3bcba9dull, 0x0000, lift_da28_0000, 0u },")
+        regs.append("    { 0x8d905f87f3bcba9dull, 0x0010, lift_da28_0010, 0u },")
+        regs.append("    { 0x8d905f87f3bcba9dull, 0x0050, lift_da28_0050, 0u },")
+        regs.append("    { 0x215297790907252aull, 0x0000, lift_da28_0000, 0u },")
+        regs.append("    { 0x215297790907252aull, 0x0010, lift_da28_0010, 0u },")
+        regs.append("    { 0x215297790907252aull, 0x0050, lift_da28_0050, 0u },")
+        regs.append("    { 0x635ca7be952ce796ull, 0x0000, lift_da28_0000, 0u },")
+        regs.append("    { 0x635ca7be952ce796ull, 0x0010, lift_da28_0010, 0u },")
+        regs.append("    { 0x635ca7be952ce796ull, 0x0050, lift_da28_0050, 0u },")
+        regs.append("    { 0xfb6ec66cb41b245full, 0x0000, lift_da28_0000, 0u },")
+        regs.append("    { 0xfb6ec66cb41b245full, 0x0010, lift_da28_0010, 0u },")
+        regs.append("    { 0xfb6ec66cb41b245full, 0x0050, lift_da28_0050, 0u },")
+        regs.append("")
+        regs.append("    // Image-specific registrations for dynamic battle images:")
 
     # Map subroutines to names for full-image matching
     sub_map = {}
@@ -644,7 +656,7 @@ inline V vuItofV(V a, float scale)
     # Match all dynamic battle images from real census
     census_regs = {}
     import os
-    if os.path.exists('notes/evidence/battle_real_census.tsv'):
+    if not disc_mode and os.path.exists('notes/evidence/battle_real_census.tsv'):
         with open('notes/evidence/battle_real_census.tsv') as f:
             for line in f:
                 line = line.strip()
@@ -681,6 +693,10 @@ inline V vuItofV(V a, float scale)
         sub_size = len(sub_code)
         sub_hash = fnv1a_64(sub_code)
         print(f"Translating {name} (PC=0x{pc:04x}, len={sub_size}B)...")
+        if disc_mode:
+            missing = [p for p in find_reachable(code, pc) if not all(covered[h][p:p+8]) or len(covered[h][p:p+8]) != 8]
+            if missing:
+                raise ValueError(f'Unextracted reachable instructions in {name}: {missing}')
         out.append(translate_segment(code, pc, name))
         regs.append(f"    {{ 0x{sub_hash:016x}ull, 0x{pc:04x}, {name}, {sub_size}u }},")
 
