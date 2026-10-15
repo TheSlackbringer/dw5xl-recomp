@@ -27,6 +27,9 @@ private:
         m_valid = false;
         m_fields[0].clear();
         m_fields[1].clear();
+        m_previousFields[0].clear();
+        m_previousFields[1].clear();
+        m_previousTicks[0] = m_previousTicks[1] = std::numeric_limits<uint64_t>::max();
         m_ticks[0] = m_ticks[1] = std::numeric_limits<uint64_t>::max();
     }
 
@@ -59,8 +62,12 @@ public:
         const bool sameGeometry = m_valid && m_width == width && m_inputHeight == height &&
                                   m_stride == strideBytes && m_mode == mode;
         const bool repeat = sameGeometry && tick == m_lastTick && odd == m_lastOdd;
-        const bool consecutive = sameGeometry && m_lastTick != std::numeric_limits<uint64_t>::max() &&
-                                 tick == m_lastTick + 1u && odd != m_lastOdd;
+        // One or two dropped fields keep the history when the parity sequence
+        // is still consistent (an odd gap alternates parity). Stale opposite
+        // rows are then woven only where the picture is proven stationary.
+        constexpr uint64_t kNoTick = std::numeric_limits<uint64_t>::max();
+        const uint64_t gap = sameGeometry && m_lastTick != kNoTick && tick > m_lastTick ? tick - m_lastTick : 0u;
+        const bool consecutive = gap != 0u && gap <= 3u && ((gap & 1u) != 0u) == (odd != m_lastOdd);
         if (!repeat && !consecutive)
             resetUnlocked();
         m_width = width;
@@ -69,6 +76,13 @@ public:
         m_mode = mode;
         const size_t parity = odd ? 1u : 0u;
         auto &current = m_fields[parity];
+        if (!repeat)
+        {
+            // Retain the previous sample of each parity. Swapping reuses the
+            // buffers instead of allocating/copying another full field.
+            m_previousFields[parity].swap(current);
+            m_previousTicks[parity] = m_ticks[parity];
+        }
         current.resize(static_cast<size_t>(fieldHeight) * rowBytes);
         for (uint32_t y = 0; y < fieldHeight; ++y)
         {
@@ -78,15 +92,27 @@ public:
         }
         m_ticks[parity] = tick;
         const auto &opposite = m_fields[1u - parity];
-        const bool pair = tick != 0u && m_ticks[1u - parity] == tick - 1u && opposite.size() == current.size();
+        const uint64_t oppositeTick = m_ticks[1u - parity];
+        const bool oppositeValid = oppositeTick != kNoTick && tick > oppositeTick && opposite.size() == current.size();
+        const bool pair = oppositeValid && tick - oppositeTick == 1u;
+        const bool stalePair = oppositeValid && tick - oppositeTick == 3u;
+        const auto recent = [](uint64_t newer, uint64_t older) {
+            return older != kNoTick && newer > older && newer - older <= 4u;
+        };
+        const bool temporalHistory = (pair || stalePair) &&
+            recent(tick, m_previousTicks[parity]) &&
+            recent(oppositeTick, m_previousTicks[1u - parity]) &&
+            m_previousFields[parity].size() == current.size() &&
+            m_previousFields[1u - parity].size() == opposite.size();
         pixels.resize(std::max(pixels.size(), static_cast<size_t>(outputHeight) * strideBytes));
         for (uint32_t y = 0; y < outputHeight; ++y)
         {
             const bool currentRow = (y & 1u) == parity;
             uint8_t *dstRow = pixels.data() + static_cast<size_t>(y) * strideBytes;
-            if (currentRow || !pair)
+            const uint8_t *doubledRow = current.data() + static_cast<size_t>(y / 2u) * rowBytes;
+            if (currentRow || !(pair || stalePair))
             {
-                std::memcpy(dstRow, current.data() + static_cast<size_t>(y / 2u) * rowBytes, rowBytes);
+                std::memcpy(dstRow, doubledRow, rowBytes);
             }
             else
             {
@@ -97,7 +123,7 @@ public:
                 const uint8_t *oppRow = opposite.data() + static_cast<size_t>(y / 2u) * rowBytes;
                 if (topIdx < 0 || botIdx >= static_cast<int32_t>(fieldHeight))
                 {
-                    std::memcpy(dstRow, oppRow, rowBytes);
+                    std::memcpy(dstRow, stalePair ? doubledRow : oppRow, rowBytes);
                 }
                 else
                 {
@@ -106,15 +132,40 @@ public:
                     for (uint32_t x = 0; x < width; ++x)
                     {
                         const size_t px = static_cast<size_t>(x) * 4u;
+                        // Spatial contrast alone also describes stationary
+                        // one-line glyph strokes. Preserve that detail only
+                        // when BOTH parity histories agree at these samples.
+                        bool stationary = temporalHistory;
+                        if (stationary)
+                        {
+                            const uint8_t *oldOpp = m_previousFields[1u - parity].data() +
+                                static_cast<size_t>(y / 2u) * rowBytes;
+                            const uint8_t *oldTop = m_previousFields[parity].data() +
+                                static_cast<size_t>(topIdx) * rowBytes;
+                            const uint8_t *oldBot = m_previousFields[parity].data() +
+                                static_cast<size_t>(botIdx) * rowBytes;
+                            for (size_t ch = 0; ch < 3u; ++ch)
+                                stationary = stationary && oppRow[px + ch] == oldOpp[px + ch] &&
+                                    topRow[px + ch] == oldTop[px + ch] &&
+                                    botRow[px + ch] == oldBot[px + ch];
+                        }
+                        if (stalePair && !stationary)
+                        {
+                            // Never weave a stale opposite sample that may have moved.
+                            std::memcpy(dstRow + px, doubledRow + px, 4u);
+                            continue;
+                        }
                         int combMax = 0;
-                        for (size_t ch = 0; ch < 3u; ++ch)
+                        for (size_t ch = 0; ch < 3u && !stationary; ++ch)
                         {
                             const int vo = oppRow[px + ch];
                             const int vt = topRow[px + ch];
                             const int vb = botRow[px + ch];
                             const int low = std::min(vt, vb);
                             const int high = std::max(vt, vb);
-                            constexpr int T = 20;
+                            // Low enough to catch faint motion combing on ground textures;
+                            // stationary detail is protected by the temporal guard above.
+                            constexpr int T = 8;
                             int d = 0;
                             if (vo > high + T)
                                 d = vo - (high + T);
@@ -131,7 +182,7 @@ public:
                         }
                         else
                         {
-                            const int w = std::min(32, combMax);
+                            const int w = std::min(32, combMax * 4);
                             for (size_t ch = 0; ch < 3u; ++ch)
                             {
                                 const int vo = oppRow[px + ch];
@@ -156,6 +207,8 @@ public:
 private:
     std::mutex m_mutex;
     std::vector<uint8_t> m_fields[2];
+    std::vector<uint8_t> m_previousFields[2];
+    uint64_t m_previousTicks[2] = {std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max()};
     uint64_t m_ticks[2] = {std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max()};
     uint64_t m_lastTick = 0;
     uint32_t m_width = 0, m_inputHeight = 0;

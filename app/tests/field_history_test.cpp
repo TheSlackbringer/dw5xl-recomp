@@ -63,5 +63,79 @@ int main() {
     h=2;p=rows({0,0});
     require(combWeaver.present(p,1,h,8,41,true,Mode::HalfHeightFrame));
     require(p.at(2*8) < 50);
+    // Stationary fine detail must not be mistaken for combing merely because
+    // it falls between dark rows of the opposite parity. The temporal guard
+    // deliberately waits for both same-parity histories before preserving it.
+    for (Mode mode : {Mode::FullHeightField, Mode::HalfHeightFrame}) {
+        for (unsigned brightRow : {2u,3u}) {
+            ReusableFieldWeaver detail;
+            for (uint64_t tick=40;tick<=48;++tick) {
+                std::vector<uint8_t> image(6*8,0);
+                for(unsigned y=0;y<6;++y) {
+                    for(unsigned c=0;c<3;++c)image[y*8+c]=y==brightRow?255:0;
+                    image[y*8+3]=255;
+                }
+                const bool odd=(tick&1u)!=0;
+                if(mode==Mode::HalfHeightFrame) {
+                    std::vector<uint8_t> field;
+                    for(unsigned y=odd?1:0;y<6;y+=2)
+                        field.insert(field.end(),image.begin()+y*8,image.begin()+(y+1)*8);
+                    image=std::move(field);
+                    h=3;
+                } else h=6;
+                require(detail.present(image,1,h,8,tick,odd,mode));
+                if(tick>=43) {
+                    require(h==6);
+                    for(unsigned y=0;y<6;++y)
+                        require(image[y*8]==(y==brightRow?255:0));
+                }
+                // Duplicate presentation must retain same-parity history.
+                if(tick==44) {
+                    auto repeat=rows({0,0,brightRow==2?uint8_t(255):uint8_t(0),
+                                      brightRow==3?uint8_t(255):uint8_t(0),0,0});
+                    if(mode==Mode::HalfHeightFrame) {
+                        auto full=repeat;repeat.clear();
+                        for(unsigned y=0;y<6;y+=2)
+                            repeat.insert(repeat.end(),full.begin()+y*8,full.begin()+(y+1)*8);
+                        h=3;
+                    } else h=6;
+                    require(detail.present(repeat,1,h,8,tick,false,mode));
+                    require(repeat[brightRow*8]==255);
+                }
+            }
+        }
+    }
+    // Actual temporal change still enables the existing spatial comb filter.
+    ReusableFieldWeaver changedDetail;
+    h=6;p=rows({0,0,255,0,0,0}); require(changedDetail.present(p,1,h,8,50,false,Mode::FullHeightField));
+    h=6;p=rows({0,0,255,0,0,0}); require(changedDetail.present(p,1,h,8,51,true,Mode::FullHeightField));
+    h=6;p=rows({0,0,255,0,0,0}); require(changedDetail.present(p,1,h,8,52,false,Mode::FullHeightField));
+    h=6;p=rows({0,10,255,10,0,0}); require(changedDetail.present(p,1,h,8,53,true,Mode::FullHeightField));
+    require(p[2*8]==10); // neighbours moved: do not preserve old white stroke
+    // Dropped fields (gap 2: same parity again; gap 3: two missing) keep the
+    // history, so stationary detail stays stable instead of re-warming.
+    for (uint64_t dropped : {42u, 43u}) {
+        ReusableFieldWeaver drops;
+        for (uint64_t tick=30;tick<=50;++tick) {
+            if (tick==dropped || (dropped==43u && tick==42u)) continue;
+            const bool odd=(tick&1u)!=0;
+            h=3;p=odd?rows({0,0,0}):rows({0,255,0}); // white stroke on even row 2
+            require(drops.present(p,1,h,8,tick,odd,Mode::HalfHeightFrame));
+            if (tick>=34) { require(h==6); check(p,{0,0,255,0,0,0}); }
+        }
+    }
+    // A stale opposite field is never woven where the picture moved.
+    ReusableFieldWeaver staleMotion;
+    h=2;p=rows({0,0}); require(staleMotion.present(p,1,h,8,60,false,Mode::HalfHeightFrame));
+    h=2;p=rows({200,200}); require(staleMotion.present(p,1,h,8,61,true,Mode::HalfHeightFrame));
+    h=2;p=rows({0,0}); require(staleMotion.present(p,1,h,8,62,false,Mode::HalfHeightFrame));
+    h=2;p=rows({200,200}); require(staleMotion.present(p,1,h,8,63,true,Mode::HalfHeightFrame));
+    h=2;p=rows({90,90}); require(staleMotion.present(p,1,h,8,66,false,Mode::HalfHeightFrame)); // 64,65 dropped
+    check(p,{90,90,90,90});
+    // Faint motion combing (here 15 levels) is blended too, not left as stripes.
+    ReusableFieldWeaver faintComb;
+    h=2;p=rows({100,100}); require(faintComb.present(p,1,h,8,70,false,Mode::HalfHeightFrame));
+    h=2;p=rows({115,115}); require(faintComb.present(p,1,h,8,71,true,Mode::HalfHeightFrame));
+    require(p.at(2*8) >= 110); // opposite-field row pulled toward its moving neighbours
     std::cout << "Field history tests passed\n";
 }
