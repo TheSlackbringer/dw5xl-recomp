@@ -263,22 +263,19 @@ namespace ps2recomp
                 }
                 case VU0_S2_VCLIPw:
                 {
-                    uint8_t field = inst.function & 0x3;
-                    std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
-
+                    // Same semantics as the VU1 CLIP: bit 0 = +x, bit 1 = -x, ... bit 5 = -z, each
+                    // compared on raw bits against |ft.w| (denormal w counts as the largest denormal).
                     return fmt::format(
-                        "{{ __m128 fs = ctx->vu0_vf[{}]; "
-                        "__m128 ft = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}); "
-                        "__m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); "
-                        "__m128 gt = _mm_cmpgt_ps(fs, ft); "
-                        "__m128 lt = _mm_cmplt_ps(fs, neg_ft); "
-                        "uint32_t gt_mask = (uint32_t)_mm_movemask_ps(gt); "
-                        "uint32_t lt_mask = (uint32_t)_mm_movemask_ps(lt); "
-                        "uint32_t flags = ((lt_mask & 0x1) << 0) | ((gt_mask & 0x1) << 1) | "
-                        "((lt_mask & 0x2) << 1) | ((gt_mask & 0x2) << 2) | "
-                        "((lt_mask & 0x4) << 2) | ((gt_mask & 0x4) << 3); "
+                        "{{ alignas(16) uint32_t fs[4], ft[4]; "
+                        "_mm_store_ps(reinterpret_cast<float *>(fs), ctx->vu0_vf[{}]); "
+                        "_mm_store_ps(reinterpret_cast<float *>(ft), ctx->vu0_vf[{}]); "
+                        "const int32_t limit = (ft[3] & 0x7F800000u) != 0u ? static_cast<int32_t>(ft[3] & 0x7FFFFFFFu) : 0x007FFFFF; "
+                        "uint32_t flags = 0u; "
+                        "for (int c = 0; c < 3; ++c) {{ "
+                        "flags |= (static_cast<int32_t>(fs[c]) > limit ? 1u : 0u) << (2 * c); "
+                        "flags |= (static_cast<int32_t>(fs[c] ^ 0x80000000u) > limit ? 1u : 0u) << (2 * c + 1); }} "
                         "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | (flags & 0x3F)) & 0xFFFFFF; }}",
-                        inst.rd, inst.rt, inst.rt, shuffle_pattern);
+                        inst.rd, inst.rt);
                 }
                 case VU0_S2_VNOP:
                     return fmt::format("// NOP operation, no action needed for VU0");
