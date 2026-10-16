@@ -139,13 +139,13 @@ def lower_usage(lower):
     if op_hi in (0x18, 0x1A, 0x1B):
         u.pipeline, u.latency = PIPE_IALU, 1; u.read_vi(vi_s); u.write_vi(vi_t); return u
     if op_hi == 0x1C:
-        u.pipeline, u.latency = PIPE_IALU, 1; u.write_vi(vi_t); return u
+        u.pipeline, u.latency = PIPE_IALU, 1; u.write_vi(vi_t & 15); return u
     if op_hi == 0x20:
         u.pipeline = PIPE_BRANCH; return u
     if op_hi == 0x21:
-        u.pipeline, u.latency = PIPE_BRANCH, 1; u.write_vi(vi_t); return u
+        u.pipeline, u.latency = PIPE_BRANCH, 1; u.write_vi(vi_t & 15); return u
     if op_hi == 0x24:
-        u.pipeline = PIPE_BRANCH; u.read_vi(vi_s); return u
+        u.pipeline = PIPE_BRANCH; u.read_vi(vi_s & 15); return u
     if op_hi == 0x25:
         u.pipeline, u.latency = PIPE_BRANCH, 1; u.read_vi(vi_s); u.write_vi(vi_t); return u
     if op_hi in (0x28, 0x29):

@@ -153,18 +153,30 @@ RANGES = [('1ad6eefff0c2e7e5',
   [(864, 2155848, 16)],
   '5eb74410b7d656eb5a22ee9e60eef38c6896a22506b84d1277503a6641acc0df')]
 
+# Other disc files a chunk may name as its source (4th chunk element), next to the executable.
+SOURCE_SHA256 = {'OVL_00.BIN': '1cb303e389c215412c3a104e26b8e43d9105f230b3b8a76564ed1a0eb92da50f'}
+
 def load_disc_bins(path):
     elf = Path(path).read_bytes()
     actual = hashlib.sha256(elf).hexdigest()
     if actual != ELF_SHA256:
         raise ValueError(f"Unsupported PAL executable SHA256: {actual}")
+    sources = {None: elf}
+    def source(name):
+        if name not in sources:
+            blob = (Path(path).parent / name).read_bytes()
+            if hashlib.sha256(blob).hexdigest() != SOURCE_SHA256.get(name):
+                raise ValueError(f"Unsupported disc file SHA256: {name}")
+            sources[name] = blob
+        return sources[name]
     bins = {}
     covered = {}
     for key, start, end, name, chunks, digest in RANGES:
         image = bins.setdefault(key, bytearray(16384))
         occupied = covered.setdefault(key, bytearray(16384))
-        for pc, offset, size in chunks:
-            data = elf[offset:offset + size]
+        for chunk in chunks:
+            pc, offset, size = chunk[:3]
+            data = source(chunk[3] if len(chunk) > 3 else None)[offset:offset + size]
             if len(data) != size or pc + size > len(image):
                 raise ValueError(f"Out-of-bounds VU input: {name}")
             for i, byte in enumerate(data):
@@ -314,3 +326,11 @@ IMAGE_REGISTRATIONS = [(1933995873025583077, 2048, 'lift_1ad6_0800'),
  (16941762177108264386, 880, 'lift_battle_clip_0370'),
  (17278749103648695599, 0, 'lift_battle_stream_0000'),
  (18117636521138529375, 96, 'lift_battle_init_0060')]
+
+# Proposed native subroutine targets: offsets/hashes only.
+RANGES.extend([('99119dfac138459b', 2048, 5200, 'lift_battle_calls_99119dfa_0800', [(2048, 2259864, 2048), (4096, 2261920, 1112)], '008dfb87a69648975f6fa618bfa17afba7d83f0ccdcbb267566bf8ef2915f0b9'), ('99119dfac138459b', 9216, 12976, 'lift_battle_calls_99119dfa_2400', [(9216, 2265288, 2048), (11264, 2267344, 1720)], 'a98f85559db802832f30e3243fadae7b5154c9ccabcade24353f3e65e4ee2ac7'), ('eb1d3af053afc5c2', 2048, 5128, 'lift_battle_calls_eb1d3af0_0800', [(2048, 2248520, 2048), (4096, 2250576, 1040)], 'b5c60b77d67ea778deb5281fe46902630687bc041220bbe6b2bc435e900009dd'), ('eb1d3af053afc5c2', 9216, 12904, 'lift_battle_calls_eb1d3af0_2400', [(9216, 2254440, 2048), (11264, 2256496, 1648)], 'b1ada5f32533e01acdc262d64f1b8476d8013786a8a8ab10db05264013fbfbcb')])
+IMAGE_REGISTRATIONS.extend([(11029770662716130715, 2048, 'lift_battle_calls_99119dfa_0800'), (11029770662716130715, 9216, 'lift_battle_calls_99119dfa_2400'), (16941762177108264386, 2048, 'lift_battle_calls_eb1d3af0_0800'), (16941762177108264386, 9216, 'lift_battle_calls_eb1d3af0_2400')])
+
+
+# Opening (OVL00) VU1 programs: offsets in OVL_00.BIN and hashes only.
+RANGES.extend([('dd3d1361f34c85a3', 672, 3120, 'lift_opening_dd3d_02a0', [(24, 409848, 2024, 'OVL_00.BIN'), (2048, 411880, 1080, 'OVL_00.BIN')], '851fc55e5a3239c8760e5780662fa06b1afb92d37bff2e53326a5bee82e24621'), ('4a6dbc6bbd3f1fbb', 784, 1352, 'lift_opening_4a6d_0310', [(256, 408688, 1104, 'OVL_00.BIN')], '8f20f6c648e0a0cc41317a896964e42f5cb04e4ebbea05bcace27af86315ff25'), ('4a6dbc6bbd3f1fbb', 256, 1352, 'lift_opening_4a6d_0100', [(256, 408688, 1104, 'OVL_00.BIN')], '1e763081903f202f62507d68d52d38905a53a4c3531147ae34417da246b9e012'), ('4a6dbc6bbd3f1fbb', 0, 248, 'lift_opening_4a6d_0000', [(0, 408432, 256, 'OVL_00.BIN')], '1fa7b2429eaecbc1e5a11487748ad7f1b6c3446715b39ef1440b263139b24dbc'), ('4dedc9b811a016b1', 680, 2480, 'lift_opening_4ded_02a8', [(184, 417704, 1864, 'OVL_00.BIN'), (2048, 419576, 440, 'OVL_00.BIN')], '25089d5f1079ca29292daaa4ac41732cf8e3fa68262e8631c0633df797a07fee'), ('881c2abb30cea5ce', 2352, 5944, 'lift_opening_881c_0930', [(112, 438864, 1936, 'OVL_00.BIN'), (2048, 440808, 2048, 'OVL_00.BIN'), (4096, 442864, 1856, 'OVL_00.BIN')], '7e26fcf776dae17eac7578a30be176e14a4e2fe4a772320c5ae83eef450a611c'), ('881c2abb30cea5ce', 0, 104, 'lift_opening_881c_0000', [(0, 438752, 112, 'OVL_00.BIN')], 'f25eaa23f29cffc494aefa5c9fbb8ba8aa07155dce19441b5bcdeef20b4424a4')])

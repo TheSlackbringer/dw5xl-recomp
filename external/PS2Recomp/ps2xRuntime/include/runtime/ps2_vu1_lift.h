@@ -558,7 +558,10 @@ namespace vl
         uint64_t hash; // FNV-1a of the 16 KB micro memory, or subroutine hash if subSize > 0
         uint32_t pc;
         Segment fn;
-        uint32_t subSize = 0; // if > 0, hash is hashCode(vuCode + pc, subSize)
+        uint32_t subSize = 0; // if > 0, hash is hashCode(vuCode + subStart, subSize)
+        // Start of the hashed range when the segment reaches code below its entry pc
+        // (branches back to shared code); ~0u means the range starts at pc.
+        uint32_t subStart = ~0u;
     };
 
     struct Registrar

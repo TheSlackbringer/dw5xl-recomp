@@ -93,7 +93,8 @@ namespace vl
             }
             else
             {
-                if (vuCode && hashCode(vuCode + pc, r.subSize) == r.hash)
+                const uint32_t start = r.subStart == ~0u ? pc : r.subStart;
+                if (vuCode && start + r.subSize <= 0x4000u && hashCode(vuCode + start, r.subSize) == r.hash)
                     return r.fn;
             }
         }

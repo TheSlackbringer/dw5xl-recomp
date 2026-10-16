@@ -128,6 +128,15 @@ def translate_upper(u):
             val = f"fmac<{fmac_map[base]}, {d}>(norm(vf[{fs}]), splat(i_reg), acc, fl)"
             return blend_wrap("acc", val, d)
             
+    # Outer product (interpreter OuterMul/OuterMSub): x = fs.y*ft.z, y = fs.z*ft.x,
+    # z = fs.x*ft.y; the exact FMAC of crossed operands (w is outside dest xyz).
+    if name in ('OPMULA', 'OPMSUB'):
+        a = f"_mm_shuffle_ps(norm(vf[{fs}]), norm(vf[{fs}]), _MM_SHUFFLE(3, 0, 2, 1))"
+        b = f"_mm_shuffle_ps(norm(vf[{ft}]), norm(vf[{ft}]), _MM_SHUFFLE(3, 1, 0, 2))"
+        if name == 'OPMULA':
+            return blend_wrap("acc", f"fmac<Mul, {d}>({a}, {b}, acc, fl)", d)
+        return blend_wrap(f"vf[{fd}]", f"fmac<MSub, {d}>({a}, {b}, acc, fl)", d)
+
     if name == 'MAX':
         return blend_wrap(f"vf[{fd}]", f"vuMinMaxV(vf[{fs}], vf[{ft}], true)", d)
     if name == 'MAXi':
@@ -252,6 +261,9 @@ def translate_lower(l, lo, i_bit, pc):
         if op == 0x09: # ISUBIU
             imm15 = (lo & 0x7FF) | ((lo >> 10) & 0x7800)
             return f"if ({ft} != 0) vi[{ft}] = vl::i16(vi[{fs}] - ({imm15}));"
+        if op == 0x1c: # FCGET: committed CLIP pipeline, low twelve bits
+            vi_t = ft & 15
+            return f"if ({vi_t} != 0) vi[{vi_t}] = static_cast<int32_t>(c.st.clip & 0x0FFFu);"
         if op == 0x11: # FCSET
             return f"vl::LiftAccess::fcsetAt(c, cyc, 0x{lo & 0xFFFFFF:06x}u);"
         if op == 0x12: # FCAND
@@ -264,7 +276,7 @@ def translate_lower(l, lo, i_bit, pc):
             
     raise ValueError(f"Unknown lower op at pc {pc:04x}: lo={lo:08x}")
 
-def find_reachable(code, entry_pc):
+def legacy_find_reachable(code, entry_pc):
     visited = set()
     worklist = [entry_pc]
     
@@ -276,7 +288,7 @@ def find_reachable(code, entry_pc):
             e_bit = (up >> 30) & 1
             l = decode_lower(lo, pc)
             
-            if l['type'] == 'NORM' and l['op'] in (0x20, 0x28, 0x29, 0x2c, 0x2d, 0x2e, 0x2f):
+            if not (up >> 31) and l['type'] == 'NORM' and l['op'] in (0x20, 0x28, 0x29, 0x2c, 0x2d, 0x2e, 0x2f):
                 d_pc = pc + 8
                 visited.add(d_pc)
                 tgt = l['tgt']
@@ -294,6 +306,24 @@ def find_reachable(code, entry_pc):
             pc += 8
             
     return sorted(visited)
+
+# Scratch proposal: prove every dynamic return before native emission.
+_NATIVE_CALL_INFO = None
+def find_reachable(code, entry_pc):
+    global _NATIVE_CALL_INFO
+    legacy = legacy_find_reachable(code, entry_pc)
+    needs_calls = False
+    for pc in legacy:
+        lo, up = struct.unpack_from('<II', code, pc)
+        l = decode_lower(lo, pc)
+        if not (up >> 31) and l['type'] == 'NORM' and l['op'] in (0x21, 0x24, 0x25):
+            needs_calls = True
+    if not needs_calls:
+        _NATIVE_CALL_INFO = None
+        return legacy
+    import native_call_analysis
+    _NATIVE_CALL_INFO = native_call_analysis.analyze(code, entry_pc, decode_lower)
+    return _NATIVE_CALL_INFO['reachable']
 
 ACC_OPS = {'ADDA', 'SUBA', 'MULA', 'MADDA', 'MSUBA', 'OPMULA', 'OPMSUB', 'CLIP', 'NOP'}
 def is_acc_op(name):
@@ -417,17 +447,18 @@ def translate_segment(code, entry_pc, fn_name):
             QUEUE_FMAC_FLAGS = True
     
     branch_info = {}
+    call_info = {}
     branch_delay_slots = set()
     targets = set()
     
     for pc in reachable:
         lo, up = struct.unpack_from('<II', code, pc)
         l = decode_lower(lo, pc)
-        if l['type'] == 'NORM' and l['op'] in (0x20, 0x28, 0x29, 0x2c, 0x2d, 0x2e, 0x2f):
+        if not (up >> 31) and l['type'] == 'NORM' and l['op'] in (0x20, 0x21, 0x24, 0x28, 0x29, 0x2c, 0x2d, 0x2e, 0x2f):
             op = l['op']
             tgt = l['tgt']
             ft, fs = l['ft'], l['fs']
-            if op == 0x20: cond = "true"
+            if op in (0x20, 0x21, 0x24): cond = "true"
             elif op == 0x28: cond = f"(brvi({ft}) == brvi({fs}))"
             elif op == 0x29: cond = f"(brvi({ft}) != brvi({fs}))"
             elif op == 0x2c: cond = f"(brvi({fs}) < 0)"
@@ -436,8 +467,18 @@ def translate_segment(code, entry_pc, fn_name):
             elif op == 0x2f: cond = f"(brvi({fs}) >= 0)"
             branch_info[pc] = (tgt, cond)
             branch_delay_slots.add(pc + 8)
-            targets.add(tgt)
+            if op == 0x24:
+                if not _NATIVE_CALL_INFO or pc not in _NATIVE_CALL_INFO['jr_targets']:
+                    raise ValueError(f'unproven JR at {pc:04x}')
+                targets.update(_NATIVE_CALL_INFO['jr_targets'][pc])
+            else:
+                targets.add(tgt)
+            if op in (0x21, 0x24):
+                call_info[pc] = (op, ft & 15, fs & 15)
             
+    if call_info or entry_pc != reachable[0]:
+        targets.add(entry_pc)
+
     blocks = []
     curr_block = []
     for pc in reachable:
@@ -475,6 +516,8 @@ def translate_segment(code, entry_pc, fn_name):
     out.append("    auto brvi = [&](int r) -> int32_t { return r == 0 ? 0 : ((bbValid && bbReg == r) ? bbVal : vi[r]); };")
     for bpc in sorted(branch_info.keys()):
         out.append(f"    bool taken_{bpc:04x} = false;")
+        if bpc in call_info and call_info[bpc][0] == 0x24:
+            out.append(f"    uint32_t jump_{bpc:04x} = 0;")
     out.append("    auto checkpoint = [&] { if (!vl::resetRequested()) return;")
     out.append("        for (int n = 1; n < 32; ++n) _mm_storeu_ps(c.st.vf[n], vf[n]);")
     out.append("        for (int n = 1; n < 16; ++n) c.st.vi[n] = vi[n];")
@@ -486,6 +529,10 @@ def translate_segment(code, entry_pc, fn_name):
     out.append("        c.st.i = i_reg; vl::LiftAccess::leave(c, cyc, hz, bbValid, bbReg, bbVal); throw vl::ResetCanceled{}; };")
     out.append("    bool resetCanceled = false;")
     out.append("    try {")
+    # Execution starts at the entry, which is not the first emitted block when the
+    # segment also reaches shared code below it.
+    if call_info or entry_pc != reachable[0]:
+        out.append(f"    goto loc_{entry_pc:04x};")
     out.append("")
 
     for block in blocks:
@@ -512,6 +559,12 @@ def translate_segment(code, entry_pc, fn_name):
                     if 'fmac<' in up_code:
                         out.append(fmac_flag_code())
                 out.append(f"    taken_{pc:04x} = {cond};")
+                if pc in call_info:
+                    op, ft, fs = call_info[pc]
+                    if op == 0x24:
+                        out.append(f"    jump_{pc:04x} = (static_cast<uint32_t>(static_cast<uint16_t>(brvi({fs}))) * 8u) & 0x3FFFu;")
+                    elif ft:
+                        out.append(f"    vi[{ft}] = {(pc + 16) // 8};")
                 out.extend(timing_end(code, pc))
                 
                 i += 1
@@ -528,7 +581,14 @@ def translate_segment(code, entry_pc, fn_name):
                 out.extend(timing_begin(code, d_pc, timings))
                 emit_pair(d_u, d_l, d_lo, d_i_bit, d_pc, out)
                 out.extend(timing_end(code, d_pc))
-                out.append(f"    if (taken_{pc:04x}) goto loc_{tgt:04x};")
+                if pc in call_info and call_info[pc][0] == 0x24:
+                    out.append(f"    switch (jump_{pc:04x}) {{")
+                    for target in sorted(_NATIVE_CALL_INFO['jr_targets'][pc]):
+                        out.append(f"    case 0x{target:04x}u: goto loc_{target:04x};")
+                    out.append('    default: throw std::logic_error("verified VU JR target proof violated");')
+                    out.append('    }')
+                else:
+                    out.append(f"    if (taken_{pc:04x}) goto loc_{tgt:04x};")
                 i += 1
                 continue
                 
@@ -555,7 +615,7 @@ def translate_segment(code, entry_pc, fn_name):
                 out.append(f"    c.st.pc = 0x{final_pc:04x};")
                 out.append("    goto done;")
                 i += 1
-                break
+                continue
                 
             i += 1
 
@@ -613,7 +673,7 @@ if __name__ == '__main__':
         if not bins:
             raise ValueError('No captured VU1 microcode found')
 
-    targets = [
+    targets = [('dd3d1361f34c85a3', 672, 3120, 'lift_opening_dd3d_02a0'), ('4dedc9b811a016b1', 680, 2480, 'lift_opening_4ded_02a8'), ('4a6dbc6bbd3f1fbb', 784, 1352, 'lift_opening_4a6d_0310'), ('4a6dbc6bbd3f1fbb', 256, 1352, 'lift_opening_4a6d_0100'), ('4a6dbc6bbd3f1fbb', 0, 248, 'lift_opening_4a6d_0000'), ('881c2abb30cea5ce', 2352, 5944, 'lift_opening_881c_0930'), ('881c2abb30cea5ce', 0, 104, 'lift_opening_881c_0000'), ] + [('99119dfac138459b', 2048, 5200, 'lift_battle_calls_99119dfa_0800'), ('99119dfac138459b', 9216, 12976, 'lift_battle_calls_99119dfa_2400'), ('eb1d3af053afc5c2', 2048, 5128, 'lift_battle_calls_eb1d3af0_0800'), ('eb1d3af053afc5c2', 9216, 12904, 'lift_battle_calls_eb1d3af0_2400')] + [
         ('1ad6eefff0c2e7e5', 0x0800, 0x0a78, 'lift_1ad6_0800'),
         ('1ad6eefff0c2e7e5', 0x1000, 0x12b0, 'lift_1ad6_1000'),
         ('da28291ffe0b3334', 0x0000, 0x0448, 'lift_da28_0000'),
@@ -644,6 +704,7 @@ if __name__ == '__main__':
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 
 namespace {
 
@@ -789,7 +850,10 @@ inline V vuItofV(V a, float scale)
             print(f"Skipping {name}: no captured microcode for {h}")
             continue
         code = bins[h]
-        sub_code = code[pc:end_pc+8]
+        # The registration hash must cover every reachable pair, including shared code
+        # below the entry pc, or another microcode image could match with different code.
+        sub_start = min(min(find_reachable(code, pc)), pc)
+        sub_code = code[sub_start:end_pc+8]
         sub_size = len(sub_code)
         sub_hash = fnv1a_64(sub_code)
         print(f"Translating {name} (PC=0x{pc:04x}, len={sub_size}B)...")
@@ -798,7 +862,8 @@ inline V vuItofV(V a, float scale)
             if missing:
                 raise ValueError(f'Unextracted reachable instructions in {name}: {missing}')
         out.append(translate_segment(code, pc, name))
-        regs.append(f"    {{ 0x{sub_hash:016x}ull, 0x{pc:04x}, {name}, {sub_size}u }},")
+        start_field = f", 0x{sub_start:04x}u" if sub_start != pc else ""
+        regs.append(f"    {{ 0x{sub_hash:016x}ull, 0x{pc:04x}, {name}, {sub_size}u{start_field} }},")
 
     out.append("""
 void lift_flush_0220(vl::Run &c)
