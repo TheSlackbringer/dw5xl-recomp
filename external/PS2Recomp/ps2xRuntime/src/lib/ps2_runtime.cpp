@@ -122,6 +122,9 @@ namespace
     };
 
     thread_local DispatchHistory g_dispatchHistory;
+    // Counts EE checkpoints that unwind generated code back to the scheduler. A call during which one happened
+    // did not return, whatever ctx->pc says (a recursive callee can unwind with pc == the caller's own entry).
+    thread_local uint64_t g_unwindEpoch = 0;
 
     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
     {
@@ -390,6 +393,8 @@ namespace
 // ---------------------------------------------------------------------------
 // KFIV-PC dev harness (env-driven, no header changes):
 //   PS2X_HIDDEN=1            create the window hidden (headless-ish runs)
+//   PS2X_LATE_VBLANK=1       log fields emitted >3 ms after their wall-clock time ([late-vblank])
+//   PS2X_HUD_LOG=1           log the F3 overlay numbers every 0.5 s ([hud] tick fps vsync frameMs maxFrameMs)
 //   PS2X_DUMP_DIR=<dir>      where frame PNGs go (default: cwd)
 //   PS2X_DUMP_EVERY=<n>      dump the presented frame every n vsync ticks
 //   PS2X_EXIT_TICK=<n>       dump final.png and _Exit(0) at vsync tick n
@@ -921,6 +926,9 @@ static void applySavedOutputSettings(GS &gs)
             gs.setAASamples(iniSamples);
         }
     }
+    // Always state the effective output so test logs show which scale a run used.
+    std::fprintf(stderr, "[output] scale=%ux aa=%ux (source: scale %s, aa %s)\n", gs.getResolutionScale(), gs.getAASamples(),
+                 (scaleEnv && *scaleEnv) ? "PS2X_GS_SCALE" : "dw5xl.ini", (aaEnv && *aaEnv) ? "PS2X_GS_SSAA" : "dw5xl.ini");
 }
 } // namespace
 
@@ -1262,6 +1270,7 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
+    m_gifArbiter.setWorkerEnabled(GifArbiter::workerRequestedByEnv());
     m_memory.setGifArbiter(&m_gifArbiter);
     // VIF1 MSCAL/MSCNT. On the async device worker the VU1 D/T enables come from
     // the kick-time FBRST snapshot and the D/T stop bits go to the command's
@@ -2129,6 +2138,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // this charge bounds straight-line call chains that have no local loop.
     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
+        ++g_unwindEpoch;
         return false;
     }
 
@@ -2167,13 +2177,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+    const uint64_t unwindEpoch = g_unwindEpoch;
     targetFn(rdram, ctx, this);
 
-    if (isStopRequested() || ctx->pc == 0u)
+    if (isStopRequested() || ctx->pc == 0u || g_unwindEpoch != unwindEpoch)
     {
         return false;
     }
 
+    // A stub that never set pc returned normally.
     if (ctx->pc == entryPc)
     {
         ctx->pc = fallthroughPc;
@@ -3015,7 +3027,9 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    const bool due = m_eeScheduler->checkpointDue(cycles);
+    g_unwindEpoch += due ? 1u : 0u;
+    return due;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
@@ -3307,6 +3321,8 @@ void PS2Runtime::run()
         static uint64_t s_lastVsyncTick = 0;
         static float s_vsyncRate = 0.0f;
         static int s_cachedHostFps = 0;
+        static float s_maxFrameMs = 0.0f; // worst host frame in the HUD window
+        s_maxFrameMs = std::max(s_maxFrameMs, GetFrameTime() * 1000.0f);
 
         const auto nowFps = std::chrono::steady_clock::now();
         const float elapsedFps = std::chrono::duration<float>(nowFps - s_lastFpsTime).count();
@@ -3315,8 +3331,14 @@ void PS2Runtime::run()
         {
             s_vsyncRate = (currentVsync >= s_lastVsyncTick) ? (float(currentVsync - s_lastVsyncTick) / elapsedFps) : 0.0f;
             s_cachedHostFps = GetFPS();
+            // PS2X_HUD_LOG=1 logs the F3 overlay numbers (host FPS, guest VSync, worst host frame) for unattended runs.
+            static const bool s_hudLog = [] { const char *v = std::getenv("PS2X_HUD_LOG"); return v && *v && *v != '0'; }();
+            if (s_hudLog)
+                std::fprintf(stderr, "[hud] tick=%llu fps=%d vsync=%.1f frameMs=%.1f maxFrameMs=%.1f\n",
+                             static_cast<unsigned long long>(currentVsync), s_cachedHostFps, s_vsyncRate, GetFrameTime() * 1000.0f, s_maxFrameMs);
             s_lastVsyncTick = currentVsync;
             s_lastFpsTime = nowFps;
+            s_maxFrameMs = 0.0f;
         }
 
         if (s_showFpsOverlay && !IsWindowHidden())
@@ -3362,3 +3384,4 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("[run] exiting loop");
 }
+

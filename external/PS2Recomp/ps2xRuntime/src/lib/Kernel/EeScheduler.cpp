@@ -481,6 +481,21 @@ void EeScheduler::postEvent(EeEvent event)
     m_eventCv.notify_one();
 }
 
+namespace
+{
+    // Wall-clock time of the earliest pending VBlank edge (steady_clock ns, 0 = none). On the PS2 the field clock
+    // is hardware time: a guest that is still running when a field is due must be interrupted then, not only once
+    // its estimated cycle count reaches the field. Written under m_eventMutex, read by the executor at checkpoints.
+    std::atomic<int64_t> g_nextFieldHostDeadlineNs{0};
+    uint32_t g_fieldClockPoll = 0u;
+    constexpr uint32_t kFieldClockPollInterval = 64u;
+
+    int64_t steadyNs(std::chrono::steady_clock::time_point time) noexcept
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count();
+    }
+}
+
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
@@ -496,6 +511,18 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     {
         m_checkpointPending.store(true, std::memory_order_release);
         return true;
+    }
+
+    if (++g_fieldClockPoll >= kFieldClockPollInterval)
+    {
+        g_fieldClockPoll = 0u;
+        const int64_t fieldDeadline = g_nextFieldHostDeadlineNs.load(std::memory_order_acquire);
+        if (fieldDeadline != 0 && steadyNs(std::chrono::steady_clock::now()) >= fieldDeadline)
+        {
+            // processDueDeadlines advances the EE clock to the wall-due field edge and emits it.
+            m_checkpointPending.store(true, std::memory_order_release);
+            return true;
+        }
     }
 
     if (m_eeCycle < m_sliceEndCycle)
@@ -1930,8 +1957,14 @@ void EeScheduler::processPendingEvents()
     applyPendingPreemption();
 }
 
+// PS2X_LATE_VBLANK=1 logs every field emitted more than 3 ms after its wall-clock time ([late-vblank], used by
+// tools/heavy_battle_test.py), with the time since the previous deadline service.
+static std::chrono::steady_clock::time_point g_lastDeadlineService{};
+static std::chrono::steady_clock::time_point g_prevDeadlineService{};
 void EeScheduler::processDueDeadlines()
 {
+    g_prevDeadlineService = g_lastDeadlineService;
+    g_lastDeadlineService = std::chrono::steady_clock::now();
     for (;;)
     {
         std::vector<ScheduledEvent> due;
@@ -2034,6 +2067,14 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                {
+                    static const bool on = [] { const char *v = std::getenv("PS2X_LATE_VBLANK"); return v && *v == '1'; }();
+                    const auto lateUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - scheduled.hostDeadline).count();
+                    if (on && lateUs > 3000) {
+                        const auto gapUs = g_prevDeadlineService == std::chrono::steady_clock::time_point{} ? -1 : std::chrono::duration_cast<std::chrono::microseconds>(g_lastDeadlineService - g_prevDeadlineService).count();
+                        std::fprintf(stderr, "[late-vblank] tick=%llu late=%lldus serviceGap=%lldus thread=%u\n", (unsigned long long)(m_vsyncTick + 1u), (long long)lateUs, (long long)gapUs, m_currentThreadId);
+                    }
+                }
                 // Keep host fields on a fixed cadence so small wake-up lateness
                 // is repaid (otherwise guest time drifts ~0.6% behind the audio
                 // clock and streamed audio starves). Only a guest that is
@@ -2307,6 +2348,16 @@ void EeScheduler::scheduleEvent(uint64_t deadlineCycle,
 
 void EeScheduler::updateNextDeadline()
 {
+    int64_t fieldDeadline = 0;
+    for (const ScheduledEvent &item : m_deadlines)
+    {
+        if (item.event.type == EeEventType::VBlankStart || item.event.type == EeEventType::VBlankEnd)
+        {
+            const int64_t ns = steadyNs(item.hostDeadline);
+            fieldDeadline = fieldDeadline == 0 ? ns : std::min(fieldDeadline, ns);
+        }
+    }
+    g_nextFieldHostDeadlineNs.store(fieldDeadline, std::memory_order_release);
     if (m_deadlines.empty())
     {
         m_nextDeadlineCycle.store(0u, std::memory_order_release);

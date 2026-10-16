@@ -317,10 +317,35 @@ namespace ps2x::device
                 return owner != std::thread::id{} && owner == std::this_thread::get_id();
             }
 
+            // Drains whose caller observes GS state also wait for the GS worker (GifArbiter).
+            static bool observesGs(DrainReason reason) noexcept
+            {
+                switch (reason)
+                {
+                case DrainReason::Vu1Memory:
+                case DrainReason::Vif1Reg:
+                case DrainReason::Vif1Fifo:
+                case DrainReason::Dmac1Reg:
+                case DrainReason::DStat:
+                    return false;
+                default:
+                    return true;
+                }
+            }
+
+            void waitGs(DrainReason reason)
+            {
+                if (t_executingDepth == 0 && observesGs(reason) && mem.m_gifArbiter)
+                    mem.m_gifArbiter->waitIdle();
+            }
+
             void drainTo(uint64_t target, DrainReason reason)
             {
                 if (!cfg.async || t_executingDepth != 0 || !isOwner())
+                {
+                    waitGs(reason);
                     return;
+                }
 
                 const uint64_t appliedNow = applied.load(std::memory_order_relaxed);
                 if (target > appliedNow)
@@ -347,6 +372,7 @@ namespace ps2x::device
                     if (cfg.trace)
                         traceDrain(reason, blocked, waitNs, pendingBefore);
                 }
+                waitGs(reason);
                 if (cfg.trace)
                     maybeReportTrace();
                 rethrowPending();
@@ -1173,6 +1199,8 @@ namespace ps2x::device
         // (BITBLTBUF/TRXPOS/TRXREG/FINISH/TRXDIR=1).
         if (findAsync(mem))
             q->drainAll(DrainReason::Explicit);
+        if (mem.m_gifArbiter)
+            mem.m_gifArbiter->waitIdle(); // GS-produced readback data
         return q->cfg.localToHost(dst, maxBytes);
     }
 
