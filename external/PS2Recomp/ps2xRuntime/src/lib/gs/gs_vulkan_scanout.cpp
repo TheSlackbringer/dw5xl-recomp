@@ -210,26 +210,8 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
         slot.fence.reset();
     };
 
-    // 1. Consume older pending slots without blocking
-    for (int k = 1; k <= 2; ++k)
-    {
-        auto &oldSlot = state.slots[(state.ringIndex + k) % 3];
-        if (oldSlot.pending && oldSlot.fence)
-        {
-            if (s_sync)
-            {
-                oldSlot.fence->wait();
-                consumeSlot(oldSlot);
-            }
-            else if (oldSlot.fence->wait_timeout(0))
-            {
-                consumeSlot(oldSlot);
-            }
-            else if (metricsEnabled) ++metrics.notReady;
-        }
-    }
-
-    // 2. Prepare current slot
+    // 1. Prepare current slot: it is the oldest slot in the ring (submitted 3 frames ago)
+    // and must be retired first to maintain chronological presentation order.
     auto &curSlot = state.slots[state.ringIndex];
     if (curSlot.pending)
     {
@@ -254,6 +236,30 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
             }
             if (curSlot.pending)
                 consumeSlot(curSlot);
+        }
+    }
+
+    // 2. Consume newer pending slots in strict chronological order if already completed.
+    // If an older slot is not ready, stop to preserve monotonic presentation order.
+    for (uint32_t k = 1; k <= 2; ++k)
+    {
+        auto &nextSlot = state.slots[(state.ringIndex + k) % 3];
+        if (nextSlot.pending && nextSlot.fence)
+        {
+            if (s_sync)
+            {
+                nextSlot.fence->wait();
+                consumeSlot(nextSlot);
+            }
+            else if (nextSlot.fence->wait_timeout(0))
+            {
+                consumeSlot(nextSlot);
+            }
+            else
+            {
+                if (metricsEnabled) ++metrics.notReady;
+                break;
+            }
         }
     }
 
