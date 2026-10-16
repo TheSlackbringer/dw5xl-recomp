@@ -176,6 +176,12 @@ Ghidra setup:
   <abs>/recomp/dw5xl/ghidra.toml <abs>/recomp/dw5xl/ghidra_functions.csv`, then
   `tools/fix_ghidra_csv.py ghidra_functions.csv ghidra_functions.code.csv 310CE8` (drops data past code end 0x310CE8,
   clamps two oversized functions) → feeds `dw5xl.toml ghidra_output`.
+- Overlays (e.g. **OVL_00.BIN**, the Opening/menus) are in the same project. Import (GUI, File → Import File):
+  format **Raw Binary**, language `r5900:LE:32:default`, Options → base address **0x61A800**, **file offset 0** (the
+  `MWo3` header occupies 0x61A800-0x61A87F and code starts at 0x61A880; NOT offset 0x80). Skip auto-analysis, then run
+  `tools/ghidra_scripts/ImportFunctionList.java` (Script Manager; add `tools/ghidra_scripts` via Manage Script
+  Directories) with `recomp/dw5xl/overlays/ovl00/ghidra_functions.code.csv` (7237 functions). The MCP serves whichever
+  program's CodeBrowser tab is active: ask the owner to switch tabs and check `get_program_info` first.
 
 **MCP (interactive, fastest for many small lookups):**
 - Open the Ghidra GUI → File → Open Project (`ghidra/dw5xl.gpr`; don't use "Import" on a .gpr) →
@@ -211,6 +217,16 @@ Ghidra setup:
 the background; conduct manual playtesting and report; closing the window exits with code 0. Don't start test runs while a
 visible playtest or other test is active (audio overlaps). Check with `pgrep -x dw5xl`; stop with `kill <pid>`
 (never `pkill -f dw5xl` from a shell whose own command line contains that string – it kills itself).
+
+**Output scale for tests: the owner plays and tests at 1x.** `game/dw5xl/dw5xl.ini` may hold another scale from a
+quick experiment, so every hidden/perf run MUST pass `PS2X_GS_SCALE=1 PS2X_GS_SSAA=1` explicitly (and only use other
+values when the task is about 2x/4x). Check the `[output] scale=…` line at the top of each run log.
+
+**Performance / stutter regressions:** run `tools/heavy_battle_test.py` (pass/fail; scripted 3-minute heavy fight with
+Musou from the owner's Zhang Jiao save, in an off-screen gamescope window at 2560x1440@240, 1x). It fails on fields
+more than 3 ms late (`PS2X_LATE_VBLANK=1`) or VSync mean < 49.8. Never measure stutter with frame dumps on: PNG dumps
+cause 40 ms host hitches. The F3/[hud] VSync number is a >=0.5 s window and reads 48.x-51.x by aliasing even when
+pacing is perfect; use late fields instead.
 
 **Hidden scripted runs (the main loop):**
 1. Reproduce: `PS2X_GS_BACKEND=vulkan PS2X_HIDDEN=1 PS2X_HOST_INPUT="<tick>:<KEY>:<hold>,..." PS2X_DUMP_DIR=<dir> PS2X_DUMP_EVERY=<n>

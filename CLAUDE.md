@@ -115,6 +115,11 @@ the owner's config, accurate software renderer; details in AGENTS.md §11). Rend
 `PS2X_GS_RECORD` (+`_FROM/_TO`) and replay/bisect it with `dw5xl_gsrender` (Vulkan vs CPU). Never send synthetic input
 to the real desktop or edit `~/.config/PCSX2`.
 
+Tests run at 1x: always pass `PS2X_GS_SCALE=1 PS2X_GS_SSAA=1` (the ini may hold another scale); check the
+`[output] scale=…` log line.
+Stutter/perf regressions: `tools/heavy_battle_test.py` (pass/fail, ~8 min, no desktop window); never measure stutter
+with frame dumps on.
+
 ## Debug switches (env)
 `PS2X_STATS` vsync/flip rate · `PS2X_GS_BACKEND=vulkan` · `PS2X_GS_SCALE=1|2|4|8|16` (SSAA) · `PS2X_GS_SYNCREADBACK=1` · `PS2X_NO_WEAVE=1` ·
 `PS2X_GS_TRACE=<file>` + `_FROM/_TO` ticks (REG/DRAW/XFER; pseudo-reg 0x7F marks GIF packet path) · `PS2X_VRAM_DUMP=<file>` raw 4 MiB GS memory
