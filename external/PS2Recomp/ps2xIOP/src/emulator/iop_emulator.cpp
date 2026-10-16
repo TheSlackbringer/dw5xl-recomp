@@ -125,6 +125,15 @@ namespace ps2x::iop::detail
                 host.audioSamples(samples);
             });
             memory.spu2().setIrqCallback([this] { pendingSoundInterrupt = true; });
+            kernel.setHostWaitPump([this]
+            {
+                // Only for a top-level host call (an RPC server function); never re-enter the scheduler.
+                if (inRunCycles || callDepth != 1u)
+                    return false;
+                const uint64_t before = totalInstructions;
+                runCycles(kDefaultSlice * 16u);
+                return totalInstructions != before; // false: no IOP thread ran in this slice
+            });
             reset();
         }
 
@@ -664,6 +673,12 @@ namespace ps2x::iop::detail
 
         void runCycles(uint64_t cycles) noexcept
         {
+            struct RunGuard
+            {
+                bool &flag;
+                bool previous;
+                ~RunGuard() { flag = previous; }
+            } const runGuard{inRunCycles, std::exchange(inRunCycles, true)};
             try
             {
                 const uint64_t target = totalCycles + cycles;
@@ -866,6 +881,7 @@ namespace ps2x::iop::detail
         bool servicingDmaInterrupts = false;
         bool servicingGuestCallbacks = false;
         uint32_t callDepth = 0u;
+        bool inRunCycles = false;
         GuestCallback secrMcCommandHandler;
         GuestCallback secrMcDevIdHandler;
         GuestCallback checkKelfPathCallback;

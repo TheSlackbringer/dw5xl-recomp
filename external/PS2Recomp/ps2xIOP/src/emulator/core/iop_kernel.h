@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <vector>
 
@@ -69,7 +70,13 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
 
+        // Runs other IOP threads for one scheduling slice on behalf of guest code executing outside
+        // any IOP thread (an RPC server function called by the host). Returns whether any IOP thread
+        // ran; always false when pumping is not possible from the current call (e.g. inside the scheduler).
+        void setHostWaitPump(std::function<bool()> pump) { m_hostWaitPump = std::move(pump); }
+
     private:
+        std::function<bool()> m_hostWaitPump;
         struct Semaphore
         {
             int id = 0;

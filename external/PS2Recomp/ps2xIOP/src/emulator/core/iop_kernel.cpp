@@ -625,6 +625,39 @@ namespace ps2x::iop::detail
                 setV0(0);
                 cpu.yielded = true;
             }
+            else if (m_hostWaitPump)
+            {
+                // On the PS2 an RPC server function runs in its module's RPC thread, so this wait
+                // blocks there while the module's other threads run (e.g. KOEISND's stop waits for
+                // its stream thread to park). Run them until the flag is satisfied.
+                const int id = event->second.id;
+                // Bounded: stop after ~110 ms of IOP time, or once no IOP thread has run for ~3.5 ms
+                // (all blocked, e.g. on the EE), so waits that only the EE can satisfy fail as before.
+                constexpr uint32_t kMaxHostWaitSlices = 1024u;
+                constexpr uint32_t kMaxIdleSlices = 32u;
+                int32_t result = -418;
+                uint32_t slice = 0, idle = 0;
+                for (; slice < kMaxHostWaitSlices && idle < kMaxIdleSlices; ++slice)
+                {
+                    idle = m_hostWaitPump() ? 0u : idle + 1u;
+                    const auto current = m_eventFlags.find(id);
+                    if (current == m_eventFlags.end())
+                    {
+                        result = -1;
+                        break;
+                    }
+                    if (eventSatisfied(current->second, bits, mode))
+                    {
+                        if (cpu.gpr[7] != 0u)
+                            m_memory.write32(cpu.gpr[7], current->second.bits);
+                        if ((mode & 0x10u) != 0u)
+                            current->second.bits = 0u;
+                        result = 0;
+                        break;
+                    }
+                }
+                setV0(result);
+            }
             else
                 setV0(-418);
             return true;
