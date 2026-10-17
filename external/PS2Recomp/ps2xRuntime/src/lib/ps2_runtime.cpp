@@ -3324,26 +3324,60 @@ void PS2Runtime::run()
             saveIniValue("aa_samples", s_aaChoice);
         }
 
+        // F3 numbers (issue 014), about once a second. VSync = guest fields per second, timed by the fields'
+        // own emission times (so a steady 50 reads 50.0, not 49/51 from where the window falls). FPS = the
+        // game's frame rate over the same span: fields in which it finished a frame (ps2x::device::gameFrameCount)
+        // or, during movies, the pictures the movie decoder handed to the game (its frame syncs do not always
+        // have device work), whichever is higher. The host window loop itself is capped at 60 and is not shown.
         static auto s_lastFpsTime = std::chrono::steady_clock::now();
         static uint64_t s_lastVsyncTick = 0;
+        static int64_t s_lastVsyncNs = 0;
+        static uint64_t s_lastGameFrames = 0;
+        static uint64_t s_lastMoviePictures = 0;
         static float s_vsyncRate = 0.0f;
-        static int s_cachedHostFps = 0;
+        static float s_gameFps = 0.0f;
         static float s_maxFrameMs = 0.0f; // worst host frame in the HUD window
         s_maxFrameMs = std::max(s_maxFrameMs, GetFrameTime() * 1000.0f);
 
         const auto nowFps = std::chrono::steady_clock::now();
         const float elapsedFps = std::chrono::duration<float>(nowFps - s_lastFpsTime).count();
         const uint64_t currentVsync = eeScheduler().currentVSyncTick();
-        if (elapsedFps >= 0.5f)
+        if (elapsedFps >= 1.0f)
         {
-            s_vsyncRate = (currentVsync >= s_lastVsyncTick) ? (float(currentVsync - s_lastVsyncTick) / elapsedFps) : 0.0f;
-            s_cachedHostFps = GetFPS();
-            // PS2X_HUD_LOG=1 logs the F3 overlay numbers (host FPS, guest VSync, worst host frame) for unattended runs.
+            auto &gsRegs = m_memory.gs();
+            uint64_t tick = 0;
+            int64_t tickNs = 0;
+            do
+            {
+                tick = gsRegs.vsyncTick.load(std::memory_order_acquire);
+                tickNs = m_memory.vsyncTickNs().load(std::memory_order_relaxed);
+            } while (tick != gsRegs.vsyncTick.load(std::memory_order_acquire));
+            const uint64_t gameFrames = ps2x::device::gameFrameCount();
+            const uint64_t moviePictures = ps2_stubs::moviePictureCount();
+            const double frames = static_cast<double>(std::max(gameFrames - s_lastGameFrames, moviePictures - s_lastMoviePictures));
+            const int64_t spanNs = tickNs - s_lastVsyncNs;
+            if (s_lastVsyncNs != 0 && tick > s_lastVsyncTick && spanNs > 0)
+            {
+                const double span = static_cast<double>(spanNs) * 1e-9;
+                s_vsyncRate = static_cast<float>(static_cast<double>(tick - s_lastVsyncTick) / span);
+                // A screen shows at most one frame per field: frames are counted at the sample moments, not
+                // exactly on field boundaries, so clamp the +-1 slack.
+                s_gameFps = std::min(s_vsyncRate, static_cast<float>(frames / span));
+            }
+            else
+            {
+                s_vsyncRate = 0.0f; // no new field: the guest clock is stalled
+                s_gameFps = static_cast<float>(frames / elapsedFps);
+            }
+            // PS2X_HUD_LOG=1 logs the F3 overlay numbers (game FPS, guest VSync, worst host frame) for unattended runs.
             static const bool s_hudLog = [] { const char *v = std::getenv("PS2X_HUD_LOG"); return v && *v && *v != '0'; }();
             if (s_hudLog)
-                std::fprintf(stderr, "[hud] tick=%llu fps=%d vsync=%.1f frameMs=%.1f maxFrameMs=%.1f\n",
-                             static_cast<unsigned long long>(currentVsync), s_cachedHostFps, s_vsyncRate, GetFrameTime() * 1000.0f, s_maxFrameMs);
-            s_lastVsyncTick = currentVsync;
+                std::fprintf(stderr, "[hud] tick=%llu fps=%.1f vsync=%.1f frameMs=%.1f maxFrameMs=%.1f\n",
+                             static_cast<unsigned long long>(currentVsync), s_gameFps, s_vsyncRate, GetFrameTime() * 1000.0f, s_maxFrameMs);
+            s_lastVsyncTick = tick;
+            s_lastVsyncNs = tickNs;
+            s_lastGameFrames = gameFrames;
+            s_lastMoviePictures = moviePictures;
             s_lastFpsTime = nowFps;
             s_maxFrameMs = 0.0f;
         }
@@ -3351,14 +3385,14 @@ void PS2Runtime::run()
         if (s_showFpsOverlay && !IsWindowHidden())
         {
             const uint32_t aaNow = m_gs.getAASamples();
-            const char *fpsText = TextFormat("FPS: %d  |  VSync: %.1f  |  Output: %ux (%ux%u)  |  AA: %ux%s",
-                s_cachedHostFps, s_vsyncRate, m_gs.getResolutionScale(), presentWidth, presentHeight, aaNow,
+            const char *fpsText = TextFormat("FPS: %.0f  |  VSync: %.1f  |  Output: %ux (%ux%u)  |  AA: %ux%s",
+                s_gameFps, s_vsyncRate, m_gs.getResolutionScale(), presentWidth, presentHeight, aaNow,
                 aaNow < s_aaChoice ? TextFormat(" (set %ux, max at this output)", s_aaChoice) : "");
             constexpr int kFontSize = 18;
             const int textW = MeasureText(fpsText, kFontSize);
             DrawRectangle(8, 8, textW + 16, kFontSize + 10, Fade(BLACK, 0.75f));
-            const Color statColor = (s_cachedHostFps >= 45 && s_vsyncRate >= 45.0f) ? GREEN :
-                                    (s_cachedHostFps >= 25 && s_vsyncRate >= 25.0f) ? YELLOW : RED;
+            const Color statColor = (s_gameFps >= 45.0f && s_vsyncRate >= 45.0f) ? GREEN :
+                                    (s_gameFps >= 25.0f && s_vsyncRate >= 25.0f) ? YELLOW : RED;
             DrawText(fpsText, 16, 13, kFontSize, statColor);
         }
         if (s_showBuildOverlay && !IsWindowHidden())

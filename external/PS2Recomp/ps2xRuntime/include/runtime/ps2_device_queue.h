@@ -140,6 +140,12 @@ namespace ps2x::device
     // Pause NEVER cancels an already accepted MSCAL. Only hard VU1 reset does.
     bool workerShouldCancelVu1() noexcept;
 
+    // Game frames: fields in which the game finished at least one frame (an
+    // explicit render-sync drain that had device work). Per second = the FPS a
+    // screen shows; counts 3D frames (two syncs per frame), movie frames (one)
+    // and never more than one per field (F3 overlay, issue 014).
+    uint64_t gameFrameCount() noexcept;
+
     // PS2X_DEVICE_PROFILE=1 (with PS2X_VU1_ASYNC_TRACE=1): device-worker time per
     // part, printed with each [vu1-async] line. Parts nest: Transfer contains
     // the VU1 runs it starts, a VU1 run contains its XGKICK GIF submits;

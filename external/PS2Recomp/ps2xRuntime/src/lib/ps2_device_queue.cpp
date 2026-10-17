@@ -75,6 +75,8 @@ namespace ps2x::device
         thread_local Command *t_workerCommand = nullptr;
         thread_local int t_executingDepth = 0;
         std::array<std::atomic<uint64_t>, static_cast<size_t>(ProfilePart::Count)> g_profileNs{};
+        std::atomic<uint64_t> g_gameFrames{0};
+        std::atomic<uint64_t> g_lastFrameField{~0ull};
 
         struct ExecutingScope
         {
@@ -365,6 +367,12 @@ namespace ps2x::device
                     const uint64_t pendingBefore = submitted.load(std::memory_order_relaxed) - appliedNow;
                     applyCompleted();
                     statDrains.fetch_add(1u, std::memory_order_relaxed);
+                    if (reason == DrainReason::Explicit)
+                    {
+                        const uint64_t field = mem.gs().vsyncTick.load(std::memory_order_relaxed);
+                        if (g_lastFrameField.exchange(field, std::memory_order_relaxed) != field)
+                            g_gameFrames.fetch_add(1u, std::memory_order_relaxed);
+                    }
                     if (blocked)
                     {
                         statBlockingDrains.fetch_add(1u, std::memory_order_relaxed);
@@ -1073,6 +1081,11 @@ namespace ps2x::device
         if (t_workerCommand && t_workerCommand->device &&
             (t_workerCommand->kind == Command::Kind::Transfer || t_workerCommand->kind == Command::Kind::Resume))
             t_workerCommand->device->checkpoint(*t_workerCommand, consumedBytes);
+    }
+
+    uint64_t gameFrameCount() noexcept
+    {
+        return g_gameFrames.load(std::memory_order_relaxed);
     }
 
     bool profileEnabled() noexcept

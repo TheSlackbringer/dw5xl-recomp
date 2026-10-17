@@ -2108,6 +2108,8 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
+        m_runtime.memory().vsyncTickNs().store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                                                  std::memory_order_relaxed);
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
         {

@@ -1,5 +1,6 @@
 #include <atomic>
 std::atomic<uint32_t> g_dw5xlMpegDemux{0}, g_dw5xlMpegGetPic{0}, g_dw5xlMpegPictures{0}, g_dw5xlStrEvents[8]{}; // DW5XL-DEBUG
+namespace { std::atomic<uint64_t> g_moviePictures{0}; } // decoded pictures handed to the game (F3 FPS)
 #include "Common.h"
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
@@ -2673,6 +2674,11 @@ namespace ps2_stubs
         setReturnU32(ctx, getPlaybackState(mpegAddr).decodeMode);
     }
 
+    uint64_t moviePictureCount() noexcept
+    {
+        return g_moviePictures.load(std::memory_order_relaxed);
+    }
+
     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         g_dw5xlMpegGetPic.fetch_add(1u, std::memory_order_relaxed); // DW5XL-DEBUG
@@ -2845,6 +2851,7 @@ namespace ps2_stubs
         if (haveFrame)
         {
             writeDecodedFrameToGuest(rdram, imageAddr, frame);
+            g_moviePictures.fetch_add(1u, std::memory_order_relaxed);
             dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, pictureCallbacks);
         }
         else if (frameCount == 0u)
