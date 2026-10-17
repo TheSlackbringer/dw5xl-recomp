@@ -418,6 +418,9 @@ public:
     void requestStop();
     bool isStopRequested() const;
 
+    // Build ID (e.g. git describe) shown by the F2 overlay with the game tick (issue 012).
+    void setBuildId(std::string id) { m_buildId = std::move(id); }
+
     EeScheduler &eeScheduler();
     const EeScheduler &eeScheduler() const;
     void postEeEvent(EeEvent event);
@@ -489,6 +492,7 @@ public:
     inline const PS2Vfs &vfs() const { return m_vfs; }
 
 private:
+    std::string m_buildId;
     RecompiledFunction resolveFunctionExact(uint32_t address) const;
     std::vector<const RecompiledModule *> m_compiledModules;
     const RecompiledModule *m_activeCompiledModule = nullptr;

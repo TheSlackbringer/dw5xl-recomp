@@ -3299,6 +3299,12 @@ void PS2Runtime::run()
         {
             s_showFpsOverlay = !s_showFpsOverlay;
         }
+        // F2: build ID and game tick, to match screenshots with logs (off by default).
+        static bool s_showBuildOverlay = false;
+        if (IsKeyPressed(KEY_F2))
+        {
+            s_showBuildOverlay = !s_showBuildOverlay;
+        }
         // F4 cycles native/2x/4x output; F5 cycles the anti-aliasing choice (1-16 samples
         // per output pixel). The two are independent: 2x/4x use 4/16 samples to build the
         // larger image and AA multiplies that, up to the 16-sample limit (4x: no extra AA).
@@ -3353,6 +3359,15 @@ void PS2Runtime::run()
             const Color statColor = (s_cachedHostFps >= 45 && s_vsyncRate >= 45.0f) ? GREEN :
                                     (s_cachedHostFps >= 25 && s_vsyncRate >= 25.0f) ? YELLOW : RED;
             DrawText(fpsText, 16, 13, kFontSize, statColor);
+        }
+        if (s_showBuildOverlay && !IsWindowHidden())
+        {
+            const char *buildText = TextFormat("Build: %s  |  Tick: %llu",
+                m_buildId.empty() ? "unknown" : m_buildId.c_str(), static_cast<unsigned long long>(currentVsync));
+            constexpr int kFontSize = 18;
+            const int y = s_showFpsOverlay ? 44 : 8;
+            DrawRectangle(8, y, MeasureText(buildText, kFontSize) + 16, kFontSize + 10, Fade(BLACK, 0.75f));
+            DrawText(buildText, 16, y + 5, kFontSize, WHITE);
         }
 
         EndDrawing();

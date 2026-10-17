@@ -8,12 +8,17 @@
 #include "ps2_log.h"
 #endif
 
+#if __has_include("dw5xl_build_id.h")
+#include "dw5xl_build_id.h"
+#endif
+
 #include <iostream>
 #include <string>
 #include <filesystem>
 #include <exception>
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -194,6 +199,10 @@ int main(int argc, char *argv[])
         }
 
         PS2Runtime runtime;
+#ifdef DW5XL_BUILD_ID
+        std::fprintf(stderr, "[build] id=%s\n", DW5XL_BUILD_ID);
+        runtime.setBuildId(DW5XL_BUILD_ID);
+#endif
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
         // This hook is to prevent leak rlimgui deps to recompiler etc
         PS2DebugPanel debugPanel;

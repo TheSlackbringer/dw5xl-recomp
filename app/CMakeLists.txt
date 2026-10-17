@@ -34,6 +34,15 @@ add_executable(dw5xl
     src/dw5xl_overlays.cpp
 )
 target_include_directories(dw5xl PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
+# Build ID (git describe --always --dirty) for the startup log and the F2 overlay (issue 012).
+set(DW5XL_BUILD_ID_DIR "${CMAKE_CURRENT_BINARY_DIR}/build_id")
+add_custom_target(dw5xl_build_id
+    COMMAND "${CMAKE_COMMAND}" "-DSRC=${CMAKE_CURRENT_SOURCE_DIR}/.." "-DOUT=${DW5XL_BUILD_ID_DIR}/dw5xl_build_id.h"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_id.cmake"
+    BYPRODUCTS "${DW5XL_BUILD_ID_DIR}/dw5xl_build_id.h"
+    VERBATIM)
+add_dependencies(dw5xl dw5xl_build_id)
+target_include_directories(dw5xl PRIVATE "${DW5XL_BUILD_ID_DIR}")
 target_link_libraries(dw5xl PRIVATE ps2_runtime rlImGui imgui)
 target_compile_definitions(dw5xl PRIVATE PS2X_ENABLE_DEBUG_UI=1)
 target_precompile_headers(dw5xl PRIVATE
