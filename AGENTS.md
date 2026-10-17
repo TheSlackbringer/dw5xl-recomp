@@ -1,270 +1,200 @@
-# AGENTS.md – DW5 Xtreme Legends native port (handoff for any coding agent)
+# AGENTS.md — Dynasty Warriors 5 Xtreme Legends native port
 
-This file contains general guidance for coding agents. Read `notes/PROJECT_SETUP.md` for current target and setup requirements, `notes/BRINGUP.md` for investigation history, and `notes/SHIPPING_RESEARCH.md` before changing player setup. `CLAUDE.md` holds the general rules in shorter form.
+Static recompilation of **Dynasty Warriors 5 Xtreme Legends** (PAL SLES_538.60) to a native Linux executable with
+**PS2Recomp** (MIPS R5900 → C++), Vulkan paraLLEl-GS renderer. Goal: XL fully playable natively, including XL's
+**Load Original** (DW5 disc), movies included. GitHub: TheSlackbringer/dw5xl-recomp.
 
-## Durable project memory
+Read first: this file → `notes/issues/README.md` (local: index, "Waiting for you", working agreement) → the current
+issue's `spec.md` and `work.md`. Setup/build commands: `notes/PROJECT_SETUP.md`. Look-ups (repo map, debug switches,
+Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. History only: `notes/BRINGUP.md`,
+`notes/CLAUDE_HANDOFF.md`, `notes/OWNER_TEST_CHECKLIST.md`.
 
-- At session start, after context loss/compaction, and before resuming another agent's
-  work, read `notes/PROJECT.md`, the newest `notes/CLAUDE_HANDOFF.md` section and relevant
-  evidence, then verify Git status/diff and build settings. The chat is not the project
-  state. Current verified project memory supersedes older status summaries, not rules.
-- Keep `notes/PROJECT.md` concise and current: architecture, agreed requirements and
-  decisions, implemented behavior with validation limits, known bugs, current dirty
-  files/build settings, pending approvals, next steps and evidence links. Keep detailed
-  plans/specs/investigations in separate local notes and link them from PROJECT.md.
-- Update it after meaningful discoveries, tests, fixes or user decisions, and before
-  long work batches or handing off. Preserve unfinished agent reports/proposals and
-  essential evidence in `notes/evidence/`; never rely solely on chat or `/tmp`.
-- Check usage when available before expensive batches and periodically during long
-  work. At 10% remaining or less, checkpoint promptly before more work; do not wait
-  for zero. Regular checkpoints remain required even without usage information.
-- Clearly distinguish approved/applied/tested from proposed/unverified work. Record
-  exact reproduction commands, remaining decisions and a short restart prompt.
-  Ignore rules remain in force: notes are local and are not transferred by Git push.
+## How we work with the owner (agreed 2026-10-16)
+1. **One folder per issue**, `notes/issues/NNN-short-name/` (local, never committed; templates in `notes/issues/`):
+   - `spec.md` — what the owner and you agreed. Copy `notes/issues/TEMPLATE-spec.md` and fill EVERY section:
+     what the owner sees; background (facts with numbers, what is ruled out); how to reproduce; **recommended fix**
+     (step by step, why it works, expected result); **native vs emulation** (a header line plus a section: which
+     parts are native code, which stay emulated, anything moving between them); **main risks** (what could go wrong
+     or need an owner decision, and what then); alternatives considered (and why not); measurable pass criteria;
+     the automated test; the 1–3 "Owner test" items only the owner can judge; out of scope. Plain words, no
+     unexplained jargon. Examples: issues 001 and 002.
+   - `work.md` — stop/go milestones (not in the spec), all your findings, progress, measurements, conclusion, fix
+     (commit) and history, kept current. Findings never live only in chat.
+2. **Spec approval before any work.** Draft the spec (fact-finding needed to write it is fine); the owner approves.
+   Push back with reasons when you think a spec is wrong; the owner decides and can overrule. No fixes or experimental
+   code changes without an approved spec. While away, the owner can allow work on an unapproved spec — explicitly.
+3. **A test per issue, written first:** `notes/issues/tests/issue_NNN_*.py` prints PASS/FAIL and must FAIL on the bug
+   before the fix (where measurable). Runner: `notes/issues/tests/run.py NNN|quick|all|list`; helpers and routes in
+   `tests/dw5test.py`. Closed issues keep their tests as regression guards.
+4. **Test tiers:** `run.py quick` (~12 min) after every change; `run.py all` (full, ~55 min) before owner test
+   sessions or while the owner is away. **Owner test sessions:** `run.py all` must pass first. Batch several
+   "fixed — owner test" issues into one session with one short list. Test window: `run.py window NNN ...` (full
+   logging, log filed under the issues). Normal play: `run.py play`. The owner only checks the specs' "Owner test"
+   items; record results in `work.md` + status.
+5. **Commits and pushes:** one local commit per fixed issue ("Fix #00N: …") when it reaches "fixed — owner test".
+   Push only after the owner confirmed the issues in the batch and agreed to the push. Other commits only on command.
+6. **Stop/go:** split big work into milestones in `work.md`. Owner present: a two-line status per milestone, and an
+   immediate report (with the alternative) when an approach doesn't pay off. Owner away: keep going, log milestones.
+7. **While the owner is away** you may: work on approved specs in the agreed order; run automated tests off-screen;
+   update `work.md` and the index; make local per-issue commits; capture PCSX2 references (headless); create NEW
+   issues (draft spec + findings) — but not fix them. Wait for the owner for: fixes without an approved spec, spec
+   changes, pushing, any visible window or desktop action, deleting outside your scratch space, downloads/installs/
+   system settings, turning the PC off (only when asked that time). Stuck: write it under "Waiting for you" and
+   continue with the next approved issue.
 
-## 1. Goal
-Native Linux port of **Dynasty Warriors 5 Xtreme Legends** via static recompilation with
-**PS2Recomp** (MIPS R5900 → C++). Target: XL fully playable natively, including XL's **Load Original** feature that reads
-the original DW5 disc, so both games run in one port. FMV movies must work in the final version.
+## Rules
+- **NEVER ASSUME — ask the owner, with a recommendation.** Need something opened, switched, installed or done
+  (a Ghidra tab, a PCSX2 screen, a file), or unsure what the owner has or wants: ask what, why, and what you recommend.
+- **Decisions are the owner's:** scope, requirements, priorities, library/function/graphics behaviour choices,
+  native-vs-emulation direction. Present 2–4 options with a recommendation; research and diagnosis may continue while
+  waiting, applying the choice may not. A request to fix something is not agreement with a particular approach.
+- **Native over emulation;** model hardware only where the runtime must. Prefer the game's own SDK code over runtime
+  HLE stubs. Find root causes; no workarounds that paper over symptoms. Survey existing approaches before inventing.
+- **Performance changes must give identical output** (same frames, same sound). Test at **1x**: every run passes
+  `PS2X_GS_SCALE=1 PS2X_GS_SSAA=1` and you check the `[output] scale=1x` log line.
+- **GPU renderer only** (Vulkan/paraLLEl-GS) for development and tests; no CPU-renderer work unless asked.
+- **The owner's desktop is off limits:** never send synthetic input to it, never screenshot it (use frame dumps),
+  never unlock it, never edit `~/.config/PCSX2`. Visible windows only for an owner test session or when asked.
+- **One game at a time;** no builds or test runs while the owner has a window open. Tests use the silent sink
+  `dw5xl_codex_tests`; live play uses the default output. Never change audio defaults or route other apps.
+- **Downloads need explicit permission** (name, source, size).
+- **Nothing derived from the game in Git:** no game files (`game/`, `discs/`), Ghidra DBs, generated or lifted C++
+  (`recomp/*/output/`, `recomp/dw5xl/vu1/`), frame dumps, captures, microcode `.bin`, screenshots. Scan before every
+  commit/push. Hooks in `.githooks/` (`git config core.hooksPath .githooks`); never bypass them (`--no-verify`).
+- **Commit identity:** author/committer `TheSlackbringer <15327900+TheSlackbringer@users.noreply.github.com>`;
+  end messages with `Co-Authored-By: Claude <model> <noreply@anthropic.com>`. Call our renderer fixes "runtime
+  patches" (`vendor/`). `external/PS2Recomp/` is vendored: runtime changes are ordinary commits here.
+- **Use the Ghidra MCP whenever you can** (`mcp__ghidra__*` tools: decompile, xrefs, strings, renames/comments)
+  for reverse engineering; call `get_program_info` first. Headless only when the MCP is unreachable (GUI closed),
+  for batch jobs, or for parallel agents — always on a copy (see Reference → Ghidra). If the needed program is not
+  the active tab, ask the owner to switch it.
+- **Parallel agents** get self-contained briefs and do analysis/patch-writing in their own worktree or scratch dir
+  (Ghidra on their own copy); one integrator builds and runs the game. Each worktree gets its own `app/build-<task>`.
+- **Never delete build dirs containing `_deps`;** no `rm` with bare shell variables (use `"${VAR:?}"`).
+- Keep `AGENTS.md` current when rules or the way of working change. Check usage
+  before expensive batches; at ≤10 % left, checkpoint (`work.md`, index) before continuing.
 
-## 2. RULES
-- **NEVER ASSUME — ask the owner, with a recommendation.** If you need something opened, switched, installed,
-  checked or done (e.g. a different Ghidra program loaded in the GUI, PCSX2 at a certain screen, a setting changed,
-  a file provided), or you are unsure what the owner has or wants, ask: say what you need, why, and what you
-  recommend. Do not assume what is open, installed or intended, and do not route around a missing piece silently.
-- **Scope changes require explicit approval.** Present the proposed scope before
-  acting; do not expand it or infer approval from a general request. After approval, carry out the work
-  within that scope and bring any proposed changes back for confirmation.
-- **Important decisions and requirements require confirmation.** Explain the options
-  and recommendations, then wait for confirmation before acting. Do not assume approval,
-  invent requirements, or change agreed requirements. A request to fix an issue is not agreement with
-  a particular choice. Routine implementation can proceed within agreed requirements.
-- **Library, function, and graphics behavior decisions require confirmation.** Explain the options,
-  give a recommendation, and wait for a decision before implementing it, even within approved scope.
-  Research, diagnosis, tests, and preparation of a proposal can continue while waiting; do not apply the proposed change.
-- **Native over emulation.** Replace hardware use at the game/SDK level with native code where practical.
-  Model hardware only where the runtime must.
-- **Survey before reinventing.** Research existing approaches and present options. Keep research
-  comparisons in local notes; dependency provenance belongs in `THIRD_PARTY.md`.
-- **Ask before downloads** (state file, source, size) and before opening the game in a visible window. Never take
-  screenshots of the user's screen; use the runtime's frame dumps. Hidden runs still play audio on the user's speakers –
-  don't run tests while the user is testing something else.
-- Hidden tests use a separate silent audio output while retaining game audio processing/capture. Live tests use default desktop output. Never change the default output or route other applications.
-- Legitimate original discs only. **Never commit or distribute game data** (`game/`, `discs/`), Ghidra DBs or generated code.
-- **GPU renderer only: use Vulkan/paraLLEl-GS for development, game runs, debugging and performance testing.** Do not run CPU renderer comparisons, develop CPU-renderer fixes, or propose switching back to CPU unless explicitly requested. Existing CPU backend code may remain; its presence does not authorize CPU work.
-- **No automatic Git staging or commits.** Leave changes unstaged; create commits only upon explicit command.
-- **Never commit or push anything derived from the game's code or data**: no generated or lifted C++ (the lifted
-  VU1 code lives only in the ignored `recomp/dw5xl/vu1/`; never `dw5xl_vu1_lifted.cpp` anywhere in Git), frame dumps
-  (`final.png`, `frame_*.png`), RAM/VRAM/VU captures or microcode `.bin` files. Repo hooks in `.githooks/` block the
-  lifted VU1 code on commit and push (enable once per clone: `git config core.hooksPath .githooks`). Never bypass
-  hooks (`--no-verify`, `-n`), and never push without the owner's explicit command.
-- Prefer the game's own SDK library code over runtime HLE stubs when a function only builds packets/structs.
-  HLE only what touches hardware the runtime cannot model.
-- Parallelise independent tasks (separate worktrees/build dirs per task, see §4); verify every fix with a test run.
-- Find root causes; don't paper over symptoms with workarounds.
+## Essentials
+- Build: `cmake --build app/build` (all), `--target dw5xl` (game). Regenerate code: `tools/regen.sh main|ovl00|…`
+  (needs the player's disc in `game/dw5xl/`). CTests: `cd app/build && ctest`.
+- Run tests: `notes/issues/tests/run.py quick` (after changes) / `run.py all` (full). Perf/stutter: `tools/heavy_battle_test.py` (no frame dumps when
+  measuring timing).
+- Unsure how the original looks or behaves: compare with PCSX2 first (`tools/pcsx2_reference.py`), then ask the owner
+  for what screenshots can't show (feel, sound timing).
+- Debug code: `DW5XL-DEBUG` (kept, env-gated) and `TEMP-DEBUG` (remove before committing).
 
-## 3. Repository layout
-- `external/PS2Recomp/` – third-party code, not ours: a vendored copy of the upstream runtime/recompiler plus our
-  maintained runtime fixes, tracked as ordinary files (no submodule). Base revision and provenance are in
-  `external/PS2Recomp/DW5XL_VENDORED.md` and
-  `THIRD_PARTY.md`.
-  `ps2xRuntime/` (EE runtime: memory, DMA, VIF, Vulkan paraLLEl-GS GPU compute renderer and CPU fallback renderer,
-  kernel/syscalls, SDK HLE stubs in `src/lib/Kernel/Stubs/`),
-  `ps2xIOP/` (IOP R3000 interpreter running the game's real IRX modules: KOEISND, LIBSD, CDVDSTM, MCMAN, DBCMAN...;
-  SPU2 model `src/emulator/core/iop_spu2.cpp`), `ps2xRecomp/` (the recompiler `ps2_recomp`).
-- `recomp/dw5xl/dw5xl.toml` – recompiler config: `stubs` (SDK functions bound to runtime HLE), `entry_points`, `[mmio]`
-  map, jump tables, `[patches]` (keep `instructions` EMPTY, see §8). `ghidra_functions.code.csv` = function list.
-  `output/` = generated C++ (~42k files, gitignored; regenerate).
-- `app/` – our executable: `CMakeLists.txt` (unity build, PCH, `-march=x86-64-v3`), `src/`:
-  `dw5xl_pad2.cpp` (libpad2 → host pad bridge), `dw5xl_images.cpp` (native replacement of the IPU still-image queue
-  at 0x1F0A40), `ipu_idec.{h,cpp}` (our own MPEG-2 intra/IPU IDEC decoder, 61 dB vs FFmpeg),
-  `dw5xl_overlays.cpp` (native active-overlay lifecycle and dispatch).
-- `tools/` – `regen.sh`, `fix_ghidra_csv.py`, `ghidra_scripts/` (DecompileAt, CallersOf, DecompileAll,
-  ExportPS2Functions), `ipu/` (decoder self-test + FFmpeg comparison), `debug/` (VRAM CT32 decoder, gdb sampler).
-- `game/dw5xl/` (extracted XL disc, run from here; `mc0/`,`mc1/` = memory cards), `game/dw5/` (DW5 disc files),
-  `discs/` (ISOs), `ghidra/` (project dw5xl, program SLES_538.60), `ghidra_iop/` (project koeisnd: KOEISND.IRX,
-  module-relative addresses; runtime base 0x53b00). All gitignored.
+## Reference
 
-## 3a. How our changes reach the game
-Generated C++ registers every game function under its PS2 address; calls go through that table. Overrides in
-`app/src` register per disc serial (`PS2_REGISTER_GAME_OVERRIDE(..., "SLES_538.60", ...)`), verify the expected
-instruction at the address, then `runtime.replaceFunction(addr, fn)`. `runtime.lookupFunction(addr)` returns the
-original so a replacement can wrap it (call the original, then adjust its result) – the intended route for later
-camera changes. PS2Recomp has no mid-function hooks. Disc files are read only; never patch them or generated output.
-Game files live in ignored local folders (`game/dw5xl`, `game/dw5`, `discs/`).
+### Repository map
+- `external/PS2Recomp/` — vendored upstream runtime/recompiler plus our runtime fixes (ordinary files; provenance in
+  `external/PS2Recomp/DW5XL_VENDORED.md` and `THIRD_PARTY.md`).
+  - `ps2xRuntime/` — EE runtime: memory, DMA, VIF, VU0/VU1 (interpreter `src/lib/vu/ps2_vu1_core.cpp`, lifted-code
+    support `include/runtime/ps2_vu1_lift.h`), GS front end + Vulkan paraLLEl-GS backend, kernel/syscalls, SDK HLE
+    stubs (`src/lib/Kernel/Stubs/`), EE scheduler (`src/lib/Kernel/EeScheduler.cpp`), async device queue
+    (`src/lib/ps2_device_queue.cpp`), GIF arbiter + GS worker (`src/lib/gs/ps2_gif_arbiter.cpp`).
+  - `ps2xIOP/` — IOP R3000 interpreter running the game's real IRX modules (KOEISND, LIBSD, CDVDSTM, MCMAN …),
+    IOP kernel `src/emulator/core/iop_kernel.cpp`, SPU2 model `src/emulator/core/iop_spu2.cpp`.
+  - `ps2xRecomp/` — the recompiler `ps2_recomp` (VU0 macro ops: `src/lib/vu_translator.cpp`).
+- `recomp/dw5xl/dw5xl.toml` — recompiler config (stubs, entry points, `[mmio]` map, jump tables, `[patches]`).
+  `recomp/dw5xl/output/` and `recomp/dw5xl/overlays/ovl0N/output/` — generated C++ (gitignored; `tools/regen.sh`).
+  `recomp/dw5xl/vu1/` — lifted VU1 C++ (gitignored, game-derived; `tools/vu1_translator.py`).
+- `app/` — our executable: `src/dw5xl_pad2.cpp` (pad bridge), `dw5xl_images.cpp` + `ipu_idec.*` (native IPU stills),
+  `dw5xl_overlays.cpp` (overlay lifecycle/dispatch); tests in `app/tests/` (CTest).
+- `tools/` — `regen.sh`, `vu1_translator.py`/`vu1_timing.py`/`disc_vu_inputs.py` (VU1 lifting from the player's own
+  disc: offsets + hashes only), `heavy_battle_test.py`, `pcsx2_reference.py`, `gsreplay/`, `ghidra_scripts/`, `debug/`.
+- Local, gitignored: `game/dw5xl/` (extracted XL disc; run from here; `mc0/`,`mc1/` memory cards), `game/dw5/`,
+  `discs/`, `ghidra/` (project dw5xl), `ghidra_iop/` (project koeisnd), `notes/` (issues, evidence, history).
 
-## 4. Build, run, version control
-Current build and run commands are in `notes/PROJECT_SETUP.md`.
-Headless test (no window, frame PNG dumps), from `game/dw5xl`: `PS2X_GS_BACKEND=vulkan PS2X_HIDDEN=1 PS2X_DUMP_DIR=<dir>
-PS2X_DUMP_EVERY=100 PS2X_EXIT_TICK=1000 PS2X_HOST_INPUT="400:ENTER:20,..." ../../app/build/dw5xl ./SLES_538.60`
-(tick = vsync, 50/s on PAL; pre-create the dump dir).
-Host input names: ENTER(Start) X(Cross) C(Circle) Z(Square) V(Triangle) UP DOWN LEFT RIGHT Q E (L1 R1).
-Leave ~100 ticks between menu presses (scroll animations swallow input). Known sequences:
-- Intro skip → main menu: `400:ENTER:20` (menu up by ~750).
-- Main menu → Options: `800:DOWN:8,900:DOWN:8,1000:X:10` (Options at ~1100).
-- Options → Opening → Play: then `1300..1600: DOWN x6 every 60`, `1700:X:10`, `1850:X:10`.
-Git: runtime changes are ordinary commits in this repo (`external/PS2Recomp/` is vendored; keep runtime and app changes in
-separate commits where practical). Parallel work: `git worktree add ../dw5-ps2-<task> -b <task>`, symlink `game/`
-and `app/deps/`, build the recompiler in `external/PS2Recomp/build`, own `app/build-<task>`.
-Ghidra headless (GUI may lock the project → work on a copy):
-`/opt/ghidra/support/analyzeHeadless <copydir> dw5xl -process SLES_538.60 -noanalysis -readOnly
--scriptPath tools/ghidra_scripts -postScript DecompileAt.java 0x1F0A40` (output lines prefixed `INFO DecompileAt.java>`).
-Recompiled C++ for any function: `recomp/dw5xl/output/*_0x<addr>.cpp` (each instruction is commented with its asm).
+### How our code reaches the game
+Generated C++ registers every game function under its PS2 address; calls go through that table. Overrides in `app/src`
+register per disc serial (`PS2_REGISTER_GAME_OVERRIDE(..., "SLES_538.60", ...)`), verify the expected instruction,
+then `runtime.replaceFunction(addr, fn)`; `runtime.lookupFunction(addr)` returns the original so a replacement can wrap
+it. No mid-function hooks. Never patch disc files or generated output by hand.
 
-## 5. Status (2026-10-13)
-- **Working:**
-  - **Boot & Menus:** Full boot to title screen and main menu (all modes), Options submenus, and Opening Edit thumbnails.
-  - **Input:** Native keyboard and gamepad support via libpad2 bridge (`dw5xl_pad2.cpp`).
-  - **Movies & Video:** PSS intro movies with audio demuxing, natural end (0xB7), and Start skipping; title screen sky animation decoded via native IDEC decoder (`ipu_idec.cpp`).
-  - **Audio:** KOEISND running on IOP interpreter with real LIBSD + SPU2 model; menu BGM, streaming movie audio, and cursor SFX (Options menu silence authentic).
-  - **3D Graphics:** Real-time 3D rendering (Opening scene 3D character models, castle gates, sky) using native libvu0 (unbound `sceVu0*` stubs).
-  - **Vulkan GPU Renderer:** paraLLEl-GS GPU compute backend (`PS2X_GS_BACKEND=vulkan`) with authentic PAL scanout (640x512 full viewport), comb-free `ReusableFieldWeaver` deinterlacing, native, 2x and 4x output (`PS2X_GS_SCALE=1|2|4`, F4) with separate anti-aliasing samples (`PS2X_GS_SSAA=1|2|4|8|16`, F5; renderer patch in `vendor/parallel-gs-patches/`), and a 3-slot asynchronous readback ring buffer running at solid 50 fps (CPU backend fallback).
-  - **Memory Card:** Saving and loading via HLE libmc (default prompt is No – press LEFT then Cross).
-  - **Overlays:** Native module generation and active-module dispatch (`dw5xl_overlays.cpp`) for OVL00 (Opening) and OVL01 (Xtreme Mode), constructor execution, and indirect vtable dispatch.
-- **Broken / Unverified:** See §6.
+### Running the game by hand (prefer the issue tests and helpers)
+From `game/dw5xl`: `PS2X_GS_BACKEND=vulkan PS2X_HIDDEN=1 PS2X_GS_SCALE=1 PS2X_GS_SSAA=1 PULSE_SINK=dw5xl_codex_tests
+PS2X_HOST_INPUT="<tick>:<KEY>:<hold>,..." PS2X_DUMP_DIR=<dir> PS2X_DUMP_EVERY=<n> PS2X_EXIT_TICK=<n> timeout <s>
+../../app/build/dw5xl ./SLES_538.60 > run.log 2>&1`. Ticks are PAL vsyncs (50/s). Keys: ENTER (Start), X (Cross),
+C (Circle), Z (Square), V (Triangle), UP DOWN LEFT RIGHT, Q/E (L1/R1); leave ~100 ticks between menu presses.
+Known routes (main menu, Opening, battle resume, heavy fight, defeat): `notes/issues/tests/dw5test.py`.
+Timeline: Koei logo 0–200, Start at 400 skips to the main menu (up by ~750).
+A host-input script disables real keyboard polling for the whole run: never set `PS2X_HOST_INPUT`/`PS2X_INPUT` for
+manual play. Silent sink missing after a reboot: `pactl load-module module-null-sink sink_name=dw5xl_codex_tests`.
+Stop a game with `kill <pid>` (never `pkill -f dw5xl` from a shell whose own command line contains that string).
+Presented-window timing without touching the desktop: instead of `PS2X_HIDDEN=1`, prefix the game with
+`gamescope --backend headless -W 2560 -H 1440 -w 2560 -h 1440 -r 240 --` (the owner's monitor; used by
+`tools/heavy_battle_test.py` and the 007 test). Frame dumps are the presented frames (`frame_<tick>.png`); contact
+sheet: `magick montage frame_*.png -tile 4x4 -geometry 256x179+2+2 -label '%f' sheet.png`.
 
-## 6. Next tasks (priority order)
-1. **In-game 3D scenes & Legend Mode loading:** Legend Mode battle loading screen stalls after tick 853 (no disc reads); investigate loading state and 3D scene initialization.
-2. **Overlay coverage & Indirect dispatch:** Continue expanding indirect call and vtable method mapping for OVL00/OVL01/OVL02 to ensure full scene and gameplay coverage.
-3. **Legend Mode submenus & font rendering:** Diagnose any remaining UI/font rendering issues in submenus (e.g. black UI screens in Xtreme/Legend Mode submenus).
-4. **Save/Load round-trip test:** Verify save creation (`mc0/`) and reboot auto-load / Options→Load.
-5. **Load Original:** DW5 disc data/overlays from `game/dw5/` once core 3D gameplay is verified.
-6. **Codebase cleanup:** Strip temporary debug instrumentation (`DW5XL-DEBUG`/`DW5XL-TEST`), retain useful traces behind env vars, implement authentic `sceSdSetEffectAttr` (currently bypassed), and prepare generic upstreamable fixes (VIF DIRECT, libgraph, MPEG 0xB7, MC getdir, Vulkan PAL scanout & async ring buffer).
+### Debug switches (env, all optional)
+Pacing/perf: `PS2X_STATS` (vsync/s per second) · `PS2X_HUD_LOG` ([hud] fps/vsync/frameMs/maxFrameMs every 0.5 s) ·
+`PS2X_LATE_VBLANK` (fields >3 ms late) · `PS2X_VU1_ASYNC_TRACE` (device worker busy/drains per second; "explicit=N"
+render syncs = 2 x game FPS) · `PS2X_VU1_CENSUS=<file>` (per-VU1-program runs/cycles/host ns) · `PS2X_VU1_LIFT=0`
+(interpret all VU1) · `PS2X_VU1_ASYNC=0` (synchronous device) · `PS2X_GS_ASYNC=0` (GS inline, no worker thread).
+VU1 exactness/speed: `PS2X_VU1_LIFT_VERIFY=1` (every native VU1 run repeated by the interpreter and compared; slow) ·
+`PS2X_DEVICE_PROFILE=1` with the async trace (device time: transfer/VU1/GIF submit/VIF unpack) ·
+`PS2X_VU1_RUN_CAPTURE=<prefix>` + `_PC/_FROM/_COUNT` (real run starts for `dw5xl_vu1_lift_test benchcap`; game data,
+local only). Translator: `DW5XL_VU1_STATIC=all|none|<segments>` (static timing, default all);
+`tools/vu1_find_disc_range.py` adds a VU1 program to the lift from a local census image.
+Graphics: `PS2X_GS_SCALE` / `PS2X_GS_SSAA` · `PS2X_NO_WEAVE` · `PS2X_GS_SYNCREADBACK` · `PS2X_GS_TRACE=<file>` +
+`_FROM/_TO` · `PS2X_GS_RECORD=<file>` + `_FROM/_TO` · `PS2X_VRAM_DUMP=<file>` (decode: `tools/debug/gs_vram_ct32.py`) ·
+`PS2X_XGKICK_CAPTURE=<prefix>` + `_FROM/_TO` · `PS2X_DEBUG_ZALWAYS`, `PS2X_ZWATCH` (experiments only).
+Sound/IOP: `PS2X_SPU2_TRACE` · `PS2X_LIBSD_TRACE` · `PS2X_KSNG_TRACE` / `PS2X_KSNH_TRACE` (sound RPCs) ·
+`PS2X_AUDIO_DUMP=<wav>` (s16 stereo 48 kHz) · `PS2X_AUDIO_TRACE` · `PS2X_SIFAUDIO_TRACE` · `PS2X_MPEGAUDIO_TRACE` ·
+`PS2X_IOP_HEAP_TRACE` · `PS2X_IO_TRACE`. Heavy IOP tracing starves audio streams: judge audio untraced.
+Other: `PS2X_IPU_DUMP=<dir>` / `PS2X_IPU_TRACE` · `PS2X_MPG_TRACE` · `PS2X_VIF1_CHAIN_TRACE` · `PS2X_PAD2_TRACE` ·
+`PS2X_RAM_DUMP_TICKS=t1,t2` · `PS2X_RAM_WATCH=addr:len` · `PS2X_CTRL=<file>` (dev command file: press/shot/threads/quit).
+Debug code in the runtime is tagged `DW5XL-DEBUG`; temporary probes `TEMP-DEBUG` (remove before committing).
+No `perf` on this machine: profile with `gprofng collect app` (see notes) or `tools/debug/gdb_sample_profile.sh`.
 
-## 7. Debug toolkit (env vars, all optional)
-`PS2X_STATS` (vsync/flip rate) · `PS2X_GS_BACKEND=vulkan` (required backend for current development and testing) ·
-`PS2X_GS_SCALE=1|2|4|8|16` (SSAA scaling factor; default 1x) · `PS2X_GS_SYNCREADBACK=1` (force synchronous readback for A/B testing) ·
-`PS2X_NO_WEAVE=1` (bypass ReusableFieldWeaver) · `PS2X_GS_TRACE=<file>` + `PS2X_GS_TRACE_FROM/_TO=<tick>` (REG/DRAW/XFER lines;
-pseudo-register `reg_0x7f` = GIF packet marker, value = path<<32|size; note: its TEST printer shows ATST off by one bit,
-the renderer decodes correctly) · `PS2X_VRAM_DUMP=<file>` (4 MiB GS memory at exit; decode with
-`tools/debug/gs_vram_ct32.py`) · `PS2X_IPU_DUMP=<dir>`, `PS2X_IPU_TRACE` · `PS2X_SPU2_TRACE` · `PS2X_LIBSD_TRACE` ·
-`PS2X_KSNG_TRACE` / `PS2X_KSNH_TRACE` (sound RPCs) · `PS2X_SIFAUDIO_TRACE` · `PS2X_MPEGAUDIO_TRACE` · `PS2X_MPEG_TRACE` ·
-`PS2X_AUDIO_DUMP=<pcm>` (s16 stereo 48 kHz) · `PS2X_MPG_TRACE` (VU1 uploads) · `PS2X_VIF1_CHAIN_TRACE` ·
-`PS2X_PAD2_TRACE` · `PS2X_RAM_DUMP_TICKS=t1,t2` (32 MiB RDRAM to `ram_<tick>.bin` in the dump dir) ·
-`PS2X_RAM_WATCH=addr:len` (logs each tick a RAM range changed) · `PS2X_ZWATCH` · `PS2X_DEBUG_ZALWAYS` (force depth pass; experiments only).
-Heavy tracing slows the IOP so audio streams starve (sounds like a beep) – judge audio untraced.
-No `perf`: use `tools/debug/gdb_sample_profile.sh`.
+### Comparing with the original (PCSX2)
+`tools/pcsx2_reference.py --out <scratch> --seconds <n> [--interval 0.5] [--keys "<sec>:<keysym>,..."]` runs the
+owner's PCSX2 headless on a private Xvfb display with a throwaway copy of the owner's config and the software renderer,
+taking F8 screenshots into `<out>/snaps` (keys: Cross=x, Start=Return, Circle=c, Square=z, Triangle=v, D-pad=arrows).
+Capture the same moment from the port and compare side by side. Screenshots are game-derived (scratch or
+`notes/evidence/` only). Never touch the owner's `~/.config/PCSX2` or send input to the real desktop.
 
-## 8. Hard-won lessons & gotchas
-- **`[patches]` in `dw5xl.toml`**: `ps2_analyzer` falsely flags ordinary stores as "Potential self-modifying code" and generates patches that NOP them. Keep `instructions` empty in `[patches]` after any re-analysis.
-- **SDK HLE stubs vs game code**: Runtime HLE stubs often have subtle bugs (e.g. `libgraph` skipped clears, `libvu0` inverted matrix multiplication order, `libvif` altered DMA tag qwc). Prefer unbinding stubs in `dw5xl.toml` so authentic game code runs, keeping only hardware-facing primitives.
-- **VIF1 DIRECT & GIF transfers**: DIRECT carries only its own payload; GIF PATH2 tag state continues IMAGE across DIRECTs.
-- **Audio & IOP timing**: IOP/SPU2 run on the host clock; EE vblank pacing repays lateness and follows PAL 50 Hz. Heavy tracing slows IOP execution enough to starve audio streams (sounds like a beep/stutter) – evaluate audio untraced.
-- **Overlays (OVL00–OVL02)**: Overlays load at 0x619000; native lifecycle, constructor execution, and indirect dispatch are handled in `app/src/dw5xl_overlays.cpp`.
-- Full investigation history and detailed root causes are recorded in `notes/BRINGUP.md`.
+### Rendering bugs: record and replay one frame
+`PS2X_GS_RECORD=<file> PS2X_GS_RECORD_FROM=<tick> PS2X_GS_RECORD_TO=<tick>` records every renderer call (starts with
+a VRAM snapshot; ~2 MB/tick in battle). `app/build/dw5xl_gsrender <rec> <cpu|vulkan> <outdir> <ticks> [--fb ...]
+[--stop-at <record>] [--probe "x,y;..." --z zbp,zpsm]` replays it; bisect with `--stop-at`.
+`dw5xl_gsrec dump <rec> --from N --count M --fields` lists the draws. Vulkan renderer fixes are runtime patches in
+`vendor/parallel-gs-patches/` (shader SPIR-V via `tools/parallel_gs_splice_shader.py`).
 
-## 9. Collaboration & Communication
-- **PS2 concepts in plain words:** Answer concisely and technically, explain PS2 concepts simply, verify claims before stating them, give clear recommendations without assuming agreement. Give short status updates during long work.
-- **Hands-on debugging:** Proactive, hands-on digging with concrete experiments – never "wait for upstream".
-- **Visual verification:** Offer visible window testing at milestones; translate playtest reports into scripted reproductions.
-- **Decision making:** Direction (native vs emulation), priorities, external downloads, and publishing require explicit confirmation. Present 2-4 options with recommendations; survey existing projects first.
-- **Multi-agent coordination:** Split independent coding/recomp tasks across parallel agents with self-contained briefs; agents do analysis/patch writing in their own worktree or scratch subfolder; one integrator applies, builds and tests; commits require explicit command.
-- Keep `notes/BRINGUP.md` updated (dated sections: cause → fix → evidence → debug switches → lesson) after each verified fix. Commit only upon explicit command. Keep `AGENTS.md`/`CLAUDE.md` current when rules or workflow change.
+### Ghidra
+- Ghidra 12.1.2 at `/opt/ghidra`. EE language `r5900:LE:32:default` (ghidra-emotionengine-reloaded); IRX modules
+  `MIPS:LE:32:default`. GhidraMCP plugin serves the active CodeBrowser tab at `http://127.0.0.1:8080/` (bridge command
+  and wheel path in `notes/PROJECT_SETUP.md`). Call `get_program_info` first: the GUI may show another program.
+- **MCP (interactive, fastest for many small lookups):** Ghidra GUI → File → Open Project `ghidra/dw5xl.gpr` →
+  double-click the program (SLES_538.60, OVL_00.BIN, LIBSD.IRX …) → CodeBrowser with GhidraMCP serves
+  `http://127.0.0.1:8080/`. Tools: get_program_info (FIRST), decompile_function_by_address, disassemble_function,
+  get_function_by_address, get_xrefs_to/from, get_function_calls, list_functions/strings/segments,
+  rename_function_by_address, set_*_comment. Limits: hardware registers (0x10000000+, 0x12000000+) and scratchpad
+  (0x70000000+) have no xrefs → use the `[mmio]` map in `dw5xl.toml`. Unreachable (GUI closed) → headless.
+- ONE source project `ghidra/dw5xl.gpr` (renames/comments go here, via GUI/MCP). Headless never runs on it: copy
+  `ghidra/dw5xl.gpr` + `ghidra/dw5xl.rep` (KOEISND: `ghidra_iop/koeisnd.*`) to your scratch dir, run
+  `analyzeHeadless <dir> dw5xl -process SLES_538.60 -noanalysis -readOnly -scriptPath tools/ghidra_scripts
+  -postScript DecompileAt.java 0xADDR ...` (also `CallersOf.java`, `DecompileAll.java <out>`), then delete the copy.
+  Output lines are prefixed `INFO  <Script>.java>`; batch addresses (30–60 s JVM start per run).
+- IOP module bases at runtime: SIO2MAN 0x10000, MCMAN 0x11000, MCSERV 0x38400, SIO2D 0x3bc00, DBCMAN 0x3ea00,
+  DS2O_D 0x43c00, LIBSD 0x46400, SDHD 0x4c100, CDVDSTM 0x4ef00, KOEISND 0x53b00 (Ghidra addresses are module-relative).
+- Overlay import (e.g. OVL_00.BIN): Raw Binary, `r5900:LE:32:default`, base 0x61A800, file offset 0 (MWo3 header
+  0x61A800–0x61A87F); no auto-analysis; then `ImportFunctionList.java` with
+  `recomp/dw5xl/overlays/ovl00/ghidra_functions.code.csv`.
+- Re-create the EE project: `analyzeHeadless ghidra dw5xl -import game/dw5xl/SLES_538.60 -overwrite -processor
+  r5900:LE:32:default -scriptPath tools/ghidra_scripts -postScript ExportPS2Functions.java <abs>/recomp/dw5xl/ghidra.toml
+  <abs>/recomp/dw5xl/ghidra_functions.csv`, then `tools/fix_ghidra_csv.py ghidra_functions.csv
+  ghidra_functions.code.csv 310CE8`.
+- Quick look at one function: the generated `recomp/dw5xl/output/*_0x<addr>.cpp` comments every instruction.
 
-## 10. Ghidra: GUI, MCP and headless
-Ghidra setup:
-- Ghidra **12.1.2** at `/opt/ghidra` (`/opt/ghidra/ghidraRun` = GUI, `/opt/ghidra/support/analyzeHeadless` = CLI).
-- User extensions in `~/.config/ghidra/ghidra_12.1.2_DEV/Extensions/`:
-  `ghidra-emotionengine-reloaded` (PS2 EE language **`r5900:LE:32:default`** – required for SLES_538.60; IOP IRX
-  modules use plain `MIPS:LE:32:default`), `GhidraMCP` (GUI plugin exposing an HTTP API).
-- Projects: `ghidra/dw5xl.gpr` (programs: SLES_538.60, plus IRX modules such as LIBSD.IRX) and `ghidra_iop/koeisnd.gpr`
-  (KOEISND.IRX). IRX addresses are module-relative; runtime IOP bases from the boot log: SIO2MAN 0x10000, MCMAN 0x11000,
-  MCSERV 0x38400, SIO2D 0x3bc00, DBCMAN 0x3ea00, DS2O_D 0x43c00, LIBSD 0x46400, SDHD 0x4c100, CDVDSTM 0x4ef00,
-  **KOEISND 0x53b00**.
-- Re-create the EE project (if lost): `analyzeHeadless ghidra dw5xl -import game/dw5xl/SLES_538.60 -overwrite
-  -processor r5900:LE:32:default -scriptPath tools/ghidra_scripts -postScript ExportPS2Functions.java
-  <abs>/recomp/dw5xl/ghidra.toml <abs>/recomp/dw5xl/ghidra_functions.csv`, then
-  `tools/fix_ghidra_csv.py ghidra_functions.csv ghidra_functions.code.csv 310CE8` (drops data past code end 0x310CE8,
-  clamps two oversized functions) → feeds `dw5xl.toml ghidra_output`.
-- Overlays (e.g. **OVL_00.BIN**, the Opening/menus) are in the same project. Import (GUI, File → Import File):
-  format **Raw Binary**, language `r5900:LE:32:default`, Options → base address **0x61A800**, **file offset 0** (the
-  `MWo3` header occupies 0x61A800-0x61A87F and code starts at 0x61A880; NOT offset 0x80). Skip auto-analysis, then run
-  `tools/ghidra_scripts/ImportFunctionList.java` (Script Manager; add `tools/ghidra_scripts` via Manage Script
-  Directories) with `recomp/dw5xl/overlays/ovl00/ghidra_functions.code.csv` (7237 functions). The MCP serves whichever
-  program's CodeBrowser tab is active: ask the owner to switch tabs and check `get_program_info` first.
-
-**MCP (interactive, fastest for many small lookups):**
-- Open the Ghidra GUI → File → Open Project (`ghidra/dw5xl.gpr`; don't use "Import" on a .gpr) →
-  double-click **SLES_538.60** in the project tree → CodeBrowser with the GhidraMCP plugin enabled → it serves
-  `http://127.0.0.1:8080/`.
-- MCP server = Python bridge, stdio:
-  `uvx --from <path to the GhidraMCP release's ghidra_mcp-2.0.0-py3-none-any.whl>
-  ghidra-mcp --ghidra-server http://127.0.0.1:8080/` (the wheel's local path is in `notes/PROJECT_SETUP.md`).
-- Tools: get_program_info (CALL FIRST – the GUI may have a different program open, e.g. LIBSD.IRX),
-  decompile_function_by_address, disassemble_function, get_function_by_address, get_xrefs_to/from,
-  get_function_calls, list_functions/strings/segments, rename_function_by_address, set_*_comment.
-- Limits: hardware registers (0x10000000+, 0x12000000+) and scratchpad (0x70000000+) have no xrefs → use the
-  `[mmio]` map in `dw5xl.toml` to find code touching a register. If the backend is unreachable (GUI closed/reboot),
-  fall back to headless.
-
-**Headless (batch, scripts, when the GUI holds the lock):**
-- ONE source project: `ghidra/dw5xl.gpr` (GUI/MCP; all renames/comments go here). Never run headless on it and never
-  treat a copy as a source. Every headless use starts from a fresh throwaway copy in the user's/agent's own scratch dir:
-  `cp -r ghidra/dw5xl.gpr ghidra/dw5xl.rep <mydir>/` (KOEISND: `ghidra_iop/koeisnd.*`), run `-readOnly` against it, then
-  delete it. Parallel agents each make their own copy.
-- `analyzeHeadless <mydir> dw5xl -process SLES_538.60 -noanalysis -readOnly -scriptPath tools/ghidra_scripts
-  -postScript <Script>.java <args>` – KOEISND: `analyzeHeadless <mydir> koeisnd -process -noanalysis -readOnly ...`.
-  Scripts: `DecompileAt.java 0xADDR...` (decompile the functions containing the addresses), `CallersOf.java 0xADDR`
-  (list callers + decompile them), `DecompileAll.java <outfile>` (whole program to one C file – great for grep, used for
-  KOEISND), `ExportPS2Functions.java <toml> <csv>`.
-- Output goes to stdout with every line prefixed `INFO  <Script>.java>`; extract with
-  `sed -n '/=== /,/REPORT: Save/p'`. Each run costs 30–60 s JVM start, so batch many addresses per run.
-- Cheap alternative for one function: the generated C++ `recomp/dw5xl/output/*_0x<addr>.cpp` contains every
-  instruction as a comment (address, word, mnemonic).
-
-## 11. How we test and open the game
-**Visible run (ask before opening visible window):** `cd game/dw5xl && PS2X_GS_BACKEND=vulkan ../../app/build/dw5xl ./SLES_538.60 > <log> 2>&1` started in
-the background; conduct manual playtesting and report; closing the window exits with code 0. Don't start test runs while a
-visible playtest or other test is active (audio overlaps). Check with `pgrep -x dw5xl`; stop with `kill <pid>`
-(never `pkill -f dw5xl` from a shell whose own command line contains that string – it kills itself).
-
-**Output scale for tests: the owner plays and tests at 1x.** `game/dw5xl/dw5xl.ini` may hold another scale from a
-quick experiment, so every hidden/perf run MUST pass `PS2X_GS_SCALE=1 PS2X_GS_SSAA=1` explicitly (and only use other
-values when the task is about 2x/4x). Check the `[output] scale=…` line at the top of each run log.
-
-**Performance / stutter regressions:** run `tools/heavy_battle_test.py` (pass/fail; scripted 3-minute heavy fight with
-Musou from the owner's Zhang Jiao save, in an off-screen gamescope window at 2560x1440@240, 1x). It fails on fields
-more than 3 ms late (`PS2X_LATE_VBLANK=1`) or VSync mean < 49.8. Never measure stutter with frame dumps on: PNG dumps
-cause 40 ms host hitches. The F3/[hud] VSync number is a >=0.5 s window and reads 48.x-51.x by aliasing even when
-pacing is perfect; use late fields instead.
-
-**Hidden scripted runs (the main loop):**
-1. Reproduce: `PS2X_GS_BACKEND=vulkan PS2X_HIDDEN=1 PS2X_HOST_INPUT="<tick>:<KEY>:<hold>,..." PS2X_DUMP_DIR=<dir> PS2X_DUMP_EVERY=<n>
-   PS2X_EXIT_TICK=<n> timeout <s> ../../app/build/dw5xl ./SLES_538.60 > run.log 2>&1` (from `game/dw5xl`; explicitly select `vulkan`).
-   Frame dumps are the presented frames (`frame_<tick>.png`, `final.png`); view them as images. Contact sheets:
-   `magick montage frame_*.png -tile 4x4 -geometry 256x179+2+2 -label '%f' sheet.png`.
-2. Timeline landmarks (ticks = vsyncs, 50/s; approximate): Koei logo 0–200, ω-Force ~300, Start at 400 skips to the main menu
-   (up by ~750); without input the intro ends ~5600 → title "PRESS START BUTTON" → idle → demo battle ~6600 (hangs).
-3. Instrument: env traces from §7, `[run:tick]` lines (pc/ra/DISPFB every 120 ticks), `[dw5xl:disp]` (display register
-   changes), `[dw5xl:movie]`, `[dw5xl:rpc]`; GS trace + VRAM dump for rendering; `PS2X_AUDIO_DUMP` + numpy/matplotlib
-   spectrogram for audio analysis.
-4. Locate code in Ghidra (MCP or headless), find the root cause, patch, `tools/regen.sh` if the toml changed, rebuild,
-   re-run the SAME script and compare frames/logs.
-5. Milestone → offer visible run testing → update BRINGUP.md. Commit only upon explicit command.
-**When unsure how the original looks or behaves, compare against PCSX2 before guessing or asking:**
-- `tools/pcsx2_reference.py --out <scratch dir> --seconds <n> [--interval 0.5] [--keys "<sec>:<keysym>,..."]` runs the
-  owner's PCSX2 (`~/Games/psx2/*.AppImage`, PAL disc in `discs/dw5xl/`) headless on a private Xvfb display with a
-  throwaway copy of the owner's PCSX2 config, and takes F8 screenshots into `<out>/snaps`. It uses PCSX2's software
-  renderer: the accurate GS reference (its Vulkan/GL renderers approximate). Keys: Cross=x, Start=Return, Circle=c,
-  Square=z, Triangle=v, D-pad=arrows. Without input the disc plays intro → title → demo → title → real-time Opening.
-- Capture the same moment from the port (`PS2X_DUMP_DIR`/`PS2X_DUMP_EVERY`) and compare contact sheets side by side.
-- Never send synthetic input to the real desktop (KDE pops a "remote control" prompt for the owner); never edit the
-  owner's `~/.config/PCSX2`. Screenshots are game-derived: scratch or `notes/evidence/` only, never git.
-- Still ask the owner when PCSX2 itself may be wrong, or for things screenshots cannot show (feel, audio timing).
-
-**Rendering bugs: record and replay one frame offline.** `PS2X_GS_RECORD=<file> PS2X_GS_RECORD_FROM=<tick>
-PS2X_GS_RECORD_TO=<tick>` records every renderer call (window starts with a VRAM snapshot; ~2 MB per tick in battle).
-`app/build/dw5xl_gsrender <rec> <cpu|vulkan> <outdir> <ticks> [--fb fbp,fbw,w,h] [--stop-at <record>]
-[--probe "x,y;..." --z zbp,zpsm]` renders it with either renderer; bisect with `--stop-at` on the Vulkan-vs-CPU
-difference to find the exact draw. `dw5xl_gsrec dump <rec> --from N --count M --fields` shows the draws.
-Vulkan renderer fixes go to `app/deps/parallel-gs` as runtime patches in `vendor/parallel-gs-patches/` (shader SPIR-V
-via `tools/parallel_gs_splice_shader.py`).
-
-- Dev-harness command file: `PS2X_CTRL=<file>` (polled ~10x/s; `press BTN ticks`, `shot <png>`, `threads <txt>`, `quit`).
-- `PS2X_HOST_INPUT` goes through the real host-input path (keyboard mapping + libpad2 bridge); `PS2X_INPUT` injects
-  guest pad masks directly.
-
-- Manual visible playtests must leave `PS2X_HOST_INPUT` and `PS2X_INPUT` unset. A nonempty host-input script disables
-  physical keyboard polling for the entire run, including after its last event.
-- Keep one game instance. The integrator closes manual playtests before builds or hidden runs; agents do scratch
-  analysis and patch preparation without shared builds or launches during active playtests.
+### Pitfalls (details in notes/BRINGUP.md and the issue work logs)
+- Keep `[patches]` in `dw5xl.toml` empty: `ps2_analyzer` falsely flags ordinary stores as self-modifying code.
+- Runtime SDK HLE stubs often differ from the real library (libgraph clears, libvu0 matrix order, libvif tags): prefer
+  unbinding them so the game's own code runs; HLE only what touches hardware.
+- VIF1 DIRECT carries only its own payload; GIF PATH2 state continues IMAGE transfers across DIRECTs.
+- VU0 macro ops are generated by `vu_translator.cpp`, separately from the (better tested) VU1 interpreter: when
+  culling/visibility looks wrong on the EE side, compare the op with the VU1 version (VCLIP bug, issue 005).
+- IOP RPC server functions run outside any IOP thread; blocking waits there need the host-wait pump (issue 004).
+- Never measure stutter with frame dumps on (PNG dumps cause 40 ms hitches); the F3/[hud] VSync figure reads 48–51
+  by aliasing even when pacing is perfect — use late fields and game FPS.
+- Lifted VU1 code must stay cycle-exact with the interpreter (Q/flag/XGKICK timing is observable by the game).
