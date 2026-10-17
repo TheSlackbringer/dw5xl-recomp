@@ -4,6 +4,9 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_device_queue.h"
 #include "vif1_capture.h"
+
+// UNPACK fast path switch (tests compare it with the general path).
+bool g_vifUnpackFastPath = true;
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -629,7 +632,42 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
+                ps2x::device::ProfileScope profile(ps2x::device::ProfilePart::VifUnpack);
                 const uint8_t *srcBase = data + pos;
+                // Fast path (issue 001) for what the game streams: V2/V3/V4-32 without
+                // mask, MODE 0, no fill cycles. Same result as the general loop below
+                // (app/tests/vif_unpack_fast_test.cpp compares both): every lane is the
+                // raw source word (V2 writes v0 v1 v0 v1; V3 reads its 4th word from the
+                // next vector, 0 past the end of the data), all four lanes written.
+                if (g_vifUnpackFastPath && vl == 0u && vn >= 1u && !maskEnable && (vif1_regs.mode & 3u) == 0u && cl >= wl)
+                {
+                    const uint32_t available = sizeBytes - pos;
+                    const uint32_t readWords = (vn == 1u) ? 2u : 4u;
+                    for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
+                    {
+                        const uint32_t destVec = (cl == wl)
+                            ? ((vuAddr + writeIndex) & 0x3FFu)
+                            : ((vuAddr + (writeIndex / wl) * cl + writeIndex % wl) & 0x3FFu);
+                        const uint32_t off = writeIndex * bytesPerVector;
+                        uint32_t words[4] = {0u, 0u, 0u, 0u};
+                        if (off + readWords * 4u <= available)
+                            std::memcpy(words, srcBase + off, readWords * 4u);
+                        else
+                            for (uint32_t c = 0; c < readWords; ++c)
+                                if (off + c * 4u + 4u <= available)
+                                    std::memcpy(&words[c], srcBase + off + c * 4u, 4u);
+                        if (vn == 1u)
+                        {
+                            words[2] = words[0];
+                            words[3] = words[1];
+                        }
+                        std::memcpy(m_vu1Data + destVec * 16u, words, sizeof(words));
+                    }
+                    pos += totalBytes;
+                    if (pos > sizeBytes)
+                        break;
+                    continue;
+                }
                 uint32_t srcIndex = 0u;
                 for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
                 {

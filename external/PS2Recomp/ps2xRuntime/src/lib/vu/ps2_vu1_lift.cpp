@@ -8,6 +8,9 @@
 #include <cfenv>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <memory>
 #include <vector>
 
 namespace vl
@@ -286,6 +289,7 @@ bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_
         // The ordered reset command clears pending pipelines next. Do not
         // interpret/replay this already partially accepted microprogram.
         m_state.cycles = m_cycle;
+        m_liftCanceled = true;
         return true;
     }
 
@@ -297,5 +301,112 @@ bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_
     m_state.haltAfterDelaySlot = false;
     m_pendingHaltD = false;
     m_pendingHaltT = false;
+    return true;
+}
+
+bool VU1Interpreter::runLiftedChecked(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
+                                      GS &gs, PS2Memory *memory)
+{
+    // PS2X_VU1_LIFT_VERIFY=1 (testing only, slow): every lifted run is
+    // repeated by the interpreter from a copy of the start state and VU
+    // memory; registers, flags, Q/P, pc, cycles, VU memory and the XGKICK
+    // packets must be identical. The game continues with the lifted result.
+    static const bool verify = []
+    {
+        const char *env = std::getenv("PS2X_VU1_LIFT_VERIFY");
+        const bool on = env && env[0] == '1';
+        if (on)
+            std::fprintf(stderr, "[vu1verify] enabled\n");
+        return on;
+    }();
+    if (!verify)
+        return runLifted(vuCode, codeSize, dataSize, memory);
+
+    static uint64_t s_runs = 0, s_mismatches = 0, s_skipped = 0;
+    auto shadow = std::make_unique<VU1Interpreter>(*this);
+    std::vector<uint8_t> shadowData(vuData, vuData + dataSize);
+    std::vector<uint8_t> liftedPackets, shadowPackets;
+    const uint32_t entryPc = m_state.pc;
+    const uint64_t entryCycle = m_cycle;
+
+    m_liftCanceled = false;
+    m_gifCapture = &liftedPackets;
+    const bool lifted = runLifted(vuCode, codeSize, dataSize, memory);
+    m_gifCapture = nullptr;
+    if (!lifted)
+        return false;
+    if (m_liftCanceled)
+    {
+        ++s_skipped;
+        return true;
+    }
+
+    shadow->m_verifyShadow = true;
+    shadow->m_gifCapture = &shadowPackets;
+    shadow->run(vuCode, codeSize, shadowData.data(), dataSize, gs, memory, std::numeric_limits<uint32_t>::max());
+    if (ps2x::device::workerShouldCancelVu1())
+    {
+        ++s_skipped;
+        return true;
+    }
+
+    ++s_runs;
+    const VU1State &a = m_state;
+    const VU1State &b = shadow->m_state;
+    char what[160] = "";
+    auto same = [](const void *x, const void *y, size_t n) { return std::memcmp(x, y, n) == 0; };
+    for (int r = 0; r < 32 && !what[0]; ++r)
+        if (!same(a.vf[r], b.vf[r], sizeof(a.vf[r])))
+            std::snprintf(what, sizeof(what), "vf%d lifted=%g,%g,%g,%g interp=%g,%g,%g,%g", r,
+                          a.vf[r][0], a.vf[r][1], a.vf[r][2], a.vf[r][3], b.vf[r][0], b.vf[r][1], b.vf[r][2], b.vf[r][3]);
+    for (int r = 0; r < 16 && !what[0]; ++r)
+        if (a.vi[r] != b.vi[r])
+            std::snprintf(what, sizeof(what), "vi%d lifted=%04x interp=%04x", r, a.vi[r] & 0xFFFF, b.vi[r] & 0xFFFF);
+    const struct { const char *name; const void *x, *y; size_t n; } fields[] = {
+        {"acc", a.acc, b.acc, sizeof(a.acc)}, {"q", &a.q, &b.q, 4}, {"p", &a.p, &b.p, 4}, {"i", &a.i, &b.i, 4},
+        {"r", &a.r, &b.r, 4}, {"pc", &a.pc, &b.pc, 4}, {"mac", &a.mac, &b.mac, 4}, {"clip", &a.clip, &b.clip, 4},
+        {"status", &a.status, &b.status, 4}, {"cycles", &a.cycles, &b.cycles, 8},
+        {"cycle", &m_cycle, &shadow->m_cycle, 8},
+        {"ebit", &a.ebit, &b.ebit, 1}, {"haltAfterDelaySlot", &a.haltAfterDelaySlot, &b.haltAfterDelaySlot, 1},
+        {"stoppedByD", &a.stoppedByD, &b.stoppedByD, 1}, {"stoppedByT", &a.stoppedByT, &b.stoppedByT, 1},
+        {"branchPending", &a.branchPending, &b.branchPending, 1},
+    };
+    for (const auto &f : fields)
+        if (!what[0] && !same(f.x, f.y, f.n))
+        {
+            uint64_t x = 0, y = 0;
+            std::memcpy(&x, f.x, f.n < 8 ? f.n : 8);
+            std::memcpy(&y, f.y, f.n < 8 ? f.n : 8);
+            std::snprintf(what, sizeof(what), "%s lifted=%llx interp=%llx", f.name,
+                          static_cast<unsigned long long>(x), static_cast<unsigned long long>(y));
+        }
+    if (!what[0] && !same(vuData, shadowData.data(), dataSize))
+    {
+        uint32_t at = 0;
+        while (vuData[at] == shadowData[at])
+            ++at;
+        std::snprintf(what, sizeof(what), "VU memory from byte 0x%04x", at);
+    }
+    if (!what[0] && liftedPackets != shadowPackets)
+        std::snprintf(what, sizeof(what), "XGKICK packets (lifted %zu bytes, interp %zu bytes)",
+                      liftedPackets.size(), shadowPackets.size());
+
+    if (what[0])
+    {
+        ++s_mismatches;
+        if (s_mismatches <= 50u)
+        {
+            uint64_t h = 1469598103934665603ull;
+            for (uint32_t n = 0; n < codeSize; ++n)
+                h = (h ^ vuCode[n]) * 1099511628211ull;
+            std::fprintf(stderr, "[vu1verify] MISMATCH hash=%016llx pc=%04x run=%llu cycles=%llu: %s\n",
+                         static_cast<unsigned long long>(h), entryPc, static_cast<unsigned long long>(s_runs),
+                         static_cast<unsigned long long>(m_cycle - entryCycle), what);
+        }
+    }
+    if ((s_runs & 0x3FFFu) == 0u || (what[0] && s_mismatches <= 50u))
+        std::fprintf(stderr, "[vu1verify] runs=%llu mismatches=%llu skipped=%llu\n",
+                     static_cast<unsigned long long>(s_runs), static_cast<unsigned long long>(s_mismatches),
+                     static_cast<unsigned long long>(s_skipped));
     return true;
 }

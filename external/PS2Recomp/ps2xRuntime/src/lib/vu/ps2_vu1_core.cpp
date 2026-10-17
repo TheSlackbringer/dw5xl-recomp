@@ -1002,6 +1002,19 @@ void VU1Interpreter::finishXgkick()
     if (!m_xgkick.active)
         return;
 
+    if (m_gifCapture)
+    {
+        const uint32_t size = m_xgkick.totalBytes;
+        const auto *sizeBytes = reinterpret_cast<const uint8_t *>(&size);
+        m_gifCapture->insert(m_gifCapture->end(), sizeBytes, sizeBytes + sizeof(size));
+        m_gifCapture->insert(m_gifCapture->end(), m_xgkick.packet.data(), m_xgkick.packet.data() + size);
+        if (m_verifyShadow)
+        {
+            m_xgkick.active = false;
+            return;
+        }
+    }
+
     // Opt-in bounded debugging only: retain exact produced packet and VU state.
     // No interpretation, rewriting or timing changes occur when disabled.
     static const char *capturePrefix = std::getenv("PS2X_XGKICK_CAPTURE");
@@ -1963,7 +1976,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_activeGs = &gs;
     m_activeMemory = memory;
 
-    if (m_unit == Unit::VU1 && census().enabled())
+    if (m_unit == Unit::VU1 && census().enabled() && !m_verifyShadow)
     {
         census().lastRunBudgetExhausted = false;
         census().lastRunAbnormalStop = false;
@@ -1972,7 +1985,34 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     // A lifted segment runs to its end; the cycle budget only bounds the
     // interpreter's time slice.
-    if (runLifted(vuCode, codeSize, dataSize, memory))
+    // PS2X_VU1_RUN_CAPTURE=<prefix> (+ _PC=<entry pc>, _FROM=<tick>, _COUNT=<n>, default 8): saves the start of
+    // VU1 runs (code, data, state) for offline benchmarks (dw5xl_vu1_lift_test benchcap). Game data: keep local.
+    static const char *s_runCapture = std::getenv("PS2X_VU1_RUN_CAPTURE");
+    if (s_runCapture && *s_runCapture && m_unit == Unit::VU1 && memory && !m_verifyShadow)
+    {
+        static const long s_capPc = std::getenv("PS2X_VU1_RUN_CAPTURE_PC") ? std::strtol(std::getenv("PS2X_VU1_RUN_CAPTURE_PC"), nullptr, 0) : -1;
+        static const uint64_t s_capFrom = std::getenv("PS2X_VU1_RUN_CAPTURE_FROM") ? std::strtoull(std::getenv("PS2X_VU1_RUN_CAPTURE_FROM"), nullptr, 0) : 0u;
+        static const uint32_t s_capCount = std::getenv("PS2X_VU1_RUN_CAPTURE_COUNT") ? static_cast<uint32_t>(std::strtoul(std::getenv("PS2X_VU1_RUN_CAPTURE_COUNT"), nullptr, 0)) : 8u;
+        static uint32_t s_captured = 0u;
+        if (s_captured < s_capCount && (s_capPc < 0 || static_cast<uint32_t>(s_capPc) == m_state.pc) &&
+            memory->gs().vsyncTick.load(std::memory_order_acquire) >= s_capFrom &&
+            !m_xgkick.active && m_nextCommitCycle == std::numeric_limits<uint64_t>::max() && m_writebackHorizon <= m_cycle)
+        {
+            const std::string stem = std::string(s_runCapture) + "." + std::to_string(s_captured++);
+            const auto dump = [&](const char *suffix, const void *bytes, size_t size)
+            {
+                if (FILE *file = std::fopen((stem + suffix).c_str(), "wb"))
+                {
+                    std::fwrite(bytes, 1u, size, file);
+                    std::fclose(file);
+                }
+            };
+            dump(".code", vuCode, codeSize);
+            dump(".data", vuData, dataSize);
+            dump(".state", &m_state, sizeof(m_state));
+        }
+    }
+    if (!m_verifyShadow && runLiftedChecked(vuCode, codeSize, vuData, dataSize, gs, memory))
     {
         if (useVuRounding && previousRoundingMode != -1)
             std::fesetround(previousRoundingMode);
@@ -2123,7 +2163,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             break;
     }
 
-    if (m_unit == Unit::VU1 && census().enabled())
+    if (m_unit == Unit::VU1 && census().enabled() && !m_verifyShadow)
     {
         census().lastRunBudgetExhausted = !programEnded && m_cycle >= budgetEnd;
         census().lastRunAbnormalStop = !programEnded && m_cycle < budgetEnd && !m_stopRequested;

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 class GS;
 class PS2Memory;
@@ -289,6 +290,12 @@ private:
     bool m_stopRequested = false;
     bool m_pendingHaltD = false;
     bool m_pendingHaltT = false;
+    // PS2X_VU1_LIFT_VERIFY=1: XGKICK packets are appended here (u32 size +
+    // bytes); the shadow interpreter of a verified run captures without
+    // submitting (see runLiftedChecked).
+    std::vector<uint8_t> *m_gifCapture = nullptr;
+    bool m_verifyShadow = false;
+    bool m_liftCanceled = false;
 
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
@@ -296,6 +303,10 @@ private:
     // Runs a lifted microprogram segment for the current pc if one is
     // registered and the pipelines are idle (ps2_vu1_lift.cpp).
     bool runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_t dataSize, PS2Memory *memory);
+    // runLifted; with PS2X_VU1_LIFT_VERIFY=1 also interprets the same run from
+    // the same start state and reports any difference.
+    bool runLiftedChecked(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
+                          GS &gs, PS2Memory *memory);
 
     InstructionUsage decodeUpperUsage(uint32_t upper) const;
     InstructionUsage decodeLowerUsage(uint32_t lower) const;

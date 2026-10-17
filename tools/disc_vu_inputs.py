@@ -334,3 +334,22 @@ IMAGE_REGISTRATIONS.extend([(11029770662716130715, 2048, 'lift_battle_calls_9911
 
 # Opening (OVL00) VU1 programs: offsets in OVL_00.BIN and hashes only.
 RANGES.extend([('dd3d1361f34c85a3', 672, 3120, 'lift_opening_dd3d_02a0', [(24, 409848, 2024, 'OVL_00.BIN'), (2048, 411880, 1080, 'OVL_00.BIN')], '851fc55e5a3239c8760e5780662fa06b1afb92d37bff2e53326a5bee82e24621'), ('4a6dbc6bbd3f1fbb', 784, 1352, 'lift_opening_4a6d_0310', [(256, 408688, 1104, 'OVL_00.BIN')], '8f20f6c648e0a0cc41317a896964e42f5cb04e4ebbea05bcace27af86315ff25'), ('4a6dbc6bbd3f1fbb', 256, 1352, 'lift_opening_4a6d_0100', [(256, 408688, 1104, 'OVL_00.BIN')], '1e763081903f202f62507d68d52d38905a53a4c3531147ae34417da246b9e012'), ('4a6dbc6bbd3f1fbb', 0, 248, 'lift_opening_4a6d_0000', [(0, 408432, 256, 'OVL_00.BIN')], '1fa7b2429eaecbc1e5a11487748ad7f1b6c3446715b39ef1440b263139b24dbc'), ('4dedc9b811a016b1', 680, 2480, 'lift_opening_4ded_02a8', [(184, 417704, 1864, 'OVL_00.BIN'), (2048, 419576, 440, 'OVL_00.BIN')], '25089d5f1079ca29292daaa4ac41732cf8e3fa68262e8631c0633df797a07fee'), ('881c2abb30cea5ce', 2352, 5944, 'lift_opening_881c_0930', [(112, 438864, 1936, 'OVL_00.BIN'), (2048, 440808, 2048, 'OVL_00.BIN'), (4096, 442864, 1856, 'OVL_00.BIN')], '7e26fcf776dae17eac7578a30be176e14a4e2fe4a772320c5ae83eef450a611c'), ('881c2abb30cea5ce', 0, 104, 'lift_opening_881c_0000', [(0, 438752, 112, 'OVL_00.BIN')], 'f25eaa23f29cffc494aefa5c9fbb8ba8aa07155dce19441b5bcdeef20b4424a4')])
+
+# Issue 001: battle programs of image 3a4f0cd1c30a3aef that were still interpreted (~27–30 ns/VU cycle);
+# located with tools/vu1_find_disc_range.py.
+RANGES.extend([
+ ('3a4f0cd1c30a3aef',
+  2048,
+  5136,
+  'lift_battle_3a4f_0800',
+  [(2048, 2269896, 2048), (4096, 2271952, 456), (4568, 2272424, 576)],
+  '89287eb97c5bfa17ee846b280bcc5a8669d6537ca851d57d69913d55d9b3d93c'),
+ ('3a4f0cd1c30a3aef',
+  9216,
+  12416,
+  'lift_battle_3a4f_2400',
+  [(9216, 2274040, 2048), (11264, 2276096, 568), (11848, 2276680, 576)],
+  '57440b64b70260c64c9798ed25c1cbb6c7a143dfe3627e39acd21faa2ee2f14d'),
+])
+IMAGE_REGISTRATIONS.extend([(4201591072419887855, 2048, 'lift_battle_3a4f_0800'),
+                            (4201591072419887855, 9216, 'lift_battle_3a4f_2400')])

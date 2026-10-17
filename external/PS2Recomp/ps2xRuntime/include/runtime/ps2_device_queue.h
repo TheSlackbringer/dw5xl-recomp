@@ -140,6 +140,23 @@ namespace ps2x::device
     // Pause NEVER cancels an already accepted MSCAL. Only hard VU1 reset does.
     bool workerShouldCancelVu1() noexcept;
 
+    // PS2X_DEVICE_PROFILE=1 (with PS2X_VU1_ASYNC_TRACE=1): device-worker time per
+    // part, printed with each [vu1-async] line. Parts nest: Transfer contains
+    // the VU1 runs it starts, a VU1 run contains its XGKICK GIF submits;
+    // VifUnpack is the UNPACK decoding inside a transfer.
+    enum class ProfilePart : uint8_t { Transfer, Vu1, GifSubmit, VifUnpack, Count };
+    bool profileEnabled() noexcept;
+    void profileAdd(ProfilePart part, uint64_t ns) noexcept;
+    struct ProfileScope
+    {
+        explicit ProfileScope(ProfilePart part) noexcept;
+        ~ProfileScope();
+        ProfileScope(const ProfileScope &) = delete;
+        ProfileScope &operator=(const ProfileScope &) = delete;
+        ProfilePart part;
+        int64_t start;
+    };
+
     // EE owner, nonblocking; false selects the existing unsupported/sync path.
     bool pauseDmaChannel(PS2Memory &mem, uint32_t channelBase, uint32_t &oldChcr);
     bool restartDmaChannel(PS2Memory &mem, uint32_t channelBase, uint32_t savedChcr, uint32_t &previousStr);

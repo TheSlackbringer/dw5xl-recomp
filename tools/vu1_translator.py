@@ -1,4 +1,4 @@
-import os, struct, sys
+import os, re, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vu1_timing
 
@@ -434,7 +434,123 @@ def timing_end(code, pc):
     lines.append("    vl::LiftAccess::tick(c, cyc);")
     return lines
 
-def translate_segment(code, entry_pc, fn_name):
+# ---- Static timing (issue 001) ---------------------------------------------
+# A region is a run of straight-line pairs (no branch, delay slot, E-bit,
+# FDIV/EFU/XGKICK wait, label after its first pair). Its stalls are computed
+# here, once; at run time a guard checks that no register produced before the
+# region delays it (the interpreter would not stall on an external operand),
+# then the pairs run at constant cycle offsets without per-pair bookkeeping.
+# If the guard fails, the unchanged per-pair code below runs instead.
+STATIC_SPECIAL_FLAGS = (vu1_timing.FLAG_FDIV | vu1_timing.FLAG_EFU | vu1_timing.FLAG_WAITQ |
+                        vu1_timing.FLAG_WAITP | vu1_timing.FLAG_XGKICK)
+STATIC_OBSERVERS = ('c.st.q', 'c.st.p', 'c.st.clip', 'c.st.mac', 'c.st.status', 'LiftAccess::', 'vl::sq',
+                    'vl::isw', 'flagsPush', 'flagsSync')
+
+def static_regions(code, blocks, targets, branch_info, branch_delay_slots):
+    special = set(branch_info) | set(branch_delay_slots)
+    for block in blocks:
+        for i, pc in enumerate(block):
+            lo, up = struct.unpack_from('<II', code, pc)
+            if (up >> 30) & 1:
+                special.add(pc)
+                if i + 1 < len(block):
+                    special.add(block[i + 1])
+            if vu1_timing.pair_timing(lo, up)['flags'] & STATIC_SPECIAL_FLAGS:
+                special.add(pc)
+    regions = []
+    for block in blocks:
+        cur = []
+        for pc in block:
+            if pc in special or (pc in targets and cur):
+                if len(cur) >= 2:
+                    regions.append(cur)
+                cur = []
+            if pc not in special:
+                cur.append(pc)
+        if len(cur) >= 2:
+            regions.append(cur)
+    return regions
+
+def simulate_region(code, region):
+    """Issue offsets, external read guards, final ready offsets and horizon of a region."""
+    local, guards, issue, hz = {}, {}, [], None
+    t = -1
+    for pc in region:
+        lo, up = struct.unpack_from('<II', code, pc)
+        tm = vu1_timing.pair_timing(lo, up)
+        k = t + 1
+        for slot in tm['reads']:
+            if slot in local:
+                k = max(k, local[slot])
+        for slot in tm['reads']:
+            if slot not in local and slot not in guards:
+                guards[slot] = k
+        for slot, lat in tm['writes']:
+            local[slot] = k + lat
+        if tm['writes']:
+            hz = max(hz or 0, k + tm['maxLat'])
+        issue.append(k)
+        t = k
+    return issue, guards, local, hz, t + 1
+
+STATIC_QUIET_OBSERVERS = ('vl::sq', 'vl::isw', 'clipAt', 'fcsetAt', 'c.st.clip', 'c.st.q', 'c.st.p', 'c.st.status')
+
+def emit_static_region(code, region, emit_one, out):
+    start = region[0]
+    issue, guards, final, hz, length = simulate_region(code, region)
+    bodies = []
+    for pc in region:
+        body = []
+        emit_one(pc, body)
+        bodies.append(body)
+    text = '\n'.join(line for body in bodies for line in body)
+    # Quiet: by the guard no result queued before the region commits before it
+    # ends, the region's FMAC flags stay in the segment's local queue, and the
+    # only results it queues in the interpreter's pipeline are clip flags. Then
+    # Q, P, MAC and status cannot change underneath it; only the clip pipeline
+    # (caught up before each CLIP/FCSET and each clip read) and PATH1 (caught up
+    # before stores and at the end) move.
+    calls = set(re.findall(r'LiftAccess::(\w+)', text))
+    quiet = calls <= {'flagsPush', 'flagsSync', 'clipAt', 'fcsetAt'}
+    # Most FMAC results in flight at once in the local flag queue: pushes in
+    # any window of kFmacLatency cycles (older ones are drained first).
+    push_at = [k for k, body in zip(issue, bodies) if any('flagsPush(' in line for line in body)]
+    window = max((sum(1 for q in push_at if k - 4 < q <= k) for k in push_at), default=0)
+    conds = [f"rdy[{slot}] <= t0 + {k}" for slot, k in sorted(guards.items(), key=lambda x: (x[1], x[0]))]
+    if quiet:
+        conds.append(f"vl::LiftAccess::quietUntil(c, t0 + {length})")
+        if window:
+            conds.append(f"vl::LiftAccess::flagRoom(fq, {window}u)")
+    out.append(f"    // static region {start:04x}-{region[-1]:04x}: {len(region)} pairs, {length} cycles"
+               f"{', quiet' if quiet else ''}")
+    out.append("    { const uint64_t t0 = cyc;")
+    out.append(f"    if ({' && '.join(conds) or 'true'}) {{")
+    out.append("    uint64_t synced = t0;")
+    for pc, k, body in zip(region, issue, bodies):
+        lo, up = struct.unpack_from('<II', code, pc)
+        t = vu1_timing.pair_timing(lo, up)
+        observers = STATIC_QUIET_OBSERVERS if quiet else STATIC_OBSERVERS
+        out.append(f"    // {pc:04x} @+{k}")
+        out.append(f"    cyc = t0 + {k};")
+        if any(o in line for line in body for o in observers):
+            out.append("    vl::LiftAccess::catchUp(c, synced, cyc);")
+        if t['firstVi'] and t['flags'] & vu1_timing.FLAG_BRANCH_DELAY:
+            out.append(f"    ov = vi[{t['firstVi']}];")
+        out.extend(body)
+        if t['firstVi'] and t['flags'] & vu1_timing.FLAG_BRANCH_DELAY:
+            out.append(f"    bbValid = true; bbReg = {t['firstVi']}; bbVal = ov;")
+        else:
+            out.append("    bbValid = false;")
+    out.append(f"    cyc = t0 + {length};")
+    if final:
+        out.append("    " + " ".join(f"rdy[{slot}] = t0 + {k};" for slot, k in sorted(final.items())))
+    if hz is not None:
+        out.append(f"    if (t0 + {hz} > hz) hz = t0 + {hz};")
+    out.append("    vl::LiftAccess::catchUp(c, synced, cyc);")
+    out.append(f"    goto rend_{start:04x};")
+    out.append("    } }")
+
+def translate_segment(code, entry_pc, fn_name, static_timing=False):
     global QUEUE_FMAC_FLAGS
     reachable = find_reachable(code, entry_pc)
     QUEUE_FMAC_FLAGS = False
@@ -535,6 +651,16 @@ def translate_segment(code, entry_pc, fn_name):
         out.append(f"    goto loc_{entry_pc:04x};")
     out.append("")
 
+    region_start, region_end = {}, {}
+    if static_timing:
+        for r in static_regions(code, blocks, targets, branch_info, branch_delay_slots):
+            region_start[r[0]] = r
+            region_end[r[-1]] = r[0]
+
+    def emit_one(rpc, body):
+        rlo, rup = struct.unpack_from('<II', code, rpc)
+        emit_pair(decode_upper(rup & 0x07ffffff), decode_lower(rlo, rpc), rlo, (rup >> 31) & 1, rpc, body)
+
     for block in blocks:
         i = 0
         while i < len(block):
@@ -548,6 +674,9 @@ def translate_segment(code, entry_pc, fn_name):
             if pc in targets:
                 out.append(f"loc_{pc:04x}:;")
                 out.append("    checkpoint();")
+
+            if pc in region_start:
+                emit_static_region(code, region_start[pc], emit_one, out)
                 
             if pc in branch_info:
                 tgt, cond = branch_info[pc]
@@ -596,6 +725,8 @@ def translate_segment(code, entry_pc, fn_name):
             out.extend(timing_begin(code, pc, timings))
             emit_pair(u, l, lo, i_bit, pc, out)
             out.extend(timing_end(code, pc))
+            if pc in region_end:
+                out.append(f"rend_{region_end[pc]:04x}:;")
             
             if e_bit:
                 i += 1
@@ -644,7 +775,20 @@ def translate_segment(code, entry_pc, fn_name):
              f"    if (!vl::LiftAccess::validate(c, kTiming, kPcs, {len(timings)}u, s_timingState, \"{fn_name}\")) {{ c.declined = true; return; }}"]
     i = out.index("@@TIMING_TABLE@@")
     out[i:i + 1] = table
-    return "\n".join(out)
+    text = "\n".join(out)
+    # Both FMAC paths are exact (identical results and flags). Programs that queue
+    # their MAC/status flags use the inlined per-lane fast path (vl::fmac). The
+    # very large programs that keep only their last flags call it out of line
+    # (vl::fmacOutOfLine): inlined there it was ~37 % slower (register pressure),
+    # called ~18 % faster than the exact path (issue 001 work.md, M12).
+    if not QUEUE_FMAC_FLAGS:
+        text = re.sub(r'\bfmac<', 'fmacOutOfLine<', text)
+    return text
+
+def static_enabled(name):
+    # DW5XL_VU1_STATIC: 'all' (default), 'none', or a comma list of segments.
+    sel = os.environ.get('DW5XL_VU1_STATIC', 'all')
+    return sel == 'all' or name in sel.split(',')
 
 if __name__ == '__main__':
     def load(path):
@@ -696,6 +840,8 @@ if __name__ == '__main__':
         ('3a4f0cd1c30a3aef', 0x04b0, 0x05f0, 'lift_battle_clip_04b0'),
         ('da28291ffe0b3334', 0x0060, 0x00f0, 'lift_battle_init_0060'),
         ('87e0189b1bc04e8e', 0x0028, 0x00f0, 'lift_battle_init_0028'),
+        ('3a4f0cd1c30a3aef', 0x0800, 0x1410, 'lift_battle_3a4f_0800'),
+        ('3a4f0cd1c30a3aef', 0x2400, 0x3080, 'lift_battle_3a4f_2400'),
     ]
 
     out = []
@@ -861,7 +1007,7 @@ inline V vuItofV(V a, float scale)
             missing = [p for p in find_reachable(code, pc) if not all(covered[h][p:p+8]) or len(covered[h][p:p+8]) != 8]
             if missing:
                 raise ValueError(f'Unextracted reachable instructions in {name}: {missing}')
-        out.append(translate_segment(code, pc, name))
+        out.append(translate_segment(code, pc, name, static_timing=static_enabled(name)))
         start_field = f", 0x{sub_start:04x}u" if sub_start != pc else ""
         regs.append(f"    {{ 0x{sub_hash:016x}ull, 0x{pc:04x}, {name}, {sub_size}u{start_field} }},")
 

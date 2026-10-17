@@ -418,6 +418,45 @@ namespace vl
             }
         }
 
+        // Static-timing regions issue their pairs at constant cycle offsets
+        // and skip the per-pair tick. Before anything that can observe the
+        // interpreter's pipelines (flag/Q reads and pushes, stores read by
+        // PATH1) and at the region's end, this applies the cycle boundaries
+        // (synced, target] exactly as the skipped ticks and stalls would have:
+        // due commits, then one cycle of PATH1 each.
+        static void catchUp(Run &c, uint64_t &synced, uint64_t target)
+        {
+            VU1Interpreter &v = vu(c);
+            if (target > synced && (v.m_xgkick.active || target >= v.m_nextCommitCycle))
+            {
+                v.m_cycle = synced;
+                advance(v, target);
+            }
+            synced = target;
+        }
+
+        // A quiet region may start: no queued MAC/status/sticky flag result or
+        // store commits before `end`. Clip, Q and P results may: the region
+        // catches up before every CLIP/FCSET and every clip, Q, P or status
+        // read, and their commits touch only clip/Q/P and status bits disjoint
+        // from the FMAC flag bits the region's local flag queue updates.
+        static bool quietUntil(Run &c, uint64_t end)
+        {
+            const VU1Interpreter &v = vu(c);
+            if (v.m_nextCommitCycle > end)
+                return true;
+            for (uint32_t bits = v.m_storeMask; bits != 0u; bits &= bits - 1u)
+                if (v.m_storePipeline[static_cast<uint32_t>(__builtin_ctz(bits))].readyCycle <= end)
+                    return false;
+            for (uint32_t bits = v.m_flagMask; bits != 0u; bits &= bits - 1u)
+            {
+                const VU1Interpreter::FlagPipelineEntry &e = v.m_flagPipeline[static_cast<uint32_t>(__builtin_ctz(bits))];
+                if (e.readyCycle <= end && (e.writesMac || e.writesStatus || e.writesSticky))
+                    return false;
+            }
+            return true;
+        }
+
         static void clipAt(Run &c, uint64_t cyc, uint32_t flags) { vu(c).m_cycle = cyc; vu(c).queueClip(flags); }
         static void fcsetAt(Run &c, uint64_t cyc, uint32_t value) { vu(c).m_cycle = cyc; vu(c).queueFcset(value); }
         static void queueQAt(Run &c, uint64_t cyc, float value, uint32_t latency, uint32_t statusDi)
@@ -479,6 +518,14 @@ namespace vl
                 v.m_flagMask &= ~(1u << first);
                 taken &= ~(1u << first);
             }
+        }
+
+        // The local queue never fills during a region whose pushes have at
+        // most `window` results in flight at once (each push first drains the
+        // results that are due), so nothing is handed back to the interpreter.
+        static bool flagRoom(const FlagQueue &q, uint32_t window)
+        {
+            return q.local && q.tail - q.head + window <= FlagQueue::kSize;
         }
 
         static void flagsSync(Run &c, FlagQueue &q, uint64_t cyc)
@@ -718,8 +765,9 @@ namespace vl
 
     // An FMAC upper op with normalized operands: the result lanes, and the
     // MAC/status/sticky flags the op commits (applyFmacDest + updateFmacFlags).
+    // Exact reference path: classifies the exact result in double precision.
     template <FmacOp Op, int Dest>
-    inline V fmac(V a, V b, V acc, Flags &fl)
+    inline V fmacExact(V a, V b, V acc, Flags &fl)
     {
         constexpr int laneMask = ((Dest & 8) ? 1 : 0) | ((Dest & 4) ? 2 : 0) | ((Dest & 2) ? 4 : 0) | ((Dest & 1) ? 8 : 0);
         V r;
@@ -804,6 +852,100 @@ namespace vl
         fl.pending = true;
         return r;
     }
+
+    // FMAC with a per-lane fast path that is exact by construction (issue 001).
+    // A lane is "fast" when its exact flags and value follow from the float
+    // result r alone; the op uses fmacExact unless every destination lane is.
+    // Normal means FLT_MIN < |x| < FLT_MAX (strict, so it holds whether r was
+    // rounded toward zero, as in a VU1 run, or to nearest):
+    //  - ADD/SUB: exact zero iff a == -b (ADD) / a == b (SUB); r is then the
+    //    same signed zero the exact path produces. Otherwise r must be normal:
+    //    then the exact sum is nonzero, normal, not FLT_MAX, with r's sign.
+    //  - MUL: exact zero iff a or b is +-0 (r is that signed zero), else r
+    //    normal as above.
+    //  - MADD/MSUB, q = float a*b:
+    //      a or b zero: the product is an exact +-0, so r = acc +- 0 is exact:
+    //        fast if r is normal, or r and acc are zero (a signed exact zero);
+    //      acc zero: r = +-q, one rounding of the exact product: fast if r and
+    //        q are normal;
+    //      otherwise: q normal, 2*FLT_MIN < |r| < FLT_MAX/2 and |r| >= |q|*2^-20
+    //        (both roundings together err by less than |r|/8, so the exact sum
+    //        has r's sign and stays normal).
+    //    The product's sticky class is then known too: zero where a or b is
+    //    zero, sign = sign(a) ^ sign(b), never underflow/overflow (q normal).
+    // app/tests/vu1_fmac_fast_test.cpp checks both paths agree bit for bit.
+    template <FmacOp Op, int Dest>
+    inline V fmac(V a, V b, V acc, Flags &fl)
+    {
+        constexpr int laneMask = ((Dest & 8) ? 1 : 0) | ((Dest & 4) ? 2 : 0) | ((Dest & 2) ? 4 : 0) | ((Dest & 1) ? 8 : 0);
+        if constexpr (laneMask == 0)
+            return fmacExact<Op, Dest>(a, b, acc, fl);
+        const __m128i absMask = _mm_set1_epi32(0x7FFFFFFF);
+        const V zero = _mm_setzero_ps();
+        const auto absBits = [&](V x) { return _mm_and_si128(_mm_castps_si128(x), absMask); };
+        const auto inRange = [](__m128i x, int32_t lo, int32_t hi)
+        { return _mm_and_si128(_mm_cmpgt_epi32(x, _mm_set1_epi32(lo)), _mm_cmplt_epi32(x, _mm_set1_epi32(hi))); };
+        const auto normal = [&](V x) { return inRange(absBits(x), 0x00800000, 0x7F7FFFFF); };
+        V r;
+        __m128i ok;
+        int productSticky = 0;
+        if constexpr (Op == Add || Op == Sub || Op == Mul)
+        {
+            V exactZero;
+            if constexpr (Op == Add)
+            {
+                r = _mm_add_ps(a, b);
+                exactZero = _mm_cmpeq_ps(a, _mm_sub_ps(zero, b));
+            }
+            else if constexpr (Op == Sub)
+            {
+                r = _mm_sub_ps(a, b);
+                exactZero = _mm_cmpeq_ps(a, b);
+            }
+            else
+            {
+                r = _mm_mul_ps(a, b);
+                exactZero = _mm_or_ps(_mm_cmpeq_ps(a, zero), _mm_cmpeq_ps(b, zero));
+            }
+            ok = _mm_or_si128(_mm_castps_si128(exactZero), normal(r));
+        }
+        else
+        {
+            const V q = _mm_mul_ps(a, b);
+            r = Op == MAdd ? _mm_add_ps(acc, q) : _mm_sub_ps(acc, q);
+            const __m128i zeroP = _mm_castps_si128(_mm_or_ps(_mm_cmpeq_ps(a, zero), _mm_cmpeq_ps(b, zero)));
+            const __m128i zeroAcc = _mm_castps_si128(_mm_cmpeq_ps(acc, zero));
+            const __m128i zeroR = _mm_castps_si128(_mm_cmpeq_ps(r, zero));
+            const __m128i rNormal = normal(r), qNormal = normal(q);
+            const __m128i strict = _mm_and_si128(inRange(absBits(r), 0x01000000, 0x7F000000),
+                _mm_castps_si128(_mm_cmpge_ps(_mm_mul_ps(_mm_castsi128_ps(absBits(r)), _mm_set1_ps(1048576.0f)),
+                                              _mm_castsi128_ps(absBits(q)))));
+            const __m128i withZeroProduct = _mm_and_si128(zeroP, _mm_or_si128(rNormal, _mm_and_si128(zeroAcc, zeroR)));
+            const __m128i withProduct = _mm_andnot_si128(zeroP,
+                _mm_and_si128(qNormal, _mm_or_si128(_mm_and_si128(zeroAcc, rNormal), _mm_andnot_si128(zeroAcc, strict))));
+            ok = _mm_or_si128(withZeroProduct, withProduct);
+            const int pz = _mm_movemask_ps(_mm_castsi128_ps(zeroP)) & laneMask;
+            const int ps = _mm_movemask_ps(_mm_xor_ps(a, b)) & laneMask;
+            productSticky = (pz ? 1 : 0) | (ps ? 2 : 0);
+        }
+        if ((_mm_movemask_ps(_mm_castsi128_ps(ok)) & laneMask) != laneMask)
+            return fmacExact<Op, Dest>(a, b, acc, fl);
+        const int z = _mm_movemask_ps(_mm_cmpeq_ps(r, zero)) & laneMask;
+        const int s = _mm_movemask_ps(r) & laneMask;
+        fl.mac = macNibble(z) | (macNibble(s) << 4);
+        fl.cur = (z ? 1u : 0u) | (s ? 2u : 0u);
+        fl.sticky |= (fl.cur | static_cast<uint32_t>(productSticky)) << 6;
+        fl.extra = static_cast<uint32_t>(productSticky);
+        fl.pending = true;
+        return r;
+    }
+
+    // fmac kept out of line. Inlined into the very large segments that keep only
+    // their last flags (e.g. actor skinning) the fast path made them ~37 % slower
+    // (register pressure); called, it is ~18 % faster there than fmacExact
+    // (issue 001 work.md, M12).
+    template <FmacOp Op, int Dest>
+    [[gnu::noinline]] V fmacOutOfLine(V a, V b, V acc, Flags &fl) { return fmac<Op, Dest>(a, b, acc, fl); }
 
     inline V vmax(V a, V b) { return _mm_max_ps(a, b); }
     inline V vmin(V a, V b) { return _mm_min_ps(a, b); }

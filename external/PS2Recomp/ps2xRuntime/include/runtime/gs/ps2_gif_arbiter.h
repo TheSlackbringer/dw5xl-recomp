@@ -46,15 +46,33 @@ public:
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
     void drain();
+    // Between beginBatch() and endBatch() (one device transfer, on the calling
+    // thread) drained packets collect in an outbox, in exactly the order the
+    // per-packet drains produce, and reach the GS worker in groups instead of
+    // one lock/wake-up per packet. endBatch(), waitIdle() on that thread and
+    // every kOutboxBatch packets hand them over. Nesting is allowed.
+    void beginBatch();
+    void endBatch();
     // Blocks until every packet handed to the GS has been processed (no-op inline).
     void waitIdle();
     // Drop only input not yet emitted; completed GS draws remain intact.
     void reset();
-    bool empty() const { return m_queue.empty(); }
+    bool empty() const { return m_queue.empty() && m_outbox.empty(); }
 
 private:
     ProcessPacketFn m_processFn;
     std::vector<GifArbiterPacket> m_queue;
+    // Packet buffers are reused instead of allocated per packet: processed
+    // buffers go to m_returned (worker, under m_workerMutex; inline drain
+    // directly), drain() swaps them into m_spare, submit() takes from m_spare.
+    std::vector<std::vector<uint8_t>> m_spare;
+    static constexpr size_t kOutboxBatch = 32u;
+    std::vector<GifArbiterPacket> m_outbox;
+    int m_batchDepth = 0;
+    std::thread::id m_batchThread;
+    void flushOutbox();
+    std::vector<std::vector<uint8_t>> m_returned;
+    void recycle(std::vector<std::vector<uint8_t>> &pool, std::vector<uint8_t> &&buffer);
 
     // GS worker: FIFO of arbitrated packets.
     std::thread m_worker;

@@ -1296,6 +1296,7 @@ bool PS2Runtime::syncCoreSubsystems()
         }
         m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
         m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
+        ps2x::device::ProfileScope profile(ps2x::device::ProfilePart::Vu1);
         if (resume)
         {
             m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,

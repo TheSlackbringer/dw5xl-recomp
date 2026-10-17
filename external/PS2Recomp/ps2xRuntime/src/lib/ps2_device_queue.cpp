@@ -74,6 +74,7 @@ namespace ps2x::device
 
         thread_local Command *t_workerCommand = nullptr;
         thread_local int t_executingDepth = 0;
+        std::array<std::atomic<uint64_t>, static_cast<size_t>(ProfilePart::Count)> g_profileNs{};
 
         struct ExecutingScope
         {
@@ -509,6 +510,14 @@ namespace ps2x::device
 
             void executeTransfer(Command &command)
             {
+                ProfileScope profile(ProfilePart::Transfer);
+                // GIF packets of this transfer reach the GS worker in groups (same order).
+                struct GifBatch
+                {
+                    GifArbiter *arbiter;
+                    explicit GifBatch(GifArbiter *a) : arbiter(a) { if (arbiter) arbiter->beginBatch(); }
+                    ~GifBatch() { if (arbiter) arbiter->endBatch(); }
+                } gifBatch(mem.m_gifArbiter);
                 bool gifFinished = true, vifFinished = true;
                 for (size_t i = 0; i < command.transfer.gifChunks.size(); ++i)
                 {
@@ -783,6 +792,18 @@ namespace ps2x::device
                              static_cast<unsigned long long>(applied.load(std::memory_order_relaxed) - traceAppliedMark),
                              static_cast<unsigned long long>(statBusyNs.load(std::memory_order_relaxed) - traceBusyMark),
                              static_cast<unsigned long long>(statIdleNs.load(std::memory_order_relaxed) - traceIdleMark));
+                if (profileEnabled())
+                {
+                    std::array<uint64_t, static_cast<size_t>(ProfilePart::Count)> now{};
+                    for (size_t i = 0; i < now.size(); ++i)
+                        now[i] = g_profileNs[i].load(std::memory_order_relaxed);
+                    std::fprintf(stderr, " profTransferUs=%llu profVu1Us=%llu profGifSubmitUs=%llu profVifUnpackUs=%llu",
+                                 static_cast<unsigned long long>((now[0] - traceProfileMark[0]) / 1000u),
+                                 static_cast<unsigned long long>((now[1] - traceProfileMark[1]) / 1000u),
+                                 static_cast<unsigned long long>((now[2] - traceProfileMark[2]) / 1000u),
+                                 static_cast<unsigned long long>((now[3] - traceProfileMark[3]) / 1000u));
+                    traceProfileMark = now;
+                }
                 for (size_t i = 0; i < reasonStats.size(); ++i)
                 {
                     const auto &s = reasonStats[i];
@@ -836,6 +857,7 @@ namespace ps2x::device
             uint64_t traceAppliedMark = 0u;
             uint64_t traceBusyMark = 0u;
             uint64_t traceIdleMark = 0u;
+            std::array<uint64_t, static_cast<size_t>(ProfilePart::Count)> traceProfileMark{};
         };
 
         // Small lock-free lookup table: PS2Memory -> device. Attach/detach are
@@ -1051,6 +1073,33 @@ namespace ps2x::device
         if (t_workerCommand && t_workerCommand->device &&
             (t_workerCommand->kind == Command::Kind::Transfer || t_workerCommand->kind == Command::Kind::Resume))
             t_workerCommand->device->checkpoint(*t_workerCommand, consumedBytes);
+    }
+
+    bool profileEnabled() noexcept
+    {
+        static const bool enabled = []
+        {
+            const char *env = std::getenv("PS2X_DEVICE_PROFILE");
+            return env && env[0] == '1';
+        }();
+        return enabled;
+    }
+
+    void profileAdd(ProfilePart part, uint64_t ns) noexcept
+    {
+        g_profileNs[static_cast<size_t>(part)].fetch_add(ns, std::memory_order_relaxed);
+    }
+
+    ProfileScope::ProfileScope(ProfilePart p) noexcept
+        : part(p), start(profileEnabled() && t_executingDepth != 0
+                             ? std::chrono::steady_clock::now().time_since_epoch().count() : -1)
+    {
+    }
+
+    ProfileScope::~ProfileScope()
+    {
+        if (start >= 0)
+            profileAdd(part, static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count() - start));
     }
 
     bool workerShouldCancelVu1() noexcept
