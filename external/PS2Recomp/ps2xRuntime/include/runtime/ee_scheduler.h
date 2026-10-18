@@ -340,6 +340,7 @@ public:
     void dispatchIrq(bool dmac, uint32_t cause);
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
+    void stepVSyncTicksForTesting(uint64_t ticks = 1) noexcept;
     uint64_t waitForNextPresentationField(uint64_t &lastTick) const;
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 

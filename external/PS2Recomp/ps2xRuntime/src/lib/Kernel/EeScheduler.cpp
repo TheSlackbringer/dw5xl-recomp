@@ -1495,6 +1495,11 @@ uint64_t EeScheduler::currentVSyncTick() const noexcept
     return m_vsyncTick.load(std::memory_order_acquire);
 }
 
+void EeScheduler::stepVSyncTicksForTesting(uint64_t ticks) noexcept
+{
+    m_vsyncTick.fetch_add(ticks, std::memory_order_acq_rel);
+}
+
 uint64_t EeScheduler::waitForNextPresentationField(uint64_t &lastTick) const
 {
     // The host window shows each guest field once: wait for the next VBlankEnd (or one field period, so the

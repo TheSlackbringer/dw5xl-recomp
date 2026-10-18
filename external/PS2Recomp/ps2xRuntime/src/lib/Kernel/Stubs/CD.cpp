@@ -10,8 +10,11 @@ namespace ps2_stubs
         constexpr uint32_t kCdStreamBlocking = 1u;
         constexpr uint32_t kDvdSectorsPerSecondX1 = 675u;
         constexpr uint32_t kDvdSectorsPerSecondX4 = kDvdSectorsPerSecondX1 * 4u;
-        constexpr uint64_t kNtScFieldsPerSecondNumerator = 60000u;
-        constexpr uint64_t kNtScFieldsPerSecondDenominator = 1001u;
+        // Field clock as a fraction: NTSC 60000/1001 Hz, PAL 50/1 Hz.
+        constexpr uint64_t kNtscFieldsPerSecondNumerator = 60000u;
+        constexpr uint64_t kNtscFieldsPerSecondDenominator = 1001u;
+        constexpr uint64_t kPalFieldsPerSecondNumerator = 50u;
+        constexpr uint64_t kPalFieldsPerSecondDenominator = 1u;
 
         struct CdStreamTimingState
         {
@@ -55,6 +58,22 @@ namespace ps2_stubs
         uint64_t currentCdStreamTick(PS2Runtime *runtime)
         {
             return runtime != nullptr ? runtime->eeScheduler().currentVSyncTick() : 0u;
+        }
+
+        struct FieldRate
+        {
+            uint64_t numerator;
+            uint64_t denominator;
+        };
+
+        // The stream clock counts VSync ticks, so convert with the game's actual field rate.
+        FieldRate cdStreamFieldRate(PS2Runtime *runtime)
+        {
+            if (runtime != nullptr && runtime->eeScheduler().palVideoMode())
+            {
+                return {kPalFieldsPerSecondNumerator, kPalFieldsPerSecondDenominator};
+            }
+            return {kNtscFieldsPerSecondNumerator, kNtscFieldsPerSecondDenominator};
         }
 
         uint32_t dvdStreamSectorsPerSecond(uint8_t spindleControl)
@@ -109,11 +128,12 @@ namespace ps2_stubs
             const uint64_t elapsedTicks = tick - g_cdStreamTiming.lastVSyncTick;
             g_cdStreamTiming.lastVSyncTick = tick;
 
-            // 59.94 Hz field clock: sectors = fields * sectors/s * 1001 / 60000.
-            const uint64_t unitsPerTick = static_cast<uint64_t>(g_cdStreamTiming.sectorsPerSecond) * kNtScFieldsPerSecondDenominator;
+            // sectors = fields * sectors/s / (fields/s), with fields/s = numerator / denominator.
+            const FieldRate rate = cdStreamFieldRate(runtime);
+            const uint64_t unitsPerTick = static_cast<uint64_t>(g_cdStreamTiming.sectorsPerSecond) * rate.denominator;
             const uint64_t accumulated = g_cdStreamTiming.productionRemainder + elapsedTicks * unitsPerTick;
-            const uint64_t elapsedProduction = accumulated / kNtScFieldsPerSecondNumerator;
-            g_cdStreamTiming.productionRemainder = accumulated % kNtScFieldsPerSecondNumerator;
+            const uint64_t elapsedProduction = accumulated / rate.numerator;
+            g_cdStreamTiming.productionRemainder = accumulated % rate.numerator;
             if (elapsedProduction == 0u)
             {
                 return;
@@ -173,11 +193,12 @@ namespace ps2_stubs
                 return now;
             }
 
-            const uint64_t requiredUnits = static_cast<uint64_t>(sectorsNeeded) * kNtScFieldsPerSecondNumerator;
+            const FieldRate rate = cdStreamFieldRate(runtime);
+            const uint64_t requiredUnits = static_cast<uint64_t>(sectorsNeeded) * rate.numerator;
             const uint64_t remainingUnits = requiredUnits > g_cdStreamTiming.productionRemainder
                                                 ? requiredUnits - g_cdStreamTiming.productionRemainder
                                                 : 0u;
-            const uint64_t unitsPerTick = static_cast<uint64_t>(g_cdStreamTiming.sectorsPerSecond) * kNtScFieldsPerSecondDenominator;
+            const uint64_t unitsPerTick = static_cast<uint64_t>(g_cdStreamTiming.sectorsPerSecond) * rate.denominator;
             const uint64_t ticks = std::max<uint64_t>(1u, (remainingUnits + unitsPerTick - 1u) / unitsPerTick);
             return now + ticks;
         }
