@@ -190,6 +190,59 @@ namespace
         }
     }
 
+// Direct interpreter oracle in addition to the fast/exact shared-helper checks.
+uint64_t interpreterChecked = 0, interpreterFailures = 0;
+
+template <ps2_vu0::Fmac Op, int Dest, bool ToAcc>
+void checkFmacInterpreter(PS2Runtime &rt, R5900Context &ctx)
+{
+    constexpr uint32_t nop = 0x000002FFu, lowerNop = 0x8000033Cu;
+    constexpr uint32_t op = Op == ps2_vu0::Add ? 0x28u : Op == ps2_vu0::Sub ? 0x2Cu :
+                            Op == ps2_vu0::Mul ? 0x2Au : Op == ps2_vu0::MAdd ? 0x29u : 0x2Du;
+    constexpr uint32_t upper = (Dest << 21) | (2u << 16) | (1u << 11) |
+        (ToAcc ? ((op >> 2) << 6) | 0x3Cu | (op & 3u) : (7u << 6) | op);
+    uint32_t program[16];
+    for (int n = 0; n < 8; ++n) { program[2*n] = lowerNop; program[2*n+1] = nop; }
+    program[1] = upper;
+    program[13] |= 0x40000000u; // six intervening cycles let MAC/status commit before ending
+    auto *code = rt.memory().getVU1Code();
+    std::memcpy(code, program, sizeof(program));
+    auto &vu = rt.vu1();
+    for (int n = 0; n < 100; ++n)
+    {
+        const V a = randomVector(), b = randomVector(), acc = randomVector(), old = randomVector();
+        const uint16_t status = static_cast<uint16_t>(rng() & 0xFFFu);
+        auto &st = vu.state();
+        st = VU1State{};
+        st.vf[0][3] = 1.0f;
+        std::memcpy(st.vf[1], &a, 16); std::memcpy(st.vf[2], &b, 16);
+        std::memcpy(st.vf[7], &old, 16); std::memcpy(st.acc, &acc, 16);
+        st.status = status; st.mac = 0xDEADu;
+        vl::setEnabledOverride(0);
+        vu.execute(code, 16384, rt.memory().getVU1Data(), 16384, rt.gs(), nullptr, 0, 0, 0, 1000);
+        vl::setEnabledOverride(-1);
+        ctx.vu0_vf[7] = old; ctx.vu0_acc = acc;
+        ctx.vu0_status = status; ctx.vu0_mac_flags = 0xDEADu;
+        if constexpr (ToAcc) ps2_vu0::toAcc<Op, Dest>(&ctx, a, b);
+        else ps2_vu0::toVf<Op, Dest>(&ctx, 7, a, b);
+        ++interpreterChecked;
+        if (std::memcmp(&ctx.vu0_vf[7], st.vf[7], 16) || std::memcmp(&ctx.vu0_acc, st.acc, 16) ||
+            ctx.vu0_mac_flags != st.mac || ctx.vu0_status != st.status)
+        {
+            if (++interpreterFailures <= 8)
+                std::fprintf(stderr, "interpreter FMAC op=%d dest=%d acc=%d MAC=%x/%x status=%x/%x\n",
+                    int(Op), Dest, int(ToAcc), ctx.vu0_mac_flags, st.mac, ctx.vu0_status, st.status);
+        }
+    }
+}
+
+template <ps2_vu0::Fmac Op, int... Dest>
+void checkInterpreterOp(PS2Runtime &rt, R5900Context &ctx, std::integer_sequence<int, Dest...>)
+{
+    (checkFmacInterpreter<Op, Dest + 1, false>(rt, ctx), ...);
+    (checkFmacInterpreter<Op, Dest + 1, true>(rt, ctx), ...);
+}
+
 int main()
 {
     auto ctx = std::make_unique<R5900Context>();
@@ -207,6 +260,11 @@ int main()
             return 2;
         // Both x87 and SSE: VU1Interpreter::execute saves/restores with fegetround (x87 on glibc).
         std::fesetround(FE_TOWARDZERO);
+        checkInterpreterOp<ps2_vu0::Add>(rt, *ctx, dests);
+        checkInterpreterOp<ps2_vu0::Sub>(rt, *ctx, dests);
+        checkInterpreterOp<ps2_vu0::Mul>(rt, *ctx, dests);
+        checkInterpreterOp<ps2_vu0::MAdd>(rt, *ctx, dests);
+        checkInterpreterOp<ps2_vu0::MSub>(rt, *ctx, dests);
         for (int i = 0; i < 20000; ++i)
         {
             const float fs = fromBits(randomBits()), ft = fromBits(randomBits());
@@ -231,5 +289,7 @@ int main()
     std::printf("vu0 macro fmac: %llu checks, %llu value mismatches, %llu flag mismatches\n",
                 static_cast<unsigned long long>(checked), static_cast<unsigned long long>(valueFailures),
                 static_cast<unsigned long long>(flagFailures));
-    return valueFailures == 0 && flagFailures == 0 && fdivFailures == 0 && ftoiFailures == 0 ? 0 : 1;
+    std::printf("vu0 macro direct interpreter: %llu checks, %llu mismatches\n",
+                static_cast<unsigned long long>(interpreterChecked), static_cast<unsigned long long>(interpreterFailures));
+    return interpreterFailures == 0 && valueFailures == 0 && flagFailures == 0 && fdivFailures == 0 && ftoiFailures == 0 ? 0 : 1;
 }

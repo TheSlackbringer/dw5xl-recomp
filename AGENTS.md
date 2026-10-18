@@ -53,6 +53,10 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
 - **Performance changes must give identical output** (same frames, same sound). Test at **1x**: every run passes
   `PS2X_GS_SCALE=1 PS2X_GS_SSAA=1` and you check the `[output] scale=1x` log line.
 - **GPU renderer only** (Vulkan/paraLLEl-GS) for development and tests; no CPU-renderer work unless asked.
+- **The port is not specific to the owner's hardware.** Keep fixes portable across supported hardware and the
+  planned Linux/Windows targets. The owner's CPU/GPU are test equipment, not product requirements. Label
+  performance measurements with their test hardware; do not generalize one machine's timings or introduce
+  machine-specific fixes. Correctness is defined by PS2 behaviour. (Owner reminder, 2026-10-18.)
 - **The owner's desktop is off limits:** never send synthetic input to it, never screenshot it (use frame dumps),
   never unlock it, never edit `~/.config/PCSX2`. Visible windows only for an owner test session or when asked.
 - **One game at a time;** no builds or test runs while the owner has a window open. Tests use the silent sink
