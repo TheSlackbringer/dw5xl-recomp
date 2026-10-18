@@ -68,6 +68,7 @@ struct VulkanGsScanoutState
     // Guards lastFrame between finishVulkanGsPresent (no device lock) and reset() (device lock held).
     std::mutex frameMutex;
     PresentationFrame lastFrame{};
+    bool hasPresentedFrame = false;
     // Opt-in observation only. Does not select slots or alter fence handling.
     struct Metrics
     {
@@ -96,6 +97,7 @@ struct VulkanGsScanoutState
         {
             std::lock_guard<std::mutex> lock(frameMutex);
             lastFrame = {};
+            hasPresentedFrame = false;
         }
         metrics = {};
     }
@@ -108,10 +110,16 @@ struct VulkanGsScanoutState
 void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
                      VulkanGsScanoutState &state,
                      const GSPresentationRequest &request,
-                     uint32_t outputScale = 1);
+                     uint32_t outputScale = 1,
+                     bool flushBeforeVsync = true);
 
 // Caller has released the device lock. Copies the reads staged by presentVulkanGs, in order, into
-// state.lastFrame (with the field weave) and returns the frame to show.
+// outFrame (with the field weave), reusing outFrame.pixels capacity. Returns true if outFrame was updated.
+bool finishVulkanGsPresentInto(Vulkan::Device &device, VulkanGsScanoutState &state,
+                               std::vector<VulkanGsScanoutState::StagedRead> &reads,
+                               ReusableFieldWeaver *weaver,
+                               PresentationFrame &outFrame);
+
 PresentationFrame finishVulkanGsPresent(Vulkan::Device &device, VulkanGsScanoutState &state,
                                         std::vector<VulkanGsScanoutState::StagedRead> &reads,
                                         ReusableFieldWeaver *weaver = nullptr);

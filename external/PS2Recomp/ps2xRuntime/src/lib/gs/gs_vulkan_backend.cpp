@@ -57,6 +57,7 @@ struct GSVulkanBackend::Impl
     std::vector<uint8_t> fifo;
     size_t fifoRead = 0;
     bool initialized = false;
+    bool dirty = false;
     uint64_t draws = 0;
     uint64_t gpuPresentations = 0, convertedPresentations = 0;
     std::atomic<uint32_t> currentScale{1};
@@ -82,6 +83,14 @@ struct GSVulkanBackend::Impl
     {
         return std::min(requestedSamples * minSamplesFor(scale), maxAASamples());
     }
+    void flushIfDirty()
+    {
+        if (dirty)
+        {
+            gs.flush();
+            dirty = false;
+        }
+    }
     // Caller holds access(). Retire pending readbacks before resetting
     // geometry/history; slots own image and fence until the copy completes.
     void applyOutput(uint32_t scale)
@@ -91,6 +100,7 @@ struct GSVulkanBackend::Impl
             samples == aaSamples.load(std::memory_order_relaxed))
             return;
         gs.flush();
+        dirty = false;
         for (auto &slot : scanoutState.slots)
             if (slot.pending && slot.fence) slot.fence->wait();
         scanoutState.reset();
@@ -112,7 +122,10 @@ struct GSVulkanBackend::Impl
             Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT))
             throw std::runtime_error("Vulkan device creation failed");
         device.set_context(context);
-        device.init_frame_contexts(4);
+        // Keep enough Granite PerFrame contexts that a multi-flush field + 3-slot
+        // async readback ring never wraps and blocks inside per_frame->begin() while
+        // holding the GS device mutex.
+        device.init_frame_contexts(16);
 
         ParallelGS::GSOptions opts{};
         opts.dynamic_super_sampling = true;
@@ -169,6 +182,7 @@ struct GSVulkanBackend::Impl
             gs.write_register(id, bits);
             state[index] = bits;
             valid[index] = true;
+            dirty = true;
         }
     }
     void readSnapshot()
@@ -176,6 +190,7 @@ struct GSVulkanBackend::Impl
         const void *mapped = gs.map_vram_read(0, vramBytes);
         if (!mapped) throw std::runtime_error("Vulkan GS VRAM readback failed");
         std::memcpy(snapshot.data(), mapped, vramBytes);
+        dirty = false;
     }
     void submit(const GSPrimitiveBatch &b)
     {
@@ -238,6 +253,7 @@ struct GSVulkanBackend::Impl
             std::memcpy(packet.data(), &tag, 8);
             std::memcpy(packet.data() + 16, data, bytes);
             gs.gif_transfer(2, packet.data(), packet.size());
+            dirty = true;
             count -= bytes; data += bytes;
         }
     }
@@ -257,12 +273,14 @@ void GSVulkanBackend::Initialize(uint8_t *vram, uint32_t size)
     m_impl->transfer = {}; m_impl->uploadedBytes = 0;
     m_impl->uploadTail.clear(); m_impl->fifo.clear(); m_impl->fifoRead = 0;
     m_impl->transferState = {}; m_impl->transferState.direction = 3;
+    m_impl->dirty = true;
     m_impl->initialized = true;
 }
 void GSVulkanBackend::Reset()
 {
     auto lock = m_impl->access();
     m_impl->gs.flush(); m_impl->gs.reset_context_state(); m_impl->valid.fill(false);
+    m_impl->dirty = false;
     m_impl->scanoutState.reset();
     m_impl->transferState = {}; m_impl->transferState.direction = 3;
     m_impl->fifo.clear(); m_impl->fifoRead = 0; m_impl->uploadTail.clear();
@@ -316,11 +334,11 @@ void GSVulkanBackend::UploadImage(const uint8_t *data, uint32_t bytes)
     p.transferState.y = p.transfer.trxpos.dsay + position / p.transfer.trxreg.rrw;
     if (complete) { p.transferState.direction = 3; p.transferState.totalPixels = 0; }
 }
-void GSVulkanBackend::Flush() { auto lock = m_impl->access(); m_impl->gs.flush(); }
+void GSVulkanBackend::Flush() { auto lock = m_impl->access(); m_impl->flushIfDirty(); }
 void GSVulkanBackend::TextureFlush() { auto lock = m_impl->access(); m_impl->reg(Reg::TEXFLUSH, 0, true); }
 void GSVulkanBackend::Sync(GSSyncReason reason)
 {
-    auto lock = m_impl->access(); m_impl->gs.flush();
+    auto lock = m_impl->access(); m_impl->flushIfDirty();
     if (reason == GSSyncReason::Reset) m_impl->device.wait_idle();
 }
 void GSVulkanBackend::SnapshotVram(std::vector<uint8_t> &out) const
@@ -337,6 +355,7 @@ void GSVulkanBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32
     p.scanout.WriteVram(psm, base, bw, x, y, value);
     auto *mapped = p.gs.map_vram_write(0, vramBytes); std::memcpy(mapped, p.snapshot.data(), vramBytes);
     p.gs.end_vram_write(0, vramBytes);
+    p.dirty = true;
 }
 GSTransferSnapshot GSVulkanBackend::GetTransferSnapshot() const
 {
@@ -365,16 +384,18 @@ bool GSVulkanBackend::ClearFramebuffer(const GSContext &c, uint32_t rgba)
         v.b = uint8_t(rgba >> 16); v.a = uint8_t(rgba >> 24); }
     Submit(b); return true;
 }
-PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
+bool GSVulkanBackend::PresentInto(const GSPresentationRequest &request, PresentationFrame &out)
 {
     auto lock = m_impl->access(); auto &p = *m_impl;
-    PresentationFrame result;
     bool gpuScanout = false;
+    bool updated = false;
     // The previous presentation's copied reads release their buffers here, under the device lock.
     p.scanoutState.retired.clear();
     try
     {
-        presentVulkanGs(p.gs, p.device, p.scanoutState, request, p.currentScale.load(std::memory_order_relaxed));
+        presentVulkanGs(p.gs, p.device, p.scanoutState, request,
+                        p.currentScale.load(std::memory_order_relaxed), p.dirty);
+        p.dirty = false;
         gpuScanout = true;
         ++p.gpuPresentations;
     }
@@ -383,10 +404,12 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
         // Preserve the fixed host viewport contract for display modes outside
         // the bounded GPU scanout bridge (native size). Rasterization remains Vulkan.
         std::fprintf(stderr, "[gs:vulkan] CPU display conversion: %s\n", error.what());
-        p.readSnapshot(); result = p.scanout.PresentFromLocalMemory(request, &p.fieldWeaver);
+        p.readSnapshot();
+        out = p.scanout.PresentFromLocalMemory(request, &p.fieldWeaver);
+        updated = static_cast<bool>(out);
         ++p.convertedPresentations;
+        p.device.next_frame_context();
     }
-    p.device.next_frame_context();
     const char *stats = std::getenv("PS2X_STATS");
     if (stats && *stats && *stats != '0' && (p.gpuPresentations + p.convertedPresentations) % 300u == 0)
         std::fprintf(stderr, "[gs:vulkan] draws=%llu GPU scanouts=%llu CPU display conversions=%llu\n",
@@ -398,12 +421,24 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
     p.scanoutState.staged.clear();
     lock.unlock();
     if (gpuScanout)
-        result = finishVulkanGsPresent(p.device, p.scanoutState, reads, &p.fieldWeaver);
+    {
+        updated = finishVulkanGsPresentInto(p.device, p.scanoutState, reads, &p.fieldWeaver, out);
+    }
     else if (!reads.empty())
-        finishVulkanGsPresent(p.device, p.scanoutState, reads, &p.fieldWeaver);
+    {
+        PresentationFrame discarded;
+        finishVulkanGsPresentInto(p.device, p.scanoutState, reads, &p.fieldWeaver, discarded);
+    }
     lock.lock();
     p.scanoutState.retired = std::move(reads);
-    return result;
+    return updated;
+}
+PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
+{
+    auto &p = *m_impl;
+    PresentInto(request, p.scanoutState.lastFrame);
+    std::lock_guard<std::mutex> lock(p.scanoutState.frameMutex);
+    return p.scanoutState.lastFrame;
 }
 
 void GSVulkanBackend::SetResolutionScale(uint32_t scale)

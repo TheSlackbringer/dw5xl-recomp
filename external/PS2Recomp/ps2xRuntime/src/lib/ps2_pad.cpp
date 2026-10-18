@@ -215,8 +215,8 @@ namespace ps2_host_input
 
     void poll(uint64_t vsyncTick)
     {
-        if (!IsWindowReady()) return;
         initScript();
+        if (!IsWindowReady() && !gScripted) return;
         bool verdite, gameplay, captured;
         {
             std::lock_guard<std::mutex> lock(gMutex);
@@ -224,12 +224,12 @@ namespace ps2_host_input
             gameplay = gState.gameplay;
             captured = gState.captured;
         }
-        const bool focused = gScripted || IsWindowFocused();
-        const double now = GetTime();
+        const bool focused = gScripted || (IsWindowReady() && IsWindowFocused());
+        const double now = IsWindowReady() ? GetTime() : 0.0;
         uint16_t pressed = 0;
         std::array<uint8_t, 4> sticks{128, 128, 128, 128};
         auto key = [&](int code, const char *name) {
-            return focused && (gScripted ? scriptedDown(name, vsyncTick) : IsKeyDown(code));
+            return focused && (gScripted ? scriptedDown(name, vsyncTick) : (IsWindowReady() && IsKeyDown(code)));
         };
         auto bind = [&](bool down, uint16_t mask) { if (down) pressed |= mask; };
         bind(key(KEY_UP, "UP") || key(KEY_W, "W"), PAD_UP);

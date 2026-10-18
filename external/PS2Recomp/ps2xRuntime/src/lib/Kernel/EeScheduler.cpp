@@ -191,7 +191,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     }
     m_eventSequence = 0;
     m_invocationSequence = 0;
-    m_vsyncTick = 0;
+    m_vsyncTick.store(0u, std::memory_order_release);
+    m_presentationTick.store(0u, std::memory_order_release);
     m_palVideoMode.store(false, std::memory_order_relaxed);
     m_vsyncFlagAddress = 0;
     m_vsyncTickAddress = 0;
@@ -463,6 +464,7 @@ void EeScheduler::requestStop()
     m_stopRequested.store(true, std::memory_order_release);
     m_checkpointPending.store(true, std::memory_order_release);
     m_eventCv.notify_all();
+    m_presentationCv.notify_all();
 }
 
 void EeScheduler::postEvent(EeEvent event)
@@ -1490,7 +1492,27 @@ void EeScheduler::setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress)
 
 uint64_t EeScheduler::currentVSyncTick() const noexcept
 {
-    return m_vsyncTick;
+    return m_vsyncTick.load(std::memory_order_acquire);
+}
+
+uint64_t EeScheduler::waitForNextPresentationField(uint64_t &lastTick) const
+{
+    // The host window shows each guest field once: wait for the next VBlankEnd (or one field period, so the
+    // window stays responsive while the game is stalled).
+    uint64_t cur = m_presentationTick.load(std::memory_order_acquire);
+    if (cur <= lastTick)
+    {
+        std::unique_lock lock(m_presentationMutex);
+        m_presentationCv.wait_for(lock, vblankPeriod(palVideoMode()), [this, lastTick]()
+                                  { return m_presentationTick.load(std::memory_order_acquire) > lastTick ||
+                                           m_stopRequested.load(std::memory_order_acquire); });
+        cur = m_presentationTick.load(std::memory_order_acquire);
+    }
+    if (cur > lastTick)
+    {
+        lastTick = cur;
+    }
+    return cur != 0u ? cur : m_vsyncTick.load(std::memory_order_acquire);
 }
 
 uint32_t EeScheduler::setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp)
@@ -2189,6 +2211,11 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankEnd:
         dispatchIrq(false, 3u);
+        {
+            std::lock_guard lock(m_presentationMutex);
+            m_presentationTick.store(m_vsyncTick.load(std::memory_order_relaxed), std::memory_order_release);
+        }
+        m_presentationCv.notify_all();
         break;
     case EeEventType::Dmac:
         break;

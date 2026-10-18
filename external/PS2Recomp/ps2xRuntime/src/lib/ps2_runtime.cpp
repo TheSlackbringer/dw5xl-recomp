@@ -933,12 +933,24 @@ static void applySavedOutputSettings(GS &gs)
 } // namespace
 
 
-// The texture grows to the largest presented image (2x output); smaller frames
+static int configuredHostTargetFps()
+{
+    if (const char *env = std::getenv("PS2X_HOST_FPS"))
+    {
+        const int fps = std::atoi(env);
+        if (fps > 0)
+            return fps;
+    }
+    return 0;
+}
+
+// The texture grows to the largest presented image (4x output); smaller frames
 // occupy its top-left corner. Display dimensions keep the logical aspect ratio.
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight,
                         uint32_t &outDisplayWidth, uint32_t &outDisplayHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
+    static uint64_t s_lastUploadedGeneration = 0u;
     static bool s_hasLatchedInitialFrame = false;
     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
     static uint32_t s_lastSourceFbp = std::numeric_limits<uint32_t>::max();
@@ -948,8 +960,6 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static uint32_t s_lastDisplayWidth = 0u;
     static uint32_t s_lastDisplayHeight = 0u;
     static bool s_hasUploadedFrame = false;
-    static std::vector<uint8_t> s_scratch;
-    static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
@@ -959,7 +969,9 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
-    else if (s_hasUploadedFrame)
+
+    const uint64_t generation = rt->gs().hostPresentationGeneration();
+    if (s_hasUploadedFrame && (!needsLatch || generation == s_lastUploadedGeneration))
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
@@ -968,7 +980,6 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         return;
     }
 
-    s_scratch.clear();
     uint32_t width = 0u;
     uint32_t height = 0u;
     uint32_t displayFbp = 0u;
@@ -976,7 +987,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     bool usedPreferredDisplaySource = false;
     uint32_t displayWidth = 0u;
     uint32_t displayHeight = 0u;
-    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch,
+    if (!rt->gs().copyLatchedHostPresentationFrame(ps2x_dev::s_lastFrame,
                                                    width,
                                                    height,
                                                    &displayFbp,
@@ -1022,14 +1033,13 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastDisplayFbp = displayFbp;
     s_lastSourceFbp = sourceFbp;
     s_lastPreferred = usedPreferredDisplaySource;
-    s_lastWidth = width;
-    s_lastHeight = height;
-    s_lastDisplayWidth = displayWidth ? displayWidth : width;
-    s_lastDisplayHeight = displayHeight ? displayHeight : height;
+    s_lastUploadedGeneration = generation;
 
     // 4x output is at most four times the native framebuffer in each direction.
-    const uint32_t texWidth = std::max<uint32_t>(FB_WIDTH, std::min<uint32_t>(width, FB_WIDTH * 4u));
-    const uint32_t texHeight = std::max<uint32_t>(FB_HEIGHT, std::min<uint32_t>(height, FB_HEIGHT * 4u));
+    const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH * 4u);
+    const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT * 4u);
+    const uint32_t texWidth = std::max<uint32_t>(FB_WIDTH, copyWidth);
+    const uint32_t texHeight = std::max<uint32_t>(FB_HEIGHT, copyHeight);
     if (texWidth != static_cast<uint32_t>(tex.width) || texHeight != static_cast<uint32_t>(tex.height))
     {
         UnloadTexture(tex);
@@ -1037,11 +1047,15 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         tex = LoadTextureFromImage(blank);
         UnloadImage(blank);
     }
-    s_uploadBuffer.assign(static_cast<size_t>(texWidth) * texHeight * 4u, 0u);
-    if (!s_scratch.empty() && width != 0u && height != 0u)
+
+    if (width == texWidth && height == texHeight)
     {
-        const uint32_t copyWidth = std::min<uint32_t>(width, texWidth);
-        const uint32_t copyHeight = std::min<uint32_t>(height, texHeight);
+        UpdateTexture(tex, ps2x_dev::s_lastFrame.data());
+    }
+    else
+    {
+        static std::vector<uint8_t> s_paddedUploadBuffer;
+        s_paddedUploadBuffer.assign(static_cast<size_t>(texWidth) * texHeight * 4u, 0u);
         const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
         const size_t dstRowBytes = static_cast<size_t>(texWidth) * 4u;
         const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
@@ -1049,22 +1063,26 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         {
             const size_t srcOffset = static_cast<size_t>(y) * srcRowBytes;
             const size_t dstOffset = static_cast<size_t>(y) * dstRowBytes;
-            if (srcOffset + copyRowBytes > s_scratch.size() ||
-                dstOffset + copyRowBytes > s_uploadBuffer.size())
+            if (srcOffset + copyRowBytes > ps2x_dev::s_lastFrame.size() ||
+                dstOffset + copyRowBytes > s_paddedUploadBuffer.size())
             {
                 break;
             }
-            std::memcpy(s_uploadBuffer.data() + dstOffset, s_scratch.data() + srcOffset, copyRowBytes);
+            std::memcpy(s_paddedUploadBuffer.data() + dstOffset, ps2x_dev::s_lastFrame.data() + srcOffset, copyRowBytes);
         }
+        UpdateTexture(tex, s_paddedUploadBuffer.data());
+        ps2x_dev::s_lastFrame.swap(s_paddedUploadBuffer);
     }
 
-    UpdateTexture(tex, s_uploadBuffer.data());
-    ps2x_dev::s_lastFrame.assign(s_uploadBuffer.begin(), s_uploadBuffer.end());
-    ps2x_dev::s_lastFrameW = std::min<uint32_t>(width, texWidth);
-    ps2x_dev::s_lastFrameH = std::min<uint32_t>(height, texHeight);
+    ps2x_dev::s_lastFrameW = copyWidth;
+    ps2x_dev::s_lastFrameH = copyHeight;
     ps2x_dev::s_lastFrameRows = texHeight;
-    outWidth = std::min<uint32_t>(width, texWidth);
-    outHeight = std::min<uint32_t>(height, texHeight);
+    s_lastWidth = copyWidth;
+    s_lastHeight = copyHeight;
+    s_lastDisplayWidth = displayWidth ? displayWidth : copyWidth;
+    s_lastDisplayHeight = displayHeight ? displayHeight : copyHeight;
+    outWidth = copyWidth;
+    outHeight = copyHeight;
     outDisplayWidth = s_lastDisplayWidth;
     outDisplayHeight = s_lastDisplayHeight;
     s_hasUploadedFrame = true;
@@ -1411,7 +1429,7 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         m_audioBackend.startPcmStream();
 #endif
-        SetTargetFPS(60);
+        SetTargetFPS(configuredHostTargetFps());
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -3219,11 +3237,17 @@ void PS2Runtime::run()
         gameThreadFinished.store(true, std::memory_order_release); });
 
     uint64_t tick = 0;
+    const int hostFpsOverride = configuredHostTargetFps();
+    uint64_t lastPresentationField = 0;
     ps2x_dev::Harness devHarness;
     devHarness.runtime = this;
     devHarness.init();
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        if (hostFpsOverride == 0 && m_eeScheduler)
+        {
+            m_eeScheduler->waitForNextPresentationField(lastPresentationField);
+        }
         m_audioBackend.updatePcmStream();
         devHarness.step(m_eeScheduler->currentVSyncTick());
         ps2_host_input::poll(m_eeScheduler->currentVSyncTick());
@@ -3328,7 +3352,7 @@ void PS2Runtime::run()
         // own emission times (so a steady 50 reads 50.0, not 49/51 from where the window falls). FPS = the
         // game's frame rate over the same span: fields in which it finished a frame (ps2x::device::gameFrameCount)
         // or, during movies, the pictures the movie decoder handed to the game (its frame syncs do not always
-        // have device work), whichever is higher. The host window loop itself is capped at 60 and is not shown.
+        // have device work), whichever is higher. The host window loop itself is paced by VBlankEnd (50 Hz) and is not shown.
         static auto s_lastFpsTime = std::chrono::steady_clock::now();
         static uint64_t s_lastVsyncTick = 0;
         static int64_t s_lastVsyncNs = 0;

@@ -59,7 +59,8 @@ bool noWeave()
 void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
                      VulkanGsScanoutState &state,
                      const GSPresentationRequest &request,
-                     uint32_t outputScale)
+                     uint32_t outputScale,
+                     bool flushBeforeVsync)
 {
     using namespace ParallelGS;
     using namespace Vulkan;
@@ -130,7 +131,8 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     // Native output averages every anti-aliasing sample into each pixel.
     info.resolve_super_samples = true;
 
-    gs.flush();
+    if (flushBeforeVsync)
+        gs.flush();
     auto output = gs.vsync(info);
     if (!output.image) throw std::runtime_error("ParallelGS GPU scanout returned no image");
     const auto width = output.image->get_width();
@@ -282,7 +284,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     state.ringIndex = (state.ringIndex + 1u) % 3u;
 
     // For synchronous mode or initial startup frame: wait immediately
-    if (s_sync || (!state.lastFrame && state.staged.empty()))
+    if (s_sync || (!state.hasPresentedFrame && !state.lastFrame && state.staged.empty()))
     {
         if (curSlot.fence)
             curSlot.fence->wait();
@@ -332,14 +334,28 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     }
 }
 
-PresentationFrame finishVulkanGsPresent(Vulkan::Device &device, VulkanGsScanoutState &state,
-                                        std::vector<VulkanGsScanoutState::StagedRead> &reads,
-                                        ReusableFieldWeaver *weaver)
+bool finishVulkanGsPresentInto(Vulkan::Device &device, VulkanGsScanoutState &state,
+                               std::vector<VulkanGsScanoutState::StagedRead> &reads,
+                               ReusableFieldWeaver *weaver,
+                               PresentationFrame &frame)
 {
+    if (reads.empty())
+        return false;
+
     std::lock_guard<std::mutex> lock(state.frameMutex);
-    auto &frame = state.lastFrame;
-    for (auto &read : reads)
+    // In high-resolution mode, paraLLEl-GS already reconstructs field-aware vertical samples on the GPU
+    // and ReusableFieldWeaver runs in Progressive mode (a no-op on the pixel buffer). If multiple readbacks
+    // completed together, earlier high-res reads would be immediately overwritten by the final read.
+    const bool skipSupersededHighRes = reads.size() > 1u && reads.back().highResolution;
+    for (size_t r = 0; r < reads.size(); ++r)
     {
+        auto &read = reads[r];
+        if (skipSupersededHighRes && r + 1u < reads.size())
+        {
+            device.unmap_host_buffer(*read.buf, Vulkan::MEMORY_ACCESS_READ_BIT);
+            continue;
+        }
+
         frame.width = read.w;
         frame.height = read.h;
         frame.displayFbp = read.displayFbp;
@@ -352,12 +368,21 @@ PresentationFrame finishVulkanGsPresent(Vulkan::Device &device, VulkanGsScanoutS
         const size_t pixelCount = static_cast<size_t>(read.w) * read.h;
         frame.pixels.resize(pixelCount * 4u);
         uint8_t *dst = frame.pixels.data();
-        for (size_t i = 0; i < pixelCount; ++i)
+        const size_t pairCount = pixelCount / 2u;
+        for (size_t i = 0; i < pairCount; ++i)
         {
+            uint64_t rgba2;
+            std::memcpy(&rgba2, read.mapped + i * 8u, sizeof(rgba2));
+            rgba2 |= 0xFF000000FF000000ULL;
+            std::memcpy(dst + i * 8u, &rgba2, sizeof(rgba2));
+        }
+        if (pixelCount & 1u)
+        {
+            const size_t last = pixelCount - 1u;
             uint32_t rgba;
-            std::memcpy(&rgba, read.mapped + i * 4u, sizeof(rgba));
+            std::memcpy(&rgba, read.mapped + last * 4u, sizeof(rgba));
             rgba |= 0xFF000000u;
-            std::memcpy(dst + i * 4u, &rgba, sizeof(rgba));
+            std::memcpy(dst + last * 4u, &rgba, sizeof(rgba));
         }
         device.unmap_host_buffer(*read.buf, Vulkan::MEMORY_ACCESS_READ_BIT);
 
@@ -381,6 +406,16 @@ PresentationFrame finishVulkanGsPresent(Vulkan::Device &device, VulkanGsScanoutS
             }
         }
     }
-    return frame;
+    state.hasPresentedFrame = static_cast<bool>(frame);
+    return true;
+}
+
+PresentationFrame finishVulkanGsPresent(Vulkan::Device &device, VulkanGsScanoutState &state,
+                                        std::vector<VulkanGsScanoutState::StagedRead> &reads,
+                                        ReusableFieldWeaver *weaver)
+{
+    finishVulkanGsPresentInto(device, state, reads, weaver, state.lastFrame);
+    std::lock_guard<std::mutex> lock(state.frameMutex);
+    return state.lastFrame;
 }
 

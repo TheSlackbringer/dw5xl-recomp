@@ -182,6 +182,7 @@ void GS::reset()
     }
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+        m_latchedFrame = {};
         m_hostPresentationFrame.clear();
         m_hostPresentationWidth = 0u;
         m_hostPresentationHeight = 0u;
@@ -190,6 +191,7 @@ void GS::reset()
         m_hostPresentationSourceFbp = 0u;
         m_hostPresentationUsedPreferred = false;
         m_hasHostPresentationFrame = false;
+        m_hostPresentationGeneration = 0u;
     }
 
     m_debugHistoryWrite = 0;
@@ -557,35 +559,39 @@ void GS::latchHostPresentationFrame()
         request = buildPresentationRequestUnlocked();
     }
 
-    PresentationFrame frame{};
+    bool updated = false;
     {
         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
         if (m_backend)
         {
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Presentation);
-            frame = m_backend->Present(request);
+            updated = m_backend->PresentInto(request, m_latchedFrame);
         }
     }
 
-    const bool hasFrame = static_cast<bool>(frame);
-    const uint32_t displayFbp = frame.displayFbp;
-    const uint32_t sourceFbp = frame.sourceFbp;
-    const uint32_t width = frame.width;
-    const uint32_t height = frame.height;
-    const bool usedPreferred = frame.usedPreferred;
+    if (!updated)
+        return;
+
+    const bool hasFrame = static_cast<bool>(m_latchedFrame);
+    const uint32_t displayFbp = m_latchedFrame.displayFbp;
+    const uint32_t sourceFbp = m_latchedFrame.sourceFbp;
+    const uint32_t width = m_latchedFrame.width;
+    const uint32_t height = m_latchedFrame.height;
+    const bool usedPreferred = m_latchedFrame.usedPreferred;
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
-        m_hostPresentationFrame = std::move(frame.pixels);
+        m_hostPresentationFrame.swap(m_latchedFrame.pixels);
         m_hostPresentationWidth = width;
         m_hostPresentationHeight = height;
-        m_hostPresentationStride = frame.strideBytes ? frame.strideBytes : kHostFrameWidth * 4u;
-        m_hostDisplayWidth = frame.displayWidth ? frame.displayWidth : width;
-        m_hostDisplayHeight = frame.displayHeight ? frame.displayHeight : height;
+        m_hostPresentationStride = m_latchedFrame.strideBytes ? m_latchedFrame.strideBytes : kHostFrameWidth * 4u;
+        m_hostDisplayWidth = m_latchedFrame.displayWidth ? m_latchedFrame.displayWidth : width;
+        m_hostDisplayHeight = m_latchedFrame.displayHeight ? m_latchedFrame.displayHeight : height;
         m_hostPresentationDisplayFbp = displayFbp;
         m_hostPresentationSourceFbp = sourceFbp;
         m_hostPresentationUsedPreferred = usedPreferred;
         m_hasHostPresentationFrame = hasFrame;
+        ++m_hostPresentationGeneration;
     }
 
     if (hasFrame)
@@ -593,6 +599,12 @@ void GS::latchHostPresentationFrame()
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
         recordPresentDebugEventUnlocked(displayFbp, sourceFbp, width, height, usedPreferred);
     }
+}
+
+uint64_t GS::hostPresentationGeneration() const
+{
+    std::lock_guard<std::mutex> lock(m_presentationMutex);
+    return m_hostPresentationGeneration;
 }
 
 bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,

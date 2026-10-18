@@ -13,14 +13,14 @@ A native PC port of **Dynasty Warriors 5: Xtreme Legends** for the PlayStation 2
 | --- | --- |
 | Boot and menus | Boot, title screen, Options and mode selection work. |
 | Input | Keyboard and gamepad input work. |
-| Audio and movies | Intro and selected event movies play with audio; menu music and sound effects work. |
-| Saves | Saving and loading have been confirmed in manual testing. |
-| Legend Mode | Scenario selection, briefing and preparation render; battles run with movement and attacks in current tests. |
-| Other modes | Edit Mode works. Destiny, Challenge and Xtreme reach battle, but need further gameplay testing after the shared battle fixes. |
-| Load Original | Local original-disc validation and the original prompts are implemented; broader mode testing remains. |
-| Opening | Reaches real-time 3D scenes, with outstanding visual defects. |
+| Audio and movies | Intro and event movies play with audio; menu music, battle BGM, voice lines, and sound effects play throughout menus and battles. |
+| Saves | Saving and loading work (`mc0/`). |
+| Legend Mode | Scenario selection, briefing, and preparation render; battles run at 50 FPS with full movement, combat, Musou, and crowd rendering at native resolution. |
+| Other modes | Edit Mode works. Destiny, Challenge, and Xtreme Modes reach battle, with further mode testing ongoing. |
+| Load Original | Original disc verification works; Musou and Free Modes unlock when the original DW5 files are present. |
+| Opening | Real-time 3D intro plays with 3D character models, silhouettes, background scenes, and synchronized audio. |
 
-Rendering defects and combat performance drops remain under investigation. These results describe tested scenes, not a complete playthrough or a guarantee that every mode works.
+Extended session stability and higher-resolution scaling performance remain in active development. These results describe tested scenes, not a complete playthrough or a guarantee that every mode works.
 
 ## Supported discs
 
@@ -103,6 +103,8 @@ PS2X_GS_BACKEND=vulkan ../../app/build/dw5xl ./SLES_538.60
 
 Saves are stored in `game/dw5xl/mc0/`. Keep that directory when updating your build.
 
+### Controls
+
 | Keyboard | PS2 input |
 | --- | --- |
 | Enter / Tab | Start / Select |
@@ -112,7 +114,18 @@ Saves are stored in `game/dw5xl/mc0/`. Keep that directory when updating your bu
 | Q / E | L1 / R1 |
 | Left Shift / Right Shift | L2 / R2 |
 
-Gamepads are also supported. Press **F3** to toggle the FPS counter, or start with `PS2X_FPS=1`. Optional supersampling is controlled by `PS2X_GS_SCALE=1|2|4|8|16`; start at `1` when testing performance.
+Gamepads are also supported.
+
+### Function keys and display
+
+| Key | Description |
+| --- | --- |
+| **F2** | Toggle build ID and game tick HUD overlay (useful for bug reports and log alignment). |
+| **F3** | Toggle real game FPS, VSync rate, resolution scale, and AA sample HUD counter. |
+| **F4** | Cycle internal resolution scale live ($1\times \to 2\times \to 4\times$) and persist to `dw5xl.ini`. |
+| **F5** | Cycle anti-aliasing sample multiplier ($1\times \to 2\times \to 4\times \to 8\times \to 16\times$) and persist to `dw5xl.ini`. |
+
+You can also pass environment variables on startup: `PS2X_FPS=1` enables the F3 overlay by default, `PS2X_GS_SCALE=1|2|4` sets the startup resolution scale, and `PS2X_GS_SSAA=1|2|4|8|16` sets the anti-aliasing sample count (defaults can be kept at `1` when profiling performance).
 
 ## Development
 
@@ -129,7 +142,7 @@ Fixes live in handwritten app/runtime code, recompiler profiles and generation t
 
 Game data, analysis databases, generated main/overlay output, builds and local research notes are excluded from Git. Contributor and coding-agent workflows are described in `AGENTS.md` and `CLAUDE.md`.
 
-Current priorities are rendering correctness, combat performance, broader gameplay testing, and preparing the native importer and Linux/Windows release packaging.
+Current priorities are long-session stability, higher-resolution performance pacing, broader gameplay testing, and preparing the native importer and Linux/Windows release packaging.
 
 ## License and attribution
 

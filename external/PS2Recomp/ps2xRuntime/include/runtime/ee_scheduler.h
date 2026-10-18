@@ -340,6 +340,7 @@ public:
     void dispatchIrq(bool dmac, uint32_t cause);
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
+    uint64_t waitForNextPresentationField(uint64_t &lastTick) const;
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
@@ -456,7 +457,10 @@ private:
     std::deque<GuestInvocation> m_pendingInvocations;
     uint64_t m_eventSequence = 0;
     uint64_t m_invocationSequence = 0;
-    uint64_t m_vsyncTick = 0;
+    std::atomic<uint64_t> m_vsyncTick{0};
+    std::atomic<uint64_t> m_presentationTick{0};
+    mutable std::mutex m_presentationMutex;
+    mutable std::condition_variable m_presentationCv;
     std::atomic<bool> m_palVideoMode{false};
     uint32_t m_vsyncFlagAddress = 0;
     uint32_t m_vsyncTickAddress = 0;

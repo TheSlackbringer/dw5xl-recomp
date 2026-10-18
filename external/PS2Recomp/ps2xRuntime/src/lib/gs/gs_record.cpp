@@ -131,43 +131,52 @@ namespace
             m_inner->Sync(reason);
         }
 
-        PresentationFrame Present(const GSPresentationRequest &request) override
+        void recordPresent(const GSPresentationRequest &request)
         {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            // The PS2X_GS_RECORD_FROM/TO window opens and closes on presentation ticks.
+            if (!m_active && !m_closed && request.vsyncTick >= m_fromTick)
             {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                // The PS2X_GS_RECORD_FROM/TO window opens and closes on presentation ticks.
-                if (!m_active && !m_closed && request.vsyncTick >= m_fromTick)
+                m_active = true;
+                // A windowed recording starts from the current VRAM so it can be replayed.
+                if (m_fromTick != 0u)
                 {
-                    m_active = true;
-                    // A windowed recording starts from the current VRAM so it can be replayed.
-                    if (m_fromTick != 0u)
+                    std::vector<uint8_t> vram;
+                    m_inner->SnapshotVram(vram);
+                    if (begin(Op::Initialize))
                     {
-                        std::vector<uint8_t> vram;
-                        m_inner->SnapshotVram(vram);
-                        if (begin(Op::Initialize))
-                        {
-                            const uint32_t size = static_cast<uint32_t>(vram.size());
-                            put(size);
-                            put(GSRecord::fnv1a(vram.data(), size));
-                            m_writer.bytes(vram.data(), size);
-                            end();
-                        }
+                        const uint32_t size = static_cast<uint32_t>(vram.size());
+                        put(size);
+                        put(GSRecord::fnv1a(vram.data(), size));
+                        m_writer.bytes(vram.data(), size);
+                        end();
                     }
                 }
-                if (begin(Op::Present))
-                {
-                    put(request);
-                    end();
-                    std::fflush(m_file); // keep the file usable if the process exits abruptly
-                }
-                if (m_active && request.vsyncTick >= m_toTick)
-                {
-                    m_active = false;
-                    m_closed = true;
-                    std::fflush(m_file);
-                }
             }
+            if (begin(Op::Present))
+            {
+                put(request);
+                end();
+                std::fflush(m_file); // keep the file usable if the process exits abruptly
+            }
+            if (m_active && request.vsyncTick >= m_toTick)
+            {
+                m_active = false;
+                m_closed = true;
+                std::fflush(m_file);
+            }
+        }
+
+        PresentationFrame Present(const GSPresentationRequest &request) override
+        {
+            recordPresent(request);
             return m_inner->Present(request);
+        }
+
+        bool PresentInto(const GSPresentationRequest &request, PresentationFrame &out) override
+        {
+            recordPresent(request);
+            return m_inner->PresentInto(request, out);
         }
 
         bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override

@@ -1,0 +1,112 @@
+Reuse vsync scanout images across fields instead of creating them every field
+
+GSRenderer::vsync created the CRTC circuit and merged scanout images from
+scratch on every field. Only small power-of-two images are recycled, so at 2x
+and 4x output two ~10 MB images were created and destroyed 50 times a second
+while the GS device lock was held. Keep a 4-entry ring of circuit 1, circuit 2
+and merged images and reuse an entry when its size, format, usage, levels and
+layers match; otherwise create a new image and store it in the ring.
+
+Applies on top of 0001 and 0002.
+
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index 6a25292..0c9b0e4 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -4258,6 +4258,19 @@ bool GSRenderer::vsync_can_skip(const PrivRegisterState &priv, const VSyncInfo &
+ 	return !scanout_is_interlaced(priv, info);
+ }
+ 
++static bool vsync_image_matches(const Vulkan::ImageHandle &img, const Vulkan::ImageCreateInfo &info)
++{
++	if (!img)
++		return false;
++	const auto &cur = img->get_create_info();
++	return cur.width == info.width &&
++	       cur.height == info.height &&
++	       cur.format == info.format &&
++	       cur.usage == info.usage &&
++	       cur.levels == info.levels &&
++	       cur.layers == info.layers;
++}
++
+ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &info,
+                                 uint32_t sampling_rate_x_log2, uint32_t sampling_rate_y_log2,
+                                 const Vulkan::Image *promoted1, const Vulkan::Image *promoted2)
+@@ -4653,7 +4666,13 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 		{
+ 			image_info.width <<= scale_log2;
+ 			image_info.height <<= scale_log2;
+-			circuit1 = device->create_image(image_info);
++			if (vsync_image_matches(vsync_circuit1_cache[vsync_cache_index], image_info))
++				circuit1 = vsync_circuit1_cache[vsync_cache_index];
++			else
++			{
++				circuit1 = device->create_image(image_info);
++				vsync_circuit1_cache[vsync_cache_index] = circuit1;
++			}
+ 			sample_crtc_circuit(cmd, *circuit1, priv.dispfb1, rect, super_samples, scale_log2, promoted1);
+ 			device->set_name(*circuit1, "Circuit1");
+ 		}
+@@ -4708,7 +4727,13 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 		{
+ 			image_info.width <<= scale_log2;
+ 			image_info.height <<= scale_log2;
+-			circuit2 = device->create_image(image_info);
++			if (vsync_image_matches(vsync_circuit2_cache[vsync_cache_index], image_info))
++				circuit2 = vsync_circuit2_cache[vsync_cache_index];
++			else
++			{
++				circuit2 = device->create_image(image_info);
++				vsync_circuit2_cache[vsync_cache_index] = circuit2;
++			}
+ 			sample_crtc_circuit(cmd, *circuit2, priv.dispfb2, rect, super_samples, scale_log2, promoted2);
+ 			device->set_name(*circuit2, "Circuit2");
+ 		}
+@@ -4838,6 +4863,7 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 			result.internal_height = result.image->get_height() >> scale_log2;
+ 			result.double_strike = double_strike;
+ 
++			vsync_cache_index = (vsync_cache_index + 1u) % 4u;
+ 			flush_submit(0);
+ 			return result;
+ 		}
+@@ -4854,7 +4880,14 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 		image_info.height -= 1u << (scale_log2 - 1);
+ 	}
+ 
+-	auto merged = device->create_image(image_info);
++	Vulkan::ImageHandle merged;
++	if (vsync_image_matches(vsync_merged_cache[vsync_cache_index], image_info))
++		merged = vsync_merged_cache[vsync_cache_index];
++	else
++	{
++		merged = device->create_image(image_info);
++		vsync_merged_cache[vsync_cache_index] = merged;
++	}
+ 
+ 	device->set_name(*merged, "Merged field");
+ 
+@@ -5147,6 +5180,7 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 		device->register_time_interval("CPU", std::move(cpu_start_ts), std::move(end_ts), "vsync");
+ 	}
+ 
++	vsync_cache_index = (vsync_cache_index + 1u) % 4u;
+ 	return result;
+ }
+ 
+diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
+index c8310af..30915fa 100644
+--- a/gs/gs_renderer.hpp
++++ b/gs/gs_renderer.hpp
+@@ -535,6 +535,10 @@ private:
+ 	bool enable_timestamps = false;
+ 
+ 	Vulkan::ImageHandle vsync_last_fields[4];
++	Vulkan::ImageHandle vsync_circuit1_cache[4];
++	Vulkan::ImageHandle vsync_circuit2_cache[4];
++	Vulkan::ImageHandle vsync_merged_cache[4];
++	uint32_t vsync_cache_index = 0;
+ 	Vulkan::ImageHandle fastmad_deinterlace(Vulkan::CommandBuffer &cmd, const VSyncInfo &vsync);
+ 
+ 	// Slangmosh
