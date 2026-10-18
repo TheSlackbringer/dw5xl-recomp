@@ -717,7 +717,7 @@ def translate_segment(code, entry_pc, fn_name, static_timing=False):
                     out.append('    default: throw std::logic_error("verified VU JR target proof violated");')
                     out.append('    }')
                 else:
-                    out.append(f"    if (taken_{pc:04x}) goto loc_{tgt:04x};")
+                    out.append(f"    if (taken_{pc:04x}) {{ taken_{pc:04x} = false; goto loc_{tgt:04x}; }}")
                 i += 1
                 continue
                 
