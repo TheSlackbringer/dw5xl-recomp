@@ -105,6 +105,7 @@ namespace ps2recomp
             output << "#include <ps2_recompiled_functions.h>\n\n";
             output << "#include \"ps2_runtime_macros.h\"\n";
             output << "#include \"ps2_runtime.h\"\n";
+            output << "#include \"ps2_vu0_macro.h\"\n";
             output << "#include <ps2_recompiled_stubs.h>\n";
             output << "#include \"ps2_syscalls.h\"\n";
             output << "#include \"ps2_stubs.h\"\n";
