@@ -56,10 +56,10 @@ bool noWeave()
 }
 }
 
-PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
-                                  VulkanGsScanoutState &state,
-                                  const GSPresentationRequest &request,
-                                  ReusableFieldWeaver *weaver, uint32_t outputScale)
+void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
+                     VulkanGsScanoutState &state,
+                     const GSPresentationRequest &request,
+                     uint32_t outputScale)
 {
     using namespace ParallelGS;
     using namespace Vulkan;
@@ -80,7 +80,7 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
     const bool fieldMode = interlaced && !frameMode;
     Circuit first = decodeCircuit(pmode.EN1 != 0, request.dispfb1, request.display1, frameFields);
     Circuit second = decodeCircuit(pmode.EN2 != 0, request.dispfb2, request.display2, frameFields);
-    if (!first.enabled && !second.enabled) return state.lastFrame;
+    if (!first.enabled && !second.enabled) return;
     pmode.EN1 = first.enabled; pmode.EN2 = second.enabled;
 
     const bool isPal = (first.enabled && (first.height > 224 || (first.display.DH + 1u) > 480)) ||
@@ -150,6 +150,7 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
         return e && *e && *e != '0';
     }();
 
+    // Maps a completed readback for finishVulkanGsPresent; the copy happens after the device lock is released.
     auto consumeSlot = [&](VulkanGsScanoutState::RbSlot &slot) {
         const auto *mapped = static_cast<const uint8_t *>(device.map_host_buffer(*slot.buf, MEMORY_ACCESS_READ_BIT));
         if (!mapped)
@@ -168,42 +169,20 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
             metrics.consumedTick = slot.vsyncTick;
             metrics.hasConsumed = true;
         }
-        state.lastFrame.width = slot.w;
-        state.lastFrame.height = slot.h;
-        state.lastFrame.displayFbp = slot.displayFbp;
-        state.lastFrame.sourceFbp = slot.sourceFbp;
-        state.lastFrame.strideBytes = slot.w * 4u;
-        state.lastFrame.displayWidth = slot.displayWidth;
-        state.lastFrame.displayHeight = slot.displayHeight;
-        state.lastFrame.pixels.assign(static_cast<size_t>(slot.w) * slot.h * 4u, 0);
-
-        for (unsigned y = 0; y < slot.h; ++y)
-        {
-            auto *row = state.lastFrame.pixels.data() + static_cast<size_t>(y) * slot.w * 4u;
-            std::memcpy(row, mapped + static_cast<size_t>(y) * slot.w * 4u, slot.w * 4u);
-            for (unsigned x = 0; x < slot.w; ++x) row[x * 4u + 3u] = 255;
-        }
-        device.unmap_host_buffer(*slot.buf, MEMORY_ACCESS_READ_BIT);
-
-        if (weaver)
-        {
-            const bool oddField = (slot.vsyncTick & 1ull) != 0ull;
-            // paraLLEl high-res output already reconstructs field-aware vertical
-            // samples. Applying our half-height weave would double it again.
-            const auto weaveMode = slot.highResolution ? ReusableFieldWeaver::Mode::Progressive :
-                                   slot.frameFields ? ReusableFieldWeaver::Mode::HalfHeightFrame :
-                                   slot.fieldMode   ? ReusableFieldWeaver::Mode::FullHeightField :
-                                                      ReusableFieldWeaver::Mode::Progressive;
-            if (!slot.highResolution && slot.frameFields && (noWeave() || uint64_t(state.lastFrame.height) * 2u > hostHeight))
-            {
-                weaver->reset();
-            }
-            else
-            {
-                weaver->present(state.lastFrame.pixels, state.lastFrame.width, state.lastFrame.height,
-                                slot.w * 4u, slot.vsyncTick, oddField, weaveMode);
-            }
-        }
+        VulkanGsScanoutState::StagedRead read;
+        read.buf = slot.buf;
+        read.mapped = mapped;
+        read.w = slot.w;
+        read.h = slot.h;
+        read.displayFbp = slot.displayFbp;
+        read.sourceFbp = slot.sourceFbp;
+        read.vsyncTick = slot.vsyncTick;
+        read.displayWidth = slot.displayWidth;
+        read.displayHeight = slot.displayHeight;
+        read.highResolution = slot.highResolution;
+        read.frameFields = slot.frameFields;
+        read.fieldMode = slot.fieldMode;
+        state.staged.push_back(std::move(read));
 
         slot.pending = false;
         slot.image.reset();
@@ -303,7 +282,7 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
     state.ringIndex = (state.ringIndex + 1u) % 3u;
 
     // For synchronous mode or initial startup frame: wait immediately
-    if (s_sync || !state.lastFrame)
+    if (s_sync || (!state.lastFrame && state.staged.empty()))
     {
         if (curSlot.fence)
             curSlot.fence->wait();
@@ -314,8 +293,10 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
     if (request.vsyncTick == 0 || request.vsyncTick >= s_lastLoggedTickVsync + 100u)
     {
         s_lastLoggedTickVsync = request.vsyncTick;
+        const uint32_t resultWidth = state.staged.empty() ? state.lastFrame.width : state.staged.back().w;
+        const uint32_t resultHeight = state.staged.empty() ? state.lastFrame.height : state.staged.back().h;
         std::fprintf(stderr, "[vulkan:vsync] tick=%llu output.img=(%u,%u) result=(%u,%u)\n",
-                     (unsigned long long)request.vsyncTick, width, height, state.lastFrame.width, state.lastFrame.height);
+                     (unsigned long long)request.vsyncTick, width, height, resultWidth, resultHeight);
     }
 
     if (metricsEnabled && metrics.hasConsumed)
@@ -349,6 +330,57 @@ PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &d
             metrics.lastLogNs = now;
         }
     }
-    return state.lastFrame;
+}
+
+PresentationFrame finishVulkanGsPresent(Vulkan::Device &device, VulkanGsScanoutState &state,
+                                        std::vector<VulkanGsScanoutState::StagedRead> &reads,
+                                        ReusableFieldWeaver *weaver)
+{
+    std::lock_guard<std::mutex> lock(state.frameMutex);
+    auto &frame = state.lastFrame;
+    for (auto &read : reads)
+    {
+        frame.width = read.w;
+        frame.height = read.h;
+        frame.displayFbp = read.displayFbp;
+        frame.sourceFbp = read.sourceFbp;
+        frame.strideBytes = read.w * 4u;
+        frame.displayWidth = read.displayWidth;
+        frame.displayHeight = read.displayHeight;
+        // Rows are contiguous (stride = width): one pass copies every RGBA pixel and forces alpha (the top byte
+        // of the little-endian word) opaque. Every byte is overwritten, so a same-size buffer is not cleared first.
+        const size_t pixelCount = static_cast<size_t>(read.w) * read.h;
+        frame.pixels.resize(pixelCount * 4u);
+        uint8_t *dst = frame.pixels.data();
+        for (size_t i = 0; i < pixelCount; ++i)
+        {
+            uint32_t rgba;
+            std::memcpy(&rgba, read.mapped + i * 4u, sizeof(rgba));
+            rgba |= 0xFF000000u;
+            std::memcpy(dst + i * 4u, &rgba, sizeof(rgba));
+        }
+        device.unmap_host_buffer(*read.buf, Vulkan::MEMORY_ACCESS_READ_BIT);
+
+        if (weaver)
+        {
+            const bool oddField = (read.vsyncTick & 1ull) != 0ull;
+            // paraLLEl high-res output already reconstructs field-aware vertical
+            // samples. Applying our half-height weave would double it again.
+            const auto weaveMode = read.highResolution ? ReusableFieldWeaver::Mode::Progressive :
+                                   read.frameFields ? ReusableFieldWeaver::Mode::HalfHeightFrame :
+                                   read.fieldMode   ? ReusableFieldWeaver::Mode::FullHeightField :
+                                                      ReusableFieldWeaver::Mode::Progressive;
+            if (!read.highResolution && read.frameFields && (noWeave() || uint64_t(frame.height) * 2u > hostHeight))
+            {
+                weaver->reset();
+            }
+            else
+            {
+                weaver->present(frame.pixels, frame.width, frame.height, read.w * 4u, read.vsyncTick, oddField,
+                                weaveMode);
+            }
+        }
+    }
+    return frame;
 }
 

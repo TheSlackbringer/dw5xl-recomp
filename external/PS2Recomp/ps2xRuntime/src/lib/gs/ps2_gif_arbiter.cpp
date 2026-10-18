@@ -1,4 +1,5 @@
 #include "runtime/gs/ps2_gif_arbiter.h"
+#include "ThreadNaming.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -48,7 +49,11 @@ void GifArbiter::startWorker()
         return;
     m_stopWorker = false;
     m_async = true;
-    m_worker = std::thread([this] { workerLoop(); });
+    m_worker = std::thread([this]
+    {
+        ThreadNaming::SetCurrentThreadName("gs-worker");
+        workerLoop();
+    });
 }
 
 void GifArbiter::stopWorker()

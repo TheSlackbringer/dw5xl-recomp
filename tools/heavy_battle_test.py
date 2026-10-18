@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Heavy-combat VSync regression test (pass/fail), at native 1x.
+"""Heavy-combat VSync regression test (pass/fail), at native 1x (or --scale 2/4, issue 015).
 
 Replays a scripted heavy fight from the owner's Legend Mode / Zhang Jiao save (the save resumes into
 the battle pause menu): resume, run into the enemy and push on into the biggest crowds, then attacks,
 moves and a Musou every 12 s for ~3 minutes. Crowd size varies per run (wall-clock pacing); on the
 build before issue 001 v3 some runs reached ~97 % device load and dropped to ~41 FPS. Fails when the guest field clock slips, i.e. when the fights would visibly slow down.
 
-  tools/heavy_battle_test.py [--mode gamescope|hidden] [--runs 2] [--audio null|real]
+  tools/heavy_battle_test.py [--mode gamescope|hidden] [--runs 2] [--audio null|real] [--scale 1|2|4]
+                             [--env KEY=VALUE ...]
 
 gamescope mode (default) runs the game in an off-screen gamescope compositor at 2560x1440@240 (the
 owner's main monitor): a real presented window that never touches the desktop. Input is the game's
@@ -65,9 +66,10 @@ def run_once(name, args, out):
     dump_dir = os.path.join(out, name)
     os.makedirs(dump_dir, exist_ok=True)
     env = {k: v for k, v in os.environ.items() if not k.startswith(('PS2X_', 'DW5XL_')) and k != 'PULSE_SINK'}
-    env.update(PS2X_GS_BACKEND='vulkan', PS2X_GS_SCALE='1', PS2X_GS_SSAA='1', PS2X_STATS='1',
+    env.update(PS2X_GS_BACKEND='vulkan', PS2X_GS_SCALE=str(args.scale), PS2X_GS_SSAA='1', PS2X_STATS='1',
                PS2X_LATE_VBLANK='1', PS2X_VU1_ASYNC_TRACE='1', PS2X_EXIT_TICK=str(args.exit_tick), PS2X_DUMP_DIR=dump_dir,
                PS2X_DUMP_EVERY='100000000', PS2X_HOST_INPUT=route(args.exit_tick))
+    env.update(kv.split('=', 1) for kv in args.env)
     if args.audio == 'null':
         env['PULSE_SINK'] = 'dw5xl_codex_tests'
     game = [os.path.join(REPO, 'app', 'build', 'dw5xl'), './SLES_538.60']
@@ -85,8 +87,8 @@ def run_once(name, args, out):
     text = open(log_path, errors='replace').read()
 
     problems = []
-    if not re.search(r'\[output\] scale=1x aa=1x', text):
-        problems.append('not running at 1x')
+    if not re.search(rf'\[output\] scale={args.scale}x aa=1x', text):
+        problems.append(f'not running at {args.scale}x')
     if f'exit tick {args.exit_tick} reached' not in text:
         problems.append('did not reach the exit tick (hang, crash or timeout)')
     # IOP catch-up stalls (thread=0, and the fields right after one) are issue 003; counted separately.
@@ -137,6 +139,8 @@ def main():
     ap.add_argument('--max-late', type=int, default=2)
     ap.add_argument('--exit-tick', type=int, default=EXIT_TICK, help='end of the fight (default %(default)s)')
     ap.add_argument('--out', default=None, help='log directory (default: a new temp dir)')
+    ap.add_argument('--scale', type=int, choices=(1, 2, 4), default=1, help='output scale (F4); AA choice stays 1')
+    ap.add_argument('--env', action='append', default=[], metavar='KEY=VALUE', help='extra environment, e.g. PS2X_DEVICE_PROFILE=1')
     args = ap.parse_args()
     if subprocess.run(['pgrep', '-x', 'dw5xl'], capture_output=True).returncode == 0:
         sys.exit('another dw5xl is running; close it first')

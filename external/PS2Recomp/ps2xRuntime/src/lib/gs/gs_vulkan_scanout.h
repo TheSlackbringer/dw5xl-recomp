@@ -7,6 +7,8 @@
 #include "image.hpp"
 
 #include <array>
+#include <mutex>
+#include <vector>
 #include <stdexcept>
 
 namespace ParallelGS { class GSInterface; }
@@ -43,6 +45,28 @@ struct VulkanGsScanoutState
     };
     std::array<RbSlot, 3> slots{};
     uint32_t ringIndex = 0;
+    // A completed readback, mapped under the device lock and copied into lastFrame after it is released
+    // (finishVulkanGsPresent), so the GS worker is not kept waiting by the frame copy.
+    struct StagedRead
+    {
+        Vulkan::BufferHandle buf;
+        const uint8_t *mapped = nullptr;
+        uint32_t w = 0;
+        uint32_t h = 0;
+        uint32_t displayFbp = 0;
+        uint32_t sourceFbp = 0;
+        uint64_t vsyncTick = 0;
+        uint32_t displayWidth = 0;
+        uint32_t displayHeight = 0;
+        bool highResolution = false;
+        bool frameFields = false;
+        bool fieldMode = false;
+    };
+    std::vector<StagedRead> staged;
+    // Copied reads keep their buffers until the next presentation releases them under the device lock.
+    std::vector<StagedRead> retired;
+    // Guards lastFrame between finishVulkanGsPresent (no device lock) and reset() (device lock held).
+    std::mutex frameMutex;
     PresentationFrame lastFrame{};
     // Opt-in observation only. Does not select slots or alter fence handling.
     struct Metrics
@@ -67,18 +91,29 @@ struct VulkanGsScanoutState
             slot.h = 0;
         }
         ringIndex = 0;
-        lastFrame = {};
+        staged.clear();
+        retired.clear();
+        {
+            std::lock_guard<std::mutex> lock(frameMutex);
+            lastFrame = {};
+        }
         metrics = {};
     }
 };
 
-// Caller serializes GS/device access and advances the device frame context.
+// Caller holds the device lock and advances the device frame context.
 // Rasterization, VRAM sampling, circuit merge and field deinterlacing stay on
 // the GPU. The RGBA readback bridges the existing fixed 640-stride host UI.
-PresentationFrame presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
-                                  VulkanGsScanoutState &state,
-                                  const GSPresentationRequest &request,
-                                  ReusableFieldWeaver *weaver = nullptr,
-                                  uint32_t outputScale = 1);
+// Completed readbacks are only mapped here (state.staged); finishVulkanGsPresent copies them.
+void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
+                     VulkanGsScanoutState &state,
+                     const GSPresentationRequest &request,
+                     uint32_t outputScale = 1);
+
+// Caller has released the device lock. Copies the reads staged by presentVulkanGs, in order, into
+// state.lastFrame (with the field weave) and returns the frame to show.
+PresentationFrame finishVulkanGsPresent(Vulkan::Device &device, VulkanGsScanoutState &state,
+                                        std::vector<VulkanGsScanoutState::StagedRead> &reads,
+                                        ReusableFieldWeaver *weaver = nullptr);
 
 

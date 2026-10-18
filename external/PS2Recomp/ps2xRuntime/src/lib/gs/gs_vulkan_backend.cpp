@@ -369,10 +369,13 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
 {
     auto lock = m_impl->access(); auto &p = *m_impl;
     PresentationFrame result;
+    bool gpuScanout = false;
+    // The previous presentation's copied reads release their buffers here, under the device lock.
+    p.scanoutState.retired.clear();
     try
     {
-        result = presentVulkanGs(p.gs, p.device, p.scanoutState, request, &p.fieldWeaver,
-                                 p.currentScale.load(std::memory_order_relaxed));
+        presentVulkanGs(p.gs, p.device, p.scanoutState, request, p.currentScale.load(std::memory_order_relaxed));
+        gpuScanout = true;
         ++p.gpuPresentations;
     }
     catch (const std::exception &error)
@@ -389,6 +392,17 @@ PresentationFrame GSVulkanBackend::Present(const GSPresentationRequest &request)
         std::fprintf(stderr, "[gs:vulkan] draws=%llu GPU scanouts=%llu CPU display conversions=%llu\n",
             static_cast<unsigned long long>(p.draws), static_cast<unsigned long long>(p.gpuPresentations),
             static_cast<unsigned long long>(p.convertedPresentations));
+    // Copy the completed readbacks without the device lock: the GS worker can keep drawing meanwhile.
+    // Each read's slot buffer is only reused by a later presentation (this thread), after the copy.
+    std::vector<VulkanGsScanoutState::StagedRead> reads = std::move(p.scanoutState.staged);
+    p.scanoutState.staged.clear();
+    lock.unlock();
+    if (gpuScanout)
+        result = finishVulkanGsPresent(p.device, p.scanoutState, reads, &p.fieldWeaver);
+    else if (!reads.empty())
+        finishVulkanGsPresent(p.device, p.scanoutState, reads, &p.fieldWeaver);
+    lock.lock();
+    p.scanoutState.retired = std::move(reads);
     return result;
 }
 
