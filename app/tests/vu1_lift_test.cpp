@@ -509,12 +509,53 @@ void benchCaptured(const std::string &prefix, int count, int iterations, bool li
         std::cout << "captured interp: " << ns[0] / cycles[0] << " ns/cycle over " << cycles[0] << " cycles\n";
 }
 
+// Issue 018: replays one saved run (PS2X_VU1_VERIFY_DUMP or PS2X_VU1_RUN_CAPTURE files) through the native code
+// and the interpreter and compares registers, flags, VU memory and the cycle count. Returns false on a difference.
+bool replayCaptured(const std::string &stem)
+{
+    const auto code = loadFile(stem + ".code"), image = loadFile(stem + ".data"), stateBytes = loadFile(stem + ".state");
+    require(code.size() == 16384 && image.size() == 16384 && stateBytes.size() == sizeof(VU1State), "capture files");
+    VU1State initial{};
+    std::memcpy(&initial, stateBytes.data(), sizeof(initial));
+    std::vector<uint8_t> endData[2];
+    VU1State endState[2]{};
+    for (int lifted : {1, 0})
+    {
+        PS2Runtime rt;
+        require(rt.memory().initialize(), "replay memory init");
+        std::memcpy(rt.memory().getVU1Code(), code.data(), 16384);
+        uint8_t *data = rt.memory().getVU1Data();
+        std::memcpy(data, image.data(), 16384);
+        auto &vu = rt.vu1();
+        vl::setEnabledOverride(lifted);
+        vu.state() = initial;
+        vu.execute(rt.memory().getVU1Code(), 16384, data, 16384, rt.gs(), &rt.memory(), initial.pc, initial.top, initial.itop, 100000);
+        vl::setEnabledOverride(-1);
+        endState[lifted] = vu.state();
+        endData[lifted].assign(data, data + 16384);
+    }
+    const VU1State &a = endState[1], &b = endState[0];
+    const bool same = std::memcmp(a.vf, b.vf, sizeof(a.vf)) == 0 && std::memcmp(a.vi, b.vi, sizeof(a.vi)) == 0 &&
+                      a.mac == b.mac && a.status == b.status && a.clip == b.clip && a.pc == b.pc &&
+                      endData[0] == endData[1] && a.cycles == b.cycles;
+    std::cout << stem << ": native cycles " << (a.cycles - initial.cycles) << ", interpreter "
+              << (b.cycles - initial.cycles) << (same ? " (identical)" : " (DIFFERENT)") << "\n";
+    return same;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
 {
     try
     {
+        if (argc >= 3 && std::string(argv[1]) == "replaycap")
+        {
+            bool all = true;
+            for (int i = 2; i < argc; ++i)
+                all = replayCaptured(argv[i]) && all;
+            return all ? 0 : 1;
+        }
         if (argc >= 4 && std::string(argv[1]) == "benchcap")
         {
             benchCaptured(argv[2], std::atoi(argv[3]), argc >= 5 ? std::atoi(argv[4]) : 2000, argc >= 6);

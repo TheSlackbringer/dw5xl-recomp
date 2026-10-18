@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -323,6 +324,23 @@ bool VU1Interpreter::runLiftedChecked(uint8_t *vuCode, uint32_t codeSize, uint8_
         return runLifted(vuCode, codeSize, dataSize, memory);
 
     static uint64_t s_runs = 0, s_mismatches = 0, s_skipped = 0;
+    // PS2X_VU1_VERIFY_DUMP=<prefix>: the first mismatching runs are saved as <prefix>.<n>.code/.data/.state (the
+    // PS2X_VU1_RUN_CAPTURE format, replayable offline) plus .txt with the entry pipeline state. Game data: keep local.
+    static const char *s_dumpPrefix = std::getenv("PS2X_VU1_VERIFY_DUMP");
+    const VU1State entryState = m_state;
+    const bool entryQuiet = !m_xgkick.active && m_nextCommitCycle == std::numeric_limits<uint64_t>::max() &&
+                            m_writebackHorizon <= m_cycle;
+    char entryPipeline[192];
+    std::snprintf(entryPipeline, sizeof(entryPipeline),
+                  "quiet=%d xgkick=%d commitIn=%lld writebackIn=%lld fdiv=%d/%lld efu=%d,%d efuResIn=%lld",
+                  int(entryQuiet), int(m_xgkick.active),
+                  m_nextCommitCycle == std::numeric_limits<uint64_t>::max() ? -1ll : (long long)(m_nextCommitCycle - m_cycle),
+                  (long long)m_writebackHorizon - (long long)m_cycle, int(m_fdiv.valid),
+                  (long long)m_fdiv.readyCycle - (long long)m_cycle, int(m_efu[0].valid), int(m_efu[1].valid),
+                  (long long)m_efuResourceReady - (long long)m_cycle);
+    std::vector<uint8_t> entryData;
+    if (s_dumpPrefix && *s_dumpPrefix)
+        entryData.assign(vuData, vuData + dataSize);
     auto shadow = std::make_unique<VU1Interpreter>(*this);
     std::vector<uint8_t> shadowData(vuData, vuData + dataSize);
     std::vector<uint8_t> liftedPackets, shadowPackets;
@@ -399,9 +417,31 @@ bool VU1Interpreter::runLiftedChecked(uint8_t *vuCode, uint32_t codeSize, uint8_
             uint64_t h = 1469598103934665603ull;
             for (uint32_t n = 0; n < codeSize; ++n)
                 h = (h ^ vuCode[n]) * 1099511628211ull;
-            std::fprintf(stderr, "[vu1verify] MISMATCH hash=%016llx pc=%04x run=%llu cycles=%llu: %s\n",
+            std::fprintf(stderr, "[vu1verify] MISMATCH hash=%016llx pc=%04x run=%llu cycles=%llu: %s (entry %s)\n",
                          static_cast<unsigned long long>(h), entryPc, static_cast<unsigned long long>(s_runs),
-                         static_cast<unsigned long long>(m_cycle - entryCycle), what);
+                         static_cast<unsigned long long>(m_cycle - entryCycle), what, entryPipeline);
+            static uint32_t s_dumped = 0;
+            if (!entryData.empty() && s_dumped < 8u)
+            {
+                const std::string stem = std::string(s_dumpPrefix) + "." + std::to_string(s_dumped++);
+                const auto dump = [&](const char *suffix, const void *bytes, size_t size)
+                {
+                    if (FILE *file = std::fopen((stem + suffix).c_str(), "wb"))
+                    {
+                        std::fwrite(bytes, 1u, size, file);
+                        std::fclose(file);
+                    }
+                };
+                dump(".code", vuCode, codeSize);
+                dump(".data", entryData.data(), entryData.size());
+                dump(".state", &entryState, sizeof(entryState));
+                char info[512];
+                const int n = std::snprintf(info, sizeof(info), "hash=%016llx pc=%04x run=%llu cycles=%llu\n%s\nentry %s\n",
+                                            static_cast<unsigned long long>(h), entryPc,
+                                            static_cast<unsigned long long>(s_runs),
+                                            static_cast<unsigned long long>(m_cycle - entryCycle), what, entryPipeline);
+                dump(".txt", info, static_cast<size_t>(std::max(0, std::min(n, int(sizeof(info)) - 1))));
+            }
         }
     }
     if ((s_runs & 0x3FFFu) == 0u || (what[0] && s_mismatches <= 50u))
