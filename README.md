@@ -66,7 +66,7 @@ This generates the main executable and OVL00–OVL02 translations locally. Ghidr
 The wrapper currently expects the pinned paraLLEl-GS revision below and its required submodules:
 
 ```sh
-git clone https://github.com/Themaister/parallel-gs.git app/deps/parallel-gs
+git clone https://github.com/Arntzen-Software/parallel-gs.git app/deps/parallel-gs
 git -C app/deps/parallel-gs checkout cc6184af7e0c03da603045ca371ffa5dae9b0655
 git -C app/deps/parallel-gs submodule update --init Granite
 git -C app/deps/parallel-gs/Granite submodule update --init \
