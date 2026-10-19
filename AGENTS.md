@@ -77,6 +77,9 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
 - **Nothing derived from the game in Git:** no game files (`game/`, `discs/`), Ghidra DBs, generated or lifted C++
   (`recomp/*/output/`, `recomp/dw5xl/vu1/`), frame dumps, captures, microcode `.bin`, screenshots. Scan before every
   commit/push. Hooks in `.githooks/` (`git config core.hooksPath .githooks`); never bypass them (`--no-verify`).
+- **Releases (owner decision 2026-10-19, issue 011):** a GitHub release may contain the compiled game; never disc
+  files, an ISO, generated or lifted C++ or any other game-derived file. Releases are built on the owner's PC (never
+  CI) and published only by the owner.
 - **Commit identity:** author/committer `TheSlackbringer <15327900+TheSlackbringer@users.noreply.github.com>`;
   end messages with `Co-Authored-By: Claude <model> <noreply@anthropic.com>`. Call our renderer fixes "runtime
   patches" (`vendor/`). `external/PS2Recomp/` is vendored: runtime changes are ordinary commits here.
