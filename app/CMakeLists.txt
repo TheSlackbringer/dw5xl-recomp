@@ -31,6 +31,10 @@ endif()
 # Runtime stubs also instantiate guest arithmetic helpers.
 target_compile_options(ps2_runtime PRIVATE ${DW5XL_STRICT_FP_FLAGS})
 
+# The game itself needs the code generated from the player's own disc (tools/regen.sh). OFF builds only what needs
+# no game data: the runtime, the tools and the tests below that use no generated code (CI, issue 011).
+option(DW5XL_BUILD_GAME "Build the game (needs locally generated code)" ON)
+if(DW5XL_BUILD_GAME) # --- game: generated main program, lifted VU1, overlays ---
 file(GLOB DW5XL_GENERATED_SOURCES CONFIGURE_DEPENDS "${DW5XL_GENERATED_DIR}/*.cpp")
 
 add_executable(dw5xl
@@ -140,6 +144,7 @@ target_precompile_headers(dw5xl_ovl02 PRIVATE
 )
 set_target_properties(dw5xl_ovl02 PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
 target_link_libraries(dw5xl PRIVATE dw5xl_ovl02)
+endif() # DW5XL_BUILD_GAME
 
 option(DW5XL_BUILD_TESTS "Build runtime and locally generated helper tests" OFF)
 if(DW5XL_BUILD_TESTS)
@@ -192,6 +197,7 @@ if(DW5XL_BUILD_TESTS)
     target_link_libraries(dw5xl_vu0_macro_test PRIVATE ps2_runtime)
     target_compile_options(dw5xl_vu0_macro_test PRIVATE ${DW5XL_ARCH_FLAGS} ${DW5XL_STRICT_FP_FLAGS})
     add_test(NAME vu0_macro COMMAND dw5xl_vu0_macro_test)
+    if(DW5XL_BUILD_GAME) # these two compile generated game functions
     add_executable(dw5xl_ee_poll_sema_test tests/ee_poll_sema_test.cpp
         "${DW5XL_GENERATED_DIR}/FUN_00144c70_0x144c70.cpp")
     target_link_libraries(dw5xl_ee_poll_sema_test PRIVATE ps2_runtime)
@@ -205,6 +211,7 @@ if(DW5XL_BUILD_TESTS)
     target_include_directories(dw5xl_original_gs_helper_test PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
     target_compile_options(dw5xl_original_gs_helper_test PRIVATE ${DW5XL_ARCH_FLAGS})
     add_test(NAME original_gs_helper COMMAND dw5xl_original_gs_helper_test)
+    endif()
     add_executable(dw5xl_disc_validation_test tests/disc_validation_test.cpp)
     target_link_libraries(dw5xl_disc_validation_test PRIVATE ps2_runtime)
     target_include_directories(dw5xl_disc_validation_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
