@@ -1,0 +1,3 @@
+// Embeds utf8.manifest (UTF-8 process code page) into a Windows executable. 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID,
+// 24 = RT_MANIFEST.
+1 24 "utf8.manifest"

@@ -29,8 +29,15 @@ function(dw5xl_windows_target_options target)
         if(target_type STREQUAL "EXECUTABLE")
             # Windows reserves 1 MiB of stack per thread by default (Linux: 8 MiB);
             # std::thread uses the executable's reserve. Same values as ps2EntryRunner.
-            target_link_options(${target} PRIVATE /STACK:16777216 /FORCE:MULTIPLE)
+            target_link_options(${target} PRIVATE /STACK:16777216 /FORCE:MULTIPLE /MANIFEST:NO)
         endif()
+    elseif(target_type STREQUAL "EXECUTABLE") # MinGW (llvm-mingw): same stack reserve
+        target_link_options(${target} PRIVATE -Wl,--stack,16777216)
+    endif()
+    if(target_type STREQUAL "EXECUTABLE")
+        # UTF-8 process code page (Windows 10 1903+): argv and narrow file APIs take UTF-8 paths, so folders with
+        # non-ASCII characters work (issue 011). MSVC: /MANIFEST:NO above, this resource is the manifest.
+        target_sources(${target} PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../../tools/windows/utf8.rc")
     endif()
     if(target_type STREQUAL "EXECUTABLE" AND COMMAND ps2x_stage_ffmpeg_runtime_dlls)
         # Copy the FFmpeg DLLs next to the executable.

@@ -19,15 +19,6 @@ set(PS2X_BUILD_STUDIO OFF CACHE BOOL "" FORCE)
 # MSVC/clang-cl only: keep the runtime's floating point like the Linux build.
 set(PS2X_MSVC_FAST_FLOAT OFF CACHE BOOL "" FORCE)
 add_subdirectory("${PS2RECOMP_DIR}" ps2recomp EXCLUDE_FROM_ALL)
-# Windows reserves 1 MiB of stack per thread by default (Linux: 8 MiB). PS2Runtime lives on main()'s stack and
-# std::thread workers (game, device, GS) use the executable's default, so every program here reserves 16 MiB.
-if(WIN32)
-    if(MSVC)
-        add_link_options("/STACK:16777216")
-    else()
-        add_link_options("-Wl,--stack,16777216")
-    endif()
-endif()
 # Runtime stubs also instantiate guest arithmetic helpers.
 target_compile_options(ps2_runtime PRIVATE ${DW5XL_STRICT_FP_FLAGS})
 
