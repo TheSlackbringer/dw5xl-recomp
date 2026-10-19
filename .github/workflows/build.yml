@@ -1,0 +1,140 @@
+# Builds and tests everything that needs no game data, on Linux and for Windows (issue 011).
+# The game itself is never built here: it needs code generated from the player's own disc, which must never
+# reach GitHub. DW5XL_BUILD_GAME=OFF builds the runtime, the recompiler, the tools and the tests that use no
+# generated code. Remove this file (one commit) to switch CI off again.
+name: build
+
+on:
+  push:
+    branches: [main, 'ci/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PARALLEL_GS_REV: cc6184af7e0c03da603045ca371ffa5dae9b0655 # README, "pinned paraLLEl-GS"
+  LLVM_MINGW: llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64
+  LLVM_MINGW_SHA256: 5f9c6ed95b2d4bdb2869a488c5fd5857fbdabcf288a0aa3eb1da43f6a08d8ab4
+  FFMPEG_ZIP: ffmpeg-n7.1-241205-lgpl-amd64-shared.zip
+  FFMPEG_SHA256: b985887dbca8c0a9a4c47f9d2bac7ec3ab994335b1b7fe7000bdb1dcd772ac68
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    container: archlinux:latest # same clang/LLVM generation as the development machine
+    steps:
+      - name: Tools
+        run: pacman -Syu --noconfirm --needed git clang lld llvm cmake ninja pkgconf python ffmpeg
+             libx11 libxrandr libxinerama libxcursor libxi xorgproto mesa libglvnd alsa-lib libpulse
+             wayland libxkbcommon vulkan-headers
+      - uses: actions/checkout@v4
+      - name: No game data in the repository
+        run: |
+          bad=$(git ls-files | grep -iE '^(game|discs|ghidra|ghidra_iop|notes)/|/output/|^recomp/[^/]+/vu1/|vu1_lifted|\.iso$' || true)
+          if [ -n "$bad" ]; then echo "game-derived or local files are tracked:"; echo "$bad"; exit 1; fi
+      - name: paraLLEl-GS (pinned) with the renderer patches
+        run: |
+          git clone -q https://github.com/Themaister/parallel-gs.git app/deps/parallel-gs
+          git -C app/deps/parallel-gs checkout -q "$PARALLEL_GS_REV"
+          git -C app/deps/parallel-gs submodule update --init Granite
+          git -C app/deps/parallel-gs/Granite submodule update --init third_party/volk third_party/khronos/vulkan-headers
+          git -C app/deps/parallel-gs apply "$PWD"/vendor/parallel-gs-patches/*.patch
+      - name: Configure
+        run: >
+          CC=clang CXX=clang++ cmake -S app -B app/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_LINKER_TYPE=LLD -DDW5XL_BUILD_GAME=OFF -DDW5XL_BUILD_TESTS=ON -DPS2X_ENABLE_SCCACHE=OFF
+          -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_ENABLE_VULKAN_GS=ON
+          -DPS2X_PARALLEL_GS_SOURCE_DIR="$PWD/app/deps/parallel-gs"
+      - name: Build
+        run: cmake --build app/build-ci
+      - name: Build the recompiler (separately, the app build turns it off)
+        run: >
+          CC=clang CXX=clang++ cmake -S external/PS2Recomp -B build-recomp -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_LINKER_TYPE=LLD -DPS2X_BUILD_RUNTIME=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF
+          -DPS2X_BUILD_STUDIO=OFF -DPS2X_ENABLE_SCCACHE=OFF
+          && cmake --build build-recomp --target ps2_recomp
+      - name: Test (no GPU, no game data)
+        run: ctest --test-dir app/build-ci --output-on-failure
+
+  windows-build:
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - name: Tools
+        run: pacman -Syu --noconfirm --needed git cmake ninja python curl unzip xz
+      - uses: actions/checkout@v4
+      - name: llvm-mingw (pinned, checksum)
+        run: |
+          curl -sSfL -o /tmp/llvm-mingw.tar.xz \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/$LLVM_MINGW.tar.xz"
+          echo "$LLVM_MINGW_SHA256  /tmp/llvm-mingw.tar.xz" | sha256sum -c -
+          tar -xf /tmp/llvm-mingw.tar.xz -C /opt
+      - name: FFmpeg for Windows (pinned, checksum)
+        run: |
+          curl -sSfL -o "/tmp/$FFMPEG_ZIP" \
+            "https://github.com/System233/ffmpeg-msvc-prebuilt/releases/download/n7.1-241205/$FFMPEG_ZIP"
+          echo "$FFMPEG_SHA256  /tmp/$FFMPEG_ZIP" | sha256sum -c -
+      - name: paraLLEl-GS (pinned) with the renderer patches
+        run: |
+          git clone -q https://github.com/Themaister/parallel-gs.git app/deps/parallel-gs
+          git -C app/deps/parallel-gs checkout -q "$PARALLEL_GS_REV"
+          git -C app/deps/parallel-gs submodule update --init Granite
+          git -C app/deps/parallel-gs/Granite submodule update --init third_party/volk third_party/khronos/vulkan-headers
+          git -C app/deps/parallel-gs apply "$PWD"/vendor/parallel-gs-patches/*.patch
+      - name: Configure (cross-compile with llvm-mingw)
+        run: >
+          cmake -S app -B app/build-win -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="$PWD/tools/windows/llvm-mingw.cmake" -DLLVM_MINGW_ROOT="/opt/$LLVM_MINGW"
+          -DDW5XL_BUILD_GAME=OFF -DDW5XL_BUILD_TESTS=ON -DPS2X_ENABLE_SCCACHE=OFF
+          -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_ENABLE_VULKAN_GS=ON
+          -DPS2X_PARALLEL_GS_SOURCE_DIR="$PWD/app/deps/parallel-gs"
+          -DPS2X_FFMPEG_PREBUILT_URL="/tmp/$FFMPEG_ZIP"
+      - name: Build
+        run: cmake --build app/build-win
+      - name: Build the recompiler for Windows
+        run: >
+          cmake -S external/PS2Recomp -B build-recomp-win -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="$PWD/tools/windows/llvm-mingw.cmake" -DLLVM_MINGW_ROOT="/opt/$LLVM_MINGW"
+          -DPS2X_BUILD_RUNTIME=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF
+          -DPS2X_ENABLE_SCCACHE=OFF
+          && cmake --build build-recomp-win --target ps2_recomp
+      - name: Collect the Windows programs (no game data)
+        run: |
+          mkdir dist
+          cp app/build-win/*_test.exe dist/
+          cp build-recomp-win/ps2xRecomp/ps2_recomp.exe dist/
+          cp "/opt/$LLVM_MINGW/x86_64-w64-mingw32/bin/libc++.dll" "/opt/$LLVM_MINGW/x86_64-w64-mingw32/bin/libunwind.dll" dist/
+          cp app/build-win/*.dll dist/
+          ls dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-tests
+          path: dist
+          retention-days: 7
+
+  windows-test:
+    needs: windows-build
+    runs-on: windows-latest # real Windows, no GPU
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-tests
+          path: dist
+      - name: Run the tests that need no game data
+        shell: pwsh
+        working-directory: dist
+        run: |
+          $tests = 'overlay_dispatch','field_history','cd_iop_read','cd_stream_rate','presentation_stride',
+                   'vif_unpack_boundary','ee_shared_vu0','ee_rounding','vu_minmax','vif_unpack_fast',
+                   'vu1_fmac_fast','vu0_macro','disc_validation','overlay_lifecycle','vu1_async_queue'
+          $failed = @()
+          foreach ($t in $tests) {
+            & ".\dw5xl_${t}_test.exe" *> "$t.log"
+            if ($LASTEXITCODE -ne 0) { $failed += $t; Write-Host "FAIL $t"; Get-Content "$t.log" -Tail 20 }
+            else { Write-Host "PASS $t" }
+          }
+          & .\ps2_recomp.exe --help *> recomp.log
+          Write-Host "ps2_recomp.exe starts: exit $LASTEXITCODE"
+          if ($failed.Count -gt 0) { exit 1 }
