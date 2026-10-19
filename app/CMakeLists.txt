@@ -138,9 +138,13 @@ target_link_libraries(dw5xl PRIVATE dw5xl_ovl02)
 endif() # DW5XL_BUILD_GAME
 
 # Setup wizard core (issue 011): reads the player's disc image, checks and extracts it. Needs no game data.
-add_library(dw5xl_setup_core STATIC setup/iso9660.cpp setup/disc_setup.cpp setup/run_process.cpp setup/codegen.cpp)
+add_library(dw5xl_setup_core STATIC setup/iso9660.cpp setup/disc_setup.cpp setup/run_process.cpp setup/codegen.cpp
+    setup/vu1lift/vu1_timing.cpp setup/vu1lift/vu1_translator.cpp)
 target_include_directories(dw5xl_setup_core PUBLIC setup)
 target_link_libraries(dw5xl_setup_core PUBLIC ffmpeg)
+# VU1 lifter (port of tools/vu1_translator.py, disc mode): dw5xl_vu1lift <SLES_538.60> <output.cpp>
+add_executable(dw5xl_vu1lift setup/vu1lift/vu1lift_main.cpp)
+target_link_libraries(dw5xl_vu1lift PRIVATE dw5xl_setup_core)
 
 option(DW5XL_BUILD_TESTS "Build runtime and locally generated helper tests" OFF)
 if(DW5XL_BUILD_TESTS)
@@ -148,6 +152,14 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_setup_disc_test tests/setup_disc_test.cpp)
     target_link_libraries(dw5xl_setup_disc_test PRIVATE dw5xl_setup_core)
     add_test(NAME setup_disc COMMAND dw5xl_setup_disc_test)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../game/dw5xl/SLES_538.60" AND NOT CMAKE_CROSSCOMPILING)
+        # Needs the player's own executable (local only, never CI): C++ lifter == tools/vu1_translator.py.
+        add_test(NAME vu1lift_matches_python COMMAND "${CMAKE_COMMAND}" -DLIFTER=$<TARGET_FILE:dw5xl_vu1lift>
+                 -DPYTHON=${Python3_EXECUTABLE} "-DREPO=${CMAKE_CURRENT_SOURCE_DIR}/.."
+                 "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/vu1lift-compare" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompareVu1Lift.cmake")
+        set_tests_properties(vu1lift_matches_python PROPERTIES TIMEOUT 300)
+    endif()
     add_executable(dw5xl_setup_codegen_test tests/setup_codegen_test.cpp)
     target_link_libraries(dw5xl_setup_codegen_test PRIVATE dw5xl_setup_core)
     add_test(NAME setup_codegen COMMAND dw5xl_setup_codegen_test)
