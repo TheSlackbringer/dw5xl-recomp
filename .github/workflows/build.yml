@@ -29,7 +29,7 @@ jobs:
         run: pacman -Syu --noconfirm --needed git clang lld llvm cmake ninja pkgconf python ffmpeg
              libx11 libxrandr libxinerama libxcursor libxi xorgproto mesa libglvnd alsa-lib libpulse
              wayland libxkbcommon vulkan-headers
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: No game data in the repository
         run: |
           bad=$(git ls-files | grep -iE '^(game|discs|ghidra|ghidra_iop|notes)/|/output/|^recomp/[^/]+/vu1/|vu1_lifted|\.iso$' || true)
@@ -64,7 +64,7 @@ jobs:
     steps:
       - name: Tools
         run: pacman -Syu --noconfirm --needed git cmake ninja python curl unzip xz
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: llvm-mingw (pinned, checksum)
         run: |
           curl -sSfL -o /tmp/llvm-mingw.tar.xz \
@@ -108,7 +108,7 @@ jobs:
           cp "/opt/$LLVM_MINGW/x86_64-w64-mingw32/bin/libc++.dll" "/opt/$LLVM_MINGW/x86_64-w64-mingw32/bin/libunwind.dll" dist/
           cp app/build-win/*.dll dist/
           ls dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-tests
           path: dist
@@ -118,7 +118,7 @@ jobs:
     needs: windows-build
     runs-on: windows-latest # real Windows, no GPU
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: windows-tests
           path: dist
