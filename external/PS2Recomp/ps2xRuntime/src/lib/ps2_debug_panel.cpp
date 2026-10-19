@@ -2206,17 +2206,28 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
-    if (IsKeyPressed(KEY_F1))
+    if (m_debuggerEnabled && IsKeyPressed(KEY_F1))
     {
         toggleVisible();
     }
 
-    if (!m_visible)
+    const bool debugger = m_debuggerEnabled && m_visible;
+    const bool overlay = m_overlayWanted && m_overlayDraw && m_overlayWanted();
+    if (!debugger && !overlay)
     {
         return;
     }
 
     rlImGuiBegin();
+    if (overlay)
+    {
+        m_overlayDraw();
+    }
+    if (!debugger)
+    {
+        rlImGuiEnd();
+        return;
+    }
 
     ImGui::SetNextWindowSize(ImVec2(780.0f, 620.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))

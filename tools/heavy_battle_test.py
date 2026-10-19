@@ -73,6 +73,10 @@ def run_once(name, args, out):
     mc = os.path.join(out, name + '-mc0')
     shutil.rmtree(mc, ignore_errors=True)
     shutil.copytree(args.save, mc, copy_function=shutil.copyfile)
+    for root, dirs, files in os.walk(mc):  # the backup is read-only; the game must be able to save
+        for name in dirs + files:
+            os.chmod(os.path.join(root, name), os.stat(os.path.join(root, name)).st_mode | 0o200)
+    os.chmod(mc, os.stat(mc).st_mode | 0o200)
     env['PS2X_MC_ROOT'] = mc
     env.update(kv.split('=', 1) for kv in args.env)
     if args.audio == 'null':

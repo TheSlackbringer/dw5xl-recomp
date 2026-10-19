@@ -9,6 +9,7 @@
 #include <cstdio>
 
 extern const RecompiledModule g_ps2Module_dw5xl_ovl00;
+void dw5xlRequestDisc(uint32_t which); // dw5xl_install.cpp
 extern const RecompiledModule g_ps2Module_dw5xl_ovl01;
 extern const RecompiledModule g_ps2Module_dw5xl_ovl02;
 
@@ -69,6 +70,8 @@ void discType(uint8_t* ram,R5900Context* ctx,PS2Runtime* runtime) {
     discCheckSession.validation=dw5xl::discs::validateImportedDisc(PS2Runtime::getIoPaths(),discCheckSession.which);
     const auto status=discCheckSession.validation;
     std::fprintf(stderr,"[dw5xl:disc] menu verification disc=%u result=%u\n",discCheckSession.which,static_cast<unsigned>(status));
+    // Installed mode: offer to install a missing or wrong disc from the player's image (dw5xl_install.cpp).
+    if(status!=dw5xl::discs::Validation::valid) dw5xlRequestDisc(discCheckSession.which);
     // Wrong bytes behave like a wrong inserted disc; absent/unreadable files
     // use the game's missing-disc prompt. The original routine owns Retry/Cancel.
     finishDiscCall(ctx,status==dw5xl::discs::Validation::valid || status==dw5xl::discs::Validation::unsupported?0x14:0);

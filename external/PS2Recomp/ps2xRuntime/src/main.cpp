@@ -171,6 +171,10 @@ namespace
 
 #if defined(DW5XL_INSTALLED_MODE)
 bool dw5xlInstalledBoot(int argc, char **argv, std::filesystem::path &elf, int &exitCode);
+#if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+class PS2DebugPanel;
+void dw5xlConfigureDebugPanel(PS2DebugPanel &panel);
+#endif
 #endif
 
 int main(int argc, char *argv[])
@@ -244,6 +248,9 @@ int main(int argc, char *argv[])
                 static_cast<PS2DebugPanel *>(userData)->shutdown();
             },
             &debugPanel);
+#if defined(DW5XL_INSTALLED_MODE)
+        dw5xlConfigureDebugPanel(debugPanel); // DW5XL: disc prompt / Discs window; F1 off in the player build
+#endif
 #endif
         if (!runtime.initialize(windowTitle.c_str()))
         {

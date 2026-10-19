@@ -346,4 +346,95 @@ bool runWizardWindow(const WizardConfig &config)
     return finished;
 }
 
+// ---- the "insert disc" panel (inside the running game) -----------------------------------------------------------
+struct DiscInstallPanel::State
+{
+    fs::path dataDir;
+    const DiscSpec *disc;
+    DiscField field{"Disc image"};
+    std::unique_ptr<SetupRun> run;
+};
+
+DiscInstallPanel::DiscInstallPanel(fs::path dataDir, const DiscSpec &disc) : m(std::make_unique<State>())
+{
+    m->dataDir = std::move(dataDir);
+    m->disc = &disc;
+    m->field.label = disc.name;
+}
+
+DiscInstallPanel::~DiscInstallPanel() = default; // a running copy is cancelled and waited for by ~SetupRun
+
+bool DiscInstallPanel::running() const { return m->run && m->run->status().running; }
+
+void DiscInstallPanel::dropped(const fs::path &image)
+{
+    if (!running())
+        m->field.set(image);
+}
+
+bool DiscInstallPanel::draw()
+{
+    const SetupStatus st = m->run ? m->run->status() : SetupStatus{};
+    if (st.finished)
+    {
+        ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1), "%s is ready.", m->disc->name);
+        return true;
+    }
+    const bool busy = m->run && st.running;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("Choose your own disc image (.iso). Its files are checked and copied once. "
+                       "You can also drop the image on the game window.");
+    ImGui::PopStyleColor();
+    ImGui::BeginDisabled(busy);
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 110.0f);
+    if (ImGui::InputText("##disc", m->field.path, sizeof(m->field.path)) || ImGui::IsItemDeactivatedAfterEdit())
+        m->field.recheck();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!fileDialogAvailable());
+    if (ImGui::Button("Browse...", ImVec2(100.0f, 0.0f)))
+    {
+        const fs::path chosen = pickDiscImage(m->disc->name);
+        if (!chosen.empty())
+            m->field.set(chosen);
+    }
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    const bool right = m->field.disc && std::string(m->field.disc->name) == m->disc->name;
+    if (!m->field.message.empty())
+    {
+        if (right)
+            ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1), "OK: %s", m->field.message.c_str());
+        else if (m->field.disc)
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1), "This is %s, not %s.", m->field.message.c_str(),
+                               m->disc->name);
+        else
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1), "Not usable: %s", m->field.message.c_str());
+    }
+    if (busy)
+    {
+        ImGui::ProgressBar(float(st.fraction), ImVec2(-1.0f, 0.0f), st.detail.c_str());
+        if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f)))
+            m->run->cancel();
+        return false;
+    }
+    if (st.failed)
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1), "%s", st.error.c_str());
+    else if (st.cancelled)
+        ImGui::TextUnformatted("Cancelled.");
+    ImGui::BeginDisabled(!right);
+    if (ImGui::Button("Install", ImVec2(120.0f, 0.0f)))
+    {
+        SetupOptions o;
+        o.root = m->dataDir;
+        o.installOnly = true;
+        o.logDir = m->dataDir / "logs";
+        o.xlIso = fromUtf8(m->field.path);
+        o.discs = std::span<const DiscSpec>(m->disc, 1);
+        m->run = std::make_unique<SetupRun>(o);
+        m->run->start();
+    }
+    ImGui::EndDisabled();
+    return false;
+}
+
 } // namespace dw5xl::setup

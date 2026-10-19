@@ -4,6 +4,7 @@
 #include "setup_pipeline.h"
 
 #include <filesystem>
+#include <memory>
 #include <string>
 
 namespace dw5xl::setup {
@@ -24,5 +25,23 @@ bool runWizardWindow(const WizardConfig &config);
 
 // The same run without a window, printing the steps; returns 0 when it finished.
 int runWizardConsole(const SetupOptions &options);
+
+// "Insert disc" panel drawn inside an imgui frame that already exists (the running game, issue 011 M7): one disc
+// image field (typed, Browse, or a file dropped on the window), Install (check + copy + marker into the player data
+// folder), progress and errors.
+class DiscInstallPanel
+{
+public:
+    DiscInstallPanel(std::filesystem::path dataDir, const DiscSpec &disc);
+    ~DiscInstallPanel();
+    // Draws the panel's contents (the caller owns the imgui window). Returns true once the disc is installed.
+    bool draw();
+    void dropped(const std::filesystem::path &image);
+    bool running() const;
+
+private:
+    struct State;
+    std::unique_ptr<State> m;
+};
 
 } // namespace dw5xl::setup

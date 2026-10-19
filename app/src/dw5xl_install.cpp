@@ -4,13 +4,24 @@
 //   dw5xl                                   play; on first start the wizard asks for the disc image
 //   dw5xl --install <DW5XL.iso> [--dw5-iso <DW5.iso>]
 //                                           install without a window (tests), exit code 0 = installed
+//   dw5xl --add-disc <image.iso>            add or repair one disc (what the in-game panel does), no window
 // DW5XL_DATA_DIR overrides the player data folder.
+// In the running game (M7): when Load Original asks for the DW5 disc and it is not installed, an "insert disc" panel
+// opens over the game; F9 opens the Discs window (both discs, add DW5, check the files).
 #include "codegen.h"
 #include "install_state.h"
+#include "ps2_debug_panel.h"
 #include "wizard_ui.h"
 
+#include "imgui.h"
+#include "raylib.h"
+
+#include <atomic>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -19,6 +30,12 @@ using namespace dw5xl::setup;
 void attachParentConsole(); // setup/wizard_console.cpp
 
 namespace {
+fs::path g_dataDir;                     // set when the game runs from the player data folder
+std::atomic<bool> g_discRequested{false}; // the game asked for the DW5 disc and it is not installed
+bool g_discsWindow = false;             // F9
+std::unique_ptr<DiscInstallPanel> g_panel;
+std::string g_checkResult;
+
 fs::path bootElfName() { return fs::path(kCodegenProfiles[0].input).filename(); }
 
 // Without a console (a Windows window program, or started from a desktop shortcut) the log goes to a file.
@@ -54,7 +71,7 @@ bool dw5xlInstalledBoot(int argc, char **argv, fs::path &elf, int &exitCode)
     options.installOnly = true;
     options.logDir = data / "logs";
 
-    fs::path xlIso, dw5Iso;
+    fs::path xlIso, dw5Iso, addDisc;
     bool install = false;
     for (int i = 1; i < argc; ++i)
     {
@@ -66,6 +83,34 @@ bool dw5xlInstalledBoot(int argc, char **argv, fs::path &elf, int &exitCode)
         }
         else if (arg == "--dw5-iso" && i + 1 < argc)
             dw5Iso = fromUtf8(argv[++i]);
+        else if (arg == "--add-disc" && i + 1 < argc)
+            addDisc = fromUtf8(argv[++i]);
+    }
+    if (!addDisc.empty())
+    {
+        attachParentConsole();
+        IsoImage iso;
+        std::string error;
+        const DiscSpec *disc = nullptr;
+        if (iso.open(addDisc, error))
+            for (const auto &candidate : kSupportedDiscs)
+            {
+                const DiscSpec one[] = {candidate};
+                if (identifyDisc(iso, one, error))
+                    disc = &candidate;
+            }
+        iso.close();
+        if (!disc)
+        {
+            std::fprintf(stderr, "%s is not a supported disc\n", utf8(addDisc).c_str());
+            exitCode = 1;
+            return false;
+        }
+        options.xlIso = addDisc;
+        options.discs = std::span<const DiscSpec>(disc, 1);
+        std::printf("adding %s into %s\n", disc->name, utf8(data).c_str());
+        exitCode = runWizardConsole(options);
+        return false;
     }
     if (install)
     {
@@ -100,6 +145,116 @@ bool dw5xlInstalledBoot(int argc, char **argv, fs::path &elf, int &exitCode)
         return false;
     }
     std::fprintf(stderr, "[install] playing from %s\n", utf8(fs::current_path()).c_str());
+    g_dataDir = data;
     elf = fs::path(".") / bootElfName();
     return true;
+}
+
+// The game's disc check (dw5xl_overlays.cpp) found the requested disc missing or wrong: offer to install it.
+// which: 0 = Dynasty Warriors 5 (Load Original). Only in installed mode.
+void dw5xlRequestDisc(uint32_t which)
+{
+    if (!g_dataDir.empty() && which == 0u && !g_discRequested.exchange(true))
+        std::fprintf(stderr, "[install] the game asks for %s: insert-disc panel open\n", kSupportedDiscs[1].name);
+}
+
+namespace {
+const DiscSpec &dw5Disc() { return kSupportedDiscs[1]; }
+
+bool overlayWanted()
+{
+    if (IsKeyPressed(KEY_F9))
+        g_discsWindow = !g_discsWindow;
+    return g_discRequested || g_discsWindow || (g_panel && g_panel->running());
+}
+
+void drawOverlay()
+{
+    if (IsFileDropped())
+    {
+        FilePathList files = LoadDroppedFiles();
+        if (files.count > 0 && g_panel)
+            g_panel->dropped(fromUtf8(files.paths[0]));
+        UnloadDroppedFiles(files);
+    }
+    const ImVec2 screen{float(GetScreenWidth()), float(GetScreenHeight())};
+    ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, screen.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(620.0f, 0.0f), ImGuiCond_Appearing);
+    bool open = true;
+    const char *title = g_discRequested ? "Insert disc###discs" : "Discs (F9)###discs";
+    if (ImGui::Begin(title, &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        if (g_discRequested)
+        {
+            ImGui::TextWrapped("The game asks for the %s disc.", dw5Disc().name);
+            if (!g_panel)
+                g_panel = std::make_unique<DiscInstallPanel>(g_dataDir, dw5Disc());
+            if (g_panel->draw())
+            {
+                ImGui::TextWrapped("Now choose NO in the game (\"Cancel data load?\") to read the disc.");
+                if (ImGui::Button("Close", ImVec2(120.0f, 0.0f)))
+                    open = false;
+            }
+        }
+        else
+        {
+            for (const auto &disc : kSupportedDiscs)
+            {
+                std::string problem;
+                const InstallState state = installState(g_dataDir, disc, &problem);
+                ImGui::Text("%s: %s", disc.name, state == InstallState::Installed  ? "installed"
+                                                 : state == InstallState::Missing ? "not installed"
+                                                                                  : "needs a repair");
+            }
+            if (!g_panel)
+            {
+                if (ImGui::Button("Add or repair a disc...", ImVec2(220.0f, 0.0f)))
+                    g_panel = std::make_unique<DiscInstallPanel>(g_dataDir, dw5Disc());
+                ImGui::SameLine();
+                if (ImGui::Button("Check the files", ImVec2(160.0f, 0.0f)))
+                {
+                    g_checkResult.clear();
+                    for (const auto &disc : kSupportedDiscs)
+                    {
+                        std::string problem;
+                        if (installState(g_dataDir, disc, &problem) == InstallState::Incomplete)
+                            g_checkResult += std::string(disc.name) + ": " + problem + "\n";
+                    }
+                    if (g_checkResult.empty())
+                        g_checkResult = "All installed files are there with the right sizes.";
+                }
+                if (!g_checkResult.empty())
+                    ImGui::TextWrapped("%s", g_checkResult.c_str());
+            }
+            else
+            {
+                ImGui::Separator();
+                g_panel->draw();
+            }
+        }
+    }
+    ImGui::End();
+    if (!open && !(g_panel && g_panel->running()))
+    {
+        g_discRequested = false;
+        g_discsWindow = false;
+        g_panel.reset();
+        g_checkResult.clear();
+    }
+}
+} // namespace
+
+// Called by the runtime's main once the debug panel exists: the game overlay, and the F1 debugger only in developer
+// runs (a player build has it off unless PS2X_DEBUG_UI=1, owner 2026-10-19).
+void dw5xlConfigureDebugPanel(PS2DebugPanel &panel)
+{
+    if (!g_dataDir.empty())
+    {
+        const char *debug = std::getenv("PS2X_DEBUG_UI");
+        const bool enabled = debug && *debug == '1';
+        panel.setDebuggerEnabled(enabled);
+        panel.setVisible(false);
+        std::fprintf(stderr, "[install] F1 debugger %s\n", enabled ? "on (PS2X_DEBUG_UI=1)" : "off (player build)");
+    }
+    panel.setOverlay(overlayWanted, drawOverlay);
 }
