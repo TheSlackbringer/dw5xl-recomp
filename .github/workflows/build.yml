@@ -36,7 +36,7 @@ jobs:
           if [ -n "$bad" ]; then echo "game-derived or local files are tracked:"; echo "$bad"; exit 1; fi
       - name: paraLLEl-GS (pinned) with the renderer patches
         run: |
-          git clone -q https://github.com/Themaister/parallel-gs.git app/deps/parallel-gs
+          git clone -q https://github.com/Arntzen-Software/parallel-gs.git app/deps/parallel-gs
           git -C app/deps/parallel-gs checkout -q "$PARALLEL_GS_REV"
           git -C app/deps/parallel-gs submodule update --init Granite
           git -C app/deps/parallel-gs/Granite submodule update --init third_party/volk third_party/khronos/vulkan-headers
@@ -78,7 +78,7 @@ jobs:
           echo "$FFMPEG_SHA256  /tmp/$FFMPEG_ZIP" | sha256sum -c -
       - name: paraLLEl-GS (pinned) with the renderer patches
         run: |
-          git clone -q https://github.com/Themaister/parallel-gs.git app/deps/parallel-gs
+          git clone -q https://github.com/Arntzen-Software/parallel-gs.git app/deps/parallel-gs
           git -C app/deps/parallel-gs checkout -q "$PARALLEL_GS_REV"
           git -C app/deps/parallel-gs submodule update --init Granite
           git -C app/deps/parallel-gs/Granite submodule update --init third_party/volk third_party/khronos/vulkan-headers
@@ -126,14 +126,20 @@ jobs:
         shell: pwsh
         working-directory: dist
         run: |
-          $tests = 'overlay_dispatch','field_history','cd_iop_read','cd_stream_rate','presentation_stride',
-                   'vif_unpack_boundary','ee_shared_vu0','ee_rounding','vu_minmax','vif_unpack_fast',
-                   'vu1_fmac_fast','vu0_macro','disc_validation','overlay_lifecycle','vu1_async_queue'
+          # Every test program in the artifact (the build only made the ones that need no game data),
+          # each with a 5-minute limit.
           $failed = @()
-          foreach ($t in $tests) {
-            & ".\dw5xl_${t}_test.exe" *> "$t.log"
-            if ($LASTEXITCODE -ne 0) { $failed += $t; Write-Host "FAIL $t"; Get-Content "$t.log" -Tail 20 }
-            else { Write-Host "PASS $t" }
+          foreach ($exe in Get-ChildItem -Filter 'dw5xl_*_test.exe' | Sort-Object Name) {
+            $t = $exe.BaseName
+            $p = Start-Process -FilePath $exe.FullName -NoNewWindow -PassThru `
+                 -RedirectStandardOutput "$t.out.log" -RedirectStandardError "$t.err.log"
+            if (-not $p.WaitForExit(300000)) {
+              $p | Stop-Process -Force; $failed += $t; Write-Host "TIMEOUT $t"; continue
+            }
+            if ($p.ExitCode -ne 0) {
+              $failed += $t; Write-Host "FAIL $t (exit $($p.ExitCode))"
+              Get-Content "$t.out.log", "$t.err.log" -Tail 20
+            } else { Write-Host "PASS $t" }
           }
           & .\ps2_recomp.exe --help *> recomp.log
           Write-Host "ps2_recomp.exe starts: exit $LASTEXITCODE"
