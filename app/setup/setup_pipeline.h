@@ -39,6 +39,9 @@ struct SetupOptions
     std::filesystem::path logDir;     // empty: root/logs/setup
     // Discs the images are checked against: [0] the required one, [1] the optional one.
     std::span<const DiscSpec> discs = kSupportedDiscs;
+    // Player install (issue 011 v4): `root` is the player data folder; Check + Extract only, then each disc gets
+    // its install marker. Generate / lift / build are the developer path and are skipped.
+    bool installOnly = false;
 
     std::filesystem::path effectiveBuildDir() const { return buildDir.empty() ? root / "app" / "build" : buildDir; }
     std::filesystem::path effectiveLogDir() const { return logDir.empty() ? root / "logs" / "setup" : logDir; }

@@ -36,6 +36,8 @@ add_executable(dw5xl
     src/dw5xl_images.cpp
     src/ipu_idec.cpp
     src/dw5xl_overlays.cpp
+    src/dw5xl_install.cpp
+    setup/wizard_console.cpp
 )
 target_include_directories(dw5xl PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
 # Build ID (git describe --always --dirty) for the startup log and the F2 overlay (issue 012).
@@ -47,8 +49,8 @@ add_custom_target(dw5xl_build_id
     VERBATIM)
 add_dependencies(dw5xl dw5xl_build_id)
 target_include_directories(dw5xl PRIVATE "${DW5XL_BUILD_ID_DIR}")
-target_link_libraries(dw5xl PRIVATE ps2_runtime rlImGui imgui)
-target_compile_definitions(dw5xl PRIVATE PS2X_ENABLE_DEBUG_UI=1)
+target_link_libraries(dw5xl PRIVATE ps2_runtime rlImGui imgui dw5xl_setup_ui)
+target_compile_definitions(dw5xl PRIVATE PS2X_ENABLE_DEBUG_UI=1 DW5XL_INSTALLED_MODE=1)
 target_precompile_headers(dw5xl PRIVATE
     "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_runtime_macros.h"
     "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_runtime.h"
@@ -59,7 +61,7 @@ target_precompile_headers(dw5xl PRIVATE
 )
 # 42k small generated files: batch them so the compiler isn't started 42k times.
 set_target_properties(dw5xl PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
-set_source_files_properties(src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
+set_source_files_properties(src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp src/dw5xl_install.cpp setup/wizard_console.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
 # Lifted VU1 microprograms are translated from the game's own microcode (tools/vu1_translator.py, run by
 # tools/regen.sh) into the ignored recomp/dw5xl/vu1/ folder. Game-derived: never committed. Without it,
 # VU1 microcode runs in the interpreter.
@@ -139,18 +141,21 @@ endif() # DW5XL_BUILD_GAME
 
 # Setup wizard core (issue 011): reads the player's disc image, checks and extracts it. Needs no game data.
 add_library(dw5xl_setup_core STATIC setup/iso9660.cpp setup/disc_setup.cpp setup/run_process.cpp setup/codegen.cpp
-    setup/build_game.cpp setup/setup_layout.cpp setup/setup_pipeline.cpp setup/vu1lift/vu1_timing.cpp setup/vu1lift/vu1_translator.cpp)
+    setup/build_game.cpp setup/install_state.cpp setup/setup_layout.cpp setup/setup_pipeline.cpp setup/vu1lift/vu1_timing.cpp setup/vu1lift/vu1_translator.cpp)
 target_include_directories(dw5xl_setup_core PUBLIC setup)
 target_link_libraries(dw5xl_setup_core PUBLIC ffmpeg)
 # VU1 lifter (port of tools/vu1_translator.py, disc mode): dw5xl_vu1lift <SLES_538.60> <output.cpp>
 add_executable(dw5xl_vu1lift setup/vu1lift/vu1lift_main.cpp)
 target_link_libraries(dw5xl_vu1lift PRIVATE dw5xl_setup_core)
-# The setup wizard: a window (raylib + imgui) or --no-window, from the player's disc image to the built game.
-add_executable(dw5xl_setup WIN32 setup/wizard_main.cpp setup/wizard_console.cpp setup/file_dialog.cpp)
-target_link_libraries(dw5xl_setup PRIVATE dw5xl_setup_core rlImGui imgui raylib)
+# The wizard's window (raylib + imgui) and no-window run, shared by dw5xl_setup and the game (installed mode).
+add_library(dw5xl_setup_ui STATIC setup/wizard_ui.cpp setup/file_dialog.cpp)
+target_link_libraries(dw5xl_setup_ui PUBLIC dw5xl_setup_core rlImGui imgui raylib)
 if(WIN32)
-    target_link_libraries(dw5xl_setup PRIVATE comdlg32)
+    target_link_libraries(dw5xl_setup_ui PUBLIC comdlg32)
 endif()
+# Developer path: build the game from your own disc (window or --no-window).
+add_executable(dw5xl_setup WIN32 setup/wizard_main.cpp setup/wizard_console.cpp)
+target_link_libraries(dw5xl_setup PRIVATE dw5xl_setup_ui)
 dw5xl_windows_target_options(dw5xl_setup)
 
 option(DW5XL_BUILD_TESTS "Build runtime and locally generated helper tests" OFF)
@@ -176,6 +181,9 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_setup_pipeline_test tests/setup_pipeline_test.cpp)
     target_link_libraries(dw5xl_setup_pipeline_test PRIVATE dw5xl_setup_core)
     add_test(NAME setup_pipeline COMMAND dw5xl_setup_pipeline_test)
+    add_executable(dw5xl_setup_install_test tests/setup_install_test.cpp)
+    target_link_libraries(dw5xl_setup_install_test PRIVATE dw5xl_setup_core)
+    add_test(NAME setup_install COMMAND dw5xl_setup_install_test)
     add_executable(dw5xl_overlay_dispatch_test tests/overlay_dispatch_test.cpp)
     target_link_libraries(dw5xl_overlay_dispatch_test PRIVATE ps2_runtime)
     target_compile_options(dw5xl_overlay_dispatch_test PRIVATE ${DW5XL_ARCH_FLAGS})

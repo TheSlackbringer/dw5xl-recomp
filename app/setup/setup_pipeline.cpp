@@ -1,5 +1,6 @@
 #include "setup_pipeline.h"
 #include "codegen.h"
+#include "install_state.h"
 #include "vu1lift/vu1_translator.h"
 
 #include <fstream>
@@ -234,6 +235,20 @@ void SetupRun::run()
         }
         before += last;
         ctx.log(std::string("copied ") + image.disc->name + " to game/" + image.disc->folder);
+        if (m_options.installOnly && !writeInstallMarker(m_options.root, *image.disc, error))
+        {
+            fail(error);
+            return;
+        }
+    }
+    if (m_options.installOnly)
+    {
+        enter(Step::Done);
+        std::lock_guard lock(m_mutex);
+        m_status.fraction = 1.0;
+        m_status.running = false;
+        m_status.finished = true;
+        return;
     }
 
     const auto runStep = [&](Step step, const SetupSteps::Fn &fn) {

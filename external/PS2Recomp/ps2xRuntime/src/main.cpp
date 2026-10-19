@@ -169,6 +169,10 @@ namespace
     }
 }
 
+#if defined(DW5XL_INSTALLED_MODE)
+bool dw5xlInstalledBoot(int argc, char **argv, std::filesystem::path &elf, int &exitCode);
+#endif
+
 int main(int argc, char *argv[])
 {
 #if defined(__ANDROID__)
@@ -178,7 +182,25 @@ int main(int argc, char *argv[])
 
     try
     {
+#if defined(DW5XL_INSTALLED_MODE)
+        // DW5XL installed mode (issue 011): no guest ELF given (a shortcut / double-click) -> the player's install,
+        // set up by the wizard on first start (app/src/dw5xl_install.cpp).
+        std::filesystem::path pathObj;
+        if (argc < 2 || (argv[1] && argv[1][0] == '-'))
+        {
+            int exitCode = 0;
+            if (!dw5xlInstalledBoot(argc, argv, pathObj, exitCode))
+            {
+                std::cout.flush();
+                std::cerr.flush();
+                std::_Exit(exitCode);
+            }
+        }
+        else
+            pathObj = getExecutablePath(argc, argv);
+#else
         std::filesystem::path pathObj = getExecutablePath(argc, argv);
+#endif
 
         std::string filePathStr = pathObj.string();
         std::string elfName = pathObj.filename().string();
