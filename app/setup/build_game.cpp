@@ -28,12 +28,13 @@ std::string readText(const fs::path &path)
 // Runs a step in a worker thread and reports Ninja's progress from its log while it runs.
 ProcessResult runWithProgress(const fs::path &program, const std::vector<std::string> &args,
                               const fs::path &workingDirectory, const fs::path &logFile, const std::string &phase,
-                              const std::function<void(const BuildProgress &)> &progress)
+                              const std::function<void(const BuildProgress &)> &progress,
+                              const std::atomic<bool> *cancel)
 {
     ProcessResult result;
     std::atomic<bool> finished{false};
     std::thread worker([&] {
-        result = runProcess(program, args, workingDirectory, logFile);
+        result = runProcess(program, args, workingDirectory, logFile, cancel);
         finished = true;
     });
     while (!finished)
@@ -105,14 +106,21 @@ BuildProgress parseNinjaProgress(const std::string &logText)
 }
 
 bool buildGame(const fs::path &root, const fs::path &buildDir, const BuildTools &tools, const fs::path &logFile,
-               const std::function<void(const BuildProgress &)> &progress, fs::path &executable, std::string &error)
+               const std::function<void(const BuildProgress &)> &progress, fs::path &executable, std::string &error,
+               const std::atomic<bool> *cancel)
 {
     std::error_code ec;
     fs::create_directories(buildDir, ec);
     fs::create_directories(logFile.parent_path(), ec);
     fs::remove(logFile, ec);
     const ProcessResult configure =
-        runWithProgress(tools.cmake, gameConfigureArgs(root, buildDir, tools), root, logFile, "configure", progress);
+        runWithProgress(tools.cmake, gameConfigureArgs(root, buildDir, tools), root, logFile, "configure", progress,
+                        cancel);
+    if (configure.cancelled)
+    {
+        error = "cancelled";
+        return false;
+    }
     if (!configure.started)
     {
         error = configure.error;
@@ -124,7 +132,13 @@ bool buildGame(const fs::path &root, const fs::path &buildDir, const BuildTools 
         return false;
     }
     const ProcessResult build =
-        runWithProgress(tools.cmake, {"--build", utf8(buildDir), "--target", "dw5xl"}, root, logFile, "build", progress);
+        runWithProgress(tools.cmake, {"--build", utf8(buildDir), "--target", "dw5xl"}, root, logFile, "build", progress,
+                        cancel);
+    if (build.cancelled)
+    {
+        error = "cancelled";
+        return false;
+    }
     if (!build.started)
     {
         error = build.error;

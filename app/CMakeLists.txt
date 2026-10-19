@@ -139,12 +139,19 @@ endif() # DW5XL_BUILD_GAME
 
 # Setup wizard core (issue 011): reads the player's disc image, checks and extracts it. Needs no game data.
 add_library(dw5xl_setup_core STATIC setup/iso9660.cpp setup/disc_setup.cpp setup/run_process.cpp setup/codegen.cpp
-    setup/build_game.cpp setup/vu1lift/vu1_timing.cpp setup/vu1lift/vu1_translator.cpp)
+    setup/build_game.cpp setup/setup_layout.cpp setup/setup_pipeline.cpp setup/vu1lift/vu1_timing.cpp setup/vu1lift/vu1_translator.cpp)
 target_include_directories(dw5xl_setup_core PUBLIC setup)
 target_link_libraries(dw5xl_setup_core PUBLIC ffmpeg)
 # VU1 lifter (port of tools/vu1_translator.py, disc mode): dw5xl_vu1lift <SLES_538.60> <output.cpp>
 add_executable(dw5xl_vu1lift setup/vu1lift/vu1lift_main.cpp)
 target_link_libraries(dw5xl_vu1lift PRIVATE dw5xl_setup_core)
+# The setup wizard: a window (raylib + imgui) or --no-window, from the player's disc image to the built game.
+add_executable(dw5xl_setup WIN32 setup/wizard_main.cpp setup/wizard_console.cpp setup/file_dialog.cpp)
+target_link_libraries(dw5xl_setup PRIVATE dw5xl_setup_core rlImGui imgui raylib)
+if(WIN32)
+    target_link_libraries(dw5xl_setup PRIVATE comdlg32)
+endif()
+dw5xl_windows_target_options(dw5xl_setup)
 
 option(DW5XL_BUILD_TESTS "Build runtime and locally generated helper tests" OFF)
 if(DW5XL_BUILD_TESTS)
@@ -166,6 +173,9 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_setup_codegen_test tests/setup_codegen_test.cpp)
     target_link_libraries(dw5xl_setup_codegen_test PRIVATE dw5xl_setup_core)
     add_test(NAME setup_codegen COMMAND dw5xl_setup_codegen_test)
+    add_executable(dw5xl_setup_pipeline_test tests/setup_pipeline_test.cpp)
+    target_link_libraries(dw5xl_setup_pipeline_test PRIVATE dw5xl_setup_core)
+    add_test(NAME setup_pipeline COMMAND dw5xl_setup_pipeline_test)
     add_executable(dw5xl_overlay_dispatch_test tests/overlay_dispatch_test.cpp)
     target_link_libraries(dw5xl_overlay_dispatch_test PRIVATE ps2_runtime)
     target_compile_options(dw5xl_overlay_dispatch_test PRIVATE ${DW5XL_ARCH_FLAGS})
