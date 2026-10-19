@@ -121,6 +121,7 @@ bool generateCode(const fs::path &root, const fs::path &recompiler, const fs::pa
 {
     std::error_code ec;
     fs::create_directories(logDir, ec);
+    const fs::path exe = fs::absolute(recompiler); // the recompiler runs with `root` as its working folder
     const int count = int(std::size(kCodegenProfiles));
     for (int i = 0; i < count; ++i)
     {
@@ -143,7 +144,7 @@ bool generateCode(const fs::path &root, const fs::path &recompiler, const fs::pa
             << rewriteRecompConfig(config, root / profile.input, root / profile.ghidraCsv, work / "output");
         const fs::path log = logDir / (std::string(profile.name) + ".log");
         fs::remove(log, ec);
-        const ProcessResult run = runProcess(recompiler, {utf8(work / "config.toml")}, root, log);
+        const ProcessResult run = runProcess(exe, {utf8(work / "config.toml")}, root, log);
         if (!run.started)
         {
             error = run.error;
