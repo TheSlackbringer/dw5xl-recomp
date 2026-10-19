@@ -1774,8 +1774,15 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
         paths.cdRoot = paths.elfDirectory;
         paths.mcRoot = paths.elfDirectory / "mc0";
     }
+    // PS2X_MC_ROOT=<dir> uses another folder as memory card slot 1 (the tests run on their own copy of a save,
+    // the player's mc0 next to the game stays untouched).
+    if (const char *mc = std::getenv("PS2X_MC_ROOT"); mc && *mc)
+    {
+        paths.mcRoot = std::filesystem::path(mc);
+    }
 
     setIoPaths(paths);
+    std::fprintf(stderr, "[io] memory card slot 1: %s\n", runtimeIoPaths().mcRoot.string().c_str());
 }
 
 namespace

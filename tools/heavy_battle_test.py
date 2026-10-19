@@ -22,7 +22,8 @@ Pass criteria per run (battle part, tick >= 4000):
     the PS2X_VU1_ASYNC_TRACE window lines), so syncs/s = 2 x game FPS. Worst second >= 90 (45 FPS) and
     mean >= 98 (49 FPS). Before the GS worker thread the worst second was ~58 (29 FPS): "slow and choppy".
 
-Needs: app/build/dw5xl built, game/dw5xl/SLES_538.60 (your disc), the save in game/dw5xl/mc0, the
+Needs: app/build/dw5xl built, game/dw5xl/SLES_538.60 (your disc), the test save in game/test-save/<name>
+(--save; each run plays on a fresh copy, game/dw5xl/mc0 is never touched), the
 null sink for --audio null (pactl load-module module-null-sink sink_name=dw5xl_codex_tests).
 Never run while another dw5xl is open or while the owner is testing. Frame dumps are disabled on
 purpose: PNG dumps cause 40 ms host hitches. The final frame is saved as <out>/final.png (game
@@ -69,6 +70,10 @@ def run_once(name, args, out):
     env.update(PS2X_GS_BACKEND='vulkan', PS2X_GS_SCALE=str(args.scale), PS2X_GS_SSAA='1', PS2X_STATS='1',
                PS2X_LATE_VBLANK='1', PS2X_VU1_ASYNC_TRACE='1', PS2X_EXIT_TICK=str(args.exit_tick), PS2X_DUMP_DIR=dump_dir,
                PS2X_DUMP_EVERY='100000000', PS2X_HOST_INPUT=route(args.exit_tick))
+    mc = os.path.join(out, name + '-mc0')
+    shutil.rmtree(mc, ignore_errors=True)
+    shutil.copytree(args.save, mc, copy_function=shutil.copyfile)
+    env['PS2X_MC_ROOT'] = mc
     env.update(kv.split('=', 1) for kv in args.env)
     if args.audio == 'null':
         env['PULSE_SINK'] = 'dw5xl_codex_tests'
@@ -87,6 +92,8 @@ def run_once(name, args, out):
     text = open(log_path, errors='replace').read()
 
     problems = []
+    if f'[io] memory card slot 1: {mc}' not in text:
+        problems.append('the game did not use the test memory card (PS2X_MC_ROOT)')
     if not re.search(rf'\[output\] scale={args.scale}x aa=1x', text):
         problems.append(f'not running at {args.scale}x')
     if f'exit tick {args.exit_tick} reached' not in text:
@@ -140,6 +147,8 @@ def main():
     ap.add_argument('--exit-tick', type=int, default=EXIT_TICK, help='end of the fight (default %(default)s)')
     ap.add_argument('--out', default=None, help='log directory (default: a new temp dir)')
     ap.add_argument('--scale', type=int, choices=(1, 2, 4), default=1, help='output scale (F4); AA choice stays 1')
+    ap.add_argument('--save', default=os.path.join(REPO, 'game', 'test-save', 'mc0-20261014-2222'),
+                    help='memory card folder to copy for each run (default: the tests\' save)')
     ap.add_argument('--env', action='append', default=[], metavar='KEY=VALUE', help='extra environment, e.g. PS2X_DEVICE_PROFILE=1')
     args = ap.parse_args()
     if subprocess.run(['pgrep', '-x', 'dw5xl'], capture_output=True).returncode == 0:
