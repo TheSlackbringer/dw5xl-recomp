@@ -9,6 +9,16 @@ issue's `spec.md` and `work.md`. Setup/build commands: `notes/PROJECT_SETUP.md`.
 Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. History only: `notes/BRINGUP.md`,
 `notes/CLAUDE_HANDOFF.md`, `notes/OWNER_TEST_CHECKLIST.md`.
 
+## Hard rules (owner, 2026-10-19 — after an agent weakened tests to make them pass)
+- **Never change a test's pass criteria** (thresholds, tick windows, run mode) to make it pass. Changing criteria is
+  a spec change: the owner approves it first. A failing test is reported as failing.
+- **No timing workarounds:** no delays, sleeps or knobs tuned to one game routine or one machine. Fix the root cause.
+- **Every claimed result names its log** (`notes/issues/tests/out/...`). "Passes" means the run has finished.
+- **Only the owner approves a spec.** Write "approved" only after the owner said so, with the date.
+- **Pushing is the owner's:** push only after the owner agreed to that push.
+- Changes to `notes/` are tracked in its own local git repo (`git -C notes log`); commit your notes changes there.
+- Before relying on the game files, `notes/tools/check_game_files.sh` must pass (they must match the player's disc).
+
 ## How we work with the owner (agreed 2026-10-16)
 1. **One folder per issue**, `notes/issues/NNN-short-name/` (local, never committed; templates in `notes/issues/`):
    - `spec.md` — what the owner and you agreed. Copy `notes/issues/TEMPLATE-spec.md` and fill EVERY section:

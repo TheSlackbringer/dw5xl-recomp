@@ -8,4 +8,31 @@ if [ -n "$bad" ]; then
     echo "$bad" >&2
     exit 1
 fi
+
+# The renderer patches must apply in order on the pinned paraLLEl-GS revision (README, step 3),
+# exactly as a fresh checkout applies them: git apply vendor/parallel-gs-patches/*.patch.
+pgs_repo=app/deps/parallel-gs
+if git diff --cached --name-only | grep -q '^vendor/parallel-gs-patches/'; then
+    # The pinned revision lives in one place: the README's checkout command.
+    pgs_rev=$(git show :README.md | sed -n 's#^git -C app/deps/parallel-gs checkout \([0-9a-f]\{40\}\)$#\1#p' | head -1)
+    if [ -z "$pgs_rev" ]; then
+        echo "Commit blocked: README.md has no 'git -C app/deps/parallel-gs checkout <revision>' line." >&2
+        exit 1
+    fi
+    if ! git -C "$pgs_repo" cat-file -e "$pgs_rev^{commit}" 2>/dev/null; then
+        echo "Commit blocked: cannot check vendor/parallel-gs-patches ($pgs_repo at $pgs_rev is missing)." >&2
+        exit 1
+    fi
+    tmp=$(mktemp -d)
+    trap 'rm -rf -- "$tmp"' EXIT
+    git -C "$pgs_repo" archive "$pgs_rev" | tar -x -C "$tmp"
+    # The staged version of every patch in the series, in file name order.
+    for path in $(git ls-files --cached 'vendor/parallel-gs-patches/*.patch' | sort); do
+        if ! git show ":$path" | (cd "$tmp" && git apply --whitespace=nowarn -); then
+            echo "Commit blocked: $path does not apply after the patches before it (on $pgs_rev)." >&2
+            echo "Export each patch against the previous patches, not against upstream." >&2
+            exit 1
+        fi
+    done
+fi
 exit 0
