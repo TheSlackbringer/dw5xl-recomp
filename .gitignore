@@ -29,3 +29,4 @@ __pycache__/
 /final.png
 /frame_*.png
 /dist/
+/BUILD_ID
