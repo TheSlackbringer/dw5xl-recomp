@@ -933,15 +933,20 @@ static void applySavedOutputSettings(GS &gs)
 } // namespace
 
 
+// Host window rate: a fixed 60 FPS by default. PS2X_HOST_FPS=<n> sets another fixed rate; PS2X_HOST_FPS=field
+// paces the window on every guest VBlankEnd instead (one host frame per field; issue 015 — makes the picture
+// jump up and down on a real desktop, owner 2026-10-19, so opt-in only).
 static int configuredHostTargetFps()
 {
     if (const char *env = std::getenv("PS2X_HOST_FPS"))
     {
+        if (std::strcmp(env, "field") == 0)
+            return 0;
         const int fps = std::atoi(env);
         if (fps > 0)
             return fps;
     }
-    return 0;
+    return 60;
 }
 
 // The texture grows to the largest presented image (4x output); smaller frames
@@ -1086,6 +1091,16 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     outDisplayWidth = s_lastDisplayWidth;
     outDisplayHeight = s_lastDisplayHeight;
     s_hasUploadedFrame = true;
+    // DW5XL-DEBUG: PS2X_DRAW_TRACE=1 logs every upload whose image or display size differs from the previous one.
+    static const bool s_drawTrace = [] { const char *e = std::getenv("PS2X_DRAW_TRACE"); return e && *e && *e != '0'; }();
+    static uint32_t s_tw = 0, s_th = 0, s_tdw = 0, s_tdh = 0;
+    if (s_drawTrace && (s_tw != outWidth || s_th != outHeight || s_tdw != outDisplayWidth || s_tdh != outDisplayHeight))
+    {
+        std::fprintf(stderr, "[draw] tick=%llu image=%ux%u display=%ux%u tex=%ux%u\n",
+                     static_cast<unsigned long long>(currentTick), outWidth, outHeight, outDisplayWidth,
+                     outDisplayHeight, texWidth, texHeight);
+        s_tw = outWidth; s_th = outHeight; s_tdw = outDisplayWidth; s_tdh = outDisplayHeight;
+    }
 }
 
 PS2Runtime::PS2Runtime()
