@@ -141,6 +141,9 @@ jobs:
               Get-Content "$t.out.log", "$t.err.log" -Tail 20
             } else { Write-Host "PASS $t" }
           }
-          & .\ps2_recomp.exe --help *> recomp.log
-          Write-Host "ps2_recomp.exe starts: exit $LASTEXITCODE"
-          if ($failed.Count -gt 0) { exit 1 }
+          # The recompiler without a config prints its usage (and exits 1): proves it starts on Windows.
+          $usage = (& .\ps2_recomp.exe 2>&1 | Out-String)
+          if ($usage -match 'Usage: ps2recomp') { Write-Host "PASS ps2_recomp.exe starts" }
+          else { $failed += 'ps2_recomp'; Write-Host "FAIL ps2_recomp.exe: $usage" }
+          if ($failed.Count -gt 0) { Write-Host "Failed: $($failed -join ', ')"; exit 1 }
+          exit 0
