@@ -91,7 +91,7 @@ target_link_libraries(ps2x_tests PRIVATE
 if(MSVC)
     target_link_options(ps2x_tests PRIVATE "/STACK:8388608")
 elseif(MINGW)
-    target_link_options(ps2x_tests PRIVATE "--stack,8388608")
+    target_link_options(ps2x_tests PRIVATE "-Wl,--stack,8388608")
 endif()
 
 if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
