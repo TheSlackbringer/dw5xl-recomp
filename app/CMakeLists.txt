@@ -146,9 +146,17 @@ set_target_properties(dw5xl_ovl02 PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SI
 target_link_libraries(dw5xl PRIVATE dw5xl_ovl02)
 endif() # DW5XL_BUILD_GAME
 
+# Setup wizard core (issue 011): reads the player's disc image, checks and extracts it. Needs no game data.
+add_library(dw5xl_setup_core STATIC setup/iso9660.cpp setup/disc_setup.cpp)
+target_include_directories(dw5xl_setup_core PUBLIC setup)
+target_link_libraries(dw5xl_setup_core PUBLIC ffmpeg)
+
 option(DW5XL_BUILD_TESTS "Build runtime and locally generated helper tests" OFF)
 if(DW5XL_BUILD_TESTS)
     enable_testing()
+    add_executable(dw5xl_setup_disc_test tests/setup_disc_test.cpp)
+    target_link_libraries(dw5xl_setup_disc_test PRIVATE dw5xl_setup_core)
+    add_test(NAME setup_disc COMMAND dw5xl_setup_disc_test)
     add_executable(dw5xl_overlay_dispatch_test tests/overlay_dispatch_test.cpp)
     target_link_libraries(dw5xl_overlay_dispatch_test PRIVATE ps2_runtime)
     target_compile_options(dw5xl_overlay_dispatch_test PRIVATE ${DW5XL_ARCH_FLAGS})
