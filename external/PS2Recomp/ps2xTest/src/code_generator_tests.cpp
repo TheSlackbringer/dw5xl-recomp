@@ -2,6 +2,7 @@
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/ps2_recompiler.h"
+#include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/types.h"
 #include <filesystem>
 #include <fstream>
@@ -498,6 +499,40 @@ void register_code_generator_tests()
 
         t.IsTrue(generated.find("label_2004:") != std::string::npos, "delay slot that is a target should emit a label");
         t.IsTrue(generated.find("goto label_2004;") != std::string::npos, "branch to delay slot should use goto");
+    });
+
+    tc.Run("BC2F/BC2T test CPCOND2 (VU0 idle), not the VU0 Z status flag", [](TestCase &t) {
+        // VCALLMS runs the VU0 microprogram to completion before the next EE instruction, so VU0 is never busy
+        // when a COP2 branch executes: CPCOND2 = 0 -> BC2F/BC2FL always taken, BC2T/BC2TL never.
+        const struct { uint32_t raw; const char *name; const char *condition; } forms[] = {
+            {0x49000001u, "BC2F", "(true)"}, {0x49010001u, "BC2T", "(false)"},
+            {0x49020001u, "BC2FL", "(true)"}, {0x49030001u, "BC2TL", "(false)"},
+        };
+        for (const auto &form : forms)
+        {
+            Function func;
+            func.name = "test_func";
+            func.start = 0x1000;
+            func.end = 0x1014;
+            func.isRecompiled = true;
+            func.isStub = false;
+
+            R5900Decoder decoder;
+            std::vector<Instruction> instructions;
+            instructions.push_back(makeNop(0x1000));
+            instructions.push_back(decoder.decodeInstruction(0x1004, form.raw)); // target 0x100c
+            instructions.push_back(makeNop(0x1008));                             // delay slot
+            instructions.push_back(makeNop(0x100c));
+            instructions.push_back(makeNop(0x1010));
+
+            CodeGenerator gen({}, {});
+            const std::string generated = gen.generateFunction(func, instructions, false);
+            printGeneratedCode(form.name, generated);
+            t.IsTrue(generated.find(std::string("branch_taken_0x1004 = ") + form.condition) != std::string::npos,
+                     std::string(form.name) + " should branch on CPCOND2 = 0 " + form.condition);
+            t.IsTrue(generated.find("vu0_status") == std::string::npos,
+                     std::string(form.name) + " must not read the VU0 status flags");
+        }
     });
 
     tc.Run("control-flow analysis keeps same-function JAL target internal and promotes only the return pc", [](TestCase &t) {

@@ -439,9 +439,12 @@ namespace ps2recomp
             if (m_branchInst.rs == COP2_BC)
             {
                 const uint8_t bcCond = static_cast<uint8_t>(m_branchInst.rt);
+                // On PS2, COP2 branches test CPCOND2 (wired to VU0 micro busy state VBS0).
+                // Under synchronous VU0 execution, microprograms complete immediately,
+                // so CPCOND2 is always false (idle: 0).
                 return (bcCond == COP2_BC_BCF || bcCond == COP2_BC_BCFL)
-                           ? "!(ctx->vu0_status & 0x1)"
-                           : "(ctx->vu0_status & 0x1)";
+                           ? "true"
+                           : "false";
             }
             break;
         default:
