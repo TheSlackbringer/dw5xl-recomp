@@ -130,7 +130,7 @@ ProcessResult runProcess(const std::filesystem::path &program, const std::vector
     if (!workingDirectory.empty())
         posix_spawn_file_actions_addchdir_np(&actions, workingDirectory.c_str());
     pid_t pid = 0;
-    const int rc = posix_spawn(&pid, owned[0].c_str(), &actions, nullptr, argv.data(), environ);
+    const int rc = posix_spawnp(&pid, owned[0].c_str(), &actions, nullptr, argv.data(), environ); // searches PATH for bare names
     posix_spawn_file_actions_destroy(&actions);
     if (rc != 0)
     {

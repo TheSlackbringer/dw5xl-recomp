@@ -139,7 +139,7 @@ endif() # DW5XL_BUILD_GAME
 
 # Setup wizard core (issue 011): reads the player's disc image, checks and extracts it. Needs no game data.
 add_library(dw5xl_setup_core STATIC setup/iso9660.cpp setup/disc_setup.cpp setup/run_process.cpp setup/codegen.cpp
-    setup/vu1lift/vu1_timing.cpp setup/vu1lift/vu1_translator.cpp)
+    setup/build_game.cpp setup/vu1lift/vu1_timing.cpp setup/vu1lift/vu1_translator.cpp)
 target_include_directories(dw5xl_setup_core PUBLIC setup)
 target_link_libraries(dw5xl_setup_core PUBLIC ffmpeg)
 # VU1 lifter (port of tools/vu1_translator.py, disc mode): dw5xl_vu1lift <SLES_538.60> <output.cpp>
@@ -160,6 +160,9 @@ if(DW5XL_BUILD_TESTS)
                  "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/vu1lift-compare" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompareVu1Lift.cmake")
         set_tests_properties(vu1lift_matches_python PROPERTIES TIMEOUT 300)
     endif()
+    add_executable(dw5xl_setup_build_test tests/setup_build_test.cpp)
+    target_link_libraries(dw5xl_setup_build_test PRIVATE dw5xl_setup_core)
+    add_test(NAME setup_build COMMAND dw5xl_setup_build_test)
     add_executable(dw5xl_setup_codegen_test tests/setup_codegen_test.cpp)
     target_link_libraries(dw5xl_setup_codegen_test PRIVATE dw5xl_setup_core)
     add_test(NAME setup_codegen COMMAND dw5xl_setup_codegen_test)
