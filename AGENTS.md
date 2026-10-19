@@ -34,10 +34,12 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
    Push back with reasons when you think a spec is wrong; the owner decides and can overrule. No fixes or experimental
    code changes without an approved spec. While away, the owner can allow work on an unapproved spec — explicitly.
 3. **A test per issue, written first:** `notes/issues/tests/issue_NNN_*.py` prints PASS/FAIL and must FAIL on the bug
-   before the fix (where measurable). Runner: `notes/issues/tests/run.py NNN|quick|all|list`; helpers and routes in
+   before the fix (where measurable). Runner: `notes/issues/tests/run.py NNN|quick|standard|full|list`; helpers and routes in
    `tests/dw5test.py`. Closed issues keep their tests as regression guards.
-4. **Test tiers:** `run.py quick` (~12 min) after every change; `run.py all` (full, ~55 min) before owner test
-   sessions or while the owner is away. **Owner test sessions:** `run.py all` must pass first. Batch several
+4. **Test tiers (owner 2026-10-19):** `run.py quick` (~12 min) after every change; `run.py standard` (~40 min,
+   every test once at full length) before a "Fix #" commit; `run.py full` (= `all`, ~80 min, every repeat) before
+   owner test sessions and pushes. Identical game runs are shared within a suite run (`dw5test.opening_dumps`,
+   `opening_timing`, `heavy_fight`). **Owner test sessions:** `run.py full` must pass first. Batch several
    "fixed — owner test" issues into one session with one short list. Test window: `run.py window NNN ...` (full
    logging, log filed under the issues). Normal play: `run.py play`. The owner only checks the specs' "Owner test"
    items; record results in `work.md` + status.
@@ -91,7 +93,7 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
 ## Essentials
 - Build: `cmake --build app/build` (all), `--target dw5xl` (game). Regenerate code: `tools/regen.sh main|ovl00|…`
   (needs the player's disc in `game/dw5xl/`). CTests: `cd app/build && ctest`.
-- Run tests: `notes/issues/tests/run.py quick` (after changes) / `run.py all` (full). Perf/stutter: `tools/heavy_battle_test.py` (no frame dumps when
+- Run tests: `notes/issues/tests/run.py quick` (after changes) / `standard` (before a Fix commit) / `full`. Perf/stutter: `tools/heavy_battle_test.py` (no frame dumps when
   measuring timing).
 - Unsure how the original looks or behaves: compare with PCSX2 first (`tools/pcsx2_reference.py`), then ask the owner
   for what screenshots can't show (feel, sound timing).
