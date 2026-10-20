@@ -1,4 +1,15 @@
-# DW5XL Recomp
+<h1 align="center">DW5XL Recomp</h1>
+
+<p align="center"><b>Dynasty Warriors 5: Xtreme Legends (PS2) as a native PC game, built on your PC from your own disc.</b></p>
+
+<p align="center">
+  <a href="https://github.com/TheSlackbringer/dw5xl-recomp/actions/workflows/build.yml"><img alt="build" src="https://img.shields.io/github/actions/workflow/status/TheSlackbringer/dw5xl-recomp/build.yml?branch=main&label=build&logo=github"></a>
+  <img alt="platform: Windows | Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0a7bbb">
+  <img alt="graphics: Vulkan" src="https://img.shields.io/badge/graphics-Vulkan-ac162c">
+  <a href="LICENSE"><img alt="license: GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-6a9a1f"></a>
+  <img alt="status: in development" src="https://img.shields.io/badge/status-in%20development-e6a200">
+  <img alt="disc: PAL SLES-53860" src="https://img.shields.io/badge/disc-PAL%20SLES--53860-555">
+</p>
 
 A native PC port of **Dynasty Warriors 5: Xtreme Legends** for the PlayStation 2, built with PS2Recomp. The game's logic is statically translated into C++; the runtime provides the PS2 hardware services it still needs. Graphics use **Vulkan through paraLLEl-GS**.
 
