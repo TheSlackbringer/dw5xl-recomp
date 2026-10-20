@@ -45,7 +45,7 @@ Play
      minutes (longer on older PCs). Then the game starts.
   4. Every later start of DW5XL.exe starts the game at once.
   5. Load Original: when the game asks for the Dynasty Warriors 5 disc, a window opens where you
-     choose that disc image; then choose NO at the game's "Cancel data load?" question.
+     choose that disc image; the game continues by itself once it is installed (only the first time).
 
 Your files
   Game files, the built game, saves, settings and logs are in %LOCALAPPDATA%\\DW5XL.
