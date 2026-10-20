@@ -43,7 +43,7 @@ add_executable(dw5xl
     setup/wizard_console.cpp
 )
 target_include_directories(dw5xl PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
-# Build ID (git describe --always --dirty) for the startup log and the F2 overlay (issue 012).
+# Build ID (git describe --always --dirty) for the startup log and the F8 overlay (issue 012).
 set(DW5XL_BUILD_ID_DIR "${CMAKE_CURRENT_BINARY_DIR}/build_id")
 add_custom_target(dw5xl_build_id
     COMMAND "${CMAKE_COMMAND}" "-DSRC=${CMAKE_CURRENT_SOURCE_DIR}/.." "-DOUT=${DW5XL_BUILD_ID_DIR}/dw5xl_build_id.h"
@@ -188,6 +188,11 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_setup_install_test tests/setup_install_test.cpp)
     target_link_libraries(dw5xl_setup_install_test PRIVATE dw5xl_setup_core)
     add_test(NAME setup_install COMMAND dw5xl_setup_install_test)
+    # Function-key layout (owner 2026-10-20), unique keys, README key table, handlers read the table.
+    add_executable(dw5xl_hotkeys_test tests/hotkeys_test.cpp)
+    target_link_libraries(dw5xl_hotkeys_test PRIVATE ps2_runtime)
+    target_compile_definitions(dw5xl_hotkeys_test PRIVATE DW5XL_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
+    add_test(NAME hotkeys COMMAND dw5xl_hotkeys_test)
     add_executable(dw5xl_overlay_dispatch_test tests/overlay_dispatch_test.cpp)
     target_link_libraries(dw5xl_overlay_dispatch_test PRIVATE ps2_runtime)
     target_compile_options(dw5xl_overlay_dispatch_test PRIVATE ${DW5XL_ARCH_FLAGS})

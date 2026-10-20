@@ -52,8 +52,10 @@ Your files
   A newer version of this folder rebuilds the game once and keeps your saves.
 
 Keys
-  F3  frame rate overlay     F4  output resolution (1x / 2x / 4x)
-  F5  anti-aliasing          F9  discs (add or check your disc images)
+  F2  anti-aliasing          F3  frame rate overlay
+  F4  output resolution (1x / 2x / 4x)
+  F8  build ID (for bug reports)
+  F10 discs (add or check your disc images)
 
 Source code: https://github.com/TheSlackbringer/dw5xl-recomp (GPL-3.0), version {build}.
 Licenses of everything included are in the LICENSES folder; the compiler and CMake also keep

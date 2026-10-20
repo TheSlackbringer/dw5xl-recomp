@@ -8,7 +8,7 @@
 // DW5XL_DATA_DIR overrides the player data folder.
 // In the running game (M7, M10): when Load Original asks for the DW5 disc and it is not installed, an "Insert disc"
 // window opens over the game and the drive reports "not ready" until the disc is installed — then Load Original
-// continues by itself; Cancel lets the game find no disc once (its own prompt). F9 opens the Discs window.
+// continues by itself; Cancel lets the game find no disc once (its own prompt). F10 opens the Discs window.
 #include "codegen.h"
 #include "disc_wait.h"
 #include "install_state.h"
@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include "runtime/hotkeys.h"
 
 namespace fs = std::filesystem;
 using namespace dw5xl::setup;
@@ -36,7 +37,7 @@ namespace {
 fs::path g_dataDir;                     // set when the game runs from the player data folder
 DiscWait g_discWait;                      // the game's DW5 disc check while the Insert-disc window is open
 std::atomic<bool> g_closeWindow{false};   // the requested disc is installed: close the Insert-disc window
-bool g_discsWindow = false;             // F9
+bool g_discsWindow = false;             // F10 (runtime/hotkeys.h)
 std::unique_ptr<DiscInstallPanel> g_panel;
 std::string g_checkResult;
 
@@ -194,7 +195,7 @@ const DiscSpec &dw5Disc() { return kSupportedDiscs[1]; }
 
 bool overlayWanted()
 {
-    if (IsKeyPressed(KEY_F9))
+    if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::Discs)))
         g_discsWindow = !g_discsWindow;
     return g_discWait.waiting() || g_discsWindow || (g_panel && g_panel->running());
 }
@@ -218,7 +219,7 @@ void drawOverlay()
     ImGui::SetNextWindowSize(ImVec2(620.0f, 0.0f), ImGuiCond_Appearing);
     bool open = true;
     const bool requested = g_discWait.waiting();
-    const char *title = requested ? "Insert disc###discs" : "Discs (F9)###discs";
+    const char *title = requested ? "Insert disc###discs" : "Discs (F10)###discs";
     if (ImGui::Begin(title, &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize))
     {
         if (requested)

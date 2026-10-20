@@ -40,6 +40,7 @@
 #include <vector>
 #include <string>
 #include <cmath>
+#include "runtime/hotkeys.h"
 
 namespace ps2_stubs
 {
@@ -904,7 +905,7 @@ static void saveIniValue(const std::string &wantedKey, uint32_t value)
     }
 }
 
-// The player's F5 anti-aliasing choice (kept when F4 changes the output scale).
+// The player's F2 anti-aliasing choice (kept when F4 changes the output scale).
 static uint32_t s_aaChoice = 1u;
 
 // Environment variables override the saved F4 settings for test runs.
@@ -3337,25 +3338,26 @@ void PS2Runtime::run()
         }
         devHarness.captureHostFrame();
 
+        // Function keys: one table, runtime/hotkeys.h (owner layout 2026-10-20: F2 AA, F3 FPS, F4 scale, F8 build ID).
         // On-screen FPS & VSync rate overlay for playtesting (disabled by default for release; enabled via PS2X_FPS=1 or toggled with F3)
         static bool s_showFpsOverlay = []() {
             const char *env = std::getenv("PS2X_FPS");
             return env && *env && *env != '0';
         }();
-        if (IsKeyPressed(KEY_F3))
+        if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::FpsOverlay)))
         {
             s_showFpsOverlay = !s_showFpsOverlay;
         }
-        // F2: build ID and game tick, to match screenshots with logs (off by default).
+        // F8: build ID and game tick, to match screenshots with logs (off by default).
         static bool s_showBuildOverlay = false;
-        if (IsKeyPressed(KEY_F2))
+        if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::BuildOverlay)))
         {
             s_showBuildOverlay = !s_showBuildOverlay;
         }
-        // F4 cycles native/2x/4x output; F5 cycles the anti-aliasing choice (1-16 samples
+        // F4 cycles native/2x/4x output; F2 cycles the anti-aliasing choice (1-16 samples
         // per output pixel). The two are independent: 2x/4x use 4/16 samples to build the
         // larger image and AA multiplies that, up to the 16-sample limit (4x: no extra AA).
-        if (IsKeyPressed(KEY_F4))
+        if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::OutputScale)))
         {
             const uint32_t current = m_gs.getResolutionScale();
             m_gs.setResolutionScale(current == 1u ? 2u : current == 2u ? 4u : 1u);
@@ -3363,7 +3365,7 @@ void PS2Runtime::run()
                 m_gs.setResolutionScale(1u);
             saveIniValue("resolution_scale", m_gs.getResolutionScale());
         }
-        if (IsKeyPressed(KEY_F5))
+        if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::AntiAliasing)))
         {
             s_aaChoice = s_aaChoice >= 16u ? 1u : s_aaChoice * 2u;
             m_gs.setAASamples(s_aaChoice);

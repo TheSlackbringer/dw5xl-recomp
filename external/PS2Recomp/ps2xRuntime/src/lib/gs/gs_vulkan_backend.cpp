@@ -63,7 +63,7 @@ struct GSVulkanBackend::Impl
     uint64_t gpuPresentations = 0, convertedPresentations = 0;
     std::atomic<uint32_t> currentScale{1};
     std::atomic<uint32_t> aaSamples{1};
-    // The player's anti-aliasing choice (F5): samples per output pixel, on top
+    // The player's anti-aliasing choice (F2): samples per output pixel, on top
     // of the samples the output scale needs to build the larger image.
     uint32_t requestedSamples = 1;
     uint32_t maxAASamples() const

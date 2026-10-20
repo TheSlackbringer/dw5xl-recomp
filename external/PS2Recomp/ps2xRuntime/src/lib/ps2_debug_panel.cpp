@@ -29,6 +29,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "runtime/hotkeys.h"
 
 namespace
 {
@@ -2206,7 +2207,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
-    if (m_debuggerEnabled && IsKeyPressed(KEY_F1))
+    if (m_debuggerEnabled && IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::Debugger)))
     {
         toggleVisible();
     }

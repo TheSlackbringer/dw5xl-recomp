@@ -418,7 +418,7 @@ public:
     void requestStop();
     bool isStopRequested() const;
 
-    // Build ID (e.g. git describe) shown by the F2 overlay with the game tick (issue 012).
+    // Build ID (e.g. git describe) shown by the F8 overlay with the game tick (issue 012).
     void setBuildId(std::string id) { m_buildId = std::move(id); }
 
     EeScheduler &eeScheduler();
