@@ -153,15 +153,15 @@ Gamepads are also supported.
 | Key | Description |
 | --- | --- |
 | **F1** | Runtime debugger (developer builds; off in the release unless `PS2X_DEBUG_UI=1`). |
-| **F2** | Cycle anti-aliasing sample multiplier ($1\times \to 2\times \to 4\times \to 8\times \to 16\times$) and persist to `dw5xl.ini`. |
-| **F3** | Toggle real game FPS, VSync rate, resolution scale, and AA sample HUD counter. |
+| **F2** | Toggle real game FPS, VSync rate, resolution scale, and AA sample HUD counter. |
+| **F3** | Cycle anti-aliasing sample multiplier ($1\times \to 2\times \to 4\times \to 8\times \to 16\times$) and persist to `dw5xl.ini`. |
 | **F4** | Cycle internal resolution scale live ($1\times \to 2\times \to 4\times$) and persist to `dw5xl.ini`. |
 | **F5** | Save state (🚧 in development). |
 | **F8** | Toggle build ID and game tick HUD overlay (useful for bug reports and log alignment). |
 | **F9** | Load state (🚧 in development). |
 | **F10** | Discs window (release build): which discs are installed, add or repair the DW5 disc, check the files. |
 
-You can also pass environment variables on startup: `PS2X_FPS=1` enables the F3 overlay by default, `PS2X_GS_SCALE=1|2|4` sets the startup resolution scale, and `PS2X_GS_SSAA=1|2|4|8|16` sets the anti-aliasing sample count (defaults can be kept at `1` when profiling performance).
+You can also pass environment variables on startup: `PS2X_FPS=1` enables the F2 overlay by default, `PS2X_GS_SCALE=1|2|4` sets the startup resolution scale, and `PS2X_GS_SSAA=1|2|4|8|16` sets the anti-aliasing sample count (defaults can be kept at `1` when profiling performance).
 
 ## Development
 

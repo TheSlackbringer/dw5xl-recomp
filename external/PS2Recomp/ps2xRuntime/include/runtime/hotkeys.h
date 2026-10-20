@@ -9,8 +9,8 @@ namespace ps2x::hotkeys
     enum class Action
     {
         Debugger,     // F1: debugger panel (developer builds, PS2X_DEBUG_UI=1 in the player build)
-        AntiAliasing, // F2: anti-aliasing choice, saved in dw5xl.ini
-        FpsOverlay,   // F3: frame rate overlay
+        FpsOverlay,   // F2: frame rate overlay (issue 014)
+        AntiAliasing, // F3: anti-aliasing choice, saved in dw5xl.ini
         OutputScale,  // F4: output resolution 1x / 2x / 4x, saved in dw5xl.ini
         SaveState,    // F5: save state (issue 027, not available yet)
         BuildOverlay, // F8: build ID and game tick overlay (issue 012)
@@ -26,8 +26,8 @@ namespace ps2x::hotkeys
     };
 
     inline constexpr Binding kBindings[] = {
-        {Action::Debugger, KEY_F1, "F1"},       {Action::AntiAliasing, KEY_F2, "F2"},
-        {Action::FpsOverlay, KEY_F3, "F3"},     {Action::OutputScale, KEY_F4, "F4"},
+        {Action::Debugger, KEY_F1, "F1"},       {Action::FpsOverlay, KEY_F2, "F2"},
+        {Action::AntiAliasing, KEY_F3, "F3"},   {Action::OutputScale, KEY_F4, "F4"},
         {Action::SaveState, KEY_F5, "F5"},      {Action::BuildOverlay, KEY_F8, "F8"},
         {Action::LoadState, KEY_F9, "F9"},      {Action::Discs, KEY_F10, "F10"},
     };

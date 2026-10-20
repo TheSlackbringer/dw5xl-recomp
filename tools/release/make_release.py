@@ -52,7 +52,7 @@ Your files
   A newer version of this folder rebuilds the game once and keeps your saves.
 
 Keys
-  F2  anti-aliasing          F3  frame rate overlay
+  F2  frame rate overlay     F3  anti-aliasing
   F4  output resolution (1x / 2x / 4x)
   F8  build ID (for bug reports)
   F10 discs (add or check your disc images)

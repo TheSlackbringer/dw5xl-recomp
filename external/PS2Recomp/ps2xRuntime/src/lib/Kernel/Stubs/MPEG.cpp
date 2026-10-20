@@ -1,6 +1,6 @@
 #include <atomic>
 std::atomic<uint32_t> g_dw5xlMpegDemux{0}, g_dw5xlMpegGetPic{0}, g_dw5xlMpegPictures{0}, g_dw5xlStrEvents[8]{}; // DW5XL-DEBUG
-namespace { std::atomic<uint64_t> g_moviePictures{0}; } // decoded pictures handed to the game (F3 FPS)
+namespace { std::atomic<uint64_t> g_moviePictures{0}; } // decoded pictures handed to the game (F2 overlay FPS)
 #include "Common.h"
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"

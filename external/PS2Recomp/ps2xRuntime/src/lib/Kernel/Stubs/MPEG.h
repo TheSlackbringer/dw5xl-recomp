@@ -23,7 +23,7 @@ namespace ps2_stubs
     void sceMpegDispHeight(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegDispWidth(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegGetDecodeMode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-    // Movie pictures decoded and handed to the game (sceMpegGetPicture with a frame): F3 FPS during movies.
+    // Movie pictures decoded and handed to the game (sceMpegGetPicture with a frame): F2 overlay FPS during movies.
     uint64_t moviePictureCount() noexcept;
     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegGetPictureRAW8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

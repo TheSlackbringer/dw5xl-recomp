@@ -1,4 +1,4 @@
-// The game window's function keys (owner layout, 2026-10-20): F1 debugger, F2 anti-aliasing, F3 frame rate,
+// The game window's function keys (owner layout, 2026-10-20): F1 debugger, F2 frame rate, F3 anti-aliasing,
 // F4 resolution, F5 save state, F8 build ID, F9 load state, F10 Discs. Checks the layout, that no key has two jobs,
 // and that README.md's key table lists exactly these keys.
 #include "runtime/hotkeys.h"
@@ -24,8 +24,8 @@ int main()
 {
     struct Want { Action action; int key; const char *what; };
     const Want layout[] = {
-        {Action::Debugger, KEY_F1, "debugger on F1"},         {Action::AntiAliasing, KEY_F2, "anti-aliasing on F2"},
-        {Action::FpsOverlay, KEY_F3, "frame rate on F3"},     {Action::OutputScale, KEY_F4, "resolution on F4"},
+        {Action::Debugger, KEY_F1, "debugger on F1"},         {Action::FpsOverlay, KEY_F2, "frame rate on F2"},
+        {Action::AntiAliasing, KEY_F3, "anti-aliasing on F3"},     {Action::OutputScale, KEY_F4, "resolution on F4"},
         {Action::SaveState, KEY_F5, "save state on F5"},      {Action::BuildOverlay, KEY_F8, "build ID on F8"},
         {Action::LoadState, KEY_F9, "load state on F9"},      {Action::Discs, KEY_F10, "Discs window on F10"},
     };

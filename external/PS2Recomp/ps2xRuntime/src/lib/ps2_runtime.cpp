@@ -395,7 +395,7 @@ namespace
 // KFIV-PC dev harness (env-driven, no header changes):
 //   PS2X_HIDDEN=1            create the window hidden (headless-ish runs)
 //   PS2X_LATE_VBLANK=1       log fields emitted >3 ms after their wall-clock time ([late-vblank])
-//   PS2X_HUD_LOG=1           log the F3 overlay numbers every 0.5 s ([hud] tick fps vsync frameMs maxFrameMs)
+//   PS2X_HUD_LOG=1           log the F2 overlay numbers every 0.5 s ([hud] tick fps vsync frameMs maxFrameMs)
 //   PS2X_DUMP_DIR=<dir>      where frame PNGs go (default: cwd)
 //   PS2X_DUMP_EVERY=<n>      dump the presented frame every n vsync ticks
 //   PS2X_EXIT_TICK=<n>       dump final.png and _Exit(0) at vsync tick n
@@ -905,7 +905,7 @@ static void saveIniValue(const std::string &wantedKey, uint32_t value)
     }
 }
 
-// The player's F2 anti-aliasing choice (kept when F4 changes the output scale).
+// The player's F3 anti-aliasing choice (kept when F4 changes the output scale).
 static uint32_t s_aaChoice = 1u;
 
 // Environment variables override the saved F4 settings for test runs.
@@ -3338,8 +3338,8 @@ void PS2Runtime::run()
         }
         devHarness.captureHostFrame();
 
-        // Function keys: one table, runtime/hotkeys.h (owner layout 2026-10-20: F2 AA, F3 FPS, F4 scale, F8 build ID).
-        // On-screen FPS & VSync rate overlay for playtesting (disabled by default for release; enabled via PS2X_FPS=1 or toggled with F3)
+        // Function keys: one table, runtime/hotkeys.h (owner layout 2026-10-20: F2 FPS, F3 AA, F4 scale, F8 build ID).
+        // On-screen FPS & VSync rate overlay for playtesting (disabled by default for release; enabled via PS2X_FPS=1 or toggled with F2)
         static bool s_showFpsOverlay = []() {
             const char *env = std::getenv("PS2X_FPS");
             return env && *env && *env != '0';
@@ -3354,7 +3354,7 @@ void PS2Runtime::run()
         {
             s_showBuildOverlay = !s_showBuildOverlay;
         }
-        // F4 cycles native/2x/4x output; F2 cycles the anti-aliasing choice (1-16 samples
+        // F4 cycles native/2x/4x output; F3 cycles the anti-aliasing choice (1-16 samples
         // per output pixel). The two are independent: 2x/4x use 4/16 samples to build the
         // larger image and AA multiplies that, up to the 16-sample limit (4x: no extra AA).
         if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::OutputScale)))
@@ -3372,7 +3372,7 @@ void PS2Runtime::run()
             saveIniValue("aa_samples", s_aaChoice);
         }
 
-        // F3 numbers (issue 014), about once a second. VSync = guest fields per second, timed by the fields'
+        // F2 overlay numbers (issue 014), about once a second. VSync = guest fields per second, timed by the fields'
         // own emission times (so a steady 50 reads 50.0, not 49/51 from where the window falls). FPS = the
         // game's frame rate over the same span: fields in which it finished a frame (ps2x::device::gameFrameCount)
         // or, during movies, the pictures the movie decoder handed to the game (its frame syncs do not always
@@ -3417,7 +3417,7 @@ void PS2Runtime::run()
                 s_vsyncRate = 0.0f; // no new field: the guest clock is stalled
                 s_gameFps = static_cast<float>(frames / elapsedFps);
             }
-            // PS2X_HUD_LOG=1 logs the F3 overlay numbers (game FPS, guest VSync, worst host frame) for unattended runs.
+            // PS2X_HUD_LOG=1 logs the F2 overlay numbers (game FPS, guest VSync, worst host frame) for unattended runs.
             static const bool s_hudLog = [] { const char *v = std::getenv("PS2X_HUD_LOG"); return v && *v && *v != '0'; }();
             if (s_hudLog)
                 std::fprintf(stderr, "[hud] tick=%llu fps=%.1f vsync=%.1f frameMs=%.1f maxFrameMs=%.1f\n",

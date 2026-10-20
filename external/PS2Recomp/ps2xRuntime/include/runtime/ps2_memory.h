@@ -363,7 +363,7 @@ public:
 
     // GS register accessors
     GSRegisters &gs() { return gs_regs; }
-    // Host steady_clock ns when gs().vsyncTick was last advanced (stored before the tick; F3 VSync, issue 014).
+    // Host steady_clock ns when gs().vsyncTick was last advanced (stored before the tick; F2 overlay VSync, issue 014).
     std::atomic<int64_t> &vsyncTickNs() { return m_vsyncTickNs; }
     const GSRegisters &gs() const { return gs_regs; }
     uint8_t *getGSVRAM() { return m_gsVRAM; }
