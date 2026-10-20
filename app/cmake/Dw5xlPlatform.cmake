@@ -39,15 +39,36 @@ function(dw5xl_windows_target_options target)
         # non-ASCII characters work (issue 011). MSVC: /MANIFEST:NO above, this resource is the manifest.
         target_sources(${target} PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../../tools/windows/utf8.rc")
     endif()
-    if(target_type STREQUAL "EXECUTABLE" AND COMMAND ps2x_stage_ffmpeg_runtime_dlls)
-        # Copy the FFmpeg DLLs next to the executable.
-        ps2x_stage_ffmpeg_runtime_dlls(${target})
+    if(target_type STREQUAL "EXECUTABLE")
+        # The DLLs every executable needs, copied once by one target the executables wait for. A copy after
+        # each link raced when several executables linked at once (CI: "Error copying file ... libwebp.dll").
+        dw5xl_runtime_dlls_target()
+        add_dependencies(${target} dw5xl_runtime_dlls)
     endif()
-    if(target_type STREQUAL "EXECUTABLE" AND NOT MSVC AND LLVM_MINGW_ROOT)
-        # llvm-mingw's C++ runtime, next to the executable: a player's PC has no other copy (issue 011).
-        foreach(dll libc++.dll libunwind.dll)
-            add_custom_command(TARGET ${target} POST_BUILD COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                "${LLVM_MINGW_ROOT}/x86_64-w64-mingw32/bin/${dll}" "$<TARGET_FILE_DIR:${target}>" VERBATIM)
-        endforeach()
+endfunction()
+
+# Copies the FFmpeg DLLs and llvm-mingw's C++ runtime (a player's PC has no other copy, issue 011) into the
+# folder of the app's executables (the app build folder).
+function(dw5xl_runtime_dlls_target)
+    if(TARGET dw5xl_runtime_dlls)
+        return()
+    endif()
+    set(dest "${CMAKE_CURRENT_BINARY_DIR}")
+    set(commands)
+    if(PS2X_FFMPEG_BIN_DIR AND PS2X_COPY_FFMPEG_DLLS_SCRIPT)
+        list(APPEND commands COMMAND "${CMAKE_COMMAND}" "-Dsource_dir=${PS2X_FFMPEG_BIN_DIR}" "-Ddest_dir=${dest}"
+             -P "${PS2X_COPY_FFMPEG_DLLS_SCRIPT}")
+    endif()
+    if(NOT MSVC AND LLVM_MINGW_ROOT)
+        list(APPEND commands COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+             "${LLVM_MINGW_ROOT}/x86_64-w64-mingw32/bin/libc++.dll"
+             "${LLVM_MINGW_ROOT}/x86_64-w64-mingw32/bin/libunwind.dll" "${dest}")
+    endif()
+    if(NOT commands)
+        set(commands COMMAND "${CMAKE_COMMAND}" -E true)
+    endif()
+    add_custom_target(dw5xl_runtime_dlls ALL ${commands} VERBATIM)
+    if(TARGET ffmpeg_external)
+        add_dependencies(dw5xl_runtime_dlls ffmpeg_external)
     endif()
 endfunction()
