@@ -94,6 +94,37 @@ std::vector<std::string> gameConfigureArgs(const fs::path &root, const fs::path 
     return args;
 }
 
+bool resetBuildIfMoved(const fs::path &buildDir, const fs::path &sourceDir)
+{
+    std::ifstream cache(buildDir / "CMakeCache.txt");
+    if (!cache)
+        return false;
+    const std::string key = "CMAKE_HOME_DIRECTORY:INTERNAL=";
+    std::string line, configured;
+    while (std::getline(cache, line))
+        if (line.rfind(key, 0) == 0)
+            configured = line.substr(key.size());
+    cache.close();
+    while (!configured.empty() && (configured.back() == '\r' || configured.back() == ' '))
+        configured.pop_back();
+    auto normal = [](const fs::path &p) {
+        std::string text = utf8(p.lexically_normal());
+        while (text.size() > 1 && text.back() == '/')
+            text.pop_back();
+#ifdef _WIN32
+        for (char &c : text)
+            c = char(std::tolower(static_cast<unsigned char>(c))); // Windows paths ignore case
+#endif
+        return text;
+    };
+    if (configured.empty() || normal(fs::path(configured)) == normal(sourceDir))
+        return false;
+    std::error_code ec;
+    fs::remove(buildDir / "CMakeCache.txt", ec);
+    fs::remove_all(buildDir / "CMakeFiles", ec);
+    return true;
+}
+
 BuildProgress parseNinjaProgress(const std::string &logText)
 {
     BuildProgress p;
@@ -116,6 +147,9 @@ bool buildGame(const fs::path &root, const fs::path &buildDir, const BuildTools 
     fs::create_directories(buildDir, ec);
     fs::create_directories(logFile.parent_path(), ec);
     fs::remove(logFile, ec);
+    if (resetBuildIfMoved(buildDir, root / "app"))
+        std::ofstream(logFile, std::ios::app) << "-- the release moved to " << utf8(root)
+                                              << ": the build configuration was reset\n";
     const ProcessResult configure =
         runWithProgress(tools.cmake, gameConfigureArgs(root, buildDir, tools, recompRoot), root, logFile, "configure", progress,
                         cancel);

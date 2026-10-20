@@ -143,6 +143,20 @@ int main(int argc, char **argv)
                                            "C:/Users/p/AppData/Local/DW5XL/recomp");
         require(has(rel, "-DDW5XL_RECOMP_ROOT=C:/Users/p/AppData/Local/DW5XL/recomp"),
                 "release: the generated code is read from the player data folder");
+        { // a newer release in another folder: the old build configuration is reset, compiled files stay
+            const fs::path b = fs::temp_directory_path() / "dw5xl_setup_moved_test";
+            fs::remove_all(b);
+            fs::create_directories(b / "CMakeFiles");
+            std::ofstream(b / "CMakeCache.txt") << "FOO:BOOL=ON\nCMAKE_HOME_DIRECTORY:INTERNAL=C:/Games/DW5XL-old/app\n";
+            std::ofstream(b / "kept.obj") << "x";
+            require(!resetBuildIfMoved(b, "C:/Games/DW5XL-old/app") && fs::exists(b / "CMakeCache.txt"),
+                    "same source folder: untouched");
+            require(resetBuildIfMoved(b, "C:/Games/DW5XL-new/app"), "another source folder: reset");
+            require(!fs::exists(b / "CMakeCache.txt") && !fs::exists(b / "CMakeFiles") && fs::exists(b / "kept.obj"),
+                    "configuration gone, compiled files kept");
+            require(!resetBuildIfMoved(b, "C:/Games/DW5XL-new/app"), "nothing configured: nothing to reset");
+            fs::remove_all(b);
+        }
         layoutTests();
         cancelTest(argc > 0 ? argv[0] : "");
         std::cout << "setup build tests passed\n";

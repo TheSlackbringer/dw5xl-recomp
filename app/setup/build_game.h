@@ -28,6 +28,12 @@ struct BuildProgress
 std::vector<std::string> gameConfigureArgs(const std::filesystem::path &root, const std::filesystem::path &buildDir,
                                            const BuildTools &tools, const std::filesystem::path &recompRoot = {});
 
+// A release in a new folder (a newer version unzipped elsewhere): CMake refuses a build folder configured for
+// another source folder. If `buildDir` was configured for a different `sourceDir`, its CMake configuration
+// (CMakeCache.txt, CMakeFiles/) is removed so the next configure starts fresh; compiled files stay. Returns true if
+// it reset the configuration.
+bool resetBuildIfMoved(const std::filesystem::path &buildDir, const std::filesystem::path &sourceDir);
+
 // Ninja's progress in a build log: the last "[done/total]" (0/0 if none yet).
 BuildProgress parseNinjaProgress(const std::string &logText);
 
