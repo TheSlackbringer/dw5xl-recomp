@@ -76,11 +76,11 @@ int runWizardConsole(const SetupOptions &options)
             shownTenth = -1;
             std::printf("[%d/%d] %s\n", int(st.step) + 1, steps, stepName(st.step));
         }
-        const int tenth = int(st.fraction * 10.0);
+        const int tenth = int(st.overall * 20.0); // every 5 % of the whole run
         if (tenth != shownTenth && st.step != Step::Done)
         {
             shownTenth = tenth;
-            std::printf("      %3d %%  %s\n", tenth * 10, st.detail.c_str());
+            std::printf("      %3d %%  %s\n", tenth * 5, st.detail.c_str());
         }
         if (!st.running)
         {
@@ -188,25 +188,31 @@ struct Wizard
         ImGui::Spacing();
     }
 
-    void steps(const SetupStatus &st)
+    // One bar for the whole run (owner 2026-10-20): which step, the overall share done, the time left.
+    void steps(const SetupStatus &st, double seconds)
     {
-        const int shown = base.installOnly ? int(Step::Extract) + 1 : kStepCount;
-        for (int i = 0; i < shown; ++i)
+        int index = 0;
+        for (size_t i = 0; i < st.plan.size(); ++i)
+            if (st.plan[i] == st.step)
+                index = int(i) + 1;
+        const int count = int(st.plan.size());
+        if (st.finished)
+            ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1), "Done.");
+        else if (st.failed)
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1), "Stopped at: %s", stepName(st.step));
+        else if (index > 0)
+            ImGui::Text("Step %d of %d: %s", index, count, stepName(st.step));
+        else
+            ImGui::TextUnformatted(stepName(st.step));
+        char label[64];
+        std::snprintf(label, sizeof(label), "%d %%", int(st.overall * 100.0));
+        ImGui::ProgressBar(float(st.overall), ImVec2(-1.0f, 28.0f), label);
+        if (!st.detail.empty() && !st.finished)
+            ImGui::TextDisabled("%s", st.detail.c_str());
+        if (st.running && st.overall > 0.15 && seconds > 30.0)
         {
-            const Step s = Step(i);
-            const bool done = st.finished || int(st.step) > i;
-            const bool current = !st.finished && st.step == s;
-            if (done)
-                ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1), "done   %s", stepName(s));
-            else if (current && st.failed)
-                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1), "failed %s", stepName(s));
-            else if (current)
-            {
-                ImGui::Text("...    %s", stepName(s));
-                ImGui::ProgressBar(float(st.fraction), ImVec2(-1.0f, 0.0f), st.detail.c_str());
-            }
-            else
-                ImGui::TextDisabled("       %s", stepName(s));
+            const int left = int(seconds * (1.0 - st.overall) / st.overall / 60.0 + 0.5);
+            ImGui::TextDisabled(left <= 1 ? "About a minute left" : "About %d minutes left", left);
         }
     }
 
@@ -250,8 +256,8 @@ struct Wizard
         else
         {
             ImGui::Separator();
-            steps(st);
             const auto secs = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started).count();
+            steps(st, double(secs));
             if (running)
             {
                 ImGui::Text("Running for %lld:%02lld", (long long)(secs / 60), (long long)(secs % 60));
@@ -418,7 +424,7 @@ bool DiscInstallPanel::draw()
     }
     if (busy)
     {
-        ImGui::ProgressBar(float(st.fraction), ImVec2(-1.0f, 0.0f), st.detail.c_str());
+        ImGui::ProgressBar(float(st.overall), ImVec2(-1.0f, 0.0f), st.detail.c_str());
         if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f)))
             m->run->cancel();
         return false;

@@ -3,6 +3,8 @@
 #include "install_state.h"
 #include "vu1lift/vu1_translator.h"
 
+#include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <iterator>
 
@@ -50,11 +52,40 @@ const char *stepName(Step step)
     return "?";
 }
 
+double overallProgress(const std::vector<Step> &plan, Step current, double fraction)
+{
+    // Share of a first start on Windows (owner's PC, 2026-10-20: ~10 minutes, most of it compiling).
+    const auto weight = [](Step s) {
+        switch (s)
+        {
+        case Step::Check: return 1.0;
+        case Step::Extract: return 12.0;
+        case Step::Generate: return 12.0;
+        case Step::LiftVu1: return 3.0;
+        case Step::Build: return 72.0;
+        case Step::Done: return 0.0;
+        }
+        return 0.0;
+    };
+    double total = 0.0, done = 0.0;
+    for (Step s : plan)
+    {
+        total += weight(s);
+        if (int(s) < int(current))
+            done += weight(s);
+        else if (s == current)
+            done += weight(s) * (fraction < 0.0 ? 0.0 : fraction > 1.0 ? 1.0 : fraction);
+    }
+    return total > 0.0 ? done / total : (current == Step::Done ? 1.0 : 0.0);
+}
+
 void StepContext::progress(double fraction, const std::string &detail)
 {
     std::lock_guard lock(m_run.m_mutex);
-    m_run.m_status.fraction = fraction < 0.0 ? 0.0 : fraction > 1.0 ? 1.0 : fraction;
-    m_run.m_status.detail = detail;
+    auto &st = m_run.m_status;
+    st.fraction = fraction < 0.0 ? 0.0 : fraction > 1.0 ? 1.0 : fraction;
+    st.detail = detail;
+    st.overall = std::max(st.overall, overallProgress(st.plan, st.step, st.fraction));
 }
 
 void StepContext::log(const std::string &line)
@@ -96,13 +127,20 @@ SetupSteps defaultSetupSteps()
         return writeIfChanged(o.effectiveDataDir() / "recomp" / "dw5xl" / "vu1" / "dw5xl_vu1_lifted.cpp", text, error);
     };
     s.build = [](const SetupOptions &o, StepContext &c, fs::path &executable, std::string &error) {
+        // CMake's preparation (configure + generate: ~1.5 min on Windows) has no step counter: creep up to 15 %
+        // over two minutes, then Ninja's [done/total] fills the rest.
+        const auto start = std::chrono::steady_clock::now();
         return buildGame(o.root, o.effectiveBuildDir(), o.tools, o.effectiveLogDir() / "build.log",
                          [&](const BuildProgress &p) {
                              if (p.total > 0)
-                                 c.progress(double(p.done) / p.total,
-                                            std::to_string(p.done) + "/" + std::to_string(p.total));
+                                 c.progress(0.15 + 0.85 * double(p.done) / p.total,
+                                            std::to_string(p.done) + "/" + std::to_string(p.total) + " files");
                              else
-                                 c.progress(0.0, p.phase);
+                             {
+                                 const double secs =
+                                     std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                                 c.progress(std::min(0.15, 0.15 * secs / 120.0), "preparing the build");
+                             }
                          },
                          executable, error, c.cancelFlag(), o.dataDir.empty() ? fs::path() : o.dataDir / "recomp");
     };
@@ -150,6 +188,7 @@ void SetupRun::enter(Step step)
         m_status.step = step;
         m_status.fraction = 0.0;
         m_status.detail.clear();
+        m_status.overall = std::max(m_status.overall, overallProgress(m_status.plan, step, 0.0));
     }
     StepContext(*this).log(std::string("== ") + stepName(step));
 }
@@ -190,6 +229,15 @@ void SetupRun::run()
         images.push_back({m_options.xlIso, discs.empty() ? nullptr : &discs[0], {}});
     if (!m_options.dw5Iso.empty())
         images.push_back({m_options.dw5Iso, discs.size() > 1 ? &discs[1] : nullptr, {}});
+    {
+        std::vector<Step> plan;
+        if (!images.empty())
+            plan = {Step::Check, Step::Extract};
+        if (!m_options.installOnly)
+            plan.insert(plan.end(), {Step::Generate, Step::LiftVu1, Step::Build});
+        std::lock_guard lock(m_mutex);
+        m_status.plan = plan;
+    }
     for (auto &image : images)
     {
         std::string error;
@@ -252,6 +300,7 @@ void SetupRun::run()
         enter(Step::Done);
         std::lock_guard lock(m_mutex);
         m_status.fraction = 1.0;
+        m_status.overall = 1.0;
         m_status.running = false;
         m_status.finished = true;
         return;
@@ -280,6 +329,7 @@ void SetupRun::run()
     enter(Step::Done);
     std::lock_guard lock(m_mutex);
     m_status.fraction = 1.0;
+    m_status.overall = 1.0;
     m_status.executable = executable;
     m_status.running = false;
     m_status.finished = true;

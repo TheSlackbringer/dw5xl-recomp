@@ -28,6 +28,11 @@ enum class Step
 inline constexpr int kStepCount = int(Step::Done);
 const char *stepName(Step step);
 
+// One progress bar for the whole run (owner 2026-10-20): the steps that run, weighted by their measured share of a
+// first start on Windows (check 1, copy 12, translate 12, VU1 3, compile 72). `current` is in `plan`;
+// `fraction` is its progress 0..1. Returns 0..1.
+double overallProgress(const std::vector<Step> &plan, Step current, double fraction);
+
 struct SetupOptions
 {
     std::filesystem::path root;       // project / release root (contains app/, recomp/, game/)
@@ -63,6 +68,9 @@ struct SetupStatus
 {
     Step step = Step::Check;
     double fraction = 0.0; // progress within the current step, 0..1
+    double overall = 0.0;  // progress of the whole run, 0..1 (overallProgress over `plan`)
+    std::vector<Step> plan; // the steps this run does (Check/Extract are skipped when the disc is installed, the
+                            // build steps in install-only runs)
     std::string detail;    // what the step is doing ("LINKDATA.BIN", "ovl01", "512/1147")
     bool running = false;
     bool finished = false; // success

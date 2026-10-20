@@ -175,6 +175,30 @@ int main()
             const auto st = runWith(o, f);
             require(st.failed && st.step == Step::Check && f.calls.empty(), "no image, nothing installed: Check fails");
         }
+        { // one progress bar: the weighted whole
+            const std::vector<Step> all = {Step::Check, Step::Extract, Step::Generate, Step::LiftVu1, Step::Build};
+            const auto near = [](double a, double b) { return a > b - 1e-9 && a < b + 1e-9; };
+            require(near(overallProgress(all, Step::Check, 0.0), 0.0), "starts at 0");
+            require(near(overallProgress(all, Step::Build, 0.5), (1 + 12 + 12 + 3 + 36) / 100.0), "weighted");
+            require(near(overallProgress(all, Step::Build, 1.0), 1.0), "ends at 1");
+            const std::vector<Step> rebuild = {Step::Generate, Step::LiftVu1, Step::Build};
+            require(near(overallProgress(rebuild, Step::LiftVu1, 0.0), 12 / 87.0), "skipped steps do not count");
+            const std::vector<Step> install = {Step::Check, Step::Extract};
+            require(near(overallProgress(install, Step::Extract, 0.5), (1 + 6) / 13.0), "install-only run");
+            double last = -1.0;
+            for (Step st : all)
+                for (double fr = 0.0; fr <= 1.0; fr += 0.25)
+                {
+                    const double v = overallProgress(all, st, fr);
+                    require(v >= last - 1e-9, "never goes backwards");
+                    last = v;
+                }
+        }
+        { // a whole run reports its plan and ends at 100 %
+            Fakes f;
+            const auto st = runWith(options(dir / "z", iso), f);
+            require(st.finished && st.overall > 0.999 && st.plan.size() == 5, "overall 1.0, five planned steps");
+        }
         for (int i = 0; i <= kStepCount; ++i)
             require(stepName(Step(i)) && *stepName(Step(i)), "every step has a name");
 
