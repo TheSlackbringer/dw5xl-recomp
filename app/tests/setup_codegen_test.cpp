@@ -92,6 +92,16 @@ int main(int argc, char **argv)
 
         // 2. Starting a missing program fails cleanly.
         require(!runProcess(root / "no-such-program", {}, {}, root / "x.log").started, "missing program not started");
+        { // first build: the whole folder is moved in one step
+            const fs::path src = root / "sync-src", dst = root / "sync-dst" / "output";
+            fs::create_directories(src / "sub");
+            std::ofstream(src / "a.cpp") << "a";
+            std::ofstream(src / "sub" / "b.cpp") << "b";
+            std::string err;
+            require(syncDirectory(src, dst, err), "sync into a new folder");
+            require(!fs::exists(src) && slurp(dst / "a.cpp") == "a" && slurp(dst / "sub" / "b.cpp") == "b",
+                    "moved: everything there, the work folder gone");
+        }
 
         // 3. Full run over the four profiles with the fake recompiler.
         for (const auto &profile : kCodegenProfiles)

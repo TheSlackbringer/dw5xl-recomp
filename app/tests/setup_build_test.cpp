@@ -138,6 +138,11 @@ int main(int argc, char **argv)
         const auto lnx = gameConfigureArgs("/home/p/dw5xl", "/home/p/dw5xl/build", BuildTools{});
         require(has(lnx, "-DCMAKE_CXX_COMPILER=clang++") && has(lnx, "-DCMAKE_LINKER_TYPE=LLD"), "clang + lld");
         require(!hasPrefix(lnx, "-DCMAKE_TOOLCHAIN_FILE="), "no toolchain file on Linux");
+        require(!hasPrefix(lnx, "-DDW5XL_RECOMP_ROOT="), "developer tree: the generated code stays in recomp/");
+        const auto rel = gameConfigureArgs("C:/DW5XL", "C:/Users/p/AppData/Local/DW5XL/build", windows,
+                                           "C:/Users/p/AppData/Local/DW5XL/recomp");
+        require(has(rel, "-DDW5XL_RECOMP_ROOT=C:/Users/p/AppData/Local/DW5XL/recomp"),
+                "release: the generated code is read from the player data folder");
         layoutTests();
         cancelTest(argc > 0 ? argv[0] : "");
         std::cout << "setup build tests passed\n";

@@ -32,13 +32,17 @@ std::string rewriteRecompConfig(const std::string &config, const std::filesystem
                                  const std::filesystem::path &ghidraCsv, const std::filesystem::path &output);
 
 // Makes `target` hold exactly the files of `source`: copies new and changed files, leaves identical files untouched
-// (so an incremental build recompiles only what changed), removes files that are no longer generated.
+// (so an incremental build recompiles only what changed), removes files that are no longer generated. When
+// `target` does not exist yet, `source` is moved there in one step (and is gone afterwards).
 bool syncDirectory(const std::filesystem::path &source, const std::filesystem::path &target, std::string &error);
 
-// Runs the recompiler for every profile under `root`. Logs go to `logDir/<profile>.log`.
+// Runs the recompiler for every profile. Configurations and function lists come from `root` (the project or the
+// release package); the disc files are read from and the generated code is written to `dataDir` (empty: `root`;
+// a release uses the player data folder). Logs go to `logDir/<profile>.log`.
 // `progress(profile, index, count)` is called before each profile; returning false cancels.
 bool generateCode(const std::filesystem::path &root, const std::filesystem::path &recompiler,
                   const std::filesystem::path &logDir,
-                  const std::function<bool(const char *, int, int)> &progress, std::string &error);
+                  const std::function<bool(const char *, int, int)> &progress, std::string &error,
+                  const std::filesystem::path &dataDir = {});
 
 } // namespace dw5xl::setup

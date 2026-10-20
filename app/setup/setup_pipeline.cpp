@@ -83,16 +83,17 @@ SetupSteps defaultSetupSteps()
             c.progress(double(index) / count, name);
             c.log(std::string("recompiling ") + name);
             return !c.cancelled();
-        }, error);
+        }, error, o.effectiveDataDir());
     };
     s.liftVu1 = [](const SetupOptions &o, StepContext &c, std::string &error) {
         std::string text;
-        if (!vu1lift::generateLiftedVu1(o.root / kCodegenProfiles[0].input, text, error, [&](const std::string &line) {
+        if (!vu1lift::generateLiftedVu1(o.effectiveDataDir() / kCodegenProfiles[0].input, text, error,
+                                        [&](const std::string &line) {
                 c.progress(0.5, line);
                 c.log(line);
             }))
             return false;
-        return writeIfChanged(o.root / "recomp" / "dw5xl" / "vu1" / "dw5xl_vu1_lifted.cpp", text, error);
+        return writeIfChanged(o.effectiveDataDir() / "recomp" / "dw5xl" / "vu1" / "dw5xl_vu1_lifted.cpp", text, error);
     };
     s.build = [](const SetupOptions &o, StepContext &c, fs::path &executable, std::string &error) {
         return buildGame(o.root, o.effectiveBuildDir(), o.tools, o.effectiveLogDir() / "build.log",
@@ -103,7 +104,7 @@ SetupSteps defaultSetupSteps()
                              else
                                  c.progress(0.0, p.phase);
                          },
-                         executable, error, c.cancelFlag());
+                         executable, error, c.cancelFlag(), o.dataDir.empty() ? fs::path() : o.dataDir / "recomp");
     };
     return s;
 }
@@ -181,7 +182,12 @@ void SetupRun::run()
         IsoImage iso;
     };
     std::vector<Image> images;
-    images.push_back({m_options.xlIso, discs.empty() ? nullptr : &discs[0], {}});
+    const fs::path data = m_options.effectiveDataDir();
+    const bool xlInstalled = !discs.empty() && installState(data, discs[0]) == InstallState::Installed;
+    if (m_options.xlIso.empty() && xlInstalled)
+        ctx.log(std::string("using the installed files of ") + discs[0].name);
+    else
+        images.push_back({m_options.xlIso, discs.empty() ? nullptr : &discs[0], {}});
     if (!m_options.dw5Iso.empty())
         images.push_back({m_options.dw5Iso, discs.size() > 1 ? &discs[1] : nullptr, {}});
     for (auto &image : images)
@@ -221,7 +227,7 @@ void SetupRun::run()
     {
         std::string error;
         uint64_t last = 0;
-        const bool ok = extractDisc(image.iso, *image.disc, m_options.root / "game" / image.disc->folder,
+        const bool ok = extractDisc(image.iso, *image.disc, discFolder(data, *image.disc),
                                     [&](const ExtractProgress &p) {
                                         last = p.doneBytes;
                                         ctx.progress(total ? double(before + p.doneBytes) / total : 1.0, p.file);
@@ -235,7 +241,7 @@ void SetupRun::run()
         }
         before += last;
         ctx.log(std::string("copied ") + image.disc->name + " to game/" + image.disc->folder);
-        if (m_options.installOnly && !writeInstallMarker(m_options.root, *image.disc, error))
+        if (!writeInstallMarker(data, *image.disc, error))
         {
             fail(error);
             return;

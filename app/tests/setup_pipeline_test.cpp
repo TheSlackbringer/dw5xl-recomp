@@ -1,5 +1,6 @@
 // Setup wizard pipeline (issue 011): step order, progress, errors and cancel, on the synthetic image with stand-in
 // generate / lift / build steps (the real ones need the player's disc and are checked locally, see notes).
+#include "install_state.h"
 #include "setup_pipeline.h"
 #include "synthetic_iso.h"
 
@@ -34,7 +35,7 @@ struct Fakes
         SetupSteps s;
         s.generate = [this](const SetupOptions &o, StepContext &c, std::string &error) {
             calls.push_back("generate");
-            require(fs::exists(o.root / "game" / "test" / "A.BIN"), "generate runs after extraction");
+            require(fs::exists(o.effectiveDataDir() / "game" / "test" / "A.BIN"), "generate runs after extraction");
             c.progress(0.5, "ovl01");
             c.log("generating ovl01");
             if (waitForCancel)
@@ -141,6 +142,38 @@ int main()
             const auto st = runWith(options(dir / "f", iso), f, true);
             require(st.cancelled && !st.failed && !st.finished, "cancel is reported as cancelled, not failed");
             require(f.calls == std::vector<std::string>{"generate"}, "nothing runs after cancel");
+        }
+        { // release layout: package (root) and player data folder apart
+            Fakes f;
+            auto o = options(dir / "pkg", iso);
+            o.dataDir = dir / "data";
+            const auto st = runWith(o, f);
+            require(st.finished, "run with a separate data folder succeeds");
+            require(fs::exists(dir / "data" / "game" / "test" / "A.BIN") &&
+                        installState(dir / "data", kDiscs[0]) == InstallState::Installed,
+                    "disc files and marker in the data folder");
+            require(!fs::exists(dir / "pkg" / "game"), "nothing written into the package folder");
+            require(o.effectiveBuildDir() == dir / "data" / "build" && o.effectiveLogDir() == dir / "data" / "logs",
+                    "build and logs in the data folder");
+
+            // a new release: no disc image given, the installed files are used, the game is rebuilt
+            Fakes again;
+            auto rebuild = o;
+            rebuild.xlIso.clear();
+            const auto st2 = runWith(rebuild, again);
+            require(st2.finished && again.calls == std::vector<std::string>{"generate", "lift", "build"},
+                    "rebuild without the disc image: check/extract skipped, the rest runs");
+            bool said = false;
+            for (const auto &line : st2.log)
+                said |= contains(line, "using the installed files");
+            require(said, "the log says the installed files are used");
+        }
+        { // no disc image and nothing installed: still an error at Check
+            Fakes f;
+            auto o = options(dir / "pkg2", {});
+            o.dataDir = dir / "data2";
+            const auto st = runWith(o, f);
+            require(st.failed && st.step == Step::Check && f.calls.empty(), "no image, nothing installed: Check fails");
         }
         for (int i = 0; i <= kStepCount; ++i)
             require(stepName(Step(i)) && *stepName(Step(i)), "every step has a name");

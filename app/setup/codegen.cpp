@@ -83,6 +83,16 @@ std::string rewriteRecompConfig(const std::string &config, const fs::path &input
 bool syncDirectory(const fs::path &source, const fs::path &target, std::string &error)
 {
     std::error_code ec;
+    // First build: nothing to keep, so move the whole folder in one step instead of copying tens of thousands of
+    // files one by one (slow on Windows, where every new file is also scanned by the virus scanner).
+    if (!fs::exists(target, ec))
+    {
+        fs::create_directories(target.parent_path(), ec);
+        fs::rename(source, target, ec);
+        if (!ec)
+            return true;
+        ec.clear(); // e.g. another drive: copy below
+    }
     fs::create_directories(target, ec);
     std::set<fs::path> generated;
     for (const auto &entry : fs::recursive_directory_iterator(source, ec))
@@ -117,8 +127,10 @@ bool syncDirectory(const fs::path &source, const fs::path &target, std::string &
 }
 
 bool generateCode(const fs::path &root, const fs::path &recompiler, const fs::path &logDir,
-                  const std::function<bool(const char *, int, int)> &progress, std::string &error)
+                  const std::function<bool(const char *, int, int)> &progress, std::string &error,
+                  const fs::path &dataDir)
 {
+    const fs::path data = dataDir.empty() ? root : dataDir;
     std::error_code ec;
     fs::create_directories(logDir, ec);
     const fs::path exe = fs::absolute(recompiler); // the recompiler runs with `root` as its working folder
@@ -131,7 +143,7 @@ bool generateCode(const fs::path &root, const fs::path &recompiler, const fs::pa
             error = "cancelled";
             return false;
         }
-        const fs::path work = root / "build-setup" / "codegen" / profile.name;
+        const fs::path work = data / "build-setup" / "codegen" / profile.name;
         fs::remove_all(work, ec);
         fs::create_directories(work / "output", ec);
         const std::string config = readText(root / profile.config);
@@ -141,7 +153,7 @@ bool generateCode(const fs::path &root, const fs::path &recompiler, const fs::pa
             return false;
         }
         std::ofstream(work / "config.toml", std::ios::binary)
-            << rewriteRecompConfig(config, root / profile.input, root / profile.ghidraCsv, work / "output");
+            << rewriteRecompConfig(config, data / profile.input, root / profile.ghidraCsv, work / "output");
         const fs::path log = logDir / (std::string(profile.name) + ".log");
         fs::remove(log, ec);
         const ProcessResult run = runProcess(exe, {utf8(work / "config.toml")}, root, log);
@@ -156,7 +168,7 @@ bool generateCode(const fs::path &root, const fs::path &recompiler, const fs::pa
                     std::to_string(run.exitCode) + "); see " + log.string();
             return false;
         }
-        if (!syncDirectory(work / "output", root / profile.output, error))
+        if (!syncDirectory(work / "output", data / profile.output, error))
             return false;
         fs::remove_all(work, ec);
     }

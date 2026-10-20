@@ -42,9 +42,21 @@ struct SetupOptions
     // Player install (issue 011 v4): `root` is the player data folder; Check + Extract only, then each disc gets
     // its install marker. Generate / lift / build are the developer path and are skipped.
     bool installOnly = false;
+    // Release (issue 011 v5): the player data folder. Disc files, generated code, the build and its logs go there;
+    // configurations, sources and tools stay in `root` (the release package). Empty: everything under `root`.
+    // With `xlIso` empty and the XL disc already installed in the data folder, Check + Extract are skipped (a new
+    // release rebuilds without asking for the disc again).
+    std::filesystem::path dataDir;
 
-    std::filesystem::path effectiveBuildDir() const { return buildDir.empty() ? root / "app" / "build" : buildDir; }
-    std::filesystem::path effectiveLogDir() const { return logDir.empty() ? root / "logs" / "setup" : logDir; }
+    std::filesystem::path effectiveDataDir() const { return dataDir.empty() ? root : dataDir; }
+    std::filesystem::path effectiveBuildDir() const
+    {
+        return !buildDir.empty() ? buildDir : dataDir.empty() ? root / "app" / "build" : dataDir / "build";
+    }
+    std::filesystem::path effectiveLogDir() const
+    {
+        return !logDir.empty() ? logDir : dataDir.empty() ? root / "logs" / "setup" : dataDir / "logs";
+    }
 };
 
 struct SetupStatus

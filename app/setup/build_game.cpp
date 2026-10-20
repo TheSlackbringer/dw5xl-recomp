@@ -52,13 +52,16 @@ ProcessResult runWithProgress(const fs::path &program, const std::vector<std::st
 }
 } // namespace
 
-std::vector<std::string> gameConfigureArgs(const fs::path &root, const fs::path &buildDir, const BuildTools &tools)
+std::vector<std::string> gameConfigureArgs(const fs::path &root, const fs::path &buildDir, const BuildTools &tools,
+                                           const fs::path &recompRoot)
 {
     std::vector<std::string> args = {"-S", utf8(root / "app"), "-B", utf8(buildDir), "-G", "Ninja",
                                      "-DCMAKE_BUILD_TYPE=Release", "-DDW5XL_BUILD_GAME=ON", "-DDW5XL_BUILD_TESTS=OFF",
                                      "-DPS2X_ENABLE_SCCACHE=OFF", "-DPS2X_ENABLE_AGRESSIVE_LOGS=OFF",
                                      "-DPS2X_ENABLE_VULKAN_GS=ON",
                                      "-DPS2X_PARALLEL_GS_SOURCE_DIR=" + utf8(root / "app" / "deps" / "parallel-gs")};
+    if (!recompRoot.empty())
+        args.push_back("-DDW5XL_RECOMP_ROOT=" + utf8(recompRoot));
     if (!tools.ninja.empty())
         args.push_back("-DCMAKE_MAKE_PROGRAM=" + utf8(tools.ninja));
     if (!tools.llvmMingwRoot.empty())
@@ -107,14 +110,14 @@ BuildProgress parseNinjaProgress(const std::string &logText)
 
 bool buildGame(const fs::path &root, const fs::path &buildDir, const BuildTools &tools, const fs::path &logFile,
                const std::function<void(const BuildProgress &)> &progress, fs::path &executable, std::string &error,
-               const std::atomic<bool> *cancel)
+               const std::atomic<bool> *cancel, const fs::path &recompRoot)
 {
     std::error_code ec;
     fs::create_directories(buildDir, ec);
     fs::create_directories(logFile.parent_path(), ec);
     fs::remove(logFile, ec);
     const ProcessResult configure =
-        runWithProgress(tools.cmake, gameConfigureArgs(root, buildDir, tools), root, logFile, "configure", progress,
+        runWithProgress(tools.cmake, gameConfigureArgs(root, buildDir, tools, recompRoot), root, logFile, "configure", progress,
                         cancel);
     if (configure.cancelled)
     {

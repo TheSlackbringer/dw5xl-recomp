@@ -24,8 +24,9 @@ struct BuildProgress
 };
 
 // The CMake arguments used to configure the game build (also used by the test and CI).
+// `recompRoot`: where the generated code is (empty: the project's recomp/; a release: <data>/recomp).
 std::vector<std::string> gameConfigureArgs(const std::filesystem::path &root, const std::filesystem::path &buildDir,
-                                           const BuildTools &tools);
+                                           const BuildTools &tools, const std::filesystem::path &recompRoot = {});
 
 // Ninja's progress in a build log: the last "[done/total]" (0/0 if none yet).
 BuildProgress parseNinjaProgress(const std::string &logText);
@@ -35,6 +36,7 @@ BuildProgress parseNinjaProgress(const std::string &logText);
 // build (CMake, Ninja and the compilers).
 bool buildGame(const std::filesystem::path &root, const std::filesystem::path &buildDir, const BuildTools &tools,
                const std::filesystem::path &logFile, const std::function<void(const BuildProgress &)> &progress,
-               std::filesystem::path &executable, std::string &error, const std::atomic<bool> *cancel = nullptr);
+               std::filesystem::path &executable, std::string &error, const std::atomic<bool> *cancel = nullptr,
+               const std::filesystem::path &recompRoot = {});
 
 } // namespace dw5xl::setup
