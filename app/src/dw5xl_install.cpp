@@ -6,8 +6,9 @@
 //                                           install without a window (tests), exit code 0 = installed
 //   dw5xl --add-disc <image.iso>            add or repair one disc (what the in-game panel does), no window
 // DW5XL_DATA_DIR overrides the player data folder.
-// In the running game (M7): when Load Original asks for the DW5 disc and it is not installed, an "insert disc" panel
-// opens over the game; F9 opens the Discs window (both discs, add DW5, check the files).
+// In the running game (M7, M10): when Load Original asks for the DW5 disc and it is not installed, an "Insert disc"
+// window opens over the game and the drive reports "not ready" until the disc is installed — then Load Original
+// continues by itself; Cancel lets the game find no disc once (its own prompt). F9 opens the Discs window.
 #include "codegen.h"
 #include "install_state.h"
 #include "ps2_debug_panel.h"
@@ -17,6 +18,7 @@
 #include "raylib.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +34,8 @@ void attachParentConsole(); // setup/wizard_console.cpp
 namespace {
 fs::path g_dataDir;                     // set when the game runs from the player data folder
 std::atomic<bool> g_discRequested{false}; // the game asked for the DW5 disc and it is not installed
+std::atomic<bool> g_cancelOnce{false};    // the player closed the Insert-disc window: report the drive ready once
+std::atomic<bool> g_closeWindow{false};   // the requested disc is installed: close the Insert-disc window
 bool g_discsWindow = false;             // F9
 std::unique_ptr<DiscInstallPanel> g_panel;
 std::string g_checkResult;
@@ -150,12 +154,36 @@ bool dw5xlInstalledBoot(int argc, char **argv, fs::path &elf, int &exitCode)
     return true;
 }
 
-// The game's disc check (dw5xl_overlays.cpp) found the requested disc missing or wrong: offer to install it.
-// which: 0 = Dynasty Warriors 5 (Load Original). Only in installed mode.
-void dw5xlRequestDisc(uint32_t which)
+// The game's disc check (dw5xl_overlays.cpp, sceCdDiskReady) — game thread, once per frame while it waits.
+// which: 0 = Dynasty Warriors 5 (Load Original). Installed mode only. true = report the drive "not ready": the
+// requested disc is not installed yet and the Insert-disc window is open for it.
+bool dw5xlDiscNotReady(uint32_t which)
 {
-    if (!g_dataDir.empty() && which == 0u && !g_discRequested.exchange(true))
-        std::fprintf(stderr, "[install] the game asks for %s: insert-disc panel open\n", kSupportedDiscs[1].name);
+    if (g_dataDir.empty() || which != 0u)
+        return false;
+    if (g_cancelOnce.exchange(false))
+        return false; // the player cancelled: the game finds no disc and shows its own prompt (NO = ask again)
+    static auto lastCheck = std::chrono::steady_clock::time_point{};
+    static bool installed = false;
+    const auto now = std::chrono::steady_clock::now();
+    if (!g_discRequested || now - lastCheck > std::chrono::seconds(1)) // the window's install, or --add-disc
+    {
+        installed = installState(g_dataDir, kSupportedDiscs[1]) == InstallState::Installed;
+        lastCheck = now;
+    }
+    if (installed)
+    {
+        if (g_discRequested.exchange(false))
+        {
+            g_closeWindow = true;
+            std::fprintf(stderr, "[install] %s installed: drive ready, the game continues\n", kSupportedDiscs[1].name);
+        }
+        return false;
+    }
+    if (!g_discRequested.exchange(true))
+        std::fprintf(stderr, "[install] the game asks for %s: Insert-disc window open, drive not ready\n",
+                     kSupportedDiscs[1].name);
+    return true;
 }
 
 namespace {
@@ -170,6 +198,11 @@ bool overlayWanted()
 
 void drawOverlay()
 {
+    if (g_closeWindow.exchange(false)) // the disc is in: the game goes on, the window goes away
+    {
+        g_panel.reset();
+        return;
+    }
     if (IsFileDropped())
     {
         FilePathList files = LoadDroppedFiles();
@@ -190,11 +223,9 @@ void drawOverlay()
             if (!g_panel)
                 g_panel = std::make_unique<DiscInstallPanel>(g_dataDir, dw5Disc());
             if (g_panel->draw())
-            {
-                ImGui::TextWrapped("Now choose NO in the game (\"Cancel data load?\") to read the disc.");
-                if (ImGui::Button("Close", ImVec2(120.0f, 0.0f)))
-                    open = false;
-            }
+                ImGui::TextWrapped("The game continues.");
+            else if (!g_panel->running() && ImGui::Button("Cancel", ImVec2(120.0f, 0.0f)))
+                open = false; // the game then finds no disc and shows its own question
         }
         else
         {
@@ -236,7 +267,8 @@ void drawOverlay()
     ImGui::End();
     if (!open && !(g_panel && g_panel->running()))
     {
-        g_discRequested = false;
+        if (g_discRequested.exchange(false))
+            g_cancelOnce = true; // Cancel: the game finds no disc once and shows its own prompt
         g_discsWindow = false;
         g_panel.reset();
         g_checkResult.clear();

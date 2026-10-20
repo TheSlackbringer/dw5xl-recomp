@@ -3,10 +3,9 @@
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
-// The game's disc check offers the insert-disc window (app/src/dw5xl_install.cpp, installed mode only); this test
-// has no window: count the requests instead.
-static int g_discRequests = 0;
-void dw5xlRequestDisc(uint32_t) { ++g_discRequests; }
+// The game's disc check asks the insert-disc window whether the drive is "not ready" (app/src/dw5xl_install.cpp,
+// installed mode only); this test has no window: the drive is always ready.
+bool dw5xlDiscNotReady(uint32_t) { return false; }
 extern const uint32_t g_ps2RecompiledFunctionTableBase=0x1000;
 extern const uint32_t g_ps2RecompiledFunctionTableEnd=0x1004;
 extern const uint32_t g_ps2RecompiledFunctionTableSlotCount=1;
