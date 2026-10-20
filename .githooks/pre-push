@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Blocks pushing any commit that contains the lifted VU1 code (game-derived; see pre-commit).
-pattern='(^|/)dw5xl_vu1_lifted\.cpp$|^recomp/[^/]+/vu1/'
+# Blocks pushing any commit that contains the lifted VU1 or VU0 code (game-derived; see pre-commit).
+pattern='(^|/)dw5xl_vu[01]_lifted\.cpp$|^recomp/[^/]+/vu[01]/'
 zero=0000000000000000000000000000000000000000
 status=0
 while read -r local_ref local_sha remote_ref remote_sha; do

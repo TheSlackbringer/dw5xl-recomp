@@ -2,6 +2,41 @@ import os, re, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vu1_timing
 
+# Target unit (issue 025): 'vu1' (16 KB micro memory, the default) or 'vu0' (4 KB micro memory, the microprograms
+# the EE starts with VCALLMS). VU0 has no PATH1/XGKICK, no EFU, no XTOP/XITOP and no WAITP/MFP.
+UNIT = 'vu1'
+
+def set_unit(unit):
+    global UNIT
+    if unit not in ('vu0', 'vu1'):
+        raise ValueError(f'unknown VU unit {unit!r}')
+    UNIT = unit
+    import native_call_analysis
+    native_call_analysis.PC_MASK = pc_mask()
+
+def pc_mask():
+    return 0x0fff if UNIT == 'vu0' else 0x3fff
+
+def mem_lq(addr):
+    return f"vl::lq0(mem, {addr})" if UNIT == 'vu0' else f"vl::lq(mem, {addr})"
+
+def mem_sq(lm, addr, val):
+    if UNIT == 'vu0':
+        return f"vl::sq0<0x{lm:x}>(c, mem, {addr}, {val});"
+    return f"vl::sq<0x{lm:x}, false>(c, mem, {addr}, {val}, 0u);"
+
+def mem_ilw(addr, comp):
+    return f"vl::ilw0(mem, {addr}, {comp})" if UNIT == 'vu0' else f"vl::ilw(mem, {addr}, {comp})"
+
+def mem_isw(lm, addr, val):
+    if UNIT == 'vu0':
+        return f"vl::isw0<0x{lm:x}>(c, mem, {addr}, {val});"
+    return f"vl::isw<0x{lm:x}, false>(c, mem, {addr}, {val}, 0u);"
+
+def vu1_only(name, pc):
+    if UNIT == 'vu0':
+        raise ValueError(f"{name} at pc {pc:04x} is not a VU0 instruction")
+
 BC = ['x', 'y', 'z', 'w']
 def dest_name(d): return ''.join(c for i, c in enumerate('xyzw') if d & (8 >> i))
 def dest_mask(d):
@@ -70,7 +105,7 @@ def decode_lower(w, pc):
             sp = ((w >> 6) & 31) << 2 | (w & 3)
             return {'type': 'SPEC', 'sp': sp, 'dd': dd, 'ft': ft, 'fs': fs, 'fd': fd,
                     'fsf': (w >> 21) & 3, 'ftf': (w >> 23) & 3}
-    tgt = (pc + 8 + imm * 8) & 0x3fff
+    tgt = (pc + 8 + imm * 8) & pc_mask()
     return {'type': 'NORM', 'op': op, 'dd': dd, 'ft': ft, 'fs': fs, 'fd': fd, 'imm': imm, 'tgt': tgt}
 
 def blend_wrap(reg, val, d):
@@ -200,22 +235,22 @@ def translate_lower(l, lo, i_bit, pc):
             return blend_wrap(f"vf[{ft}]", f"vl::mr32(vf[{fs}])", dd)
         if sp == 0x34: # LQI
             stmts = []
-            bw = blend_wrap(f"vf[{ft}]", f"vl::lq(mem, vi[{fs}])", dd)
+            bw = blend_wrap(f"vf[{ft}]", mem_lq(f"vi[{fs}]"), dd)
             if bw: stmts.append(bw)
             stmts.append(f"if ({fs} != 0) vi[{fs}] = vl::i16(vi[{fs}] + 1);")
             return " ".join(stmts)
         if sp == 0x35: # SQI
-            stmts = [f"vl::sq<0x{lm:x}, false>(c, mem, vi[{ft}], vf[{fs}], 0u);"]
+            stmts = [mem_sq(lm, f"vi[{ft}]", f"vf[{fs}]")]
             stmts.append(f"if ({ft} != 0) vi[{ft}] = vl::i16(vi[{ft}] + 1);")
             return " ".join(stmts)
         if sp == 0x36: # LQD
             stmts = [f"if ({fs} != 0) vi[{fs}] = vl::i16(vi[{fs}] - 1);"]
-            bw = blend_wrap(f"vf[{ft}]", f"vl::lq(mem, vi[{fs}])", dd)
+            bw = blend_wrap(f"vf[{ft}]", mem_lq(f"vi[{fs}]"), dd)
             if bw: stmts.append(bw)
             return " ".join(stmts)
         if sp == 0x37: # SQD
             stmts = [f"if ({ft} != 0) vi[{ft}] = vl::i16(vi[{ft}] - 1);"]
-            stmts.append(f"vl::sq<0x{lm:x}, false>(c, mem, vi[{ft}], vf[{fs}], 0u);")
+            stmts.append(mem_sq(lm, f"vi[{ft}]", f"vf[{fs}]"))
             return " ".join(stmts)
         if sp == 0x38: # DIV
             return f"{{ uint32_t di = 0; const float qv = vl::div(vl::lane<{l['fsf']}>(vf[{fs}]), vl::lane<{l['ftf']}>(vf[{ft}]), di); vl::LiftAccess::queueQAt(c, cyc, qv, 7u, di); }}"
@@ -228,17 +263,21 @@ def translate_lower(l, lo, i_bit, pc):
             return blend_wrap(f"vf[{ft}]", val, dd)
         if sp == 0x3e: # ILWR
             comp = 0 if dd & 8 else (1 if dd & 4 else (2 if dd & 2 else 3))
-            return f"if ({ft} != 0) vi[{ft}] = vl::ilw(mem, vi[{fs}], {comp});"
+            return f"if ({ft} != 0) vi[{ft}] = {mem_ilw(f'vi[{fs}]', comp)};"
         if sp == 0x3f: # ISWR
             lm = dest_mask(dd)
-            return f"vl::isw<0x{lm:x}, false>(c, mem, vi[{fs}], vi[{ft}], 0u);"
+            return mem_isw(lm, f"vi[{fs}]", f"vi[{ft}]")
         if sp == 0x68: # XTOP
+            vu1_only('XTOP', pc)
             return f"if ({ft} != 0) vi[{ft}] = static_cast<int32_t>(c.st.top & 0x3FFu);"
         if sp == 0x69: # XITOP
+            vu1_only('XITOP', pc)
             return f"if ({ft} != 0) vi[{ft}] = static_cast<int32_t>(c.st.itop & 0x3FFu);"
         if sp == 0x6c: # XGKICK
+            vu1_only('XGKICK', pc)
             return f"vl::LiftAccess::xgkickAt(c, cyc, vi[{fs}] & 0x3FF);"
         if sp == 0x7b: # WAITP
+            vu1_only('WAITP', pc)
             return ""
             
     if t == 'NORM':
@@ -247,14 +286,14 @@ def translate_lower(l, lo, i_bit, pc):
         lm = dest_mask(dd)
         ft, fs, imm, tgt = l['ft'], l['fs'], l['imm'], l['tgt']
         if op == 0x00: # LQ
-            return blend_wrap(f"vf[{ft}]", f"vl::lq(mem, vi[{fs}] + ({imm}))", dd)
+            return blend_wrap(f"vf[{ft}]", mem_lq(f"vi[{fs}] + ({imm})"), dd)
         if op == 0x01: # SQ
-            return f"vl::sq<0x{lm:x}, false>(c, mem, vi[{ft}] + ({imm}), vf[{fs}], 0u);"
+            return mem_sq(lm, f"vi[{ft}] + ({imm})", f"vf[{fs}]")
         if op == 0x04: # ILW
             comp = 0 if dd & 8 else (1 if dd & 4 else (2 if dd & 2 else 3))
-            return f"if ({ft} != 0) vi[{ft}] = vl::ilw(mem, vi[{fs}] + ({imm}), {comp});"
+            return f"if ({ft} != 0) vi[{ft}] = {mem_ilw(f'vi[{fs}] + ({imm})', comp)};"
         if op == 0x05: # ISW
-            return f"vl::isw<0x{lm:x}, false>(c, mem, vi[{fs}] + ({imm}), vi[{ft}], 0u);"
+            return mem_isw(lm, f"vi[{fs}] + ({imm})", f"vi[{ft}]")
         if op == 0x08: # IADDIU
             imm15 = (lo & 0x7FF) | ((lo >> 10) & 0x7800)
             return f"if ({ft} != 0) vi[{ft}] = vl::i16(vi[{fs}] + ({imm15}));"
@@ -271,6 +310,10 @@ def translate_lower(l, lo, i_bit, pc):
         if op == 0x13: # FCOR
             imm24 = lo & 0xFFFFFF
             return f"vi[1] = ((c.st.clip | 0x{imm24:06x}u) == 0xFFFFFFu) ? 1 : 0;"
+        if op == 0x16: # FSAND: committed status flags (low twelve bits) AND imm12 (issue 025, VU0 program 0x0030)
+            vi_t = ft & 15
+            imm12 = (((lo >> 21) & 1) << 11) | (lo & 0x7FF)
+            return f"vl::LiftAccess::flagsSync(c, fq, cyc); if ({vi_t} != 0) vi[{vi_t}] = static_cast<int32_t>((c.st.status & 0xFFFu) & 0x{imm12:03x}u);"
         if op == 0x1a: # FMAND
             return f"vl::LiftAccess::flagsSync(c, fq, cyc); if ({ft} != 0) vi[{ft}] = static_cast<int32_t>(c.st.mac & (vi[{fs}] & 0xFFFF));"
             
@@ -691,7 +734,7 @@ def translate_segment(code, entry_pc, fn_name, static_timing=False):
                 if pc in call_info:
                     op, ft, fs = call_info[pc]
                     if op == 0x24:
-                        out.append(f"    jump_{pc:04x} = (static_cast<uint32_t>(static_cast<uint16_t>(brvi({fs}))) * 8u) & 0x3FFFu;")
+                        out.append(f"    jump_{pc:04x} = (static_cast<uint32_t>(static_cast<uint16_t>(brvi({fs}))) * 8u) & 0x{pc_mask():04X}u;")
                     elif ft:
                         out.append(f"    vi[{ft}] = {(pc + 16) // 8};")
                 out.extend(timing_end(code, pc))
@@ -790,62 +833,8 @@ def static_enabled(name):
     sel = os.environ.get('DW5XL_VU1_STATIC', 'all')
     return sel == 'all' or name in sel.split(',')
 
-if __name__ == '__main__':
-    def load(path):
-        with open(path, 'rb') as f:
-            return f.read()
-
-    def fnv1a_64(data):
-        h = 1469598103934665603
-        for b in data:
-            h = ((h ^ b) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
-        return h
-
-    input_mode = os.environ.get('DW5XL_VU1_INPUT', 'disc')
-    if input_mode not in ('disc', 'capture'):
-        raise ValueError('DW5XL_VU1_INPUT must be disc or capture')
-    disc_mode = input_mode == 'disc'
-    if disc_mode:
-        from disc_vu_inputs import load_disc_bins, IMAGE_REGISTRATIONS
-        bins, covered = load_disc_bins(os.environ.get('DW5XL_VU1_ELF', 'game/dw5xl/SLES_538.60'))
-    else:
-        bins = {}
-        import glob
-        for p in glob.glob(os.environ.get('DW5XL_VU1_CENSUS_GLOB', 'notes/evidence/battle_real_census.tsv.*.bin')):
-            h = p.split('.')[-2]
-            bins[h] = load(p)
-        if not bins:
-            raise ValueError('No captured VU1 microcode found')
-
-    targets = [('dd3d1361f34c85a3', 672, 3120, 'lift_opening_dd3d_02a0'), ('4dedc9b811a016b1', 680, 2480, 'lift_opening_4ded_02a8'), ('4a6dbc6bbd3f1fbb', 784, 1352, 'lift_opening_4a6d_0310'), ('4a6dbc6bbd3f1fbb', 256, 1352, 'lift_opening_4a6d_0100'), ('4a6dbc6bbd3f1fbb', 0, 248, 'lift_opening_4a6d_0000'), ('881c2abb30cea5ce', 2352, 5944, 'lift_opening_881c_0930'), ('881c2abb30cea5ce', 0, 104, 'lift_opening_881c_0000'), ] + [('99119dfac138459b', 2048, 5200, 'lift_battle_calls_99119dfa_0800'), ('99119dfac138459b', 9216, 12976, 'lift_battle_calls_99119dfa_2400'), ('eb1d3af053afc5c2', 2048, 5128, 'lift_battle_calls_eb1d3af0_0800'), ('eb1d3af053afc5c2', 9216, 12904, 'lift_battle_calls_eb1d3af0_2400')] + [
-        ('1ad6eefff0c2e7e5', 0x0800, 0x0a78, 'lift_1ad6_0800'),
-        ('1ad6eefff0c2e7e5', 0x1000, 0x12b0, 'lift_1ad6_1000'),
-        ('da28291ffe0b3334', 0x0000, 0x0448, 'lift_da28_0000'),
-        ('da28291ffe0b3334', 0x0010, 0x0950, 'lift_da28_0010'),
-        ('da28291ffe0b3334', 0x0050, 0x1070, 'lift_da28_0050'),
-        ('1b91674603e323f2', 0x0800, 0x0c48, 'lift_1b91_0800'),
-        ('3249a2515e770fcc', 0x0800, 0x0c48, 'lift_battle_actor_skinning_0800'),
-        ('baa8e61743cea7a2', 0x0800, 0x0b18, 'lift_battle_mesh_0800'),
-        ('baa8e61743cea7a2', 0x2400, 0x27e0, 'lift_battle_fx_2400'),
-        ('64127817c106b85a', 0x2400, 0x2750, 'lift_battle_particles_2400'),
-        ('46d6ccb25f6b8d32', 0x2400, 0x29b8, 'lift_battle_terrain_2400'),
-        ('46d6ccb25f6b8d32', 0x0800, 0x0e18, 'lift_battle_water_0800'),
-        ('60b13c6c3365e06a', 0x2400, 0x2878, 'lift_battle_shadows_2400'),
-        ('baa8e61743cea7a2', 0x0040, 0x00f0, 'lift_battle_init_0040'),
-        ('baa8e61743cea7a2', 0x00f0, 0x0230, 'lift_battle_stream_00f0'),
-        ('84a67c1d4789e87b', 0x0230, 0x0370, 'lift_battle_clip_0230'),
-        ('60b13c6c3365e06a', 0x0800, 0x0b88, 'lift_battle_shadows_0800'),
-        ('84a67c1d4789e87b', 0x0000, 0x0028, 'lift_battle_stream_0000'),
-        ('3a4f0cd1c30a3aef', 0x0370, 0x04b0, 'lift_battle_clip_0370'),
-        ('3a4f0cd1c30a3aef', 0x04b0, 0x05f0, 'lift_battle_clip_04b0'),
-        ('da28291ffe0b3334', 0x0060, 0x00f0, 'lift_battle_init_0060'),
-        ('87e0189b1bc04e8e', 0x0028, 0x00f0, 'lift_battle_init_0028'),
-        ('3a4f0cd1c30a3aef', 0x0800, 0x1410, 'lift_battle_3a4f_0800'),
-        ('3a4f0cd1c30a3aef', 0x2400, 0x3080, 'lift_battle_3a4f_2400'),
-    ]
-
-    out = []
-    out.append("""#include "runtime/ps2_vu1_lift.h"
+# Shared preamble of every generated lift file (VU1 and, issue 025, VU0): includes and helpers.
+LIFT_PREAMBLE = """#include "runtime/ps2_vu1_lift.h"
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -912,7 +901,64 @@ inline V vuItofV(V a, float scale)
 }
 
 } // namespace
-""")
+"""
+
+if __name__ == '__main__':
+    def load(path):
+        with open(path, 'rb') as f:
+            return f.read()
+
+    def fnv1a_64(data):
+        h = 1469598103934665603
+        for b in data:
+            h = ((h ^ b) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+        return h
+
+    input_mode = os.environ.get('DW5XL_VU1_INPUT', 'disc')
+    if input_mode not in ('disc', 'capture'):
+        raise ValueError('DW5XL_VU1_INPUT must be disc or capture')
+    disc_mode = input_mode == 'disc'
+    if disc_mode:
+        from disc_vu_inputs import load_disc_bins, IMAGE_REGISTRATIONS
+        bins, covered = load_disc_bins(os.environ.get('DW5XL_VU1_ELF', 'game/dw5xl/SLES_538.60'))
+    else:
+        bins = {}
+        import glob
+        for p in glob.glob(os.environ.get('DW5XL_VU1_CENSUS_GLOB', 'notes/evidence/battle_real_census.tsv.*.bin')):
+            h = p.split('.')[-2]
+            bins[h] = load(p)
+        if not bins:
+            raise ValueError('No captured VU1 microcode found')
+
+    targets = [('dd3d1361f34c85a3', 672, 3120, 'lift_opening_dd3d_02a0'), ('4dedc9b811a016b1', 680, 2480, 'lift_opening_4ded_02a8'), ('4a6dbc6bbd3f1fbb', 784, 1352, 'lift_opening_4a6d_0310'), ('4a6dbc6bbd3f1fbb', 256, 1352, 'lift_opening_4a6d_0100'), ('4a6dbc6bbd3f1fbb', 0, 248, 'lift_opening_4a6d_0000'), ('881c2abb30cea5ce', 2352, 5944, 'lift_opening_881c_0930'), ('881c2abb30cea5ce', 0, 104, 'lift_opening_881c_0000'), ] + [('99119dfac138459b', 2048, 5200, 'lift_battle_calls_99119dfa_0800'), ('99119dfac138459b', 9216, 12976, 'lift_battle_calls_99119dfa_2400'), ('eb1d3af053afc5c2', 2048, 5128, 'lift_battle_calls_eb1d3af0_0800'), ('eb1d3af053afc5c2', 9216, 12904, 'lift_battle_calls_eb1d3af0_2400')] + [
+        ('1ad6eefff0c2e7e5', 0x0800, 0x0a78, 'lift_1ad6_0800'),
+        ('1ad6eefff0c2e7e5', 0x1000, 0x12b0, 'lift_1ad6_1000'),
+        ('da28291ffe0b3334', 0x0000, 0x0448, 'lift_da28_0000'),
+        ('da28291ffe0b3334', 0x0010, 0x0950, 'lift_da28_0010'),
+        ('da28291ffe0b3334', 0x0050, 0x1070, 'lift_da28_0050'),
+        ('1b91674603e323f2', 0x0800, 0x0c48, 'lift_1b91_0800'),
+        ('3249a2515e770fcc', 0x0800, 0x0c48, 'lift_battle_actor_skinning_0800'),
+        ('baa8e61743cea7a2', 0x0800, 0x0b18, 'lift_battle_mesh_0800'),
+        ('baa8e61743cea7a2', 0x2400, 0x27e0, 'lift_battle_fx_2400'),
+        ('64127817c106b85a', 0x2400, 0x2750, 'lift_battle_particles_2400'),
+        ('46d6ccb25f6b8d32', 0x2400, 0x29b8, 'lift_battle_terrain_2400'),
+        ('46d6ccb25f6b8d32', 0x0800, 0x0e18, 'lift_battle_water_0800'),
+        ('60b13c6c3365e06a', 0x2400, 0x2878, 'lift_battle_shadows_2400'),
+        ('baa8e61743cea7a2', 0x0040, 0x00f0, 'lift_battle_init_0040'),
+        ('baa8e61743cea7a2', 0x00f0, 0x0230, 'lift_battle_stream_00f0'),
+        ('84a67c1d4789e87b', 0x0230, 0x0370, 'lift_battle_clip_0230'),
+        ('60b13c6c3365e06a', 0x0800, 0x0b88, 'lift_battle_shadows_0800'),
+        ('84a67c1d4789e87b', 0x0000, 0x0028, 'lift_battle_stream_0000'),
+        ('3a4f0cd1c30a3aef', 0x0370, 0x04b0, 'lift_battle_clip_0370'),
+        ('3a4f0cd1c30a3aef', 0x04b0, 0x05f0, 'lift_battle_clip_04b0'),
+        ('da28291ffe0b3334', 0x0060, 0x00f0, 'lift_battle_init_0060'),
+        ('87e0189b1bc04e8e', 0x0028, 0x00f0, 'lift_battle_init_0028'),
+        ('3a4f0cd1c30a3aef', 0x0800, 0x1410, 'lift_battle_3a4f_0800'),
+        ('3a4f0cd1c30a3aef', 0x2400, 0x3080, 'lift_battle_3a4f_2400'),
+    ]
+
+    out = []
+    out.append(LIFT_PREAMBLE)
 
     regs = []
     if disc_mode:

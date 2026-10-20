@@ -1781,8 +1781,8 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
 
 namespace
 {
-    // PS2X_VU1_CENSUS=<file>: at exit, write per-(microcode hash, entry PC)
-    // run counts and VU1 cycles, and the microcode images (<file>.<hash>.bin).
+    // PS2X_VU1_CENSUS=<file> / PS2X_VU0_CENSUS=<file> (DW5XL-DEBUG, issue 025 adds VU0): at exit, write
+    // per-(microcode hash, entry PC) run counts and VU cycles, and the microcode images (<file>.<hash>.bin).
     struct VuCensus
     {
         struct Entry
@@ -1809,9 +1809,9 @@ namespace
         uint64_t cachedGeneration = ~0ull;
         uint64_t cachedHash = 0;
 
-        VuCensus()
+        explicit VuCensus(const char *envName)
         {
-            if (const char *env = std::getenv("PS2X_VU1_CENSUS"))
+            if (const char *env = std::getenv(envName))
                 path = env;
         }
         ~VuCensus() { dump(); }
@@ -1884,10 +1884,16 @@ namespace
         }
     };
 
-    VuCensus &census()
+    VuCensus &census(VU1Interpreter::Unit unit)
     {
-        static VuCensus instance;
-        return instance;
+        static VuCensus vu1("PS2X_VU1_CENSUS");
+        static VuCensus vu0("PS2X_VU0_CENSUS");
+        return unit == VU1Interpreter::Unit::VU0 ? vu0 : vu1;
+    }
+
+    uint64_t codeGeneration(VU1Interpreter::Unit unit, const PS2Memory &memory)
+    {
+        return unit == VU1Interpreter::Unit::VU0 ? memory.getVU0CodeGeneration() : memory.getVU1CodeGeneration();
     }
 }
 
@@ -1912,10 +1918,10 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
     m_state.vf[0][3] = 1.0f;
-    if (m_unit == Unit::VU1 && census().enabled() && memory)
+    if (census(m_unit).enabled() && memory)
     {
-        VuCensus &c = census();
-        c.lastHash = c.hashOf(vuCode, codeSize, memory->getVU1CodeGeneration());
+        VuCensus &c = census(m_unit);
+        c.lastHash = c.hashOf(vuCode, codeSize, codeGeneration(m_unit, *memory));
         c.lastPc = m_state.pc;
         const uint64_t before = m_cycle;
         const auto hostBefore = std::chrono::steady_clock::now();
@@ -1945,9 +1951,9 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     m_state.itop = itop;
     m_state.stoppedByD = false;
     m_state.stoppedByT = false;
-    if (m_unit == Unit::VU1 && census().enabled())
+    if (census(m_unit).enabled())
     {
-        VuCensus &c = census();
+        VuCensus &c = census(m_unit);
         const uint64_t before = m_cycle;
         const auto hostBefore = std::chrono::steady_clock::now();
         run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
@@ -1976,10 +1982,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_activeGs = &gs;
     m_activeMemory = memory;
 
-    if (m_unit == Unit::VU1 && census().enabled() && !m_verifyShadow)
+    if (census(m_unit).enabled() && !m_verifyShadow)
     {
-        census().lastRunBudgetExhausted = false;
-        census().lastRunAbnormalStop = false;
+        census(m_unit).lastRunBudgetExhausted = false;
+        census(m_unit).lastRunAbnormalStop = false;
     }
     const int previousRoundingMode = std::fegetround();
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
@@ -2163,10 +2169,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             break;
     }
 
-    if (m_unit == Unit::VU1 && census().enabled() && !m_verifyShadow)
+    if (census(m_unit).enabled() && !m_verifyShadow)
     {
-        census().lastRunBudgetExhausted = !programEnded && m_cycle >= budgetEnd;
-        census().lastRunAbnormalStop = !programEnded && m_cycle < budgetEnd && !m_stopRequested;
+        census(m_unit).lastRunBudgetExhausted = !programEnded && m_cycle >= budgetEnd;
+        census(m_unit).lastRunAbnormalStop = !programEnded && m_cycle < budgetEnd && !m_stopRequested;
     }
     if (programEnded && !resetCanceled)
     {

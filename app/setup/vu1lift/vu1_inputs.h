@@ -300,6 +300,24 @@ inline constexpr Target kTargets[] = {
     {"3a4f0cd1c30a3aef", 2048u, 5136u, "lift_battle_3a4f_0800"},
     {"3a4f0cd1c30a3aef", 9216u, 12416u, "lift_battle_3a4f_2400"},
 };
+inline constexpr Chunk kVu0Chunks0[] = {{80u, 2236040u, 16u, nullptr}, {232u, 2236192u, 568u, nullptr}, {2504u, 2238472u, 376u, nullptr}, {2912u, 2238880u, 56u, nullptr}};
+inline constexpr Chunk kVu0Chunks1[] = {{144u, 2236104u, 16u, nullptr}, {192u, 2236152u, 40u, nullptr}, {368u, 2236328u, 432u, nullptr}};
+inline constexpr Chunk kVu0Chunks2[] = {{32u, 2235992u, 16u, nullptr}, {160u, 2236120u, 32u, nullptr}, {232u, 2236192u, 568u, nullptr}};
+inline constexpr Chunk kVu0Chunks3[] = {{48u, 2236008u, 16u, nullptr}, {1824u, 2237784u, 224u, nullptr}, {2048u, 2238016u, 456u, nullptr}};
+inline constexpr Chunk kVu0Chunks4[] = {{0u, 406424u, 360u, "OVL_00.BIN"}, {392u, 406816u, 496u, "OVL_00.BIN"}};
+inline constexpr Chunk kVu0Chunks5[] = {{360u, 406784u, 528u, "OVL_00.BIN"}};
+inline constexpr Chunk kVu0Chunks6[] = {{888u, 407312u, 216u, "OVL_00.BIN"}};
+inline constexpr Chunk kVu0Chunks7[] = {{1104u, 407528u, 872u, "OVL_00.BIN"}};
+inline constexpr Range kVu0Ranges[] = {
+    {"fd5ecac9d295d513", 80u, 2960u, "vu0_fd5e_0050", kVu0Chunks0, 4u, "b3013fe234c46de37d0aebe7320c96cf2dd8f5b0dec95b18634f92335b3e0ed9"},
+    {"fd5ecac9d295d513", 144u, 792u, "vu0_fd5e_0090", kVu0Chunks1, 3u, "c791747009b7f705d2cb42ec6a1a5b882da3c6cb7f144d652c518083da0e7883"},
+    {"fd5ecac9d295d513", 32u, 792u, "vu0_fd5e_0020", kVu0Chunks2, 3u, "b8a490854fc83519f3c117157d53681438ff3307ee31dbc2c0fac44fb6f07059"},
+    {"fd5ecac9d295d513", 48u, 2496u, "vu0_fd5e_0030", kVu0Chunks3, 3u, "1edd2693880f3f65c74d7cbf0093acaa2cf936ff17d7c76f40beef9841b91f93"},
+    {"76d23035e908a12e", 0u, 880u, "vu0_76d2_0000", kVu0Chunks4, 2u, "9a8a0e523d870a09743066e86b60c43d9f6a452b4d65546f0f8bae3d0929987b"},
+    {"76d23035e908a12e", 360u, 880u, "vu0_76d2_0168", kVu0Chunks5, 1u, "428d6370f12e1c2650e09ddac01d10d5e77356b5512329fe29e11cc65261bf85"},
+    {"76d23035e908a12e", 888u, 1096u, "vu0_76d2_0378", kVu0Chunks6, 1u, "951cdb8984f0771d954b45a50b2084ee6582b07ac2f8550e3440b25a15691f7e"},
+    {"76d23035e908a12e", 1104u, 1968u, "vu0_76d2_0450", kVu0Chunks7, 1u, "49cb72b51cc7961bb740f53762d66b8b60810a0e66f72fe199e9578a33e1f586"},
+};
 inline constexpr const char *kPrologue = R"DW5XL(#include "runtime/ps2_vu1_lift.h"
 #include <cmath>
 #include <cstdint>

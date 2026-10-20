@@ -45,14 +45,21 @@ out.append('inline constexpr Target kTargets[] = {')
 for key, pc, end, name in targets:
     out.append(f'    {{"{key}", {pc}u, {end}u, "{name}"}},')
 out.append('};')
-# The fixed C++ text the translator writes before the segments and after them, verbatim.
+# VU0 microprograms (issue 025): the same tables for tools/vu0_translator.py.
+for i, (key, start, end, name, chunks, digest) in enumerate(d.VU0_RANGES):
+    items = [f'{{{c[0]}u, {c[1]}u, {c[2]}u, {chr(34) + c[3] + chr(34) if len(c) > 3 else "nullptr"}}}' for c in chunks]
+    out.append(f'inline constexpr Chunk kVu0Chunks{i}[] = {{{", ".join(items)}}};')
+out.append('inline constexpr Range kVu0Ranges[] = {')
+for i, (key, start, end, name, chunks, digest) in enumerate(d.VU0_RANGES):
+    out.append(f'    {{"{key}", {start}u, {end}u, "{name}", kVu0Chunks{i}, {len(chunks)}u, "{digest}"}},')
+out.append('};')
+# The fixed C++ text the translator writes before the segments (LIFT_PREAMBLE, shared with the VU0 output) and
+# after them (the flush functions), verbatim.
 blocks = []
-pos = 0
-for _ in range(2):
-    start = src.index('out.append("""', pos) + len('out.append("""')
-    end = src.index('""")', start)
-    blocks.append(src[start:end])
-    pos = end
+start = src.index('LIFT_PREAMBLE = """') + len('LIFT_PREAMBLE = """')
+blocks.append(src[start:src.index('"""', start)])
+start = src.index('out.append("""') + len('out.append("""')
+blocks.append(src[start:src.index('""")', start)])
 for name, text in zip(('kPrologue', 'kFlushFunctions'), blocks):
     if ')DW5XL"' in text:
         raise SystemExit('raw string delimiter appears in the block')

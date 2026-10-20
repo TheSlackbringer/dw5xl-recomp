@@ -24,4 +24,10 @@ bool generateLiftedVu1(const std::filesystem::path &elf, std::string &text, std:
                        const std::function<void(const std::string &)> &log = {},
                        const std::function<bool(const std::string &)> &staticTiming = {});
 
+// The VU0 microprograms the game starts with VCALLMS (issue 025), exactly what `python3 tools/vu0_translator.py`
+// writes: same translator with the VU0 target (4 KB micro memory), inputs from VU0_RANGES.
+bool generateLiftedVu0(const std::filesystem::path &elf, std::string &text, std::string &error,
+                       const std::function<void(const std::string &)> &log = {},
+                       const std::function<bool(const std::string &)> &staticTiming = {});
+
 } // namespace dw5xl::vu1lift

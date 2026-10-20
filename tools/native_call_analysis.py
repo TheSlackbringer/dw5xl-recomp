@@ -6,6 +6,7 @@ from collections import deque
 import vu1_timing
 
 BRANCHES = {0x20,0x21,0x24,0x25,0x28,0x29,0x2c,0x2d,0x2e,0x2f}
+PC_MASK = 0x3fff  # micro memory mask: 0x3fff VU1, 0x0fff VU0 (set by vu1_translator.set_unit, issue 025)
 MAX_VALUES = 64
 UNKNOWN = None
 
@@ -91,7 +92,7 @@ def analyze(code,entry,decode_lower):
             elif op==0x24:
                 values=state[1][l['fs']&15]
                 if values is None:unresolved.add(pc);continue
-                dests={(int(x)&0xffff)*8&0x3fff for x in values}
+                dests={(int(x)&0xffff)*8&PC_MASK for x in values}
                 jr_targets.setdefault(pc,set()).update(dests)
                 for dst in dests:enqueue(dst,out)
             else:

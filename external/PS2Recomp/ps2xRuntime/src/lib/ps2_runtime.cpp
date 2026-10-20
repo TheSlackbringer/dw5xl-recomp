@@ -1442,6 +1442,10 @@ bool PS2Runtime::initialize(const char *title)
         }
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
+        // DW5XL-DEBUG (issue 025): PS2X_MUTE=1 silences the output for test runs where no silent sink exists
+        // (Windows); the audio device and stream keep running exactly as in normal play, only the volume is 0.
+        if (const char *mute = std::getenv("PS2X_MUTE"); mute && *mute == '1')
+            SetMasterVolume(0.0f);
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         m_audioBackend.startPcmStream();
 #endif

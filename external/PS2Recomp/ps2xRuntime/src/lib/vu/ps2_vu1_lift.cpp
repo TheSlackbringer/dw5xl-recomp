@@ -24,7 +24,8 @@ namespace vl
     void LiftAccess::prepareActive(Run &c)
     {
         VU1Interpreter &v = vu(c);
-        prepare(c, v.m_activeMemory->getVU1Code(), v.m_activeMemory);
+        prepare(c, v.m_unit == VU1Interpreter::Unit::VU0 ? v.m_activeMemory->getVU0Code() : v.m_activeMemory->getVU1Code(),
+                v.m_activeMemory);
     }
     namespace { std::atomic<int> g_enabledOverride{-1}; }
     void setEnabledOverride(int value) { g_enabledOverride.store(value, std::memory_order_relaxed); }
@@ -84,11 +85,12 @@ namespace vl
         registry().insert(registry().end(), registrations, registrations + count);
     }
 
-    Segment find(uint64_t hash, uint32_t pc, const uint8_t *vuCode)
+    Segment find(uint64_t hash, uint32_t pc, const uint8_t *vuCode, bool vu0)
     {
+        const uint32_t codeSize = vu0 ? 0x1000u : 0x4000u;
         for (const Registration &r : registry())
         {
-            if (r.pc != pc)
+            if (r.pc != pc || r.vu0 != vu0)
                 continue;
             if (r.subSize == 0)
             {
@@ -98,7 +100,7 @@ namespace vl
             else
             {
                 const uint32_t start = r.subStart == ~0u ? pc : r.subStart;
-                if (vuCode && start + r.subSize <= 0x4000u && hashCode(vuCode + start, r.subSize) == r.hash)
+                if (vuCode && start + r.subSize <= codeSize && hashCode(vuCode + start, r.subSize) == r.hash)
                     return r.fn;
             }
         }
@@ -182,25 +184,41 @@ namespace vl
 
 bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_t dataSize, PS2Memory *memory)
 {
-    // PS2X_VU1_LIFT: enabled by default, unset or != "0" -> true. PS2X_VU1_LIFT=0 -> false.
-    static const bool enabled = []
-    {
-        const char *env = std::getenv("PS2X_VU1_LIFT");
-        const bool on = !(env && env[0] == '0' && env[1] == '\0');
-        if (on)
-            std::fprintf(stderr, "[vu1lift] enabled\n");
-        return on;
-    }();
-    static uint64_t s_totalCalls = 0;
-    static uint64_t s_guardBail = 0;
-    static uint64_t s_findMiss = 0;
-    static uint64_t s_findHit = 0;
+    // PS2X_VU1_LIFT / PS2X_VU0_LIFT (issue 025): enabled by default, unset or != "0" -> true; "0" -> false.
+    // VU1 runs on the device worker, VU0 microprograms (VCALLMS) on the EE thread: each unit keeps its own
+    // switch, counters and caches.
+    const bool vu0 = m_unit == Unit::VU0;
+    const int unitIndex = vu0 ? 1 : 0;
+    const char *tag = vu0 ? "vu0lift" : "vu1lift";
+    static const bool s_enabled[2] = {
+        []
+        {
+            const char *env = std::getenv("PS2X_VU1_LIFT");
+            const bool on = !(env && env[0] == '0' && env[1] == '\0');
+            if (on)
+                std::fprintf(stderr, "[vu1lift] enabled\n");
+            return on;
+        }(),
+        []
+        {
+            const char *env = std::getenv("PS2X_VU0_LIFT");
+            const bool on = !(env && env[0] == '0' && env[1] == '\0');
+            if (on)
+                std::fprintf(stderr, "[vu0lift] enabled\n");
+            return on;
+        }()};
+    static uint64_t s_totalCallsByUnit[2] = {}, s_guardBailByUnit[2] = {}, s_findMissByUnit[2] = {}, s_findHitByUnit[2] = {};
+    uint64_t &s_totalCalls = s_totalCallsByUnit[unitIndex];
+    uint64_t &s_guardBail = s_guardBailByUnit[unitIndex];
+    uint64_t &s_findMiss = s_findMissByUnit[unitIndex];
+    uint64_t &s_findHit = s_findHitByUnit[unitIndex];
 
     ++s_totalCalls;
 
+    const uint32_t unitSize = vu0 ? 0x1000u : 0x4000u;
     const int forced = vl::enabledOverride();
-    if (forced == 0 || (forced < 0 && !enabled) || m_unit != Unit::VU1 || !memory || codeSize != 0x4000u || dataSize != 0x4000u ||
-        vuCode != memory->getVU1Code() || !m_activeVuData)
+    if (forced == 0 || (forced < 0 && !s_enabled[unitIndex]) || !memory || codeSize != unitSize || dataSize != unitSize ||
+        vuCode != (vu0 ? memory->getVU0Code() : memory->getVU1Code()) || !m_activeVuData)
         return false;
 
     // Lifted schedules start from idle pipelines.
@@ -212,12 +230,22 @@ bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_
         return false;
     }
 
-    thread_local const uint8_t *cachedCode = nullptr;
-    thread_local uint64_t cachedGeneration = ~0ull;
-    thread_local uint64_t cachedHash = 0;
-    thread_local std::array<vl::Segment, 2048> s_pcCache{};
-    thread_local std::array<bool, 2048> s_pcCacheValid{};
-    const uint64_t generation = memory->getVU1CodeGeneration();
+    struct LookupCache
+    {
+        const uint8_t *code = nullptr;
+        uint64_t generation = ~0ull;
+        uint64_t hash = 0;
+        std::array<vl::Segment, 2048> segments{};
+        std::array<bool, 2048> valid{};
+    };
+    thread_local LookupCache s_cacheByUnit[2];
+    LookupCache &cache = s_cacheByUnit[unitIndex];
+    const uint8_t *&cachedCode = cache.code;
+    uint64_t &cachedGeneration = cache.generation;
+    uint64_t &cachedHash = cache.hash;
+    std::array<vl::Segment, 2048> &s_pcCache = cache.segments;
+    std::array<bool, 2048> &s_pcCacheValid = cache.valid;
+    const uint64_t generation = vu0 ? memory->getVU0CodeGeneration() : memory->getVU1CodeGeneration();
     if (vuCode != cachedCode || generation != cachedGeneration)
     {
         cachedHash = vl::hashCode(vuCode, codeSize);
@@ -233,7 +261,7 @@ bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_
     }
     else
     {
-        segment = vl::find(cachedHash, m_state.pc, vuCode);
+        segment = vl::find(cachedHash, m_state.pc, vuCode, vu0);
         s_pcCache[pcSlot] = segment;
         s_pcCacheValid[pcSlot] = true;
     }
@@ -242,7 +270,7 @@ bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_
         ++s_findMiss;
         if ((s_findMiss & 0x3FFF) == 1)
         {
-            std::fprintf(stderr, "[vu1lift:miss] calls=%llu bail=%llu miss=%llu hit=%llu hash=0x%016llx pc=0x%04x\n",
+            std::fprintf(stderr, "[%s:miss] calls=%llu bail=%llu miss=%llu hit=%llu hash=0x%016llx pc=0x%04x\n", tag,
                          static_cast<unsigned long long>(s_totalCalls),
                          static_cast<unsigned long long>(s_guardBail),
                          static_cast<unsigned long long>(s_findMiss),
@@ -256,7 +284,7 @@ bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_
     ++s_findHit;
     if ((s_findHit & 0x3FFF) == 1)
     {
-        std::fprintf(stderr, "[vu1lift:hit] calls=%llu bail=%llu miss=%llu hit=%llu hash=0x%016llx pc=0x%04x\n",
+        std::fprintf(stderr, "[%s:hit] calls=%llu bail=%llu miss=%llu hit=%llu hash=0x%016llx pc=0x%04x\n", tag,
                      static_cast<unsigned long long>(s_totalCalls),
                      static_cast<unsigned long long>(s_guardBail),
                      static_cast<unsigned long long>(s_findMiss),
@@ -274,6 +302,7 @@ bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_
                   self->startXgkick(qwordAddress);
               },
               &m_xgkick.active, m_cycle};
+    c.codeSize = unitSize;
     try
     {
         vl::checkReset(c);
@@ -312,18 +341,33 @@ bool VU1Interpreter::runLiftedChecked(uint8_t *vuCode, uint32_t codeSize, uint8_
     // repeated by the interpreter from a copy of the start state and VU
     // memory; registers, flags, Q/P, pc, cycles, VU memory and the XGKICK
     // packets must be identical. The game continues with the lifted result.
-    static const bool verify = []
-    {
-        const char *env = std::getenv("PS2X_VU1_LIFT_VERIFY");
-        const bool on = env && env[0] == '1';
-        if (on)
-            std::fprintf(stderr, "[vu1verify] enabled\n");
-        return on;
-    }();
-    if (!verify)
+    // PS2X_VU0_LIFT_VERIFY=1 does the same for VU0 microprograms (issue 025); log tag [vu0verify].
+    const int unitIndex = m_unit == Unit::VU0 ? 1 : 0;
+    const char *tag = unitIndex ? "vu0verify" : "vu1verify";
+    static const bool s_verify[2] = {
+        []
+        {
+            const char *env = std::getenv("PS2X_VU1_LIFT_VERIFY");
+            const bool on = env && env[0] == '1';
+            if (on)
+                std::fprintf(stderr, "[vu1verify] enabled\n");
+            return on;
+        }(),
+        []
+        {
+            const char *env = std::getenv("PS2X_VU0_LIFT_VERIFY");
+            const bool on = env && env[0] == '1';
+            if (on)
+                std::fprintf(stderr, "[vu0verify] enabled\n");
+            return on;
+        }()};
+    if (!s_verify[unitIndex])
         return runLifted(vuCode, codeSize, dataSize, memory);
 
-    static uint64_t s_runs = 0, s_mismatches = 0, s_skipped = 0;
+    static uint64_t s_runsByUnit[2] = {}, s_mismatchesByUnit[2] = {}, s_skippedByUnit[2] = {};
+    uint64_t &s_runs = s_runsByUnit[unitIndex];
+    uint64_t &s_mismatches = s_mismatchesByUnit[unitIndex];
+    uint64_t &s_skipped = s_skippedByUnit[unitIndex];
     // PS2X_VU1_VERIFY_DUMP=<prefix>: the first mismatching runs are saved as <prefix>.<n>.code/.data/.state (the
     // PS2X_VU1_RUN_CAPTURE format, replayable offline) plus .txt with the entry pipeline state. Game data: keep local.
     static const char *s_dumpPrefix = std::getenv("PS2X_VU1_VERIFY_DUMP");
@@ -417,7 +461,7 @@ bool VU1Interpreter::runLiftedChecked(uint8_t *vuCode, uint32_t codeSize, uint8_
             uint64_t h = 1469598103934665603ull;
             for (uint32_t n = 0; n < codeSize; ++n)
                 h = (h ^ vuCode[n]) * 1099511628211ull;
-            std::fprintf(stderr, "[vu1verify] MISMATCH hash=%016llx pc=%04x run=%llu cycles=%llu: %s (entry %s)\n",
+            std::fprintf(stderr, "[%s] MISMATCH hash=%016llx pc=%04x run=%llu cycles=%llu: %s (entry %s)\n", tag,
                          static_cast<unsigned long long>(h), entryPc, static_cast<unsigned long long>(s_runs),
                          static_cast<unsigned long long>(m_cycle - entryCycle), what, entryPipeline);
             static uint32_t s_dumped = 0;
@@ -445,7 +489,7 @@ bool VU1Interpreter::runLiftedChecked(uint8_t *vuCode, uint32_t codeSize, uint8_
         }
     }
     if ((s_runs & 0x3FFFu) == 0u || (what[0] && s_mismatches <= 50u))
-        std::fprintf(stderr, "[vu1verify] runs=%llu mismatches=%llu skipped=%llu\n",
+        std::fprintf(stderr, "[%s] runs=%llu mismatches=%llu skipped=%llu\n", tag,
                      static_cast<unsigned long long>(s_runs), static_cast<unsigned long long>(s_mismatches),
                      static_cast<unsigned long long>(s_skipped));
     return true;

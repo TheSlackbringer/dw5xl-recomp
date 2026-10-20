@@ -49,6 +49,42 @@ std::string S(long long v) { return std::to_string(v); }
 
 [[noreturn]] void fail(const std::string &message) { throw std::runtime_error(message); }
 
+// Target unit (issue 025, as UNIT / set_unit in the Python): VU1 (16 KB micro memory) or VU0 (4 KB, the
+// microprograms the EE starts with VCALLMS). VU0 has no PATH1/XGKICK, no EFU, no XTOP/XITOP and no WAITP/MFP.
+bool g_vu0 = false;
+
+uint32_t pcMask() { return g_vu0 ? 0x0fffu : 0x3fffu; }
+
+std::string memLq(const std::string &addr)
+{
+    return (g_vu0 ? "vl::lq0(mem, " : "vl::lq(mem, ") + addr + ")";
+}
+
+std::string memSq(uint32_t lm, const std::string &addr, const std::string &val)
+{
+    if (g_vu0)
+        return F("vl::sq0<0x%x>(c, mem, ", lm) + addr + ", " + val + ");";
+    return F("vl::sq<0x%x, false>(c, mem, ", lm) + addr + ", " + val + ", 0u);";
+}
+
+std::string memIlw(const std::string &addr, int comp)
+{
+    return (g_vu0 ? "vl::ilw0(mem, " : "vl::ilw(mem, ") + addr + F(", %d)", comp);
+}
+
+std::string memIsw(uint32_t lm, const std::string &addr, const std::string &val)
+{
+    if (g_vu0)
+        return F("vl::isw0<0x%x>(c, mem, ", lm) + addr + ", " + val + ");";
+    return F("vl::isw<0x%x, false>(c, mem, ", lm) + addr + ", " + val + ", 0u);";
+}
+
+void vu1Only(const char *name, uint32_t pc)
+{
+    if (g_vu0)
+        fail(F("%s at pc %04x is not a VU0 instruction", name, pc));
+}
+
 std::pair<uint32_t, uint32_t> unpackPair(const std::vector<uint8_t> &code, uint32_t pc)
 {
     if (size_t(pc) + 8 > code.size())
@@ -183,7 +219,7 @@ Lower decodeLower(uint32_t w, uint32_t pc)
     l.type = LType::NORM;
     l.op = op;
     l.imm = imm;
-    l.tgt = uint32_t(int(pc) + 8 + imm * 8) & 0x3fff;
+    l.tgt = uint32_t(int(pc) + 8 + imm * 8) & pcMask();
     return l;
 }
 
@@ -313,25 +349,25 @@ std::string translateLower(const Lower &l, uint32_t lo, bool iBit, uint32_t pc)
         if (sp == 0x34)
         {
             std::string out;
-            const std::string bw = blendWrap(vft, F("vl::lq(mem, vi[%u])", fs), dd);
+            const std::string bw = blendWrap(vft, memLq(F("vi[%u]", fs)), dd);
             if (!bw.empty())
                 out = bw + " ";
             return out + F("if (%u != 0) vi[%u] = vl::i16(vi[%u] + 1);", fs, fs, fs);
         }
         if (sp == 0x35)
-            return F("vl::sq<0x%x, false>(c, mem, vi[%u], vf[%u], 0u);", lm, ft, fs) + " " +
+            return memSq(lm, F("vi[%u]", ft), F("vf[%u]", fs)) + " " +
                    F("if (%u != 0) vi[%u] = vl::i16(vi[%u] + 1);", ft, ft, ft);
         if (sp == 0x36)
         {
             std::string out = F("if (%u != 0) vi[%u] = vl::i16(vi[%u] - 1);", fs, fs, fs);
-            const std::string bw = blendWrap(vft, F("vl::lq(mem, vi[%u])", fs), dd);
+            const std::string bw = blendWrap(vft, memLq(F("vi[%u]", fs)), dd);
             if (!bw.empty())
                 out += " " + bw;
             return out;
         }
         if (sp == 0x37)
             return F("if (%u != 0) vi[%u] = vl::i16(vi[%u] - 1);", ft, ft, ft) + " " +
-                   F("vl::sq<0x%x, false>(c, mem, vi[%u], vf[%u], 0u);", lm, ft, fs);
+                   memSq(lm, F("vi[%u]", ft), F("vf[%u]", fs));
         if (sp == 0x38)
             return F("{ uint32_t di = 0; const float qv = vl::div(vl::lane<%u>(vf[%u]), vl::lane<%u>(vf[%u]), di); "
                      "vl::LiftAccess::queueQAt(c, cyc, qv, 7u, di); }",
@@ -350,18 +386,30 @@ std::string translateLower(const Lower &l, uint32_t lo, bool iBit, uint32_t pc)
         if (sp == 0x3e)
         {
             const int comp = (dd & 8) ? 0 : (dd & 4) ? 1 : (dd & 2) ? 2 : 3;
-            return F("if (%u != 0) vi[%u] = vl::ilw(mem, vi[%u], %d);", ft, ft, fs, comp);
+            return F("if (%u != 0) vi[%u] = ", ft, ft) + memIlw(F("vi[%u]", fs), comp) + ";";
         }
         if (sp == 0x3f)
-            return F("vl::isw<0x%x, false>(c, mem, vi[%u], vi[%u], 0u);", destMask(dd), fs, ft);
+            return memIsw(destMask(dd), F("vi[%u]", fs), F("vi[%u]", ft));
         if (sp == 0x68)
+        {
+            vu1Only("XTOP", pc);
             return F("if (%u != 0) vi[%u] = static_cast<int32_t>(c.st.top & 0x3FFu);", ft, ft);
+        }
         if (sp == 0x69)
+        {
+            vu1Only("XITOP", pc);
             return F("if (%u != 0) vi[%u] = static_cast<int32_t>(c.st.itop & 0x3FFu);", ft, ft);
+        }
         if (sp == 0x6c)
+        {
+            vu1Only("XGKICK", pc);
             return F("vl::LiftAccess::xgkickAt(c, cyc, vi[%u] & 0x3FF);", fs);
+        }
         if (sp == 0x7b)
+        {
+            vu1Only("WAITP", pc);
             return "";
+        }
     }
     if (l.type == LType::NORM)
     {
@@ -369,16 +417,16 @@ std::string translateLower(const Lower &l, uint32_t lo, bool iBit, uint32_t pc)
         const int imm = l.imm;
         const std::string vft = "vf[" + S(ft) + "]";
         if (op == 0x00)
-            return blendWrap(vft, F("vl::lq(mem, vi[%u] + (%d))", fs, imm), dd);
+            return blendWrap(vft, memLq(F("vi[%u] + (%d)", fs, imm)), dd);
         if (op == 0x01)
-            return F("vl::sq<0x%x, false>(c, mem, vi[%u] + (%d), vf[%u], 0u);", lm, ft, imm, fs);
+            return memSq(lm, F("vi[%u] + (%d)", ft, imm), F("vf[%u]", fs));
         if (op == 0x04)
         {
             const int comp = (dd & 8) ? 0 : (dd & 4) ? 1 : (dd & 2) ? 2 : 3;
-            return F("if (%u != 0) vi[%u] = vl::ilw(mem, vi[%u] + (%d), %d);", ft, ft, fs, imm, comp);
+            return F("if (%u != 0) vi[%u] = ", ft, ft) + memIlw(F("vi[%u] + (%d)", fs, imm), comp) + ";";
         }
         if (op == 0x05)
-            return F("vl::isw<0x%x, false>(c, mem, vi[%u] + (%d), vi[%u], 0u);", lm, fs, imm, ft);
+            return memIsw(lm, F("vi[%u] + (%d)", fs, imm), F("vi[%u]", ft));
         if (op == 0x08 || op == 0x09)
         {
             const uint32_t imm15 = (lo & 0x7FF) | ((lo >> 10) & 0x7800);
@@ -395,6 +443,14 @@ std::string translateLower(const Lower &l, uint32_t lo, bool iBit, uint32_t pc)
             return F("vi[1] = ((c.st.clip & 0x%06xu) != 0) ? 1 : 0;", lo & 0xFFFFFF);
         if (op == 0x13)
             return F("vi[1] = ((c.st.clip | 0x%06xu) == 0xFFFFFFu) ? 1 : 0;", lo & 0xFFFFFF);
+        if (op == 0x16) // FSAND (issue 025, VU0 program 0x0030)
+        {
+            const uint32_t viT = ft & 15;
+            const uint32_t imm12 = (((lo >> 21) & 1) << 11) | (lo & 0x7FF);
+            return F("vl::LiftAccess::flagsSync(c, fq, cyc); if (%u != 0) vi[%u] = static_cast<int32_t>((c.st.status & "
+                     "0xFFFu) & 0x%03xu);",
+                     viT, viT, imm12);
+        }
         if (op == 0x1a)
             return F("vl::LiftAccess::flagsSync(c, fq, cyc); if (%u != 0) vi[%u] = static_cast<int32_t>(c.st.mac & "
                      "(vi[%u] & 0xFFFF));",
@@ -624,7 +680,7 @@ NativeCallInfo analyzeNativeCalls(const std::vector<uint8_t> &code, uint32_t ent
                 }
                 std::set<uint32_t> dests;
                 for (int x : *values)
-                    dests.insert((uint32_t(x & 0xffff) * 8) & 0x3fff);
+                    dests.insert((uint32_t(x & 0xffff) * 8) & pcMask());
                 jrTargets[pc].insert(dests.begin(), dests.end());
                 for (uint32_t dst : dests)
                     enqueue(dst, out);
@@ -1252,8 +1308,8 @@ std::string translateSegment(const std::vector<uint8_t> &code, uint32_t entryPc,
                     const auto [op, ft, fs] = call->second;
                     if (op == 0x24)
                         out.push_back(F("    jump_%04x = (static_cast<uint32_t>(static_cast<uint16_t>(brvi(%u))) * "
-                                        "8u) & 0x3FFFu;",
-                                        pc, fs));
+                                        "8u) & 0x%04Xu;",
+                                        pc, fs, pcMask()));
                     else if (ft)
                         out.push_back(F("    vi[%u] = %u;", ft, (pc + 16) / 8));
                 }
@@ -1366,8 +1422,10 @@ struct DiscBins
     std::map<std::string, std::vector<uint8_t>> bins, covered;
 };
 
-// disc_vu_inputs.load_disc_bins
-DiscBins loadDiscBins(const std::filesystem::path &elfPath)
+// disc_vu_inputs._load_bins: load_disc_bins (VU1, 16 KB images) and load_vu0_bins (VU0, 4 KB, each range's SHA256
+// over its own chunks)
+DiscBins loadBins(const std::filesystem::path &elfPath, const Range *ranges, size_t rangeCount, size_t imageSize,
+                  bool ownDigest)
 {
     const std::vector<uint8_t> elf = readFile(elfPath);
     const std::string actual = dw5xl::setup::sha256Hex(elf.data(), elf.size());
@@ -1392,10 +1450,12 @@ DiscBins loadDiscBins(const std::filesystem::path &elfPath)
         return it->second;
     };
     DiscBins out;
-    for (const Range &range : kRanges)
+    for (size_t r = 0; r < rangeCount; ++r)
     {
-        auto &image = out.bins.try_emplace(range.key, std::vector<uint8_t>(16384, 0)).first->second;
-        auto &occupied = out.covered.try_emplace(range.key, std::vector<uint8_t>(16384, 0)).first->second;
+        const Range &range = ranges[r];
+        auto &image = out.bins.try_emplace(range.key, std::vector<uint8_t>(imageSize, 0)).first->second;
+        auto &occupied = out.covered.try_emplace(range.key, std::vector<uint8_t>(imageSize, 0)).first->second;
+        std::vector<uint8_t> own(imageSize, 0);
         for (uint32_t c = 0; c < range.chunkCount; ++c)
         {
             const Chunk &chunk = range.chunks[c];
@@ -1409,13 +1469,33 @@ DiscBins loadDiscBins(const std::filesystem::path &elfPath)
                     fail(std::string("Overlapping VU inputs disagree: ") + range.name);
                 image[chunk.pc + i] = byte;
                 occupied[chunk.pc + i] = 1;
+                own[chunk.pc + i] = byte;
             }
         }
-        if (dw5xl::setup::sha256Hex(&image[range.start], range.end + 8 - range.start) != range.sha256)
+        const std::vector<uint8_t> &checked = ownDigest ? own : image;
+        if (size_t(range.end) + 8 > checked.size() ||
+            dw5xl::setup::sha256Hex(&checked[range.start], range.end + 8 - range.start) != range.sha256)
             fail(std::string("VU instruction range mismatch: ") + range.name);
     }
     return out;
 }
+
+DiscBins loadDiscBins(const std::filesystem::path &elfPath)
+{
+    return loadBins(elfPath, kRanges, std::size(kRanges), 16384, false);
+}
+
+DiscBins loadVu0Bins(const std::filesystem::path &elfPath)
+{
+    return loadBins(elfPath, kVu0Ranges, std::size(kVu0Ranges), 4096, true);
+}
+
+// Restores the VU1 target when a VU0 translation ends (also on errors).
+struct Vu0Target
+{
+    Vu0Target() { g_vu0 = true; }
+    ~Vu0Target() { g_vu0 = false; }
+};
 } // namespace
 
 bool generateLiftedVu1(const std::filesystem::path &elf, std::string &text, std::string &error,
@@ -1478,6 +1558,54 @@ bool generateLiftedVu1(const std::filesystem::path &elf, std::string &text, std:
         out.push_back("static const vl::Registration s_battle_registrations[] = {\n" + join(regs, "\n") + "\n};\n" +
                       "static vl::Registrar s_battle_registrar(s_battle_registrations, sizeof(s_battle_registrations) / "
                       "sizeof(s_battle_registrations[0]));\n");
+        text = join(out, "\n\n");
+        return true;
+    }
+    catch (const std::exception &e)
+    {
+        error = e.what();
+        return false;
+    }
+}
+
+// Port of tools/vu0_translator.py (issue 025).
+bool generateLiftedVu0(const std::filesystem::path &elf, std::string &text, std::string &error,
+                       const std::function<void(const std::string &)> &log,
+                       const std::function<bool(const std::string &)> &staticTiming)
+{
+    try
+    {
+        const Vu0Target target;
+        const DiscBins disc = loadVu0Bins(elf);
+        std::vector<std::string> out{kPrologue};
+        std::vector<std::string> regs;
+        for (const Range &range : kVu0Ranges)
+        {
+            const std::vector<uint8_t> &code = disc.bins.at(range.key);
+            const std::vector<uint8_t> &cov = disc.covered.at(range.key);
+            const std::vector<uint32_t> reach = findReachable(code, range.start);
+            std::string missing;
+            for (uint32_t p : reach)
+            {
+                bool all = size_t(p) + 8 <= cov.size();
+                for (uint32_t b = 0; all && b < 8; ++b)
+                    all = cov[p + b] != 0;
+                if (!all)
+                    missing += (missing.empty() ? "" : ", ") + std::to_string(p);
+            }
+            if (!missing.empty())
+                fail(std::string("Unextracted reachable VU0 instructions in ") + range.name + ": [" + missing + "]");
+            if (reach.back() != range.end)
+                fail(F("%s: last reachable pair 0x%04x, VU0_RANGES says 0x%04x", range.name, reach.back(), range.end));
+            if (log)
+                log(F("Translating %s (VU0 pc=0x%04x, %zu pairs)...", range.name, range.start, reach.size()));
+            out.push_back(translateSegment(code, range.start, range.name, !staticTiming || staticTiming(range.name)));
+            regs.push_back(std::string("    { 0x") + range.key + F("ull, 0x%04x, ", range.start) + range.name +
+                           ", 0u, ~0u, true },");
+        }
+        out.push_back("static const vl::Registration s_vu0_registrations[] = {\n" + join(regs, "\n") + "\n};\n" +
+                      "static vl::Registrar s_vu0_registrar(s_vu0_registrations, "
+                      "sizeof(s_vu0_registrations) / sizeof(s_vu0_registrations[0]));\n");
         text = join(out, "\n\n");
         return true;
     }

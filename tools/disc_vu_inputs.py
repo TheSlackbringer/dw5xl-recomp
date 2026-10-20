@@ -157,6 +157,15 @@ RANGES = [('1ad6eefff0c2e7e5',
 SOURCE_SHA256 = {'OVL_00.BIN': '1cb303e389c215412c3a104e26b8e43d9105f230b3b8a76564ed1a0eb92da50f'}
 
 def load_disc_bins(path):
+    return _load_bins(path, RANGES, 16384)
+
+def load_vu0_bins(path):
+    """VU0 microprogram images (4 KB micro memory, issue 025) rebuilt from VU0_RANGES. The VU0 programs share
+    code, so each range's SHA256 is checked over that range's own chunks (as tools/vu1_find_disc_range.py
+    computes it), not over the image the earlier ranges already filled."""
+    return _load_bins(path, VU0_RANGES, 4096, own_digest=True)
+
+def _load_bins(path, ranges, image_size, own_digest=False):
     elf = Path(path).read_bytes()
     actual = hashlib.sha256(elf).hexdigest()
     if actual != ELF_SHA256:
@@ -171,20 +180,23 @@ def load_disc_bins(path):
         return sources[name]
     bins = {}
     covered = {}
-    for key, start, end, name, chunks, digest in RANGES:
-        image = bins.setdefault(key, bytearray(16384))
-        occupied = covered.setdefault(key, bytearray(16384))
+    for key, start, end, name, chunks, digest in ranges:
+        image = bins.setdefault(key, bytearray(image_size))
+        occupied = covered.setdefault(key, bytearray(image_size))
+        own = bytearray(image_size)
         for chunk in chunks:
             pc, offset, size = chunk[:3]
             data = source(chunk[3] if len(chunk) > 3 else None)[offset:offset + size]
             if len(data) != size or pc + size > len(image):
                 raise ValueError(f"Out-of-bounds VU input: {name}")
+            own[pc:pc + size] = data
             for i, byte in enumerate(data):
                 if occupied[pc+i] and image[pc+i] != byte:
                     raise ValueError(f"Overlapping VU inputs disagree: {name}")
                 image[pc+i] = byte
                 occupied[pc+i] = 1
-        if hashlib.sha256(image[start:end+8]).hexdigest() != digest:
+        checked = own if own_digest else image
+        if hashlib.sha256(checked[start:end+8]).hexdigest() != digest:
             raise ValueError(f"VU instruction range mismatch: {name}")
     return {key: bytes(image) for key, image in bins.items()}, covered
 
@@ -353,3 +365,34 @@ RANGES.extend([
 ])
 IMAGE_REGISTRATIONS.extend([(4201591072419887855, 2048, 'lift_battle_3a4f_0800'),
                             (4201591072419887855, 9216, 'lift_battle_3a4f_2400')])
+
+# VU0 microprograms started by VCALLMS (issue 025): one 4 KB image (census hash fd5ecac9d295d513, Si Shui Gate),
+# entries found with tools/vu1_find_disc_range.py. Same format as RANGES; offsets, sizes and SHA256 only.
+VU0_RANGES = [
+    ('fd5ecac9d295d513', 0x0050, 0x0b90, 'vu0_fd5e_0050',
+     [(80, 2236040, 16), (232, 2236192, 568), (2504, 2238472, 376), (2912, 2238880, 56)],
+     'b3013fe234c46de37d0aebe7320c96cf2dd8f5b0dec95b18634f92335b3e0ed9'),
+    ('fd5ecac9d295d513', 0x0090, 0x0318, 'vu0_fd5e_0090',
+     [(144, 2236104, 16), (192, 2236152, 40), (368, 2236328, 432)],
+     'c791747009b7f705d2cb42ec6a1a5b882da3c6cb7f144d652c518083da0e7883'),
+    ('fd5ecac9d295d513', 0x0020, 0x0318, 'vu0_fd5e_0020',
+     [(32, 2235992, 16), (160, 2236120, 32), (232, 2236192, 568)],
+     'b8a490854fc83519f3c117157d53681438ff3307ee31dbc2c0fac44fb6f07059'),
+    ('fd5ecac9d295d513', 0x0030, 0x09c0, 'vu0_fd5e_0030',
+     [(48, 2236008, 16), (1824, 2237784, 224), (2048, 2238016, 456)],
+     '1edd2693880f3f65c74d7cbf0093acaa2cf936ff17d7c76f40beef9841b91f93'),
+    # The Opening's VU0 image (census hash 76d23035e908a12e, in OVL_00.BIN); 0x0000 builds the bone rotation
+    # matrices (sin/cos subroutine), 93.5 % of the Opening's VU0 cycles.
+    ('76d23035e908a12e', 0x0000, 0x0370, 'vu0_76d2_0000',
+     [(0, 406424, 360, 'OVL_00.BIN'), (392, 406816, 496, 'OVL_00.BIN')],
+     '9a8a0e523d870a09743066e86b60c43d9f6a452b4d65546f0f8bae3d0929987b'),
+    ('76d23035e908a12e', 0x0168, 0x0370, 'vu0_76d2_0168',
+     [(360, 406784, 528, 'OVL_00.BIN')],
+     '428d6370f12e1c2650e09ddac01d10d5e77356b5512329fe29e11cc65261bf85'),
+    ('76d23035e908a12e', 0x0378, 0x0448, 'vu0_76d2_0378',
+     [(888, 407312, 216, 'OVL_00.BIN')],
+     '951cdb8984f0771d954b45a50b2084ee6582b07ac2f8550e3440b25a15691f7e'),
+    ('76d23035e908a12e', 0x0450, 0x07b0, 'vu0_76d2_0450',
+     [(1104, 407528, 872, 'OVL_00.BIN')],
+     '49cb72b51cc7961bb740f53762d66b8b60810a0e66f72fe199e9578a33e1f586'),
+]

@@ -54,6 +54,8 @@ namespace vl
         // Set by a segment whose embedded timing does not match the
         // interpreter's decode: runLifted then interprets the program.
         bool declined = false;
+        // Micro memory size of the running unit: 16 KB (VU1) or 4 KB (VU0, issue 025).
+        uint32_t codeSize = 0x4000u;
     };
 
     using Segment = void (*)(Run &);
@@ -83,7 +85,7 @@ namespace vl
         static void prepare(Run &c, const uint8_t *vuCode, PS2Memory *memory)
         {
             VU1Interpreter &v = vu(c);
-            v.getDecodedInstructionPairForPc(vuCode, 0x4000u, memory, 0u);
+            v.getDecodedInstructionPairForPc(vuCode, c.codeSize, memory, 0u);
             if (!v.m_liftTimingValid)
             {
                 for (size_t i = 0; i < v.m_liftTiming.size(); ++i)
@@ -599,6 +601,8 @@ namespace vl
         // Start of the hashed range when the segment reaches code below its entry pc
         // (branches back to shared code); ~0u means the range starts at pc.
         uint32_t subStart = ~0u;
+        // A VU0 microprogram (4 KB micro memory, run on the EE thread by VCALLMS); issue 025.
+        bool vu0 = false;
     };
 
     struct Registrar
@@ -606,7 +610,7 @@ namespace vl
         Registrar(const Registration *registrations, size_t count);
     };
 
-    Segment find(uint64_t hash, uint32_t pc, const uint8_t *vuCode = nullptr);
+    Segment find(uint64_t hash, uint32_t pc, const uint8_t *vuCode = nullptr, bool vu0 = false);
     // Number of lifted segments whose embedded timing did not match the
     // interpreter's decode (they run interpreted).
     uint32_t declinedSegments();
@@ -726,6 +730,33 @@ namespace vl
         if constexpr (Kick)
             kickCatchUp(c, cycle);
         storeLanes<Imm>(mem + qaddr(a), _mm_set1_epi32(static_cast<int32_t>(static_cast<uint16_t>(value))));
+    }
+
+    // VU0 data memory (issue 025): 4 KB, addresses wrap like the interpreter's (addr * 16) & 0xFFF. VU0 has no
+    // PATH1, so stores never advance an XGKICK.
+    inline uint32_t qaddr0(int32_t a) { return (static_cast<uint32_t>(a) << 4) & 0x0FF0u; }
+
+    inline V lq0(const uint8_t *mem, int32_t a) { return _mm_loadu_ps(reinterpret_cast<const float *>(mem + qaddr0(a))); }
+
+    inline int32_t ilw0(const uint8_t *mem, int32_t a, int comp)
+    {
+        uint32_t v;
+        std::memcpy(&v, mem + qaddr0(a) + comp * 4, sizeof(v));
+        return i16(static_cast<int32_t>(v));
+    }
+
+    template <int Imm>
+    inline void sq0(Run &c, uint8_t *mem, int32_t a, V v)
+    {
+        checkReset(c);
+        storeLanes<Imm>(mem + qaddr0(a), _mm_castps_si128(v));
+    }
+
+    template <int Imm>
+    inline void isw0(Run &c, uint8_t *mem, int32_t a, int32_t value)
+    {
+        checkReset(c);
+        storeLanes<Imm>(mem + qaddr0(a), _mm_set1_epi32(static_cast<int32_t>(static_cast<uint16_t>(value))));
     }
 
     // Per-pair trace (pc, cycle relative to the segment start) to stderr,

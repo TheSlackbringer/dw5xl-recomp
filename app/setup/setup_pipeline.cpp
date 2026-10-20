@@ -124,7 +124,18 @@ SetupSteps defaultSetupSteps()
                 c.log(line);
             }))
             return false;
-        return writeIfChanged(o.effectiveDataDir() / "recomp" / "dw5xl" / "vu1" / "dw5xl_vu1_lifted.cpp", text, error);
+        if (!writeIfChanged(o.effectiveDataDir() / "recomp" / "dw5xl" / "vu1" / "dw5xl_vu1_lifted.cpp", text, error))
+            return false;
+        // Issue 025: the VU0 microprograms (VCALLMS), translated the same way from the same executable.
+        std::string vu0Text;
+        if (!vu1lift::generateLiftedVu0(o.effectiveDataDir() / kCodegenProfiles[0].input, vu0Text, error,
+                                        [&](const std::string &line) {
+                c.progress(0.9, line);
+                c.log(line);
+            }))
+            return false;
+        return writeIfChanged(o.effectiveDataDir() / "recomp" / "dw5xl" / "vu0" / "dw5xl_vu0_lifted.cpp", vu0Text,
+                              error);
     };
     s.build = [](const SetupOptions &o, StepContext &c, fs::path &executable, std::string &error) {
         // CMake's preparation (configure + generate: ~1.5 min on Windows) has no step counter: creep up to 15 %

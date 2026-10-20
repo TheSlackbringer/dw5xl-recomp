@@ -119,6 +119,8 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
 - `recomp/dw5xl/dw5xl.toml` — recompiler config (stubs, entry points, `[mmio]` map, jump tables, `[patches]`).
   `recomp/dw5xl/output/` and `recomp/dw5xl/overlays/ovl0N/output/` — generated C++ (gitignored; `tools/regen.sh`).
   `recomp/dw5xl/vu1/` — lifted VU1 C++ (gitignored, game-derived; `tools/vu1_translator.py`).
+  `recomp/dw5xl/vu0/` — lifted VU0 microprograms (gitignored, game-derived; `tools/vu0_translator.py`, issue 025;
+  the launcher's C++ port `app/setup/vu1lift/` writes both, CTests `vu1lift/vu0lift_matches_python`).
 - `app/` — our executable: `src/dw5xl_pad2.cpp` (pad bridge), `dw5xl_images.cpp` + `ipu_idec.*` (native IPU stills),
   `dw5xl_overlays.cpp` (overlay lifecycle/dispatch); tests in `app/tests/` (CTest).
 - `tools/` — `regen.sh`, `vu1_translator.py`/`vu1_timing.py`/`disc_vu_inputs.py` (VU1 lifting from the player's own
@@ -152,6 +154,10 @@ Pacing/perf: `PS2X_STATS` (vsync/s per second) · `PS2X_HUD_LOG` ([hud] fps/vsyn
 `PS2X_LATE_VBLANK` (fields >3 ms late) · `PS2X_VU1_ASYNC_TRACE` (device worker busy/drains per second; "explicit=N"
 render syncs = 2 x game FPS) · `PS2X_VU1_CENSUS=<file>` (per-VU1-program runs/cycles/host ns) · `PS2X_VU1_LIFT=0`
 (interpret all VU1) · `PS2X_VU1_ASYNC=0` (synchronous device) · `PS2X_GS_ASYNC=0` (GS inline, no worker thread).
+VU0 microprograms (`VCALLMS`, issue 025): `PS2X_VU0_LIFT=0` (interpret them) · `PS2X_VU0_LIFT_VERIFY=1` (every
+native VU0 run repeated by the interpreter and compared; `[vu0verify]`) · `PS2X_VU0_CENSUS=<file>` (per-program
+runs/cycles/host ns + the 4 KB image, game data) · `[vu0lift:hit|miss]` counters give the native share.
+Test runs without a silent sink (Windows): `PS2X_MUTE=1` (master volume 0, audio timing unchanged).
 VU1 exactness/speed: `PS2X_VU1_LIFT_VERIFY=1` (every native VU1 run repeated by the interpreter and compared; slow) ·
 `PS2X_DEVICE_PROFILE=1` with the async trace (device time: transfer/VU1/GIF submit/VIF unpack) ·
 `PS2X_VU1_RUN_CAPTURE=<prefix>` + `_PC/_FROM/_COUNT` (real run starts for `dw5xl_vu1_lift_test benchcap`; game data,

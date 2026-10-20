@@ -60,4 +60,6 @@ if [[ "$selection" == main || "$selection" == all ]]; then
     # DW5XL_VU1_INPUT=capture retains explicit research inputs; never commit generated code.
     # Stop on input/translation errors rather than silently compiling stale lifted output.
     python3 "$root/tools/vu1_translator.py"
+    # Issue 025: the VU0 microprograms (VCALLMS) from the same executable, into recomp/dw5xl/vu0/.
+    python3 "$root/tools/vu0_translator.py"
 fi

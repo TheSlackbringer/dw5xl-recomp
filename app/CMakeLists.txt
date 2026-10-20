@@ -76,6 +76,18 @@ if(EXISTS "${DW5XL_VU1_LIFTED_SRC}")
 else()
     message(STATUS "No lifted VU1 code (run tools/regen.sh); VU1 microcode will be interpreted")
 endif()
+# Lifted VU0 microprograms (issue 025): the programs the game starts with VCALLMS, translated the same way
+# (tools/vu0_translator.py) into the ignored recomp/dw5xl/vu0/ folder. Game-derived: never committed. Without it,
+# VU0 microprograms run in the interpreter.
+set(DW5XL_VU0_LIFTED_SRC "${DW5XL_RECOMP_ROOT}/dw5xl/vu0/dw5xl_vu0_lifted.cpp" CACHE FILEPATH
+    "Generated VU0 microprogram translations (game-derived)")
+if(EXISTS "${DW5XL_VU0_LIFTED_SRC}")
+    target_sources(dw5xl PRIVATE "${DW5XL_VU0_LIFTED_SRC}")
+    set_source_files_properties("${DW5XL_VU0_LIFTED_SRC}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
+    set_property(SOURCE "${DW5XL_VU0_LIFTED_SRC}" APPEND PROPERTY COMPILE_OPTIONS ${DW5XL_STRICT_FP_FLAGS})
+else()
+    message(STATUS "No lifted VU0 code (run tools/vu0_translator.py); VU0 microprograms will be interpreted")
+endif()
 # Generated code uses SSE4.1/AVX intrinsics (PS2Recomp only enables them in its own directory).
 target_compile_options(dw5xl PRIVATE ${DW5XL_ARCH_FLAGS} ${DW5XL_STRICT_FP_FLAGS})
 
@@ -175,6 +187,11 @@ if(DW5XL_BUILD_TESTS)
                  -DPYTHON=${Python3_EXECUTABLE} "-DREPO=${CMAKE_CURRENT_SOURCE_DIR}/.."
                  "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/vu1lift-compare" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompareVu1Lift.cmake")
         set_tests_properties(vu1lift_matches_python PROPERTIES TIMEOUT 300)
+        # Issue 025: the same for the VU0 microprograms (C++ --vu0 == tools/vu0_translator.py).
+        add_test(NAME vu0lift_matches_python COMMAND "${CMAKE_COMMAND}" -DLIFTER=$<TARGET_FILE:dw5xl_vu1lift>
+                 -DPYTHON=${Python3_EXECUTABLE} "-DREPO=${CMAKE_CURRENT_SOURCE_DIR}/.." -DUNIT=vu0
+                 "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/vu0lift-compare" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompareVu1Lift.cmake")
+        set_tests_properties(vu0lift_matches_python PROPERTIES TIMEOUT 120)
     endif()
     add_executable(dw5xl_setup_build_test tests/setup_build_test.cpp)
     target_link_libraries(dw5xl_setup_build_test PRIVATE dw5xl_setup_core)
