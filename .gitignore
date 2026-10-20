@@ -30,3 +30,4 @@ __pycache__/
 /frame_*.png
 /dist/
 /BUILD_ID
+/build-recomp*/

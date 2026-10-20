@@ -43,4 +43,11 @@ function(dw5xl_windows_target_options target)
         # Copy the FFmpeg DLLs next to the executable.
         ps2x_stage_ffmpeg_runtime_dlls(${target})
     endif()
+    if(target_type STREQUAL "EXECUTABLE" AND NOT MSVC AND LLVM_MINGW_ROOT)
+        # llvm-mingw's C++ runtime, next to the executable: a player's PC has no other copy (issue 011).
+        foreach(dll libc++.dll libunwind.dll)
+            add_custom_command(TARGET ${target} POST_BUILD COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${LLVM_MINGW_ROOT}/x86_64-w64-mingw32/bin/${dll}" "$<TARGET_FILE_DIR:${target}>" VERBATIM)
+        endforeach()
+    endif()
 endfunction()

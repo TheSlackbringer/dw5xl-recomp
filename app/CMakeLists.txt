@@ -8,7 +8,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Dw5xlPlatform.cmake")
 
 set(PS2RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../external/PS2Recomp")
-set(DW5XL_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../recomp/dw5xl/output")
+# Generated game code (game-derived, never in git): recomp/ in a developer tree; the player data folder when the
+# release's launcher builds the game (issue 011 v5).
+set(DW5XL_RECOMP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../recomp" CACHE PATH "Folder holding the generated game code")
+set(DW5XL_GENERATED_DIR "${DW5XL_RECOMP_ROOT}/dw5xl/output")
 
 # Only the runtime (and the IOP module it needs) from PS2Recomp.
 set(PS2X_BUILD_RECOMP OFF CACHE BOOL "" FORCE)
@@ -65,7 +68,7 @@ set_source_files_properties(src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec
 # Lifted VU1 microprograms are translated from the game's own microcode (tools/vu1_translator.py, run by
 # tools/regen.sh) into the ignored recomp/dw5xl/vu1/ folder. Game-derived: never committed. Without it,
 # VU1 microcode runs in the interpreter.
-set(DW5XL_VU1_LIFTED_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../recomp/dw5xl/vu1/dw5xl_vu1_lifted.cpp")
+set(DW5XL_VU1_LIFTED_SRC "${DW5XL_RECOMP_ROOT}/dw5xl/vu1/dw5xl_vu1_lifted.cpp")
 if(EXISTS "${DW5XL_VU1_LIFTED_SRC}")
     target_sources(dw5xl PRIVATE "${DW5XL_VU1_LIFTED_SRC}")
     set_source_files_properties("${DW5XL_VU1_LIFTED_SRC}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
@@ -77,7 +80,7 @@ endif()
 target_compile_options(dw5xl PRIVATE ${DW5XL_ARCH_FLAGS} ${DW5XL_STRICT_FP_FLAGS})
 
 # Overlay headers/symbols are isolated from the base executable's generated code.
-set(DW5XL_OVL00_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../recomp/dw5xl/overlays/ovl00/output")
+set(DW5XL_OVL00_DIR "${DW5XL_RECOMP_ROOT}/dw5xl/overlays/ovl00/output")
 file(GLOB DW5XL_OVL00_SOURCES CONFIGURE_DEPENDS "${DW5XL_OVL00_DIR}/*.cpp")
 if(NOT DW5XL_OVL00_SOURCES)
     message(FATAL_ERROR "Missing generated OVL00 code; run tools/regen.sh ovl00")
@@ -98,7 +101,7 @@ set_target_properties(dw5xl_ovl00 PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SI
 target_link_libraries(dw5xl PRIVATE dw5xl_ovl00)
 
 # Overlay headers/symbols are isolated from the base executable's generated code.
-set(DW5XL_OVL01_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../recomp/dw5xl/overlays/ovl01/output")
+set(DW5XL_OVL01_DIR "${DW5XL_RECOMP_ROOT}/dw5xl/overlays/ovl01/output")
 file(GLOB DW5XL_OVL01_SOURCES CONFIGURE_DEPENDS "${DW5XL_OVL01_DIR}/*.cpp")
 if(NOT DW5XL_OVL01_SOURCES)
     message(FATAL_ERROR "Missing generated OVL01 code; run tools/regen.sh ovl01")
@@ -118,7 +121,7 @@ target_precompile_headers(dw5xl_ovl01 PRIVATE
 set_target_properties(dw5xl_ovl01 PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
 target_link_libraries(dw5xl PRIVATE dw5xl_ovl01)
 
-set(DW5XL_OVL02_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../recomp/dw5xl/overlays/ovl02/output")
+set(DW5XL_OVL02_DIR "${DW5XL_RECOMP_ROOT}/dw5xl/overlays/ovl02/output")
 file(GLOB DW5XL_OVL02_SOURCES CONFIGURE_DEPENDS "${DW5XL_OVL02_DIR}/*.cpp")
 if(NOT DW5XL_OVL02_SOURCES)
     message(FATAL_ERROR "Missing generated OVL02 code; run tools/regen.sh ovl02")
@@ -149,7 +152,8 @@ add_executable(dw5xl_vu1lift setup/vu1lift/vu1lift_main.cpp)
 target_link_libraries(dw5xl_vu1lift PRIVATE dw5xl_setup_core)
 # The wizard's window (raylib + imgui) and no-window run, shared by dw5xl_setup and the game (installed mode).
 add_library(dw5xl_setup_ui STATIC setup/wizard_ui.cpp setup/file_dialog.cpp)
-target_link_libraries(dw5xl_setup_ui PUBLIC dw5xl_setup_core rlImGui imgui raylib)
+# raylib before dw5xl_setup_core: the core pulls in user32 (via FFmpeg), whose CloseWindow must not win over raylib's.
+target_link_libraries(dw5xl_setup_ui PUBLIC rlImGui imgui raylib dw5xl_setup_core)
 if(WIN32)
     target_link_libraries(dw5xl_setup_ui PUBLIC comdlg32)
 endif()
