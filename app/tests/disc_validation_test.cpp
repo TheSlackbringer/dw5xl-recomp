@@ -6,6 +6,7 @@
 // The game's disc check asks the insert-disc window whether the drive is "not ready" (app/src/dw5xl_install.cpp,
 // installed mode only); this test has no window: the drive is always ready.
 bool dw5xlDiscNotReady(uint32_t) { return false; }
+void dw5xlDiscChecked(uint32_t) {}
 extern const uint32_t g_ps2RecompiledFunctionTableBase=0x1000;
 extern const uint32_t g_ps2RecompiledFunctionTableEnd=0x1004;
 extern const uint32_t g_ps2RecompiledFunctionTableSlotCount=1;

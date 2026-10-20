@@ -1,5 +1,6 @@
 // Installed mode (issue 011 v4): player data folder, install marker, and the wizard's install-only run, on the
 // synthetic image (no game data).
+#include "disc_wait.h"
 #include "install_state.h"
 #include "setup_pipeline.h"
 #include "synthetic_iso.h"
@@ -106,6 +107,28 @@ int main()
         require(!writeInstallMarker(dir / "nothing-here", wrong[0], error), "no marker without the files");
         require(installState(dir / "nothing-here", wrong[0]) == InstallState::Missing, "still missing");
 
+        { // Load Original without a click (M10): what the game's disc check is told
+            using E = DiscWait::Event;
+            DiscWait w;
+            E e;
+            require(w.notReady(false, e) && e == E::WindowOpened, "disc missing: not ready, window opens");
+            require(w.notReady(false, e) && e == E::None, "still waiting: no second window");
+            require(!w.notReady(true, e) && e == E::DiscReady, "installed: ready, window closes");
+            require(!w.notReady(true, e) && e == E::None, "the game's second ready poll: still ready");
+
+            DiscWait c;
+            require(c.notReady(false, e) && e == E::WindowOpened, "missing again: window");
+            c.cancel();
+            require(!c.notReady(false, e) && e == E::None, "after Cancel: ready (state 3)");
+            require(!c.notReady(false, e) && e == E::None,
+                    "after Cancel: still ready at the game's second poll (state 4) - the window must not reopen");
+            c.checked(); // the game found no disc and shows its own question
+            require(c.notReady(false, e) && e == E::WindowOpened, "NO in the game's question: the window comes back");
+
+            DiscWait idle;
+            idle.cancel(); // nothing open: no effect
+            require(idle.notReady(false, e) && e == E::WindowOpened, "a stray cancel changes nothing");
+        }
         fs::remove_all(dir);
         std::cout << "setup install tests passed\n";
         return 0;

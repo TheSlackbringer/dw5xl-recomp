@@ -10,6 +10,7 @@
 
 extern const RecompiledModule g_ps2Module_dw5xl_ovl00;
 bool dw5xlDiscNotReady(uint32_t which); // dw5xl_install.cpp
+void dw5xlDiscChecked(uint32_t which);  // dw5xl_install.cpp
 extern const RecompiledModule g_ps2Module_dw5xl_ovl01;
 extern const RecompiledModule g_ps2Module_dw5xl_ovl02;
 
@@ -69,6 +70,7 @@ void discReady(uint8_t* ram,R5900Context* ctx,PS2Runtime* runtime) {
 }
 void discType(uint8_t* ram,R5900Context* ctx,PS2Runtime* runtime) {
     if(!scopedDiscCall(runtime,ctx,0x637FA0u)) {originalDiscCalls[2](ram,ctx,runtime);return;}
+    dw5xlDiscChecked(discCheckSession.which); // the ready polls of this check are over (a cancel ends here)
     discCheckSession.validation=dw5xl::discs::validateImportedDisc(PS2Runtime::getIoPaths(),discCheckSession.which);
     const auto status=discCheckSession.validation;
     std::fprintf(stderr,"[dw5xl:disc] menu verification disc=%u result=%u\n",discCheckSession.which,static_cast<unsigned>(status));

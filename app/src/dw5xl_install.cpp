@@ -10,6 +10,7 @@
 // window opens over the game and the drive reports "not ready" until the disc is installed — then Load Original
 // continues by itself; Cancel lets the game find no disc once (its own prompt). F9 opens the Discs window.
 #include "codegen.h"
+#include "disc_wait.h"
 #include "install_state.h"
 #include "ps2_debug_panel.h"
 #include "wizard_ui.h"
@@ -33,8 +34,7 @@ void attachParentConsole(); // setup/wizard_console.cpp
 
 namespace {
 fs::path g_dataDir;                     // set when the game runs from the player data folder
-std::atomic<bool> g_discRequested{false}; // the game asked for the DW5 disc and it is not installed
-std::atomic<bool> g_cancelOnce{false};    // the player closed the Insert-disc window: report the drive ready once
+DiscWait g_discWait;                      // the game's DW5 disc check while the Insert-disc window is open
 std::atomic<bool> g_closeWindow{false};   // the requested disc is installed: close the Insert-disc window
 bool g_discsWindow = false;             // F9
 std::unique_ptr<DiscInstallPanel> g_panel;
@@ -161,29 +161,32 @@ bool dw5xlDiscNotReady(uint32_t which)
 {
     if (g_dataDir.empty() || which != 0u)
         return false;
-    if (g_cancelOnce.exchange(false))
-        return false; // the player cancelled: the game finds no disc and shows its own prompt (NO = ask again)
     static auto lastCheck = std::chrono::steady_clock::time_point{};
     static bool installed = false;
     const auto now = std::chrono::steady_clock::now();
-    if (!g_discRequested || now - lastCheck > std::chrono::seconds(1)) // the window's install, or --add-disc
+    if (!g_discWait.waiting() || now - lastCheck > std::chrono::seconds(1)) // the window's install, or --add-disc
     {
         installed = installState(g_dataDir, kSupportedDiscs[1]) == InstallState::Installed;
         lastCheck = now;
     }
-    if (installed)
-    {
-        if (g_discRequested.exchange(false))
-        {
-            g_closeWindow = true;
-            std::fprintf(stderr, "[install] %s installed: drive ready, the game continues\n", kSupportedDiscs[1].name);
-        }
-        return false;
-    }
-    if (!g_discRequested.exchange(true))
+    DiscWait::Event event;
+    const bool notReady = g_discWait.notReady(installed, event);
+    if (event == DiscWait::Event::WindowOpened)
         std::fprintf(stderr, "[install] the game asks for %s: Insert-disc window open, drive not ready\n",
                      kSupportedDiscs[1].name);
-    return true;
+    else if (event == DiscWait::Event::DiscReady)
+    {
+        g_closeWindow = true;
+        std::fprintf(stderr, "[install] %s installed: drive ready, the game continues\n", kSupportedDiscs[1].name);
+    }
+    return notReady;
+}
+
+// The game asked for the disc type (dw5xl_overlays.cpp): this disc check is over.
+void dw5xlDiscChecked(uint32_t which)
+{
+    if (which == 0u)
+        g_discWait.checked();
 }
 
 namespace {
@@ -193,7 +196,7 @@ bool overlayWanted()
 {
     if (IsKeyPressed(KEY_F9))
         g_discsWindow = !g_discsWindow;
-    return g_discRequested || g_discsWindow || (g_panel && g_panel->running());
+    return g_discWait.waiting() || g_discsWindow || (g_panel && g_panel->running());
 }
 
 void drawOverlay()
@@ -214,10 +217,11 @@ void drawOverlay()
     ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, screen.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(620.0f, 0.0f), ImGuiCond_Appearing);
     bool open = true;
-    const char *title = g_discRequested ? "Insert disc###discs" : "Discs (F9)###discs";
+    const bool requested = g_discWait.waiting();
+    const char *title = requested ? "Insert disc###discs" : "Discs (F9)###discs";
     if (ImGui::Begin(title, &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize))
     {
-        if (g_discRequested)
+        if (requested)
         {
             ImGui::TextWrapped("The game asks for the %s disc.", dw5Disc().name);
             if (!g_panel)
@@ -267,8 +271,11 @@ void drawOverlay()
     ImGui::End();
     if (!open && !(g_panel && g_panel->running()))
     {
-        if (g_discRequested.exchange(false))
-            g_cancelOnce = true; // Cancel: the game finds no disc once and shows its own prompt
+        if (requested)
+        {
+            g_discWait.cancel(); // the game finds no disc and shows its own question
+            std::fprintf(stderr, "[install] Insert-disc window cancelled\n");
+        }
         g_discsWindow = false;
         g_panel.reset();
         g_checkResult.clear();
