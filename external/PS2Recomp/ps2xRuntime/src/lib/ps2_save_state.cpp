@@ -357,17 +357,23 @@ void PS2Runtime::serializeState(ps2x::StateArchive &a)
     a.tag("DONE");
 }
 
-bool PS2Runtime::performStateRequest(bool save, const std::string &path)
+bool PS2Runtime::performStateRequest(bool save, const std::string &path, bool &retry)
 {
     const auto started = std::chrono::steady_clock::now();
-    const uint64_t tick = m_memory.gs().vsyncTick;
+    retry = false;
     try
     {
-        // Nothing in flight: the VIF1/VU1/GIF device finishes what it was given and the renderer flushes.
+        // Nothing in flight: the VIF1/VU1/GIF device finishes what it was given and the renderer flushes. What that
+        // completes (DMA interrupts, events) is handled by the scheduler first: then this request comes back.
         ps2x::device::drainAll(m_memory, ps2x::device::DrainReason::Explicit);
         m_gifArbiter.drain();
         m_gifArbiter.waitIdle();
-        if (save)
+        if (!m_eeScheduler->stateQuiet())
+        {
+            retry = true;
+            return false;
+        }
+        const auto saveTo = [&](const std::string &target)
         {
             ps2x::StateArchive body = ps2x::StateArchive::writer();
             serializeState(body);
@@ -379,10 +385,14 @@ bool PS2Runtime::performStateRequest(bool save, const std::string &path)
             std::vector<uint8_t> file(sizeof(Header));
             std::memcpy(file.data(), &header, sizeof(Header));
             file.insert(file.end(), body.data().begin(), body.data().end());
-            writeFileAtomically(path, file);
+            writeFileAtomically(target, file);
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
-            std::cerr << "[state] saved " << path << " at tick " << tick << " (" << file.size() / (1024 * 1024)
+            std::cerr << "[state] saved " << target << " at tick " << m_memory.gs().vsyncTick << " (" << file.size() / (1024 * 1024)
                       << " MiB, " << ms << " ms)" << std::endl;
+        };
+        if (save)
+        {
+            saveTo(path);
             return true;
         }
 
@@ -426,6 +436,9 @@ bool PS2Runtime::performStateRequest(bool save, const std::string &path)
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
         std::cerr << "[state] loaded " << path << " (saved at tick " << m_memory.gs().vsyncTick << ", " << ms
                   << " ms)" << std::endl;
+        // Test switch: save again at once, before the game runs a single step (save -> load -> save identity).
+        if (const char *again = std::getenv("PS2X_STATE_RESAVE"); again && *again)
+            saveTo(again);
         return true;
     }
     catch (const std::exception &e)

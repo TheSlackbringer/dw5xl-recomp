@@ -424,7 +424,9 @@ public:
 
     // DW5XL (issue 027): save states (src/lib/ps2_save_state.cpp). Carried out by the EE scheduler at a quiet point,
     // on the executor. A state from another build or format is refused before anything changes.
-    bool performStateRequest(bool save, const std::string &path);
+    // retry: the drain at the start made new work (device completions, events); the scheduler keeps the request and
+    // tries again at its next quiet point.
+    bool performStateRequest(bool save, const std::string &path, bool &retry);
     // Components outside the runtime (the app's overlays, IPU decoder, pad bridge, ...) add their state here; they
     // are saved and loaded in registration order, each under its own section tag.
     using StateHook = std::function<void(ps2x::StateArchive &)>;

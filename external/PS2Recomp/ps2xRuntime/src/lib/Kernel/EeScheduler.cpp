@@ -2574,7 +2574,19 @@ bool EeScheduler::serviceStateRequest()
         m_stateRequestKind = StateRequestKind::None;
         m_stateRequestPending.store(false, std::memory_order_release);
     }
-    const bool ok = m_runtime.performStateRequest(kind == StateRequestKind::Save, path);
+    bool retry = false;
+    const bool ok = m_runtime.performStateRequest(kind == StateRequestKind::Save, path, retry);
+    if (retry)
+    {
+        std::lock_guard lock(m_stateRequestMutex); // the drain made new work: handle it, come back next pass
+        if (!m_stateRequestPending.load(std::memory_order_acquire))
+        {
+            m_stateRequestKind = kind;
+            m_stateRequestPath = path;
+            m_stateRequestPending.store(true, std::memory_order_release);
+        }
+        return false;
+    }
     return ok && kind == StateRequestKind::Load;
 }
 
