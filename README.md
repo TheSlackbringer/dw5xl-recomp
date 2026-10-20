@@ -2,10 +2,10 @@
 
 A native PC port of **Dynasty Warriors 5: Xtreme Legends** for the PlayStation 2, built with PS2Recomp. The game's logic is statically translated into C++; the runtime provides the PS2 hardware services it still needs. Graphics use **Vulkan through paraLLEl-GS**.
 
-**In development.** Linux is the current development and testing platform. Windows is planned. There is no packaged player release yet, and full playability has not been established.
+**In development.** Windows builds come as a self-building release (below); on Linux the game is built from source for now, a Linux release is planned. Full playability has not been established.
 
 > [!IMPORTANT]
-> You need your own legal copy of **Dynasty Warriors 5: Xtreme Legends** (English PAL, `SLES_538.60`). This repository does not provide disc images, game executables, IRX modules or game assets. The main executable and overlay C++ translations are generated locally from your disc. It does not provide or download either game.
+> You need your own legal copy of **Dynasty Warriors 5: Xtreme Legends** (English PAL, `SLES_538.60`). Nothing from the game is in this repository or in its releases: no disc images, game executables, IRX modules, game assets or translated game code. The game is built on your own PC from your own disc.
 
 ## Current progress
 
@@ -14,7 +14,8 @@ A native PC port of **Dynasty Warriors 5: Xtreme Legends** for the PlayStation 2
 | Boot and menus | Boot, title screen, Options and mode selection work. |
 | Input | Keyboard and gamepad input work. |
 | Audio and movies | Intro and event movies play with audio; menu music, battle BGM, voice lines, and sound effects play throughout menus and battles. |
-| Saves | Saving and loading work (`mc0/`). |
+| Saves | Saving and loading work. |
+| Windows | The release builds and runs the game on Windows 10/11; frame rate on Windows is being worked on. |
 | Legend Mode | Scenario selection, briefing, and preparation render; battles run at 50 FPS with full movement, combat, Musou, and crowd rendering at native resolution. |
 | Other modes | Edit Mode works. Destiny, Challenge, and Xtreme Modes reach battle, with further mode testing ongoing. |
 | Load Original | Original disc verification works; Musou and Free Modes unlock when the original DW5 files are present. |
@@ -29,9 +30,27 @@ Extended session stability and higher-resolution scaling performance remain in a
 | Dynasty Warriors 5: Xtreme Legends | English PAL | `SLES_538.60` | Yes |
 | Dynasty Warriors 5 | English PAL | `SLES_533.39` | Optional, for Load Original |
 
-Other regions and revisions are unsupported. You can use XL alone. To unlock the original game's Musou and Free modes, supply the supported original DW5 files and select **Load Original** in the game. Having both games present does not unlock those modes at startup; verification fails when the original DW5 copy is missing or invalid.
+Other regions and revisions are unsupported (the program checks every file against the known checksums). You can use XL alone. To unlock the original game's Musou and Free modes, supply the supported original DW5 disc and select **Load Original** in the game. Having both games present does not unlock those modes at startup; verification fails when the original DW5 copy is missing or invalid.
 
-The planned player release will provide a prebuilt application and native disc importer. That installer is not implemented; the workflow below is for developers.
+## Playing on Windows
+
+The release is a **builder**, not a game: it contains our program, the source code, a compiler and the tools, and builds the game on your PC from your own disc. You install nothing else — no Visual Studio, no Python, no Git — and nothing is downloaded while it builds.
+
+**You need:** Windows 10 (version 1903 or newer) or 11, 64-bit; a CPU with AVX2 (Intel since 2013, AMD Ryzen); a graphics card with a current Vulkan driver; about 10 GB of free space; your disc image(s) as `.iso`.
+
+1. Download `DW5XL-<version>-windows-x64.zip` from the [Releases](../../releases) page and **unzip it close to the drive root**, e.g. `C:\Games\` (the compiler inside has deep folders, and Windows trips over paths longer than 260 characters).
+2. Start **`DW5XL.exe`**. The program is not signed, so Windows may say *"Windows protected your PC"*: choose **More info → Run anyway**.
+3. **First start:** choose your DW5XL disc image (Browse, or drag it onto the window), optionally the DW5 image for Load Original, and press **Start**. The disc is checked and copied, the game's code is translated and compiled for your PC — about **10 minutes** once (longer on older PCs; Windows Defender scanning the new files adds to it). Then the game starts.
+4. **Every later start:** `DW5XL.exe` starts the game at once. A newer release rebuilds once, without asking for the disc again.
+5. **Load Original:** when the game asks for the Dynasty Warriors 5 disc, an *Insert disc* window opens over the game: choose that disc image and press **Install** — the game continues by itself.
+
+Your game files, the built game, saves, settings and logs are in `%LOCALAPPDATA%\DW5XL`. Replacing the release folder with a newer version keeps them. If something goes wrong, the logs are in `%LOCALAPPDATA%\DW5XL\logs` (`setup.log`, `build.log`, `game.log`); please attach them to an issue.
+
+**Known issues:** the frame rate on Windows is lower than on Linux in busy battles and the picture can jump (issue 025, being measured); higher output resolutions (F4) cost more on Windows.
+
+## Playing on Linux
+
+A Linux release (an AppImage with the same self-building wizard) is planned. Until then, build from source as described below; `dw5xl_setup` (built with the game) offers the same wizard window for building from your own disc.
 
 ## Building on Linux
 
@@ -101,7 +120,7 @@ cd game/dw5xl
 PS2X_GS_BACKEND=vulkan ../../app/build/dw5xl ./SLES_538.60
 ```
 
-Saves are stored in `game/dw5xl/mc0/`. Keep that directory when updating your build.
+In this developer setup, saves are stored in `game/dw5xl/mc0/`. Keep that directory when updating your build. (The Windows release keeps everything in `%LOCALAPPDATA%\DW5XL` instead.)
 
 ### Controls
 
@@ -124,6 +143,8 @@ Gamepads are also supported.
 | **F3** | Toggle real game FPS, VSync rate, resolution scale, and AA sample HUD counter. |
 | **F4** | Cycle internal resolution scale live ($1\times \to 2\times \to 4\times$) and persist to `dw5xl.ini`. |
 | **F5** | Cycle anti-aliasing sample multiplier ($1\times \to 2\times \to 4\times \to 8\times \to 16\times$) and persist to `dw5xl.ini`. |
+| **F9** | Discs window (release build): which discs are installed, add or repair the DW5 disc, check the files. |
+| **F1** | Runtime debugger (developer builds; off in the release unless `PS2X_DEBUG_UI=1`). |
 
 You can also pass environment variables on startup: `PS2X_FPS=1` enables the F3 overlay by default, `PS2X_GS_SCALE=1|2|4` sets the startup resolution scale, and `PS2X_GS_SSAA=1|2|4|8|16` sets the anti-aliasing sample count (defaults can be kept at `1` when profiling performance).
 
@@ -142,7 +163,19 @@ Fixes live in handwritten app/runtime code, recompiler profiles and generation t
 
 Game data, analysis databases, generated main/overlay output, builds and local research notes are excluded from Git. Contributor and coding-agent workflows are described in `AGENTS.md` and `CLAUDE.md`.
 
-Current priorities are long-session stability, higher-resolution performance pacing, broader gameplay testing, and preparing the native importer and Linux/Windows release packaging.
+Current priorities are Windows performance, long-session stability, broader gameplay testing and the Linux release.
+
+### Making a release
+
+Releases contain only our code and freely licensed tools — never the compiled game, disc files, an ISO or translated code (PS2Recomp is GPL-3.0; see `AGENTS.md`). On a clean commit, after the full test suite:
+
+```sh
+cmake --build app/build-release-win --target dw5xl_setup      # the launcher, cross-compiled with llvm-mingw
+cmake --build build-recomp-win --target ps2_recomp           # the recompiler for Windows
+tools/release/make_release.py windows --build app/build-release-win --recomp-build build-recomp-win
+```
+
+The script refuses a dirty tree, packs the launcher, sources, compiler (llvm-mingw for Windows), CMake, Ninja, the minimal FFmpeg (`tools/release/build_ffmpeg.sh`) and the licenses, scans the package for anything from the game, and writes the zip and its SHA-256 to `dist/`. Publishing is done by the maintainer.
 
 ## License and attribution
 
