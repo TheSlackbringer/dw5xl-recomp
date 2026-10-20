@@ -591,6 +591,17 @@ entry_points = [
   "scePad2SetButtonOrder@0x00130C88",
   "sceVibGetProfile@0x00130D70",
   "sceVibSetActParam@0x00130DF0",
+  # Issue 026: game functions reached only through pointers and missing from the Ghidra lists
+  # (tools/find_missing_entries.py). Battle-event handler #24 of the table at 0x31BCF0 (Hu Lao Gate freeze):
+  "battleEventHandler24@0x001EA770",
+  # Predicates 1 and 2 of the table at 0x31B650 (Ghidra merged them into entry_001c24f0):
+  "fieldFlagsPredicate1@0x001C2510",
+  "fieldFlagsPredicate2@0x001C2530",
+  # C++ exception what() from the vtables at 0x35A300 / 0x35A310:
+  "exceptionWhat@0x00100580",
+  "exceptionWhat2@0x001021D0",
+  # Same "return 1" handler pattern as its neighbours; no reference found, added so it can never freeze:
+  "unreferencedHandler@0x0011A0D8",
 ]
 
 # Legacy compatibility field. The analyzer no longer auto-populates skip entries.
