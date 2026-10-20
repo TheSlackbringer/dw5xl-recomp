@@ -17,6 +17,8 @@ struct WizardConfig
     SetupOptions base;       // base.installOnly: the player install (check + extract), else the developer build
     std::string layoutError; // shown instead of allowing a start (incomplete package)
     std::filesystem::path xlIso, dw5Iso; // prefilled fields
+    bool discInstalled = false;     // the XL files are already in the data folder: Start works without an image
+    bool closeWhenFinished = false; // the release launcher: close the window when done (the game starts next)
 };
 
 // Runs the wizard in its own window until the player closes it. Returns true if a run finished; in install mode

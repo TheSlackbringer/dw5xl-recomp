@@ -127,10 +127,11 @@ struct Wizard
     std::chrono::steady_clock::time_point started;
     std::string actionError;
 
+    bool discInstalled = false;
     bool canStart() const
     {
-        return layoutError.empty() && xl.disc == &kSupportedDiscs[0] &&
-               (dw5.path[0] == '\0' || dw5.disc == &kSupportedDiscs[1]);
+        const bool xlOk = xl.disc == &kSupportedDiscs[0] || (discInstalled && xl.path[0] == '\0');
+        return layoutError.empty() && xlOk && (dw5.path[0] == '\0' || dw5.disc == &kSupportedDiscs[1]);
     }
 
     void start()
@@ -229,6 +230,10 @@ struct Wizard
         if (!layoutError.empty())
             ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1), "This package is incomplete: %s", layoutError.c_str());
 
+        if (discInstalled && !run)
+            ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1),
+                               "Your game files are installed. Start builds the game for this version; "
+                               "no disc image needed.");
         discRow(xl, running);
         discRow(dw5, running);
 
@@ -297,6 +302,7 @@ bool runWizardWindow(const WizardConfig &config)
     Wizard w;
     w.base = config.base;
     w.layoutError = config.layoutError;
+    w.discInstalled = config.discInstalled;
     if (!config.xlIso.empty())
         w.xl.set(config.xlIso);
     if (!config.dw5Iso.empty())
@@ -317,7 +323,7 @@ bool runWizardWindow(const WizardConfig &config)
         if (w.run && w.run->status().finished)
         {
             finished = true;
-            if (w.base.installOnly)
+            if (w.base.installOnly || config.closeWhenFinished)
                 break; // the game starts next
         }
         if (IsFileDropped())

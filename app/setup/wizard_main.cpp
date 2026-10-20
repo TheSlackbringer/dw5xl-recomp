@@ -1,12 +1,21 @@
-// dw5xl_setup — the developer path (issue 011): builds the game from your own disc.
-//   dw5xl_setup                         the window: pick the disc image(s), Start, watch the steps, Play
+// dw5xl_setup — builds the game from your own disc (issue 011).
+// In a release package (a BUILD_ID file next to app/) it is the launcher the player starts every time (v5):
+//   - the game is built for this release and the disc is installed -> start the game, close;
+//   - otherwise the wizard: disc image -> check, copy, translate, VU1, compile -> start the game.
+//   Everything goes to the player data folder (%LOCALAPPDATA%\DW5XL, ~/.local/share/dw5xl, DW5XL_DATA_DIR).
+// In the developer tree it builds into the project as before.
+//   dw5xl_setup                         the window
 //   dw5xl_setup --iso <DW5XL.iso> [--dw5-iso <DW5.iso>] [--root <dir>] --no-window
 //                                       the same run without a window (prints the steps, exit code 0 = done)
-// Players do not need it: the released game installs its files from the disc itself (wizard_ui, install mode).
+//   dw5xl_setup --rebuild               release: build again even if the game is up to date
+#include "codegen.h"
+#include "install_state.h"
+#include "run_process.h"
 #include "setup_layout.h"
 #include "wizard_ui.h"
 
 #include <cstdio>
+#include <fstream>
 #include <string>
 
 void attachParentConsole(); // wizard_console.cpp
@@ -25,7 +34,16 @@ struct Args
 {
     fs::path xlIso, dw5Iso, root;
     bool noWindow = false;
+    bool rebuild = false;
 };
+
+std::string firstLine(const fs::path &path)
+{
+    std::ifstream in(path);
+    std::string line;
+    std::getline(in, line);
+    return line;
+}
 
 Args parseArgs(int argc, char **argv)
 {
@@ -42,6 +60,8 @@ Args parseArgs(int argc, char **argv)
             a.root = fromUtf8(argv[++i]);
         else if (arg == "--no-window")
             a.noWindow = true;
+        else if (arg == "--rebuild")
+            a.rebuild = true;
     }
     return a;
 }
@@ -71,6 +91,33 @@ int main(int argc, char **argv)
     }
     options.root = root;
 
+    // Release package: the launcher.
+    const std::string release = root.empty() ? std::string() : firstLine(root / "BUILD_ID");
+    fs::path game, stamp, data;
+    if (!release.empty())
+    {
+        data = playerDataDir();
+        if (data.empty())
+            layoutError = "no player data folder (LOCALAPPDATA / HOME not set)";
+        options.dataDir = data;
+        game = options.effectiveBuildDir() / (kWindows ? "dw5xl.exe" : "dw5xl");
+        stamp = options.effectiveBuildDir() / "built-from.txt";
+    }
+    const auto installed = [&] { return installState(data, kSupportedDiscs[0]) == InstallState::Installed; };
+    const auto startGame = [&] {
+        std::string error;
+        if (!launchDetached(game, {}, data, error))
+        {
+            std::fprintf(stderr, "dw5xl_setup: %s\n", error.c_str());
+            return 1;
+        }
+        return 0;
+    };
+    const auto markBuilt = [&] { std::ofstream(stamp) << release << "\n"; };
+    if (!release.empty() && layoutError.empty() && !args.rebuild && !args.noWindow && fs::exists(game) &&
+        firstLine(stamp) == release && installed())
+        return startGame(); // built for this release: play
+
     if (args.noWindow)
     {
         if (!layoutError.empty())
@@ -78,16 +125,28 @@ int main(int argc, char **argv)
             std::fprintf(stderr, "dw5xl_setup: %s\n", layoutError.c_str());
             return 2;
         }
-        if (args.xlIso.empty())
+        if (args.xlIso.empty() && !(!release.empty() && installed()))
         {
             std::fprintf(stderr, "usage: dw5xl_setup --iso <DW5XL.iso> [--dw5-iso <DW5.iso>] [--root <dir>] --no-window\n");
             return 2;
         }
         options.xlIso = args.xlIso;
         options.dw5Iso = args.dw5Iso;
-        return runWizardConsole(options);
+        const int rc = runWizardConsole(options);
+        if (rc == 0 && !release.empty())
+            markBuilt();
+        return rc;
     }
     WizardConfig config{options, layoutError, args.xlIso, args.dw5Iso};
-    runWizardWindow(config);
+    if (!release.empty())
+    {
+        config.discInstalled = installed();
+        config.closeWhenFinished = true;
+    }
+    if (runWizardWindow(config) && !release.empty())
+    {
+        markBuilt();
+        return startGame();
+    }
     return 0;
 }
