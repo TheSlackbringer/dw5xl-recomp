@@ -1,3 +1,4 @@
+#include "runtime/stub_state.h"
 #include "Common.h"
 #include "MemoryCard.h"
 
@@ -1540,4 +1541,31 @@ namespace ps2_stubs
     {
         setReturnS32(ctx, 1);
     }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2_stubs
+{
+namespace
+{
+    void serializeMemoryCardStubState(ps2x::StateArchive &a)
+    {
+        std::lock_guard lock(g_mcStateMutex);
+        a.tag("SMCD");
+        if (a.saving() && (!g_mcFiles.empty() || g_mcCommandPending))
+            throw ps2x::StateError("a memory card file is open or a card command is pending");
+        a.value(g_mcNextFd);
+        a.value(g_mcLastCmd);
+        a.value(g_mcLastResult);
+        for (McPortState &port : g_mcPorts)
+        {
+            a.string(port.currentDir);
+            a.value(port.formatted);
+        }
+        a.value(g_cvMcFileCursor);
+        if (a.loading())
+            g_mcCommandPending = false;
+    }
+    [[maybe_unused]] const bool g_mcStubStateRegistered = ps2x::registerStubState("stub-memcard", &serializeMemoryCardStubState);
+}
 }

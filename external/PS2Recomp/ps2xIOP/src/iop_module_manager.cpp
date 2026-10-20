@@ -1,3 +1,4 @@
+#include "ps2x/state_archive.h"
 #include "iop_module_manager.h"
 
 #include "ps2x/iop/ps2_path.h"
@@ -176,5 +177,23 @@ namespace ps2x::iop::detail
             --found->second;
         else
             m_loadedKeyReferences.erase(found);
+    }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2x::iop::detail
+{
+    void IopModuleManager::serializeState(ps2x::StateArchive &a)
+    {
+        a.tag("IMOD");
+        a.map(m_records, [](ps2x::StateArchive &x, Record &r)
+        {
+            x.string(r.key);
+            x.value(r.references);
+            x.value(r.physical);
+        });
+        a.podMap(m_hleIdsByKey);
+        a.podMap(m_loadedKeyReferences);
+        a.value(m_nextHleId);
     }
 }

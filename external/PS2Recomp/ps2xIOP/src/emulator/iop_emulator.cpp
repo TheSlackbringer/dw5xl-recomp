@@ -1,3 +1,4 @@
+#include "ps2x/state_archive.h"
 #include <cstdio>
 #include "iop_emulator.h"
 #include "imports/iop_cdvd.h"
@@ -1015,4 +1016,63 @@ namespace ps2x::iop::detail
         return static_cast<uint32_t>(m_impl->rpc.serverCount());
     }
 
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2x::iop::detail
+{
+    void IopEmulator::serializeState(ps2x::StateArchive &a)
+    {
+        Impl &e = *m_impl;
+        if (a.saving() && (e.servicingSoundInterrupt || e.servicingDmaInterrupts || e.servicingGuestCallbacks ||
+                           e.callDepth != 0u || e.inRunCycles))
+            throw ps2x::StateError("IOP is inside a callback or a run slice");
+        a.tag("IEMU");
+        e.memory.serializeState(a);
+        e.kernel.serializeState(a);
+        e.cdvd.serializeState(a);
+        e.rpc.serializeState(a);
+        e.intrman.serializeState(a);
+        e.timrman.serializeState(a);
+        e.ioman.serializeState(a);
+        e.imports.serializeState(a);
+        a.map(e.modules, [](ps2x::StateArchive &x, Impl::Module &m)
+        {
+            x.value(m.id);
+            x.string(m.path);
+            x.string(m.name);
+            x.value(m.base);
+            x.value(m.size);
+            x.value(m.entry);
+            x.value(m.gp);
+            x.value(m.resident);
+        });
+        a.podMap(e.pendingDmaInterrupts);
+        struct PendingCallback { uint64_t cycle; Impl::ScheduledGuestCallback callback; };
+        std::vector<PendingCallback> callbacks;
+        for (const auto &[cycle, callback] : e.pendingGuestCallbacks)
+            callbacks.push_back({cycle, callback});
+        a.vector(callbacks);
+        a.value(e.nextModuleId);
+        a.value(e.moduleCursor);
+        a.value(e.totalCycles);
+        a.value(e.soundCycles);
+        a.value(e.pendingSoundInterrupt);
+        a.value(e.totalInstructions);
+        a.value(e.eeCycleCarry);
+        a.value(e.hostClockPendingEe);
+        a.value(e.secrMcCommandHandler);
+        a.value(e.secrMcDevIdHandler);
+        a.value(e.checkKelfPathCallback);
+        a.tag("IEND");
+        if (a.loading())
+        {
+            e.pendingGuestCallbacks.clear();
+            for (const PendingCallback &p : callbacks)
+                e.pendingGuestCallbacks.emplace(p.cycle, p.callback);
+            e.hostClockEpochNs.reset(); // the IOP clock restarts from the restored cycle count
+            e.hostClockLastNs = 0u;
+            e.activeCpu = nullptr;
+        }
+    }
 }

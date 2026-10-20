@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <vector>
 
+namespace ps2x { class StateArchive; }
+
 class GSRasterBackend
 {
 public:
@@ -36,6 +38,10 @@ public:
     virtual void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) = 0;
     virtual void SnapshotVram(std::vector<uint8_t> &out) const = 0;
     virtual GSTransferSnapshot GetTransferSnapshot() const = 0;
+
+    // DW5XL (issue 027): renderer state for save states (VRAM the renderer owns, register shadows, transfers).
+    // Called on the EE executor at a quiet point after a flush. Renderers without support refuse.
+    virtual void SerializeState(ps2x::StateArchive &archive);
 
     virtual void SetResolutionScale(uint32_t scale) { (void)scale; }
     virtual uint32_t GetResolutionScale() const { return 1; }

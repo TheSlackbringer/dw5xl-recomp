@@ -1,3 +1,4 @@
+#include "ps2x/state_archive.h"
 #include "iop_timrman.h"
 
 #include "../core/iop_cpu.h"
@@ -472,5 +473,18 @@ namespace ps2x::iop::detail
             next = std::min(next, timer.overflowCycle);
         }
         return next;
+    }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2x::iop::detail
+{
+    void IopTimrman::serializeState(ps2x::StateArchive &a)
+    {
+        a.tag("ITMR");
+        if (a.saving() && m_servicing)
+            throw ps2x::StateError("IOP timer callback in progress");
+        a.value(m_timers);
+        a.value(m_holdMode);
     }
 }

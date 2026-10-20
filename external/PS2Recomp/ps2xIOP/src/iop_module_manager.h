@@ -1,4 +1,5 @@
 #pragma once
+#include "ps2x/state_archive.h"
 
 #include "ps2x/iop/iop_types.h"
 
@@ -15,6 +16,8 @@ namespace ps2x::iop::detail
     class IopModuleManager
     {
     public:
+        // DW5XL (issue 027): loaded-module records for save states.
+        void serializeState(ps2x::StateArchive &archive);
         IopModuleManager();
 
         void reset();

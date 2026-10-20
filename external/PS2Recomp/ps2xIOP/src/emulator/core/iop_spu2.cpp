@@ -1,3 +1,4 @@
+#include "ps2x/state_archive.h"
 #include "iop_spu2.h"
 
 #include <algorithm>
@@ -801,4 +802,37 @@ namespace ps2x::iop::detail
     void IopSpu2::setPcmCallback(std::function<void(std::span<const int16_t>)> callback) { m_impl->pcmCallback = std::move(callback); }
     void IopSpu2::setIrqCallback(std::function<void()> callback) { m_impl->irqCallback = std::move(callback); }
     IopSpu2::Statistics IopSpu2::statistics() const { return m_impl->stats; }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2x::iop::detail
+{
+    void IopSpu2::serializeState(ps2x::StateArchive &a)
+    {
+        Impl &s = *m_impl;
+        a.tag("SPU2");
+        a.vector(s.ram);
+        a.value(s.regs);
+        for (auto &core : s.cores)
+        {
+            a.value(core.voices);
+            a.value(core.masterLeft);
+            a.value(core.masterRight);
+            a.value(core.keyOn);
+            a.value(core.keyOff);
+            a.value(core.endx);
+            a.value(core.noise);
+            a.value(core.noiseTimer);
+            a.value(core.dmaBusy);
+            a.value(core.dmaAuto);
+            a.deque(core.input);
+            a.value(core.inputPosition);
+            a.value(core.reverbPosition);
+            a.value(core.reverbOutput);
+            a.value(core.reverbInput);
+        }
+        a.value(s.remainder);
+        if (a.loading())
+            s.pcm.clear(); // host output buffer: refilled from the restored voices
+    }
 }

@@ -1,3 +1,4 @@
+#include "runtime/stub_state.h"
 #include "Common.h"
 #include "Pad.h"
 
@@ -860,4 +861,19 @@ namespace ps2_stubs
         g_padOverrideEnabled = false;
         g_padOverrideState = PadInputState{};
     }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2_stubs
+{
+namespace
+{
+    void serializePadStubState(ps2x::StateArchive &a)
+    {
+        std::lock_guard lock(g_padStateMutex);
+        a.tag("SPAD");
+        a.value(g_padPorts); // which ports the game opened; the buttons themselves come from the host
+    }
+    [[maybe_unused]] const bool g_padStubStateRegistered = ps2x::registerStubState("stub-pad", &serializePadStubState);
+}
 }

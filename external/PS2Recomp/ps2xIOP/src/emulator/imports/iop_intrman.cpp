@@ -1,3 +1,4 @@
+#include "ps2x/state_archive.h"
 #include "iop_intrman.h"
 
 #include "../core/iop_cpu.h"
@@ -109,5 +110,16 @@ namespace ps2x::iop::detail
                                                       handler->second.gp,
                                                       100000u);
         return true;
+    }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2x::iop::detail
+{
+    void IopIntrman::serializeState(ps2x::StateArchive &a)
+    {
+        a.tag("IINT");
+        a.podMap(m_handlers);
+        a.podMap(m_enabled);
     }
 }

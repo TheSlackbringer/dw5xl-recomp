@@ -41,6 +41,8 @@ struct Sample
     std::unordered_map<int, Thing> things;
     std::unordered_map<uint32_t, uint32_t> registers;
     std::unordered_set<uint32_t> addresses;
+    std::unordered_map<std::string, uint32_t> named; // string keys (IOP module manager)
+    std::unordered_set<std::string> keys;
     std::vector<Thing> list;
     uint8_t block[64] = {};
 
@@ -63,6 +65,8 @@ struct Sample
         a.map(things, thing);
         a.podMap(registers);
         a.podSet(addresses);
+        a.podMap(named);
+        a.podSet(keys);
         a.sequence(list, thing);
         a.raw(block, sizeof(block));
         a.tag("END ");
@@ -84,6 +88,11 @@ Sample filled()
         s.registers[0x10000000u + i * 0x10u] = i * 3u;
     for (uint32_t i = 0; i < 30; ++i)
         s.addresses.insert(0x00100000u + i * 4u);
+    for (const char *name : {"sio2man", "padman", "mcman", "libsd", "cdvdfsv"})
+    {
+        s.named[name] = uint32_t(std::string(name).size());
+        s.keys.insert(name);
+    }
     s.list = {Thing{1, "a", {1}, {}}, Thing{2, "b", {}, {9}}};
     for (int i = 0; i < 64; ++i)
         s.block[i] = uint8_t(i * 5);
@@ -113,6 +122,7 @@ int main()
           "maps come back with their contents");
     check(loaded.bits == original.bits && loaded.queue == original.queue && loaded.text == original.text,
           "strings, bit vectors and deques come back");
+    check(loaded.named == original.named && loaded.keys == original.keys, "string-keyed maps and sets come back");
 
     // Same contents, different insertion order: identical bytes (maps and sets are written in key order).
     Sample reordered = filled();

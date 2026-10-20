@@ -1,4 +1,5 @@
 #pragma once
+#include "ps2x/state_archive.h"
 
 #include "iop_cpu.h"
 
@@ -48,6 +49,8 @@ namespace ps2x::iop::detail
     class IopKernel
     {
     public:
+        // DW5XL (issue 027): save-state support.
+        void serializeState(ps2x::StateArchive &archive);
         explicit IopKernel(IopMemory &memory) noexcept;
 
         void reset();

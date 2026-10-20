@@ -1,3 +1,4 @@
+#include "ps2x/state_archive.h"
 #include "iop_kernel.h"
 
 #include "iop_memory.h"
@@ -792,6 +793,30 @@ namespace ps2x::iop::detail
                 thread.state = IopThreadState::Dead;
                 m_hasDeadThreads = true;
             }
+        }
+    }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2x::iop::detail
+{
+    void IopKernel::serializeState(ps2x::StateArchive &a)
+    {
+        a.tag("IKRN");
+        a.podMap(m_threads);
+        a.value(m_hasDeadThreads);
+        a.podMap(m_semaphores);
+        a.podMap(m_eventFlags);
+        a.value(m_nextThreadId);
+        a.value(m_nextSemaphoreId);
+        a.value(m_nextEventFlagId);
+        int current = m_currentThread ? m_currentThread->id : 0;
+        a.value(current);
+        if (a.loading())
+        {
+            rebuildThreadList();
+            const auto it = m_threads.find(current);
+            m_currentThread = it != m_threads.end() ? &it->second : nullptr;
         }
     }
 }

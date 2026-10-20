@@ -1,3 +1,4 @@
+#include "ps2x/state_archive.h"
 #include "iop_rpc.h"
 
 #include "../core/iop_cpu.h"
@@ -347,5 +348,17 @@ namespace ps2x::iop::detail
     {
         const auto server = m_servers.find(sid);
         return server != m_servers.end() && server->second.function != 0u;
+    }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2x::iop::detail
+{
+    void IopRpcBridge::serializeState(ps2x::StateArchive &a)
+    {
+        a.tag("IRPC");
+        a.podMap(m_servers);
+        a.value(m_nextDmaId);
+        a.value(m_sifInitialized);
     }
 }

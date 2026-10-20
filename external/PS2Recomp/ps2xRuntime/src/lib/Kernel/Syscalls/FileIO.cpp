@@ -1,3 +1,4 @@
+#include "runtime/stub_state.h"
 #include "Common.h"
 #include "FileIO.h"
 
@@ -413,4 +414,20 @@ namespace ps2_syscalls
             setReturnS32(ctx, 0); // Success
         }
     }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2_syscalls
+{
+namespace
+{
+    void serializeFileIoSyscallState(ps2x::StateArchive &a)
+    {
+        std::lock_guard lock(g_vagAccumMutex);
+        a.tag("SFIO");
+        if (a.saving() && !g_vagAccum.empty())
+            throw ps2x::StateError("a VAG upload is being collected");
+    }
+    [[maybe_unused]] const bool g_fileIoStateRegistered = ps2x::registerStubState("syscall-fileio", &serializeFileIoSyscallState);
+}
 }

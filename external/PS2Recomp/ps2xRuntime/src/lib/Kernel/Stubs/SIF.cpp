@@ -1,3 +1,4 @@
+#include "runtime/stub_state.h"
 #include <cstdlib>
 #include "Common.h"
 #include "SIF.h"
@@ -922,4 +923,28 @@ namespace ps2_stubs
     {
         setReturnS32(ctx, 0);
     }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2_stubs
+{
+namespace
+{
+    void serializeSifStubState(ps2x::StateArchive &a)
+    {
+        a.tag("SSIF");
+        {
+            std::lock_guard lock(g_sifDmaTransferMutex);
+            a.value(g_nextSifDmaTransferId);
+        }
+        std::lock_guard lock(g_sifCmdStateMutex);
+        a.podMap(g_sifRegs);
+        a.podMap(g_sifSregs);
+        a.podMap(g_sifCmdHandlers);
+        a.value(g_sifCmdBuffer);
+        a.value(g_sifSysCmdBuffer);
+        a.value(g_sifCmdInitialized);
+    }
+    [[maybe_unused]] const bool g_sifStubStateRegistered = ps2x::registerStubState("stub-sif", &serializeSifStubState);
+}
 }

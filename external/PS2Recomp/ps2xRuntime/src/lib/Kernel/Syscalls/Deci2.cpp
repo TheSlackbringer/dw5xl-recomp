@@ -1,3 +1,4 @@
+#include "runtime/stub_state.h"
 #include "System.h"
 #include "Common.h"
 #include "ps2_runtime.h"
@@ -232,4 +233,17 @@ namespace ps2_syscalls
         }
 #endif
     }
+}
+
+// DW5XL (issue 027): save states.
+namespace
+{
+    void serializeDeci2State(ps2x::StateArchive &a)
+    {
+        std::lock_guard lock(g_deci2Mutex);
+        a.tag("SDCI");
+        a.podMap(g_deci2Sessions);
+        a.value(g_nextDeci2Socket);
+    }
+    [[maybe_unused]] const bool g_deci2StateRegistered = ps2x::registerStubState("syscall-deci2", &serializeDeci2State);
 }

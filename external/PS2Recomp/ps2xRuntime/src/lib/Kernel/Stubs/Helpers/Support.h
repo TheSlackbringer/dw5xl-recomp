@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cctype>
 #include "runtime/ps2_device_queue.h"
+#include "runtime/stub_state.h"
 
 namespace
 {
@@ -1972,4 +1973,51 @@ namespace
         std::memcpy(scratch + kGsParamScratchOffset, &g_gparam, sizeof(g_gparam));
         return PS2_SCRATCHPAD_BASE + kGsParamScratchOffset;
     }
+}
+
+// DW5XL (issue 027): every source that includes this header has its own copy of the globals above, so each copy
+// saves itself (registered under the including file's name).
+namespace
+{
+    void serializeSupportState(ps2x::StateArchive &a)
+    {
+        a.tag("SUPP");
+        a.map(g_cdFilesByKey, [](ps2x::StateArchive &x, CdFileEntry &e)
+        {
+            std::string path = e.hostPath.string();
+            x.string(path);
+            if (x.loading())
+                e.hostPath = path;
+            x.value(e.sizeBytes);
+            x.value(e.baseLbn); // the game may keep pseudo LBNs it was given: they must stay the same
+            x.value(e.sectors);
+        });
+        a.value(g_nextPseudoLbn);
+        a.value(g_lastCdError);
+        a.value(g_cdMode);
+        a.value(g_cdStreamingLbn);
+        a.value(g_cdStreamingEndLbn);
+        a.value(g_cdInitialized);
+        {
+            std::lock_guard lock(g_file_mutex);
+            if (a.saving() && !g_file_map.empty())
+                throw ps2x::StateError("an EE host file is open");
+            a.value(g_next_file_handle);
+        }
+        {
+            std::lock_guard lock(g_dmaStubMutex);
+            a.podMap(g_dmaPendingPolls);
+        }
+        a.value(g_gparam);
+        if (a.loading())
+        {
+            // Lookup caches, rebuilt from the disc files on demand.
+            g_cdLeafIndex.clear();
+            g_cdLoosePathIndex.clear();
+            g_cdLeafIndexBuilt = false;
+            g_cdImageSizeValid = false;
+        }
+    }
+    [[maybe_unused]] const bool g_supportStateRegistered =
+        ps2x::registerStubState((std::string("support:") + PS2X_STATE_TU_NAME).c_str(), &serializeSupportState);
 }

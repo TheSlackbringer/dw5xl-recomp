@@ -1,4 +1,5 @@
 #pragma once
+#include "ps2x/state_archive.h"
 
 #include <cstdint>
 #include <functional>
@@ -12,6 +13,8 @@ namespace ps2x::iop::detail
     class IopSpu2
     {
     public:
+        // DW5XL (issue 027): save-state support.
+        void serializeState(ps2x::StateArchive &archive);
         static constexpr uint32_t CyclesPerFrame = 768;
         static constexpr uint32_t SampleRate = 48000;
         struct Statistics

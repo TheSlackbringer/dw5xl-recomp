@@ -271,6 +271,7 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
 }
 
 class PS2Runtime;
+namespace ps2x { class StateArchive; } // DW5XL (issue 027): runtime/state_archive.h
 
 // Generated module metadata and entries have static lifetime. Registration does
 // not activate a module; the game-specific loader validates loaded bytes first.
@@ -420,6 +421,14 @@ public:
 
     // Build ID (e.g. git describe) shown by the F8 overlay with the game tick (issue 012).
     void setBuildId(std::string id) { m_buildId = std::move(id); }
+
+    // DW5XL (issue 027): save states (src/lib/ps2_save_state.cpp). Carried out by the EE scheduler at a quiet point,
+    // on the executor. A state from another build or format is refused before anything changes.
+    bool performStateRequest(bool save, const std::string &path);
+    // Components outside the runtime (the app's overlays, IPU decoder, pad bridge, ...) add their state here; they
+    // are saved and loaded in registration order, each under its own section tag.
+    using StateHook = std::function<void(ps2x::StateArchive &)>;
+    void registerStateHook(std::string name, StateHook hook);
 
     EeScheduler &eeScheduler();
     const EeScheduler &eeScheduler() const;
@@ -583,6 +592,8 @@ private:
     };
 
     std::vector<LoadedModule> m_loadedModules;
+    void serializeState(ps2x::StateArchive &archive); // DW5XL (issue 027)
+    std::vector<std::pair<std::string, StateHook>> m_stateHooks;
     uint8_t *m_boundRdram = nullptr;
     uint8_t *m_boundGSVram = nullptr;
 };

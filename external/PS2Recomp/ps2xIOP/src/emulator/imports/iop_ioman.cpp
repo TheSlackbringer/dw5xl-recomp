@@ -1,3 +1,4 @@
+#include "ps2x/state_archive.h"
 #include "iop_ioman.h"
 
 #include "../core/iop_cpu.h"
@@ -97,6 +98,7 @@ namespace ps2x::iop::detail
         for (auto &file : m_files)
             std::fclose(file.second);
         m_files.clear();
+        m_filePaths.clear();
         m_nextFd = 3;
     }
 
@@ -141,6 +143,7 @@ namespace ps2x::iop::detail
             }
             const int32_t fd = m_nextFd++;
             m_files[fd] = file;
+            m_filePaths[fd] = {hostPath, access == 2u || access == 3u};
             if (traceIoOperation())
                 std::fprintf(stderr, "[io:ioman] pc=%08x open fd=%d flags=%08x guest=\"%s\" path=\"%s\"\n",
                              cpu.pc, fd, a1, guestPath.c_str(), hostPath.c_str());
@@ -156,6 +159,7 @@ namespace ps2x::iop::detail
                 return true;
             }
             std::fclose(it->second);
+            m_filePaths.erase(it->first);
             m_files.erase(it);
             setV0(0u);
             return true;
@@ -296,6 +300,55 @@ namespace ps2x::iop::detail
         }
         default:
             return false;
+        }
+    }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2x::iop::detail
+{
+    void IopIoman::serializeState(ps2x::StateArchive &a)
+    {
+        a.tag("IIOM");
+        a.sequence(m_devices, [](ps2x::StateArchive &x, Device &d)
+        {
+            x.value(d.address);
+            x.value(d.gp);
+            x.string(d.name);
+        });
+        a.value(m_nextFd);
+        struct OpenFile { int32_t fd = 0; std::string path; bool writable = false; int64_t position = 0; };
+        std::vector<OpenFile> open;
+        if (a.saving())
+            for (const auto &[fd, file] : m_files)
+            {
+                const auto path = m_filePaths.find(fd);
+                if (path == m_filePaths.end())
+                    throw ps2x::StateError("IOP file " + std::to_string(fd) + " has no recorded path");
+                open.push_back({fd, path->second.first, path->second.second, static_cast<int64_t>(std::ftell(file))});
+            }
+        a.sequence(open, [](ps2x::StateArchive &x, OpenFile &f)
+        {
+            x.value(f.fd);
+            x.string(f.path);
+            x.value(f.writable);
+            x.value(f.position);
+        });
+        if (a.loading())
+        {
+            for (auto &file : m_files)
+                std::fclose(file.second);
+            m_files.clear();
+            m_filePaths.clear();
+            for (const OpenFile &f : open)
+            {
+                std::FILE *file = std::fopen(f.path.c_str(), f.writable ? "r+b" : "rb"); // never truncate on reopen
+                if (!file)
+                    throw ps2x::StateError("cannot reopen IOP file " + f.path);
+                std::fseek(file, static_cast<long>(f.position), SEEK_SET);
+                m_files[f.fd] = file;
+                m_filePaths[f.fd] = {f.path, f.writable};
+            }
         }
     }
 }

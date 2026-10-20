@@ -1,4 +1,5 @@
 #pragma once
+#include "ps2x/state_archive.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,8 @@ namespace ps2x::iop::detail
     class IopMemory
     {
     public:
+        // DW5XL (issue 027): save-state support.
+        void serializeState(ps2x::StateArchive &archive);
         static constexpr uint32_t RamSize = 2u * 1024u * 1024u;
         static constexpr uint32_t ScratchBase = 0x1F800000u;
         static constexpr uint32_t ScratchSize = 0x400u;

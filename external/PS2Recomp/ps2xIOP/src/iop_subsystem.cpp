@@ -1,3 +1,4 @@
+#include "ps2x/state_archive.h"
 #include "ps2x/iop/iop_subsystem.h"
 
 #include "iop_service.h"
@@ -278,5 +279,18 @@ namespace ps2x::iop
             snapshot.services.push_back(std::move(row));
         }
         return snapshot;
+    }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2x::iop
+{
+    void IopSubsystem::serializeState(ps2x::StateArchive &a)
+    {
+        a.tag("IOPS");
+        m_impl->moduleManager.serializeState(a);
+        m_impl->emulator.serializeState(a);
+        if (a.loading())
+            m_impl->rebuildRoutes();
     }
 }

@@ -1,3 +1,4 @@
+#include "ps2x/state_archive.h"
 #include <vector>
 #include <cstdio>
 #include "iop_memory.h"
@@ -443,5 +444,30 @@ namespace ps2x::iop::detail
             result.push_back(ch);
         }
         return result;
+    }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2x::iop::detail
+{
+    void IopMemory::serializeState(ps2x::StateArchive &a)
+    {
+        a.tag("IMEM");
+        a.vector(m_ram);
+        a.vector(m_owned);
+        a.vector(m_scratch);
+        a.podMap(m_hardware);
+        a.vector(m_allocations);
+        a.value(m_heapCursor);
+        a.value(m_interruptStatus);
+        a.value(m_interruptMask);
+        a.value(m_interruptControl);
+        bool hasDma = m_dmaStart.has_value();
+        DmaStart dma = hasDma ? *m_dmaStart : DmaStart{};
+        a.value(hasDma);
+        a.value(dma);
+        if (a.loading())
+            m_dmaStart = hasDma ? std::optional<DmaStart>(dma) : std::nullopt;
+        m_spu2.serializeState(a);
     }
 }

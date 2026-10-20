@@ -1,4 +1,5 @@
 #pragma once
+#include "ps2x/state_archive.h"
 
 #include "ps2x/iop/iop_types.h"
 
@@ -43,6 +44,8 @@ namespace ps2x::iop::detail
     class IopRpcBridge
     {
     public:
+        // DW5XL (issue 027): save-state support.
+        void serializeState(ps2x::StateArchive &archive);
         IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept;
 
         void reset();

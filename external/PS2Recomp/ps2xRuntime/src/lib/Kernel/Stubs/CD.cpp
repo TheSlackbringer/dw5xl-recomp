@@ -1,3 +1,4 @@
+#include "runtime/stub_state.h"
 #include "Common.h"
 #include "CD.h"
 #include "MPEG.h"
@@ -1082,4 +1083,18 @@ namespace ps2_stubs
         }
         setReturnS32(ctx, 1);
     }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2_stubs
+{
+namespace
+{
+    void serializeCdStubState(ps2x::StateArchive &a)
+    {
+        a.tag("SCDS");
+        a.value(g_cdStreamTiming);
+    }
+    [[maybe_unused]] const bool g_cdStubStateRegistered = ps2x::registerStubState("stub-cd", &serializeCdStubState);
+}
 }

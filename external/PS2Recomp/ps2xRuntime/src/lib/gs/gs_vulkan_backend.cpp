@@ -3,6 +3,7 @@
 #include "gs_vulkan_scanout.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/ps2_gs_memory.h"
+#include "runtime/state_archive.h"
 #include "gs_interface.hpp"
 #include "context.hpp"
 #include "thread_id.hpp"
@@ -467,4 +468,53 @@ uint32_t GSVulkanBackend::GetAASamples() const
     // Effective AA per output pixel (samples beyond what the output scale needs).
     return std::max(1u, m_impl->aaSamples.load(std::memory_order_relaxed) /
                             Impl::minSamplesFor(m_impl->currentScale.load(std::memory_order_relaxed)));
+}
+
+// DW5XL (issue 027): save states. paraLLEl-GS keeps its own copy of VRAM and its register state; both go through
+// its own interface (map_vram_read/map_vram_write, the register structs, clobber_register_state() after writing
+// them back). Scanout buffers and the field weaver are rebuilt from the next fields, not saved.
+void GSVulkanBackend::SerializeState(ps2x::StateArchive &a)
+{
+    auto lock = m_impl->access();
+    auto &p = *m_impl;
+    p.gs.flush();
+    a.tag("GSVK");
+    std::vector<uint8_t> vram(vramBytes);
+    if (a.saving())
+    {
+        const void *mapped = p.gs.map_vram_read(0, vramBytes);
+        if (!mapped)
+            throw ps2x::StateError("Vulkan GS VRAM readback failed");
+        std::memcpy(vram.data(), mapped, vramBytes);
+    }
+    a.raw(vram.data(), vramBytes);
+    ParallelGS::RegisterState regs = p.gs.get_register_state();
+    ParallelGS::PrivRegisterState priv = p.gs.get_priv_register_state();
+    a.value(regs);
+    a.value(priv);
+    a.value(p.state);
+    a.value(p.valid);
+    a.value(p.transfer);
+    a.value(p.transferState);
+    a.value(p.uploadedBytes);
+    a.vector(p.uploadTail);
+    a.vector(p.fifo);
+    uint64_t fifoRead = p.fifoRead;
+    a.value(fifoRead);
+    if (a.loading())
+    {
+        void *mapped = p.gs.map_vram_write(0, vramBytes);
+        if (!mapped)
+            throw ps2x::StateError("Vulkan GS VRAM mapping failed");
+        std::memcpy(mapped, vram.data(), vramBytes);
+        p.gs.end_vram_write(0, vramBytes);
+        p.gs.get_register_state() = regs;
+        p.gs.get_priv_register_state() = priv;
+        p.gs.clobber_register_state();
+        std::memcpy(p.snapshot.data(), vram.data(), vramBytes);
+        p.fifoRead = size_t(fifoRead);
+        p.scanoutState.reset();
+        p.fieldWeaver.reset();
+        p.dirty = true;
+    }
 }

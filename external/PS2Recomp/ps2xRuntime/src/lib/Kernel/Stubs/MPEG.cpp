@@ -1,3 +1,4 @@
+#include "runtime/stub_state.h"
 #include <atomic>
 std::atomic<uint32_t> g_dw5xlMpegDemux{0}, g_dw5xlMpegGetPic{0}, g_dw5xlMpegPictures{0}, g_dw5xlStrEvents[8]{}; // DW5XL-DEBUG
 namespace { std::atomic<uint64_t> g_moviePictures{0}; } // decoded pictures handed to the game (F2 overlay FPS)
@@ -3049,4 +3050,94 @@ namespace ps2_stubs
         getPlaybackState(mpegAddr).imageBufferAddr = imageBufferAddr;
         setReturnS32(ctx, 0);
     }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2_stubs
+{
+namespace
+{
+    void serializeMpegStubState(ps2x::StateArchive &a)
+    {
+        std::lock_guard lock(g_mpeg_stub_mutex);
+        a.tag("SMPG");
+        MpegStubState &m = g_mpeg_stub_state;
+        // A handle the game keeps between movies is saved; a movie in progress (frames queued, a demux transaction,
+        // a decoder that has not reached its end) holds a live FFmpeg decoder and is refused. The decoder is created
+        // again from the next movie data, as after sceMpegCreate.
+        if (a.saving())
+            for (const auto &[addr, p] : m.playbackByMpeg)
+                if (!p.decodedFrames.empty() || p.demuxTransaction || p.retryPacket ||
+                    (p.decoder && !p.streamEnded && !p.sequenceEndDecoded))
+                    throw ps2x::StateError("a movie is playing");
+        a.value(m.initialized);
+        a.value(m.nextCallbackHandle);
+        a.value(m.cdStreamGeneration);
+        a.value(m.cdStreamBytesProduced);
+        a.value(m.cdStreamBytesDemuxed);
+        a.value(m.cdStreamEofPending);
+        a.value(m.currentCdStreamEofSeen);
+        a.map(m.callbacksByMpeg, [](ps2x::StateArchive &x, std::vector<MpegRegisteredCallback> &list) { x.vector(list); });
+        a.value(g_nextPlaybackGeneration);
+        a.map(m.playbackByMpeg, [](ps2x::StateArchive &x, MpegPlaybackState &p)
+        {
+            x.value(p.sdkWorkAddr);
+            x.value(p.callbackGeneration);
+            x.value(p.picturesServed);
+            x.value(p.width);
+            x.value(p.height);
+            x.value(p.decodeMode);
+            x.value(p.imageBufferAddr);
+            x.value(p.sawInput);
+            x.value(p.sawSequenceEnd);
+            x.value(p.sequenceEndDecoded);
+            x.value(p.acceptedProgramEnd);
+            x.value(p.streamEnded);
+            x.value(p.decoderFailed);
+            x.value(p.cdStreamGeneration);
+            x.value(p.waitingForVideoSequenceHeader);
+            x.vector(p.videoSequenceSyncBuffer);
+            x.value(p.frameRateCode);
+            x.value(p.frameRateExtensionN);
+            x.value(p.frameRateExtensionD);
+            x.value(p.hasFrameRateExtension);
+            x.vector(p.videoTimingScanBuffer);
+            x.value(p.pictureIntervalQ32);
+            x.value(p.nextPictureTickQ32);
+            x.value(p.presentationEndTickQ32);
+            x.value(p.firstPresentedPts90k);
+            x.value(p.ptsPresentationBaseTickQ32);
+            x.value(p.presentationPalMode);
+            x.value(p.retryPacketAddr);
+            uint64_t retryBytes = p.retryPacketBytes, retryEvent = p.retryEvent, retryCallback = p.retryCallback;
+            x.value(retryBytes);
+            x.value(retryEvent);
+            x.value(retryCallback);
+            x.value(p.retryPacket);
+            x.value(p.lastOutputServiceTick);
+            x.value(p.lastInputServiceTick);
+            x.value(p.acceptedVideoPayloadBytes);
+            if (x.loading())
+            {
+                p.retryPacketBytes = size_t(retryBytes);
+                p.retryEvent = size_t(retryEvent);
+                p.retryCallback = size_t(retryCallback);
+                p.guestRdram = ps2x::stateGuestRdram();
+                p.decoder.reset();
+                p.decodedFrames.clear();
+                p.demuxTransaction.reset();
+            }
+        });
+        {
+            std::lock_guard scratchLock(g_mpegCallbackScratchMutex);
+            a.value(g_mpegCallbackScratchBase);
+            a.value(g_mpegCallbackScratchNext);
+        }
+        uint64_t demux = g_nextDemuxToken.load();
+        a.value(demux);
+        if (a.loading())
+            g_nextDemuxToken.store(demux);
+    }
+    [[maybe_unused]] const bool g_mpegStubStateRegistered = ps2x::registerStubState("stub-mpeg", &serializeMpegStubState);
+}
 }

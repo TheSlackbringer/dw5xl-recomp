@@ -1,4 +1,5 @@
 #pragma once
+#include "ps2x/state_archive.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +16,8 @@ namespace ps2x::iop::detail
     class IopIoman
     {
     public:
+        // DW5XL (issue 027): save-state support (open files are reopened by path on load).
+        void serializeState(ps2x::StateArchive &archive);
         explicit IopIoman(IopMemory &memory) noexcept;
 
         void reset();
@@ -33,6 +36,8 @@ namespace ps2x::iop::detail
         // Host-backed files for ioman open/read/... on disc (cdrom0:) and
         // host: paths, resolved under the runtime's working directory.
         std::map<int32_t, std::FILE *> m_files;
+        // DW5XL (issue 027): host path and writability of each open file, so a loaded state can reopen them.
+        std::map<int32_t, std::pair<std::string, bool>> m_filePaths;
         int32_t m_nextFd = 3;
     };
 }

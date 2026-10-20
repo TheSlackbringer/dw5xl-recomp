@@ -12,6 +12,7 @@ public:
     ~GSVulkanBackend() override;
     void Initialize(uint8_t *, uint32_t) override;
     void Reset() override;
+    void SerializeState(ps2x::StateArchive &archive) override; // DW5XL (issue 027)
     void Submit(const GSPrimitiveBatch &) override;
     void LoadClut(const GSTex0Reg &, const GSTexClutReg &) override;
     void BeginTransfer(const GSTransferCommand &) override;

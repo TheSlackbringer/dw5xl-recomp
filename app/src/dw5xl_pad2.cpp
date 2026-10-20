@@ -12,6 +12,7 @@
 //   +0x04 u32 connected               +0x1C     data, then the button profile
 // DualShock2 analog report (18 bytes, profile 0xFFFFFFFF): buttons (active low),
 // RX RY LX LY, then pressures R L U D Tri Cir Cross Sq L1 R1 L2 R2.
+#include "runtime/state_archive.h"
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "runtime/ps2_pad.h"
@@ -165,6 +166,13 @@ namespace
 
     void applyPad2Bridge(PS2Runtime &runtime)
     {
+        // DW5XL (issue 027): the libpad2 sockets the game opened survive a save state.
+        runtime.registerStateHook("PAD2", [](ps2x::StateArchive &a)
+        {
+            a.value(g_socketPort);
+            a.value(g_nextSocket);
+            a.value(g_counter);
+        });
         constexpr uint32_t expected[][2] = {
             {kDbcCreateSocket, 0x27BDFF90u}, {kDbcLink, 0x27BDFFB0u},
             {kDbcGetInfo, 0x27BDFF80u},      {kDbcSendData2, 0x27BDFF70u},

@@ -258,9 +258,13 @@ struct JumpTable
     std::vector<uint32_t> targets; // Jump targets
 };
 
+namespace ps2x { class StateArchive; }
+
 class PS2Memory
 {
 public:
+    // DW5XL (issue 027): guest memory and the memory-side device registers for save states.
+    void serializeState(ps2x::StateArchive &archive);
     PS2Memory();
     ~PS2Memory();
 

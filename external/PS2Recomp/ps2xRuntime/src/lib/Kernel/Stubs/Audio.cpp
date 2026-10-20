@@ -1,3 +1,4 @@
+#include "runtime/stub_state.h"
 #include "Common.h"
 #include "Audio.h"
 
@@ -654,4 +655,19 @@ namespace ps2_stubs
     {
         TODO_NAMED("sceSynthSizerLfoTriangle", rdram, ctx, runtime);
     }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2_stubs
+{
+namespace
+{
+    void serializeAudioStubState(ps2x::StateArchive &a)
+    {
+        std::lock_guard lock(g_audio_stub_mutex);
+        a.tag("SAUD");
+        a.value(g_audio_stub_state);
+    }
+    [[maybe_unused]] const bool g_audioStubStateRegistered = ps2x::registerStubState("stub-audio", &serializeAudioStubState);
+}
 }

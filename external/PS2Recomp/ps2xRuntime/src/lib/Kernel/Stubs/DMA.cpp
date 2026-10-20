@@ -1,3 +1,4 @@
+#include "runtime/stub_state.h"
 #include "Common.h"
 #include "DMA.h"
 #include "runtime/ps2_device_queue.h"
@@ -263,4 +264,19 @@ namespace ps2_stubs
     {
         TODO_NAMED("sceDmaWatch", rdram, ctx, runtime);
     }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2_stubs
+{
+namespace
+{
+    void serializeDmaStubState(ps2x::StateArchive &a)
+    {
+        std::lock_guard lock(g_dmaEnvMutex);
+        a.tag("SDMA");
+        a.value(g_dmaCurrentEnv);
+    }
+    [[maybe_unused]] const bool g_dmaStubStateRegistered = ps2x::registerStubState("stub-dma", &serializeDmaStubState);
+}
 }

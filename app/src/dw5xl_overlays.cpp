@@ -1,5 +1,6 @@
 // Native dispatch for separately compiled SLES_538.60 overlays.
 // Original loader/finalizer code owns RAM copying, BSS and constructors.
+#include "runtime/state_archive.h"
 #include "game_overrides.h"
 #include "dw5xl_disc_validation.h"
 #include "runtime/ee_scheduler.h"
@@ -211,6 +212,11 @@ void installOverlays(PS2Runtime& runtime) {
     if(!prepareDiscHooks(runtime)) {
         std::fprintf(stderr,"[dw5xl:disc] declined: disc-check entries unavailable\n");return;
     }
+    // DW5XL (issue 027): no state in the middle of a Load Original disc check (its session spans EE yields).
+    runtime.registerStateHook("DISC",[](ps2x::StateArchive& a){
+        if(a.saving() && discCheckSession.runtime) throw ps2x::StateError("a Load Original disc check is running");
+        if(a.loading()) discCheckSession.clear();
+    });
     supportedOverlays[2].module=&adaptedOvl02.descriptor;
     for(const auto& image:supportedOverlays)
         if(!runtime.registerCompiledModule(*image.module)) {

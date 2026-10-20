@@ -1,4 +1,5 @@
 #pragma once
+#include "ps2x/state_archive.h"
 
 #include <array>
 #include <cstddef>
@@ -12,6 +13,8 @@ namespace ps2x::iop::detail
     class IopTimrman
     {
     public:
+        // DW5XL (issue 027): save-state support.
+        void serializeState(ps2x::StateArchive &archive);
         void reset() noexcept;
 
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ps2_runtime.h"
+#include "runtime/state_archive.h"
 
 #include <array>
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -368,6 +370,14 @@ public:
     [[nodiscard]] EeKernelSnapshot snapshot() const;
     void publishSnapshot();
 
+    // DW5XL (issue 027): save states. A state is taken or restored only at a quiet point: at the top of run(), with
+    // no host callback pending anywhere (no invocation in progress, no resume or wait completion, no queued event).
+    // Requests from any thread are carried out there, on the executor.
+    enum class StateRequestKind : uint8_t { None, Save, Load };
+    void requestState(StateRequestKind kind, std::string path);
+    [[nodiscard]] bool stateQuiet(std::string *reason = nullptr) const;
+    void serializeState(ps2x::StateArchive &archive);
+
 private:
     struct ScheduledEvent
     {
@@ -474,4 +484,15 @@ private:
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;
     uint64_t m_snapshotSequence = 0;
+
+    // DW5XL (issue 027): the pending save/load request (any thread sets it; run() carries it out at a quiet point).
+    bool serviceStateRequest(); // true when a state was loaded
+    std::mutex m_stateRequestMutex;
+    std::atomic<bool> m_stateRequestPending{false};
+    StateRequestKind m_stateRequestKind = StateRequestKind::None;
+    std::string m_stateRequestPath;
+    uint64_t m_stateSaveAtTick = 0;  // PS2X_SAVE_STATE_AT=<tick>:<file> (0 = off)
+    std::string m_stateSaveAtPath;
+    uint64_t m_stateLoadAtTick = 0;  // PS2X_LOAD_STATE=<file> (loaded once the game reached this field)
+    std::string m_stateLoadAtPath;
 };

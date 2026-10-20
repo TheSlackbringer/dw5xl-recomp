@@ -66,6 +66,8 @@ struct VuLiftTiming
     bool operator==(const VuLiftTiming &) const = default;
 };
 
+namespace ps2x { class StateArchive; }
+
 class VU1Interpreter
 {
     // Lifted microprograms run on this interpreter's scheduler: its decoded
@@ -73,6 +75,8 @@ class VU1Interpreter
     friend struct vl::LiftAccess;
 
 public:
+    // DW5XL (issue 027): registers, pipelines and cycle state for save states (caches are rebuilt, not saved).
+    void serializeState(ps2x::StateArchive &archive);
     enum class Unit : uint8_t
     {
         VU0,

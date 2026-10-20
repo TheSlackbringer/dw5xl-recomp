@@ -1,4 +1,5 @@
 #pragma once
+#include "ps2x/state_archive.h"
 
 #include "ps2x/iop/iop_host.h"
 #include "ps2x/iop/iop_types.h"
@@ -13,6 +14,8 @@ namespace ps2x::iop
     class IopSubsystem
     {
     public:
+        // DW5XL (issue 027): the IOP for save states; service routes are rebuilt on load.
+        void serializeState(ps2x::StateArchive &archive);
         explicit IopSubsystem(IopHost &host);
         ~IopSubsystem();
 

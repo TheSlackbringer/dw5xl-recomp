@@ -1,4 +1,5 @@
 #pragma once
+#include "ps2x/state_archive.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -22,6 +23,8 @@ namespace ps2x::iop::detail
     class IopImportRegistry
     {
     public:
+        // DW5XL (issue 027): save-state support.
+        void serializeState(ps2x::StateArchive &archive);
         explicit IopImportRegistry(IopMemory &memory) noexcept;
 
         void reset();

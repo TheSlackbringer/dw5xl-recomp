@@ -1,5 +1,7 @@
 #include <unordered_map>
 #include "Common.h"
+#include "Helpers/State.h"
+#include "runtime/stub_state.h"
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
 
@@ -1118,4 +1120,55 @@ namespace ps2_syscalls
         uint32_t queuePtr = getRegU32(ctx, 4);
         setReturnS32(ctx, static_cast<int32_t>(queuePtr));
     }
+}
+
+// DW5XL (issue 027): save states. The HLE kernel globals of Helpers/State.h (one shared copy: inline variables).
+namespace
+{
+    void serializeHleKernelState(ps2x::StateArchive &a)
+    {
+        a.tag("SHLE");
+        {
+            std::lock_guard lock(g_rpc_mutex);
+            a.podMap(g_rpc_servers);
+            a.podMap(g_rpc_clients);
+            a.value(g_rpc_initialized);
+            a.value(g_rpc_next_id);
+            a.value(g_rpc_packet_index);
+            a.value(g_rpc_server_index);
+            a.value(g_rpc_active_queue);
+        }
+        {
+            std::lock_guard lock(g_bootmode_mutex);
+            a.value(g_bootmode_initialized);
+            a.value(g_bootmode_pool_offset);
+            a.podMap(g_bootmode_addresses);
+        }
+        {
+            std::lock_guard lock(g_tls_mutex);
+            a.value(g_tls_index);
+        }
+        {
+            std::lock_guard lock(g_osd_mutex);
+            a.value(g_osd_config_initialized);
+            a.value(g_osd_config_raw);
+            a.value(g_osd_config2_raw);
+        }
+        {
+            std::lock_guard lock(g_ps2_path_mutex);
+            a.string(g_ps2_cwd_device); // host folders stay as this run set them up
+        }
+        std::lock_guard lock(g_sif_module_mutex);
+        a.map(g_sif_modules_by_id, [](ps2x::StateArchive &x, SifModuleRecord &r)
+        {
+            x.value(r.id);
+            x.string(r.path);
+            x.string(r.pathKey);
+            x.value(r.refCount);
+            x.value(r.loaded);
+        });
+        a.podMap(g_sif_module_id_by_path);
+        a.value(g_next_sif_module_id);
+    }
+    [[maybe_unused]] const bool g_hleKernelStateRegistered = ps2x::registerStubState("hle-kernel", &serializeHleKernelState);
 }

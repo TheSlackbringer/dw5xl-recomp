@@ -96,9 +96,13 @@ struct GSDebugHistoryEntry
     bool usedPreferred = false;
 };
 
+namespace ps2x { class StateArchive; }
+
 class GS
 {
 public:
+    // DW5XL (issue 027): GS state for save states (drawing registers, vertex queue, GIF path progress, renderer).
+    void serializeState(ps2x::StateArchive &archive);
     GS();
     ~GS() = default;
 

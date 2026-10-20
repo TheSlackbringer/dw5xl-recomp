@@ -1,3 +1,4 @@
+#include "ps2x/state_archive.h"
 #include "iop_imports.h"
 
 #include "../core/iop_memory.h"
@@ -191,5 +192,21 @@ namespace ps2x::iop::detail
             else
                 ++library;
         }
+    }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2x::iop::detail
+{
+    void IopImportRegistry::serializeState(ps2x::StateArchive &a)
+    {
+        a.tag("IIMP");
+        a.map(m_libraries, [](ps2x::StateArchive &x, ExportLibrary &lib)
+        {
+            x.value(lib.tableAddress);
+            x.value(lib.version);
+            x.string(lib.name);
+            x.vector(lib.functions);
+        });
     }
 }

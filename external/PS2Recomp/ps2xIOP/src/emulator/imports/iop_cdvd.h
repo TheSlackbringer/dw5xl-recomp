@@ -1,4 +1,5 @@
 #pragma once
+#include "ps2x/state_archive.h"
 
 #include <cstdint>
 #include <memory>
@@ -18,6 +19,8 @@ namespace ps2x::iop::detail
     class IopCdvd
     {
     public:
+        // DW5XL (issue 027): save-state support.
+        void serializeState(ps2x::StateArchive &archive);
         struct CompletionCallback
         {
             uint32_t address = 0u;

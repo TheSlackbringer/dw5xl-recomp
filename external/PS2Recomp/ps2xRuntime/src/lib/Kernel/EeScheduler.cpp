@@ -225,6 +225,25 @@ void EeScheduler::run()
 {
     assertExecutor();
     m_running.store(true, std::memory_order_release);
+    // DW5XL (issue 027): test switches. PS2X_SAVE_STATE_AT=<tick>:<file> saves at the first quiet point from that
+    // field on; PS2X_LOAD_STATE=<file> loads once the game reached field PS2X_LOAD_STATE_TICK (default 30, so the
+    // host side has finished starting up).
+    if (const char *at = std::getenv("PS2X_SAVE_STATE_AT"); at && *at)
+    {
+        const std::string spec = at;
+        const size_t colon = spec.find(':');
+        if (colon != std::string::npos)
+        {
+            m_stateSaveAtTick = std::max<uint64_t>(1u, std::strtoull(spec.substr(0, colon).c_str(), nullptr, 10));
+            m_stateSaveAtPath = spec.substr(colon + 1);
+        }
+    }
+    if (const char *load = std::getenv("PS2X_LOAD_STATE"); load && *load)
+    {
+        const char *tick = std::getenv("PS2X_LOAD_STATE_TICK");
+        m_stateLoadAtTick = std::max<uint64_t>(1u, tick && *tick ? std::strtoull(tick, nullptr, 10) : 30u);
+        m_stateLoadAtPath = load;
+    }
     const char *dispatchEnv = std::getenv("PS2X_EE_DISPATCH_TRACE");
     const bool dispatchTrace = dispatchEnv && *dispatchEnv && *dispatchEnv != '0';
     struct DispatchStats { uint64_t calls = 0, ns = 0, dmaCalls = 0, dmaNs = 0, dmaMaxNs = 0; };
@@ -244,6 +263,16 @@ void EeScheduler::run()
         if (ps2x::device::pollCompletions(m_runtime.memory()))
         {
             m_runtime.drainCompletedDmacHandlers(m_rdram);
+        }
+
+        // DW5XL (issue 027): a save/load request is carried out here, at the first quiet point. After a load the
+        // scheduler's state is the saved one: start the loop over.
+        if (m_stateRequestPending.load(std::memory_order_acquire) || m_stateSaveAtTick != 0u || m_stateLoadAtTick != 0u)
+        {
+            if (serviceStateRequest())
+            {
+                continue;
+            }
         }
 
         if (m_currentThreadId == 0)
@@ -2466,5 +2495,245 @@ void EeScheduler::publishIdleDebugContext()
     if (selected)
     {
         publishDebugContext(selected->activeContext());
+    }
+}
+
+// ---- DW5XL (issue 027): save states --------------------------------------------------------------------------------
+
+void EeScheduler::requestState(StateRequestKind kind, std::string path)
+{
+    {
+        std::lock_guard lock(m_stateRequestMutex);
+        m_stateRequestKind = kind;
+        m_stateRequestPath = std::move(path);
+        m_stateRequestPending.store(kind != StateRequestKind::None, std::memory_order_release);
+    }
+    std::lock_guard lock(m_eventMutex); // wake an idle executor so it reaches the top of run()
+    m_eventCv.notify_all();
+}
+
+bool EeScheduler::stateQuiet(std::string *reason) const
+{
+    auto fail = [&](std::string why)
+    {
+        if (reason)
+            *reason = std::move(why);
+        return false;
+    };
+    if (!m_events.empty())
+        return fail("events are queued");
+    for (const GuestInvocation &invocation : m_pendingInvocations)
+        if (invocation.onComplete || invocation.shouldExecute)
+            return fail("an invocation with a host callback is queued");
+    for (const auto &[id, thread] : m_threads)
+    {
+        if (!thread.invocations.empty())
+            return fail("thread " + std::to_string(id) + " is inside an interrupt, alarm or callback");
+        if (thread.resumeCompletion)
+            return fail("thread " + std::to_string(id) + " has a resume completion");
+        if (thread.wait.completion)
+            return fail("thread " + std::to_string(id) + " waits with a host completion");
+    }
+    if (m_insideInterrupt)
+        return fail("inside an interrupt");
+    return true;
+}
+
+bool EeScheduler::serviceStateRequest()
+{
+    const uint64_t tick = m_vsyncTick.load(std::memory_order_acquire);
+    if (m_stateSaveAtTick != 0u && tick >= m_stateSaveAtTick)
+    {
+        m_stateSaveAtTick = 0u;
+        requestState(StateRequestKind::Save, m_stateSaveAtPath);
+    }
+    if (m_stateLoadAtTick != 0u && tick >= m_stateLoadAtTick)
+    {
+        m_stateLoadAtTick = 0u;
+        requestState(StateRequestKind::Load, m_stateLoadAtPath);
+    }
+    if (!m_stateRequestPending.load(std::memory_order_acquire))
+        return false;
+    static std::string s_lastRefusal;
+    std::string reason;
+    if (!stateQuiet(&reason))
+    {
+        if (reason != s_lastRefusal) // say once per reason, not every iteration
+            std::fprintf(stderr, "[state] waiting for a quiet point at tick %llu: %s\n",
+                         static_cast<unsigned long long>(tick), reason.c_str());
+        s_lastRefusal = reason;
+        return false;
+    }
+    s_lastRefusal.clear();
+    StateRequestKind kind;
+    std::string path;
+    {
+        std::lock_guard lock(m_stateRequestMutex);
+        kind = m_stateRequestKind;
+        path = m_stateRequestPath;
+        m_stateRequestKind = StateRequestKind::None;
+        m_stateRequestPending.store(false, std::memory_order_release);
+    }
+    const bool ok = m_runtime.performStateRequest(kind == StateRequestKind::Save, path);
+    return ok && kind == StateRequestKind::Load;
+}
+
+void EeScheduler::serializeState(ps2x::StateArchive &a)
+{
+    std::string reason;
+    if (a.saving() && !stateQuiet(&reason))
+        throw ps2x::StateError("EE scheduler is not at a quiet point: " + reason);
+
+    auto context = [](ps2x::StateArchive &x, R5900Context &c) { x.value(c); };
+    auto wait = [](ps2x::StateArchive &x, EeWaitState &w)
+    {
+        x.value(w.reason);
+        uint32_t kind = static_cast<uint32_t>(w.payload.index());
+        x.value(kind);
+        if (x.loading())
+        {
+            switch (kind)
+            {
+            case 0: w.payload = std::monostate{}; break;
+            case 1: w.payload = EeSemaphoreWait{}; break;
+            case 2: w.payload = EeEventFlagWait{}; break;
+            case 3: w.payload = EeVSyncWait{}; break;
+            case 4: w.payload = EeExternalWait{}; break;
+            default: throw ps2x::StateError("unknown EE wait kind");
+            }
+            w.completion = {};
+        }
+        std::visit([&](auto &payload)
+        {
+            if constexpr (!std::is_same_v<std::decay_t<decltype(payload)>, std::monostate>)
+                x.value(payload);
+        }, w.payload);
+    };
+    auto invocation = [&](ps2x::StateArchive &x, GuestInvocation &inv)
+    {
+        x.value(inv.kind);
+        x.value(inv.sequence);
+        x.value(inv.tag);
+        context(x, inv.context);
+        if (x.loading())
+        {
+            inv.shouldExecute = {};
+            inv.onComplete = {};
+        }
+    };
+
+    a.tag("EESC");
+    a.map(m_threads, [&](ps2x::StateArchive &x, GuestThread &t)
+    {
+        x.value(t.id);
+        context(x, t.context);
+        x.value(t.entry);
+        x.value(t.stack);
+        x.value(t.stackSize);
+        x.value(t.gp);
+        x.value(t.attr);
+        x.value(t.option);
+        x.value(t.arg);
+        x.value(t.initialPriority);
+        x.value(t.currentPriority);
+        x.value(t.status);
+        x.value(t.suspendCount);
+        x.value(t.wakeupCount);
+        x.value(t.ownsStack);
+        x.value(t.tlsBase);
+        wait(x, t.wait);
+        if (x.loading())
+            t.resumeCompletion = {};
+        x.sequence(t.invocations, invocation); // empty at a quiet point
+    });
+    for (auto &queue : m_readyQueues)
+        a.deque(queue);
+    a.vector(m_sharedCop2);
+    a.map(m_semaphores, [](ps2x::StateArchive &x, EeSemaphore &s)
+    {
+        x.value(s.id);
+        x.value(s.count);
+        x.value(s.maxCount);
+        x.value(s.initCount);
+        x.value(s.attr);
+        x.value(s.option);
+        x.deque(s.waiters);
+    });
+    a.map(m_eventFlags, [](ps2x::StateArchive &x, EeEventFlag &f)
+    {
+        x.value(f.id);
+        x.value(f.attr);
+        x.value(f.option);
+        x.value(f.initBits);
+        x.value(f.bits);
+        x.deque(f.waiters);
+    });
+    a.podMap(m_alarms);
+    a.podMap(m_intcHandlers);
+    a.podMap(m_dmacHandlers);
+    a.value(m_nextThreadId);
+    a.value(m_nextInvocationThreadId);
+    a.value(m_nextSemaphoreId);
+    a.value(m_nextEventFlagId);
+    a.value(m_nextAlarmId);
+    a.value(m_nextIntcHandlerId);
+    a.value(m_nextDmacHandlerId);
+    a.value(m_intcHeadOrder);
+    a.value(m_intcTailOrder);
+    a.value(m_dmacHeadOrder);
+    a.value(m_dmacTailOrder);
+    a.value(m_enabledIntcMask);
+    a.value(m_enabledDmacMask);
+    a.value(m_currentThreadId);
+    a.value(m_rescheduleRequested);
+    a.value(m_timeSliceExpired);
+    a.value(m_insideInterrupt);
+    a.value(m_pendingEeTimerInterrupts);
+    a.value(m_eeCycle);
+    a.value(m_sliceEndCycle);
+    a.deque(m_events); // empty at a quiet point
+    // Deadlines: guest cycles only. The host (wall-clock) deadline is re-derived on load from the cycles still to
+    // go, so saving the same state twice gives the same bytes.
+    a.sequence(m_deadlines, [this](ps2x::StateArchive &x, ScheduledEvent &d)
+    {
+        x.value(d.deadlineCycle);
+        x.value(d.event);
+        x.value(d.sequence);
+        if (x.loading())
+        {
+            const uint64_t remaining = d.deadlineCycle > m_eeCycle ? d.deadlineCycle - m_eeCycle : 0u;
+            d.hostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(remaining);
+        }
+    });
+    {
+        // Queued invocations without host callbacks (a quiet point allows no others).
+        std::vector<GuestInvocation> pending(m_pendingInvocations.begin(), m_pendingInvocations.end());
+        a.sequence(pending, invocation);
+        if (a.loading())
+            m_pendingInvocations.assign(pending.begin(), pending.end());
+    }
+    a.value(m_eventSequence);
+    a.value(m_invocationSequence);
+    uint64_t vsyncTick = m_vsyncTick.load(std::memory_order_acquire);
+    uint64_t presentationTick = m_presentationTick.load(std::memory_order_acquire);
+    bool pal = m_palVideoMode.load(std::memory_order_acquire);
+    a.value(vsyncTick);
+    a.value(presentationTick);
+    a.value(pal);
+    a.value(m_vsyncFlagAddress);
+    a.value(m_vsyncTickAddress);
+    a.value(m_gsVSyncCallback);
+    a.value(m_gsVSyncCallbackGp);
+    a.value(m_gsVSyncCallbackSp);
+    a.podMap(m_invocationStackTops);
+    a.tag("EEND");
+    if (a.loading())
+    {
+        m_vsyncTick.store(vsyncTick, std::memory_order_release);
+        m_presentationTick.store(presentationTick, std::memory_order_release);
+        m_palVideoMode.store(pal, std::memory_order_release);
+        m_checkpointPending.store(false, std::memory_order_release);
+        updateNextDeadline();
+        publishSnapshot();
     }
 }

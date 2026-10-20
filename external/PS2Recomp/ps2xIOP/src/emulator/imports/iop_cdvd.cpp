@@ -1,3 +1,4 @@
+#include "ps2x/state_archive.h"
 #include "iop_cdvd.h"
 
 #include "../core/iop_cpu.h"
@@ -157,6 +158,8 @@ namespace ps2x::iop::detail
 
     class IopCdvd::Impl
     {
+        friend class IopCdvd; // DW5XL (issue 027): IopCdvd::serializeState
+
     public:
         struct Callback
         {
@@ -788,5 +791,38 @@ namespace ps2x::iop::detail
     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept
     {
         return m_impl->takeCompletionCallback();
+    }
+}
+
+// DW5XL (issue 027): save states.
+namespace ps2x::iop::detail
+{
+    void IopCdvd::serializeState(ps2x::StateArchive &a)
+    {
+        Impl &c = *m_impl;
+        a.tag("ICDV");
+        a.value(c.callback);
+        bool hasCompletion = c.completionCallback.has_value();
+        CompletionCallback completion = hasCompletion ? *c.completionCallback : CompletionCallback{};
+        a.value(hasCompletion);
+        a.value(completion);
+        a.value(c.initialized);
+        a.value(c.mediaMode);
+        a.value(c.currentLsn);
+        a.value(c.lastError);
+        a.value(c.streamFlag);
+        a.value(c.lastReadTimeout);
+        a.value(c.interruptEventFlagId);
+        if (a.loading())
+        {
+            c.completionCallback = hasCompletion ? std::optional<CompletionCallback>(completion) : std::nullopt;
+            // Host handles and the virtual disc index are rebuilt from the disc files on the next read.
+            c.closeFiles();
+            c.nodes.clear();
+            c.metadataSectors.clear();
+            c.virtualIsoBuilt = false;
+            c.virtualIsoValid = false;
+            c.volumeSectors = 0u;
+        }
     }
 }

@@ -1,4 +1,5 @@
 #pragma once
+#include "ps2x/state_archive.h"
 
 #include "ps2x/iop/iop_host.h"
 #include "ps2x/iop/iop_types.h"
@@ -14,6 +15,8 @@ namespace ps2x::iop::detail
     class IopEmulator
     {
     public:
+        // DW5XL (issue 027): the whole IOP (memory, SPU2, kernel, CD, timers, files, modules) for save states.
+        void serializeState(ps2x::StateArchive &archive);
         explicit IopEmulator(IopHost &host);
         ~IopEmulator();
 
