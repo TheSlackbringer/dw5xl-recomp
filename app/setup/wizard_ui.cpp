@@ -108,6 +108,8 @@ struct DiscField
     char path[4096] = "";
     std::string message;
     const DiscSpec *disc = nullptr;
+    bool installed = false; // its files are already in the data folder, checked when they were copied
+    bool replace = false;   // the player chose to install from another image anyway
 
     void set(const fs::path &p)
     {
@@ -127,10 +129,9 @@ struct Wizard
     std::chrono::steady_clock::time_point started;
     std::string actionError;
 
-    bool discInstalled = false;
     bool canStart() const
     {
-        const bool xlOk = xl.disc == &kSupportedDiscs[0] || (discInstalled && xl.path[0] == '\0');
+        const bool xlOk = xl.disc == &kSupportedDiscs[0] || (xl.installed && xl.path[0] == '\0');
         return layoutError.empty() && xlOk && (dw5.path[0] == '\0' || dw5.disc == &kSupportedDiscs[1]);
     }
 
@@ -164,6 +165,20 @@ struct Wizard
     {
         ImGui::TextUnformatted(f.label);
         ImGui::PushID(f.label);
+        // Installed (owner 2026-10-20): say so plainly instead of an empty field that looks like it needs input.
+        if (f.installed && !f.replace && f.path[0] == '\0')
+        {
+            ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1), "Installed and verified - no disc image needed.");
+            if (!locked)
+            {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Use another image..."))
+                    f.replace = true;
+            }
+            ImGui::PopID();
+            ImGui::Spacing();
+            return;
+        }
         ImGui::BeginDisabled(locked);
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 110.0f);
         if (ImGui::InputText("##path", f.path, sizeof(f.path)) || ImGui::IsItemDeactivatedAfterEdit())
@@ -178,6 +193,17 @@ struct Wizard
         }
         ImGui::EndDisabled();
         ImGui::EndDisabled();
+        if (f.installed && !locked)
+        {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Keep the installed files"))
+            {
+                f.path[0] = '\0';
+                f.message.clear();
+                f.disc = nullptr;
+                f.replace = false;
+            }
+        }
         if (!f.message.empty())
         {
             const bool good = f.disc != nullptr;
@@ -236,10 +262,11 @@ struct Wizard
         if (!layoutError.empty())
             ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1), "This package is incomplete: %s", layoutError.c_str());
 
-        if (discInstalled && !run)
-            ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1),
-                               "Your game files are installed. Start builds the game for this version; "
-                               "no disc image needed.");
+        if (xl.installed && !run && !base.installOnly)
+        {
+            ImGui::TextWrapped("Your game files are already installed. Start builds the game for this version.");
+            ImGui::Spacing();
+        }
         discRow(xl, running);
         discRow(dw5, running);
 
@@ -250,8 +277,10 @@ struct Wizard
                 start();
             ImGui::EndDisabled();
             ImGui::SameLine();
+            const bool copies = xl.path[0] != '\0' || dw5.path[0] != '\0';
             ImGui::TextDisabled(base.installOnly ? "Copies and checks the game files from your disc (1-2 minutes)."
-                                                 : "Copies the game files, translates and compiles them (10-30 minutes).");
+                                : copies         ? "Copies the game files, translates and compiles them (10-30 minutes)."
+                                                 : "Translates and compiles the game (10-30 minutes).");
         }
         else
         {
@@ -308,7 +337,8 @@ bool runWizardWindow(const WizardConfig &config)
     Wizard w;
     w.base = config.base;
     w.layoutError = config.layoutError;
-    w.discInstalled = config.discInstalled;
+    w.xl.installed = config.discInstalled;
+    w.dw5.installed = config.dw5Installed;
     if (!config.xlIso.empty())
         w.xl.set(config.xlIso);
     if (!config.dw5Iso.empty())

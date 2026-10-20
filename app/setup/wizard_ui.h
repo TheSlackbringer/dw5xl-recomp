@@ -18,6 +18,7 @@ struct WizardConfig
     std::string layoutError; // shown instead of allowing a start (incomplete package)
     std::filesystem::path xlIso, dw5Iso; // prefilled fields
     bool discInstalled = false;     // the XL files are already in the data folder: Start works without an image
+    bool dw5Installed = false;      // the DW5 files (Load Original) are already in the data folder
     bool closeWhenFinished = false; // the release launcher: close the window when done (the game starts next)
 };
 

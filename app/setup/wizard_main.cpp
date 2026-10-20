@@ -141,6 +141,7 @@ int main(int argc, char **argv)
     if (!release.empty())
     {
         config.discInstalled = installed();
+        config.dw5Installed = installState(data, kSupportedDiscs[1]) == InstallState::Installed;
         config.closeWhenFinished = true;
     }
     if (runWizardWindow(config) && !release.empty())
