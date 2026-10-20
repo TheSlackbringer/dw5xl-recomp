@@ -72,7 +72,7 @@ jobs:
     container: archlinux:latest
     steps:
       - name: Tools
-        run: pacman -Syu --noconfirm --needed git cmake ninja python curl unzip xz make diffutils
+        run: pacman -Syu --noconfirm --needed git cmake ninja python curl unzip xz make diffutils gcc # gcc: host compiler for FFmpeg's configure
       - uses: actions/checkout@v7
       - name: llvm-mingw (pinned, checksum)
         run: |
