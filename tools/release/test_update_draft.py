@@ -4,6 +4,7 @@ import hashlib
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from update_draft import GitHub, PublishedDuringUpdate, select_release, update_draft
 
@@ -68,6 +69,27 @@ class DraftLifecycleTest(unittest.TestCase):
         self.assertTrue(github.state[0]['draft'])
         self.assertTrue(github.state[0]['prerelease'])
         self.assertEqual(github.state[0]['target_commitish'], '123abcd')
+
+    def test_versioned_release_notes_keep_current_build_metadata(self):
+        notes = Path(self.scratch.name) / 'notes'
+        notes.mkdir()
+        (notes / 'v0.1.0-alpha.1.md').write_text('## New: Linux AppImage\n\nSynthetic release notes.\n')
+        github = FakeGitHub([])
+        with patch('update_draft.NOTES_DIR', notes, create=True):
+            self.update(github)
+        body = github.state[0]['body']
+        self.assertIn('## New: Linux AppImage', body)
+        self.assertIn('123abcd', body)
+        self.assertIn('run 42', body)
+
+    def test_published_version_notes_are_not_reused_for_next_draft(self):
+        notes = Path(self.scratch.name) / 'notes'
+        notes.mkdir()
+        (notes / 'v0.1.0-alpha.1.md').write_text('Previous release only.\n')
+        github = FakeGitHub([release('v0.1.0-alpha.1', False)])
+        with patch('update_draft.NOTES_DIR', notes, create=True):
+            self.update(github)
+        self.assertNotIn('Previous release only.', github.state[-1]['body'])
 
     def test_unpublished_draft_keeps_its_number(self):
         github = FakeGitHub([release('v0.1.0-alpha.1', True)])

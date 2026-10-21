@@ -13,6 +13,8 @@ from pathlib import Path
 import re
 import subprocess
 
+NOTES_DIR = Path(__file__).with_name('notes')
+
 
 class PublishedDuringUpdate(Exception):
     pass
@@ -92,6 +94,16 @@ def package_for_version(source, version):
     return target, checksum
 
 
+def release_body(version, commit, run_id, subject, platforms):
+    metadata = (f'Built by GitHub Actions from {commit} (run {run_id}) after every test job passed.\n\n'
+                f'{platforms} builder packages: launcher, compiler, sources and tools. '
+                'The first start builds the game from your own disc.\n\n'
+                f'Latest commit: {subject.splitlines()[0] if subject else ""}\n\n'
+                'Draft packages are updated by CI until the owner publishes this version.')
+    notes = NOTES_DIR / f'{version}.md'
+    return notes.read_text().rstrip() + '\n\n---\n\n' + metadata if notes.is_file() else metadata
+
+
 def update_draft(github, source, commit, run_id, subject, series='v0.1.0-alpha'):
     sources = [source] if isinstance(source, Path) else list(source)
     platforms = 'Windows and Linux' if len(sources) > 1 else 'Windows'
@@ -101,11 +113,7 @@ def update_draft(github, source, commit, run_id, subject, series='v0.1.0-alpha')
             'tag_name': version,
             'target_commitish': commit,
             'name': f'DW5XL {version}',
-            'body': (f'Built by GitHub Actions from {commit} (run {run_id}) after every test job passed.\n\n'
-                     f'{platforms} builder packages: launcher, compiler, sources and tools. '
-                     'The first start builds the game from your own disc.\n\n'
-                     f'Latest commit: {subject.splitlines()[0] if subject else ""}\n\n'
-                     'Draft packages are updated by CI until the owner publishes this version.'),
+            'body': release_body(version, commit, run_id, subject, platforms),
         }
         try:
             if release is None:
