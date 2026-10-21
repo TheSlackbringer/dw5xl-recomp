@@ -603,6 +603,11 @@ namespace vl
         uint32_t subStart = ~0u;
         // A VU0 microprogram (4 KB micro memory, run on the EE thread by VCALLMS); issue 025.
         bool vu0 = false;
+        // Issue 025: if runCount > 0, hash is FNV-1a over exactly the program's reachable code, given as runCount
+        // (start, size) byte ranges in ascending order. Any microcode image holding the same program matches,
+        // whatever other programs sit in the gaps.
+        const uint32_t *runs = nullptr;
+        uint32_t runCount = 0;
     };
 
     struct Registrar

@@ -531,10 +531,18 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     uint32_t firstChunk = copyBytes;
                     if (destAddr + firstChunk > PS2_VU1_CODE_SIZE)
                         firstChunk = PS2_VU1_CODE_SIZE - destAddr;
-                    std::memcpy(m_vu1Code + destAddr, data + pos, firstChunk);
-                    if (copyBytes > firstChunk)
-                        std::memcpy(m_vu1Code, data + pos + firstChunk, copyBytes - firstChunk);
-                    markVU1CodeModified();
+                    // Issue 025: games re-upload the same microcode many times per frame. Bytes that are already
+                    // there change nothing, so they must not invalidate the decode cache or the translation lookup.
+                    const bool same = std::memcmp(m_vu1Code + destAddr, data + pos, firstChunk) == 0 &&
+                                      (copyBytes == firstChunk ||
+                                       std::memcmp(m_vu1Code, data + pos + firstChunk, copyBytes - firstChunk) == 0);
+                    if (!same)
+                    {
+                        std::memcpy(m_vu1Code + destAddr, data + pos, firstChunk);
+                        if (copyBytes > firstChunk)
+                            std::memcpy(m_vu1Code, data + pos + firstChunk, copyBytes - firstChunk);
+                        markVU1CodeModified();
+                    }
                 }
             }
             pos += mpgBytes;

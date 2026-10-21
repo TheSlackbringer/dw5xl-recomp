@@ -79,6 +79,28 @@ inline constexpr Chunk kChunks33[] = {{112u, 438864u, 1936u, "OVL_00.BIN"}, {204
 inline constexpr Chunk kChunks34[] = {{0u, 438752u, 112u, "OVL_00.BIN"}};
 inline constexpr Chunk kChunks35[] = {{2048u, 2269896u, 2048u, nullptr}, {4096u, 2271952u, 456u, nullptr}, {4568u, 2272424u, 576u, nullptr}};
 inline constexpr Chunk kChunks36[] = {{9216u, 2274040u, 2048u, nullptr}, {11264u, 2276096u, 568u, nullptr}, {11848u, 2276680u, 576u, nullptr}};
+inline constexpr Chunk kChunks37[] = {{0u, 2158264u, 696u, nullptr}};
+inline constexpr Chunk kChunks38[] = {{0u, 2158984u, 872u, nullptr}};
+inline constexpr Chunk kChunks39[] = {{2048u, 2289048u, 696u, nullptr}};
+inline constexpr Chunk kChunks40[] = {{1520u, 2245368u, 16u, nullptr}, {1544u, 2245392u, 40u, nullptr}, {2048u, 2289048u, 696u, nullptr}};
+inline constexpr Chunk kChunks41[] = {{1520u, 2245368u, 16u, nullptr}, {1544u, 2245392u, 40u, nullptr}, {2048u, 2269080u, 792u, nullptr}};
+inline constexpr Chunk kChunks42[] = {{1536u, 2245384u, 48u, nullptr}, {9216u, 2289768u, 848u, nullptr}};
+inline constexpr Chunk kChunks43[] = {{0u, 2290696u, 584u, nullptr}, {600u, 2291296u, 32u, nullptr}};
+inline constexpr Chunk kChunks44[] = {{0u, 2155144u, 720u, nullptr}};
+inline constexpr Chunk kChunks45[] = {{64u, 2239560u, 16u, nullptr}, {3040u, 2242544u, 1056u, nullptr}, {4096u, 2243608u, 120u, nullptr}};
+inline constexpr Chunk kChunks46[] = {{0u, 2156968u, 1272u, nullptr}};
+inline constexpr Chunk kChunks47[] = {{2048u, 2269896u, 2048u, nullptr}, {4096u, 2271952u, 456u, nullptr}, {4568u, 2272424u, 576u, nullptr}};
+inline constexpr Chunk kChunks48[] = {{32u, 2239528u, 16u, nullptr}, {2384u, 2241888u, 656u, nullptr}};
+inline constexpr Chunk kChunks49[] = {{0u, 2158984u, 888u, nullptr}};
+inline constexpr Chunk kChunks50[] = {{1184u, 2155848u, 16u, nullptr}};
+inline constexpr Chunk kChunks51[] = {{1520u, 2245368u, 16u, nullptr}, {1544u, 2245392u, 40u, nullptr}, {2048u, 2269896u, 2048u, nullptr}, {4096u, 2271952u, 456u, nullptr}, {4568u, 2272424u, 576u, nullptr}};
+inline constexpr Chunk kChunks52[] = {{0u, 406768u, 16u, "OVL_00.BIN"}};
+inline constexpr Chunk kChunks53[] = {{112u, 438864u, 1936u, "OVL_00.BIN"}, {2048u, 440808u, 304u, "OVL_00.BIN"}, {2368u, 441128u, 1728u, "OVL_00.BIN"}, {4096u, 442864u, 1856u, "OVL_00.BIN"}};
+inline constexpr Chunk kChunks54[] = {{0u, 417520u, 184u, "OVL_00.BIN"}};
+inline constexpr Chunk kChunks55[] = {{16u, 409840u, 656u, "OVL_00.BIN"}, {688u, 410512u, 1360u, "OVL_00.BIN"}, {2048u, 411880u, 1080u, "OVL_00.BIN"}};
+inline constexpr Chunk kChunks56[] = {{184u, 417704u, 496u, "OVL_00.BIN"}, {696u, 418216u, 1352u, "OVL_00.BIN"}, {2048u, 419576u, 440u, "OVL_00.BIN"}};
+inline constexpr Chunk kChunks57[] = {{1536u, 2245384u, 48u, nullptr}, {9216u, 2273016u, 992u, nullptr}};
+inline constexpr Chunk kChunks58[] = {{2048u, 2279112u, 976u, nullptr}};
 inline constexpr Range kRanges[] = {
     {"1ad6eefff0c2e7e5", 2048u, 2680u, "lift_1ad6_0800", kChunks0, 1u, "2f3879c28eeebe36ce2d32c44c1bf6c37588de02df327e853f364434e815474a"},
     {"1ad6eefff0c2e7e5", 4096u, 4784u, "lift_1ad6_1000", kChunks1, 2u, "088206beaf43d8fffbe7cb8ef919d097201fb41179cc1721c00f9fe5c16dfdde"},
@@ -117,6 +139,28 @@ inline constexpr Range kRanges[] = {
     {"881c2abb30cea5ce", 0u, 104u, "lift_opening_881c_0000", kChunks34, 1u, "f25eaa23f29cffc494aefa5c9fbb8ba8aa07155dce19441b5bcdeef20b4424a4"},
     {"3a4f0cd1c30a3aef", 2048u, 5136u, "lift_battle_3a4f_0800", kChunks35, 3u, "89287eb97c5bfa17ee846b280bcc5a8669d6537ca851d57d69913d55d9b3d93c"},
     {"3a4f0cd1c30a3aef", 9216u, 12416u, "lift_battle_3a4f_2400", kChunks36, 3u, "57440b64b70260c64c9798ed25c1cbb6c7a143dfe3627e39acd21faa2ee2f14d"},
+    {"d29a38db75ab7cca_0000", 0u, 688u, "lift_sishui_d29a_0000", kChunks37, 1u, "ad9ba2b0b885d3085560ff64cd7d652ad18f8ee9f4cf17b7704585090c1f75ec"},
+    {"1ba40975a14161fc_0000", 0u, 864u, "lift_sishui_1ba4_0000", kChunks38, 1u, "dda311869bcc9fe9f17def8f1ec370d7fa6e70f0e7696f78200ba7905e68469c"},
+    {"49f60042ec1ea159_0800", 2048u, 2736u, "lift_sishui_49f6_0800", kChunks39, 1u, "c79fe520b2fac464cfe849193e97feb7ae0b83b47d4df03950b5d78d9c564ce9"},
+    {"49f60042ec1ea159_05f0", 1520u, 2736u, "lift_sishui_49f6_05f0", kChunks40, 3u, "c5699ccfe6f1cbb48ac5cd2c57f347714b5244ad9dfd5b8b300195f319a7fcea"},
+    {"563f13c8dedc09e4_05f0", 1520u, 2832u, "lift_sishui_563f_05f0", kChunks41, 3u, "026302f28965d941f5eae6d63aad1330a906121a73da17e8cbf6d6a276c23c4c"},
+    {"49f60042ec1ea159_0600", 1536u, 10056u, "lift_sishui_49f6_0600", kChunks42, 2u, "df4879779345772db6940dd27b04acd0dccafb86dfe877c2ae422d6f04c2941a"},
+    {"6621289d99458305_0000", 0u, 624u, "lift_sishui_6621_0000", kChunks43, 2u, "598a7c6fe3bcbf3c411d520f12e21d07e8947165dbe2206fdb69fcfa6723add2"},
+    {"fae9165130cc72ff_0000", 0u, 712u, "lift_sishui_fae9_0000", kChunks44, 1u, "80e7c3ebf6a371fdbdb3842d132a95abde66a4e0970ba690f26037e9b5d4a0e6"},
+    {"8d905f87f3bcba9d_0040", 64u, 4208u, "lift_sishui_8d90_0040", kChunks45, 3u, "2f05fc9977a4a90cf990ffeaecc1bbd0125a3d263eec53d1ebcd41ee82e61035"},
+    {"5e225d7fd5bf037b_0000", 0u, 1264u, "lift_sishui_5e22_0000", kChunks46, 1u, "99e480d5d3c54777be23c52050d622c6e7372f0a85e9511c8faa37d350a42467"},
+    {"336695fe491687e6_0800", 2048u, 5136u, "lift_sishui_3366_0800", kChunks47, 3u, "89287eb97c5bfa17ee846b280bcc5a8669d6537ca851d57d69913d55d9b3d93c"},
+    {"3cb47dd9f41da6ae_0020", 32u, 3032u, "lift_sishui_3cb4_0020", kChunks48, 2u, "428cdeb5826e4a84c9dbb066cc6aa0a05f828c7862748677fd65e7aeab65db95"},
+    {"1ba40975a14161fc_0368", 872u, 880u, "lift_sishui_1ba4_0368", kChunks49, 1u, "3b652ffdb2e8cb3328443a9e764c1b4c846a31951b257ff690cab7f615e57a83"},
+    {"eb1d3af053afc5c2_04a0", 1184u, 1192u, "lift_sishui_eb1d_04a0", kChunks50, 1u, "5eb74410b7d656eb5a22ee9e60eef38c6896a22506b84d1277503a6641acc0df"},
+    {"3a4f0cd1c30a3aef_05f0", 1520u, 5136u, "lift_sishui_3a4f_05f0", kChunks51, 5u, "bb955c614f07dc75a13926e9fa7c8be5364243ed97a9f085f55ab18ce0cebf82"},
+    {"dd3d1361f34c85a3_0000", 0u, 8u, "lift_opening_dd3d_0000", kChunks52, 1u, "5eb74410b7d656eb5a22ee9e60eef38c6896a22506b84d1277503a6641acc0df"},
+    {"881c2abb30cea5ce_0070", 112u, 5944u, "lift_opening_881c_0070", kChunks53, 4u, "4d6c00440928cd410fce0ee185285937694c2beb81caf87efc89d9f7e333b100"},
+    {"4dedc9b811a016b1_0000", 0u, 176u, "lift_opening_4ded_0000", kChunks54, 1u, "6b58bcdba4b00a4f0505ac4432c08a285defa93bd21c0290aa9cf9ddb5a51e75"},
+    {"dd3d1361f34c85a3_0010", 16u, 3120u, "lift_opening_dd3d_0010", kChunks55, 3u, "e092ee754418fca7c06c404ab71ada70a99313d1ea4f779f0a04a97b9929a6da"},
+    {"4dedc9b811a016b1_00b8", 184u, 2480u, "lift_opening_4ded_00b8", kChunks56, 3u, "b4eb54528f77a27671d9bbe01e1af6286044b8fa9956ab37fd01b400c109ad94"},
+    {"baa8e61743cea7a2_0600", 1536u, 10200u, "lift_battle_baa8_0600", kChunks57, 2u, "59a42e029f333b93580aa184c2805f0f8557b8f44a6af8e545b7bcfd5f16876d"},
+    {"64c44bbb44892dc9_0800", 2048u, 3016u, "lift_battle_64c4_0800", kChunks58, 1u, "5844121311d241bfa214d908d4a07fc415375be630e74adfb63473d47f2fe090"},
 };
 inline constexpr ImageRegistration kImageRegistrations[] = {
     {0x1ad6eefff0c2e7e5ull, 2048u, "lift_1ad6_0800"},
@@ -262,6 +306,28 @@ inline constexpr ImageRegistration kImageRegistrations[] = {
     {0xeb1d3af053afc5c2ull, 9216u, "lift_battle_calls_eb1d3af0_2400"},
     {0x3a4f0cd1c30a3aefull, 2048u, "lift_battle_3a4f_0800"},
     {0x3a4f0cd1c30a3aefull, 9216u, "lift_battle_3a4f_2400"},
+    {0xd29a38db75ab7ccaull, 0u, "lift_sishui_d29a_0000"},
+    {0x1ba40975a14161fcull, 0u, "lift_sishui_1ba4_0000"},
+    {0x49f60042ec1ea159ull, 2048u, "lift_sishui_49f6_0800"},
+    {0x49f60042ec1ea159ull, 1520u, "lift_sishui_49f6_05f0"},
+    {0x563f13c8dedc09e4ull, 1520u, "lift_sishui_563f_05f0"},
+    {0x49f60042ec1ea159ull, 1536u, "lift_sishui_49f6_0600"},
+    {0x6621289d99458305ull, 0u, "lift_sishui_6621_0000"},
+    {0xfae9165130cc72ffull, 0u, "lift_sishui_fae9_0000"},
+    {0x8d905f87f3bcba9dull, 64u, "lift_sishui_8d90_0040"},
+    {0x5e225d7fd5bf037bull, 0u, "lift_sishui_5e22_0000"},
+    {0x336695fe491687e6ull, 2048u, "lift_sishui_3366_0800"},
+    {0x3cb47dd9f41da6aeull, 32u, "lift_sishui_3cb4_0020"},
+    {0x1ba40975a14161fcull, 872u, "lift_sishui_1ba4_0368"},
+    {0xeb1d3af053afc5c2ull, 1184u, "lift_sishui_eb1d_04a0"},
+    {0x3a4f0cd1c30a3aefull, 1520u, "lift_sishui_3a4f_05f0"},
+    {0xdd3d1361f34c85a3ull, 0u, "lift_opening_dd3d_0000"},
+    {0x881c2abb30cea5ceull, 112u, "lift_opening_881c_0070"},
+    {0x4dedc9b811a016b1ull, 0u, "lift_opening_4ded_0000"},
+    {0xdd3d1361f34c85a3ull, 16u, "lift_opening_dd3d_0010"},
+    {0x4dedc9b811a016b1ull, 184u, "lift_opening_4ded_00b8"},
+    {0xbaa8e61743cea7a2ull, 1536u, "lift_battle_baa8_0600"},
+    {0x64c44bbb44892dc9ull, 2048u, "lift_battle_64c4_0800"},
 };
 inline constexpr Target kTargets[] = {
     {"dd3d1361f34c85a3", 672u, 3120u, "lift_opening_dd3d_02a0"},
@@ -299,6 +365,28 @@ inline constexpr Target kTargets[] = {
     {"87e0189b1bc04e8e", 40u, 240u, "lift_battle_init_0028"},
     {"3a4f0cd1c30a3aef", 2048u, 5136u, "lift_battle_3a4f_0800"},
     {"3a4f0cd1c30a3aef", 9216u, 12416u, "lift_battle_3a4f_2400"},
+    {"d29a38db75ab7cca_0000", 0u, 688u, "lift_sishui_d29a_0000"},
+    {"1ba40975a14161fc_0000", 0u, 864u, "lift_sishui_1ba4_0000"},
+    {"49f60042ec1ea159_0800", 2048u, 2736u, "lift_sishui_49f6_0800"},
+    {"49f60042ec1ea159_05f0", 1520u, 2736u, "lift_sishui_49f6_05f0"},
+    {"563f13c8dedc09e4_05f0", 1520u, 2832u, "lift_sishui_563f_05f0"},
+    {"49f60042ec1ea159_0600", 1536u, 10056u, "lift_sishui_49f6_0600"},
+    {"6621289d99458305_0000", 0u, 624u, "lift_sishui_6621_0000"},
+    {"fae9165130cc72ff_0000", 0u, 712u, "lift_sishui_fae9_0000"},
+    {"8d905f87f3bcba9d_0040", 64u, 4208u, "lift_sishui_8d90_0040"},
+    {"5e225d7fd5bf037b_0000", 0u, 1264u, "lift_sishui_5e22_0000"},
+    {"336695fe491687e6_0800", 2048u, 5136u, "lift_sishui_3366_0800"},
+    {"3cb47dd9f41da6ae_0020", 32u, 3032u, "lift_sishui_3cb4_0020"},
+    {"1ba40975a14161fc_0368", 872u, 880u, "lift_sishui_1ba4_0368"},
+    {"eb1d3af053afc5c2_04a0", 1184u, 1192u, "lift_sishui_eb1d_04a0"},
+    {"3a4f0cd1c30a3aef_05f0", 1520u, 5136u, "lift_sishui_3a4f_05f0"},
+    {"dd3d1361f34c85a3_0000", 0u, 8u, "lift_opening_dd3d_0000"},
+    {"881c2abb30cea5ce_0070", 112u, 5944u, "lift_opening_881c_0070"},
+    {"4dedc9b811a016b1_0000", 0u, 176u, "lift_opening_4ded_0000"},
+    {"dd3d1361f34c85a3_0010", 16u, 3120u, "lift_opening_dd3d_0010"},
+    {"4dedc9b811a016b1_00b8", 184u, 2480u, "lift_opening_4ded_00b8"},
+    {"baa8e61743cea7a2_0600", 1536u, 10200u, "lift_battle_baa8_0600"},
+    {"64c44bbb44892dc9_0800", 2048u, 3016u, "lift_battle_64c4_0800"},
 };
 inline constexpr Chunk kVu0Chunks0[] = {{80u, 2236040u, 16u, nullptr}, {232u, 2236192u, 568u, nullptr}, {2504u, 2238472u, 376u, nullptr}, {2912u, 2238880u, 56u, nullptr}};
 inline constexpr Chunk kVu0Chunks1[] = {{144u, 2236104u, 16u, nullptr}, {192u, 2236152u, 40u, nullptr}, {368u, 2236328u, 432u, nullptr}};

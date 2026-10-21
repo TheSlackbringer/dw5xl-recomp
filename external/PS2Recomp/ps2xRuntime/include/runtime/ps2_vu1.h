@@ -300,6 +300,7 @@ private:
     std::vector<uint8_t> *m_gifCapture = nullptr;
     bool m_verifyShadow = false;
     bool m_liftCanceled = false;
+    bool m_lastRunLifted = false; // the last run() executed translated code (census, issue 025)
 
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,

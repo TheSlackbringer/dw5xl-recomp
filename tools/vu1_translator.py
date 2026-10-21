@@ -419,8 +419,47 @@ def lower_writes_vf(l):
 MAC_STATUS_READERS = (0x14, 0x15, 0x16, 0x17, 0x18, 0x1a, 0x1b)
 QUEUE_FMAC_FLAGS = True
 
-def fmac_flag_code():
+# Issue 025: FMAC flag results nothing can observe. A result lands kFmacLatency (4) cycles after its pair and stays
+# visible until the next result lands. If the next flag-producing FMAC follows in straight-line code and no flag
+# reader, branch or stop (E/D/T bit) comes from the pair after this one up to three pairs after that next FMAC,
+# no instruction (and no later run) can see this result: it is not queued, and its sticky bits (cur | extra, all
+# that commit ORs into status bits 6-11) ride on the next queued result, which commits no earlier than any reader
+# that could have seen them.
+DEAD_PUSHES = set()
+_BRANCH_OPS = (0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2c, 0x2d, 0x2e, 0x2f)
+
+def find_dead_pushes(code, reachable):
+    reach = set(reachable)
+    info = {}
+    for pc in reachable:
+        lo, up = struct.unpack_from('<II', code, pc)
+        i_bit = (up >> 31) & 1
+        l = decode_lower(lo, pc)
+        m = re.search(r'fmac<\w+, (\d+)>', translate_upper(decode_upper(up & 0x07ffffff)))
+        lower_norm = not i_bit and l['type'] == 'NORM'
+        info[pc] = (m is not None and int(m.group(1)) != 0,
+                    lower_norm and l['op'] in MAC_STATUS_READERS,
+                    bool((up >> 27) & 0xB) or (lower_norm and l['op'] in _BRANCH_OPS))
+    dead = set()
+    for pc in reachable:
+        push, _, barrier = info[pc]
+        if not push or barrier:
+            continue
+        q = pc + 8
+        while q in reach and not info[q][1] and not info[q][2] and not info[q][0]:
+            q += 8
+        if q not in reach or not info[q][0] or info[q][1] or info[q][2]:
+            continue
+        if all(q + 8 * k in reach and not info[q + 8 * k][1] and not info[q + 8 * k][2] for k in (1, 2, 3)):
+            dead.add(pc)
+    return dead
+
+def fmac_flag_code(pc=None):
     if QUEUE_FMAC_FLAGS:
+        if DEAD_PUSHES and pc in DEAD_PUSHES:
+            return "    if (fl.pending) { fl.pending = false; stk |= fl.cur | fl.extra; }"
+        if DEAD_PUSHES:
+            return "    if (fl.pending) { fl.pending = false; vl::LiftAccess::flagsPush(c, fq, cyc, fl.mac, fl.cur, fl.extra | stk); stk = 0; }"
         return "    if (fl.pending) { fl.pending = false; vl::LiftAccess::flagsPush(c, fq, cyc, fl.mac, fl.cur, fl.extra); }"
     return "    if (fl.pending) { fl.pending = false; lastMac = fl.mac; lastCur = fl.cur; sticky6 |= fl.cur | fl.extra; anyFmac = true; }"
 
@@ -440,7 +479,7 @@ def emit_pair(u, l, lo, i_bit, pc, out):
     if up_code:
         out.append(f"    {up_code}")
         if 'fmac<' in up_code:
-            out.append(fmac_flag_code())
+            out.append(fmac_flag_code(pc))
     if lo_code: out.append(f"    {lo_code}")
 
 def timing_begin(code, pc, timings):
@@ -594,7 +633,7 @@ def emit_static_region(code, region, emit_one, out):
     out.append("    } }")
 
 def translate_segment(code, entry_pc, fn_name, static_timing=False):
-    global QUEUE_FMAC_FLAGS
+    global QUEUE_FMAC_FLAGS, DEAD_PUSHES
     reachable = find_reachable(code, entry_pc)
     QUEUE_FMAC_FLAGS = False
     for rpc in reachable:
@@ -669,8 +708,11 @@ def translate_segment(code, entry_pc, fn_name, static_timing=False):
     out.append("    uint8_t *mem = c.mem;")
     out.append("    uint64_t *rdy = vl::LiftAccess::readyTable(c);")
     out.append("    uint64_t cyc = vl::LiftAccess::cycle(c), hz = 0;")
+    DEAD_PUSHES = find_dead_pushes(code, reachable) if QUEUE_FMAC_FLAGS else set()
     if QUEUE_FMAC_FLAGS:
         out.append("    vl::LiftAccess::FlagQueue fq; vl::LiftAccess::flagsEnter(c, fq);")
+    if DEAD_PUSHES:
+        out.append("    uint32_t stk = 0; // sticky bits of FMAC results nothing can observe (issue 025)")
     out.append("    bool bbValid = false; uint8_t bbReg = 0; int32_t bbVal = 0, ov = 0;")
     out.append("    auto brvi = [&](int r) -> int32_t { return r == 0 ? 0 : ((bbValid && bbReg == r) ? bbVal : vi[r]); };")
     for bpc in sorted(branch_info.keys()):
@@ -729,7 +771,7 @@ def translate_segment(code, entry_pc, fn_name, static_timing=False):
                 if up_code:
                     out.append(f"    {up_code}")
                     if 'fmac<' in up_code:
-                        out.append(fmac_flag_code())
+                        out.append(fmac_flag_code(pc))
                 out.append(f"    taken_{pc:04x} = {cond};")
                 if pc in call_info:
                     op, ft, fs = call_info[pc]
@@ -955,6 +997,29 @@ if __name__ == '__main__':
         ('87e0189b1bc04e8e', 0x0028, 0x00f0, 'lift_battle_init_0028'),
         ('3a4f0cd1c30a3aef', 0x0800, 0x1410, 'lift_battle_3a4f_0800'),
         ('3a4f0cd1c30a3aef', 0x2400, 0x3080, 'lift_battle_3a4f_2400'),
+        # Issue 025 (spec v3): Si Shui Gate fight programs that ran interpreted.
+        ('d29a38db75ab7cca_0000', 0x0000, 0x02b0, 'lift_sishui_d29a_0000'),
+        ('1ba40975a14161fc_0000', 0x0000, 0x0360, 'lift_sishui_1ba4_0000'),
+        ('49f60042ec1ea159_0800', 0x0800, 0x0ab0, 'lift_sishui_49f6_0800'),
+        ('49f60042ec1ea159_05f0', 0x05f0, 0x0ab0, 'lift_sishui_49f6_05f0'),
+        ('563f13c8dedc09e4_05f0', 0x05f0, 0x0b10, 'lift_sishui_563f_05f0'),
+        ('49f60042ec1ea159_0600', 0x0600, 0x2748, 'lift_sishui_49f6_0600'),
+        ('6621289d99458305_0000', 0x0000, 0x0270, 'lift_sishui_6621_0000'),
+        ('fae9165130cc72ff_0000', 0x0000, 0x02c8, 'lift_sishui_fae9_0000'),
+        ('8d905f87f3bcba9d_0040', 0x0040, 0x1070, 'lift_sishui_8d90_0040'),
+        ('5e225d7fd5bf037b_0000', 0x0000, 0x04f0, 'lift_sishui_5e22_0000'),
+        ('336695fe491687e6_0800', 0x0800, 0x1410, 'lift_sishui_3366_0800'),
+        ('3cb47dd9f41da6ae_0020', 0x0020, 0x0bd8, 'lift_sishui_3cb4_0020'),
+        ('1ba40975a14161fc_0368', 0x0368, 0x0370, 'lift_sishui_1ba4_0368'),
+        ('eb1d3af053afc5c2_04a0', 0x04a0, 0x04a8, 'lift_sishui_eb1d_04a0'),
+        ('3a4f0cd1c30a3aef_05f0', 0x05f0, 0x1410, 'lift_sishui_3a4f_05f0'),
+        ('dd3d1361f34c85a3_0000', 0x0000, 0x0008, 'lift_opening_dd3d_0000'),
+        ('881c2abb30cea5ce_0070', 0x0070, 0x1738, 'lift_opening_881c_0070'),
+        ('4dedc9b811a016b1_0000', 0x0000, 0x00b0, 'lift_opening_4ded_0000'),
+        ('dd3d1361f34c85a3_0010', 0x0010, 0x0c30, 'lift_opening_dd3d_0010'),
+        ('4dedc9b811a016b1_00b8', 0x00b8, 0x09b0, 'lift_opening_4ded_00b8'),
+        ('baa8e61743cea7a2_0600', 0x0600, 0x27d8, 'lift_battle_baa8_0600'),
+        ('64c44bbb44892dc9_0800', 0x0800, 0x0bc8, 'lift_battle_64c4_0800'),
     ]
 
     out = []
@@ -1053,9 +1118,23 @@ if __name__ == '__main__':
             missing = [p for p in find_reachable(code, pc) if not all(covered[h][p:p+8]) or len(covered[h][p:p+8]) != 8]
             if missing:
                 raise ValueError(f'Unextracted reachable instructions in {name}: {missing}')
+        reach = find_reachable(code, pc)
         out.append(translate_segment(code, pc, name, static_timing=static_enabled(name)))
         start_field = f", 0x{sub_start:04x}u" if sub_start != pc else ""
         regs.append(f"    {{ 0x{sub_hash:016x}ull, 0x{pc:04x}, {name}, {sub_size}u{start_field} }},")
+        # Issue 025: when the footprint has gaps (other programs may sit there), also register the reachable code
+        # alone, so every microcode image holding this program uses the translation.
+        runs = []
+        for rpc in reach:
+            if runs and runs[-1][0] + runs[-1][1] == rpc:
+                runs[-1][1] += 8
+            else:
+                runs.append([rpc, 8])
+        if sum(size for _, size in runs) != sub_size:
+            run_hash = fnv1a_64(b''.join(code[start:start + size] for start, size in runs))
+            out.append(f"static const uint32_t kRuns_{name}[] = {{ " +
+                       ", ".join(f"0x{start:04x}u, {size}u" for start, size in runs) + " };")
+            regs.append(f"    {{ 0x{run_hash:016x}ull, 0x{pc:04x}, {name}, 0u, ~0u, false, kRuns_{name}, {len(runs)}u }},")
 
     out.append("""
 void lift_flush_0220(vl::Run &c)

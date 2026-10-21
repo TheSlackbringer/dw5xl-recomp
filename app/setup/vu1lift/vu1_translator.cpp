@@ -806,14 +806,79 @@ std::string join(const std::vector<std::string> &items, const std::string &sep)
     return out;
 }
 
+// Issue 025 (port of find_dead_pushes): the destination mask of the first "fmac<Op, Dest>" in an upper's code, or
+// -1 if there is none.
+int fmacDest(const std::string &upCode)
+{
+    for (size_t pos = upCode.find("fmac<"); pos != std::string::npos; pos = upCode.find("fmac<", pos + 1))
+    {
+        size_t p = pos + 5, q = p;
+        while (q < upCode.size() && (std::isalnum(static_cast<unsigned char>(upCode[q])) || upCode[q] == '_'))
+            ++q;
+        if (q == p || upCode.compare(q, 2, ", ") != 0)
+            continue;
+        size_t d = q + 2, e = d;
+        while (e < upCode.size() && std::isdigit(static_cast<unsigned char>(upCode[e])))
+            ++e;
+        if (e == d || e >= upCode.size() || upCode[e] != '>')
+            continue;
+        return std::stoi(upCode.substr(d, e - d));
+    }
+    return -1;
+}
+
+// FMAC flag results nothing can observe (same rule as tools/vu1_translator.py find_dead_pushes).
+std::set<uint32_t> findDeadPushes(const std::vector<uint8_t> &code, const std::vector<uint32_t> &reachable)
+{
+    static const std::set<uint32_t> kBranchOps = {0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2c, 0x2d, 0x2e, 0x2f};
+    const std::set<uint32_t> reach(reachable.begin(), reachable.end());
+    struct Info { bool push, reader, barrier; };
+    std::map<uint32_t, Info> info;
+    for (uint32_t pc : reachable)
+    {
+        const auto [lo, up] = unpackPair(code, pc);
+        const bool iBit = (up >> 31) & 1;
+        const Lower l = decodeLower(lo, pc);
+        const int dest = fmacDest(translateUpper(decodeUpper(up & 0x07ffffff)));
+        const bool lowerNorm = !iBit && l.type == LType::NORM;
+        info[pc] = {dest > 0, lowerNorm && kMacStatusReaders.count(l.op) != 0,
+                    ((up >> 27) & 0xB) != 0 || (lowerNorm && kBranchOps.count(l.op) != 0)};
+    }
+    auto at = [&](uint32_t pc) -> const Info * { return reach.count(pc) ? &info.at(pc) : nullptr; };
+    std::set<uint32_t> dead;
+    for (uint32_t pc : reachable)
+    {
+        const Info &p = info.at(pc);
+        if (!p.push || p.barrier)
+            continue;
+        uint32_t q = pc + 8;
+        while (at(q) && !at(q)->reader && !at(q)->barrier && !at(q)->push)
+            q += 8;
+        if (!at(q) || !at(q)->push || at(q)->reader || at(q)->barrier)
+            continue;
+        bool clear = true;
+        for (uint32_t k = 1; k <= 3 && clear; ++k)
+            clear = at(q + 8 * k) && !at(q + 8 * k)->reader && !at(q + 8 * k)->barrier;
+        if (clear)
+            dead.insert(pc);
+    }
+    return dead;
+}
+
 struct Segment
 {
     const std::vector<uint8_t> &code;
     bool queueFmacFlags = true;
+    std::set<uint32_t> deadPushes;
     std::vector<std::pair<uint32_t, PairTiming>> timings;
 
-    std::string fmacFlagCode() const
+    std::string fmacFlagCode(uint32_t pc) const
     {
+        if (queueFmacFlags && !deadPushes.empty() && deadPushes.count(pc))
+            return "    if (fl.pending) { fl.pending = false; stk |= fl.cur | fl.extra; }";
+        if (queueFmacFlags && !deadPushes.empty())
+            return "    if (fl.pending) { fl.pending = false; vl::LiftAccess::flagsPush(c, fq, cyc, fl.mac, fl.cur, "
+                   "fl.extra | stk); stk = 0; }";
         if (queueFmacFlags)
             return "    if (fl.pending) { fl.pending = false; vl::LiftAccess::flagsPush(c, fq, cyc, fl.mac, fl.cur, "
                    "fl.extra); }";
@@ -843,7 +908,7 @@ struct Segment
         {
             out.push_back("    " + upCode);
             if (contains(upCode, "fmac<"))
-                out.push_back(fmacFlagCode());
+                out.push_back(fmacFlagCode(pc));
         }
         if (!loCode.empty())
             out.push_back("    " + loCode);
@@ -1229,7 +1294,11 @@ std::string translateSegment(const std::vector<uint8_t> &code, uint32_t entryPc,
     out.push_back("    uint64_t *rdy = vl::LiftAccess::readyTable(c);");
     out.push_back("    uint64_t cyc = vl::LiftAccess::cycle(c), hz = 0;");
     if (queue)
+        seg.deadPushes = findDeadPushes(code, reachable);
+    if (queue)
         out.push_back("    vl::LiftAccess::FlagQueue fq; vl::LiftAccess::flagsEnter(c, fq);");
+    if (!seg.deadPushes.empty())
+        out.push_back("    uint32_t stk = 0; // sticky bits of FMAC results nothing can observe (issue 025)");
     out.push_back("    bool bbValid = false; uint8_t bbReg = 0; int32_t bbVal = 0, ov = 0;");
     out.push_back("    auto brvi = [&](int r) -> int32_t { return r == 0 ? 0 : ((bbValid && bbReg == r) ? bbVal : "
                   "vi[r]); };");
@@ -1299,7 +1368,7 @@ std::string translateSegment(const std::vector<uint8_t> &code, uint32_t entryPc,
                 {
                     out.push_back("    " + upCode);
                     if (contains(upCode, "fmac<"))
-                        out.push_back(seg.fmacFlagCode());
+                        out.push_back(seg.fmacFlagCode(pc));
                 }
                 out.push_back(F("    taken_%04x = ", pc) + cond + ";");
                 const auto call = callInfo.find(pc);
@@ -1551,6 +1620,32 @@ bool generateLiftedVu1(const std::filesystem::path &elf, std::string &text, std:
             const std::string startField = subStart != t.pc ? F(", 0x%04xu", subStart) : std::string();
             regs.push_back(F("    { 0x%016llxull, 0x%04x, ", (unsigned long long)subHash, t.pc) + t.name +
                            F(", %zuu", subSize) + startField + " },");
+            // Issue 025: when the footprint has gaps, also register the reachable code alone (same as the Python).
+            std::vector<std::pair<uint32_t, uint32_t>> runs;
+            for (uint32_t p : reach)
+            {
+                if (!runs.empty() && runs.back().first + runs.back().second == p)
+                    runs.back().second += 8;
+                else
+                    runs.emplace_back(p, 8u);
+            }
+            size_t runBytes = 0;
+            for (const auto &r : runs)
+                runBytes += r.second;
+            if (runBytes != subSize)
+            {
+                std::vector<uint8_t> joined;
+                std::string list;
+                for (const auto &[start, size] : runs)
+                {
+                    joined.insert(joined.end(), code.begin() + start, code.begin() + start + size);
+                    list += (list.empty() ? "" : ", ") + F("0x%04xu, %uu", start, size);
+                }
+                const uint64_t runHash = fnv1a64(joined.data(), joined.size());
+                out.push_back(std::string("static const uint32_t kRuns_") + t.name + "[] = { " + list + " };");
+                regs.push_back(F("    { 0x%016llxull, 0x%04x, ", (unsigned long long)runHash, t.pc) + t.name +
+                               ", 0u, ~0u, false, kRuns_" + t.name + F(", %zuu },", runs.size()));
+            }
         }
         out.push_back(kFlushFunctions);
         regs.push_back("    { 0x5344f2e1f3bd36fbull, 0x0220, lift_flush_0220, 16u },");

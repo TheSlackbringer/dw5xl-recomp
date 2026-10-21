@@ -1795,6 +1795,8 @@ namespace
             uint64_t budgetExhaustions = 0;
             uint64_t abnormalStops = 0;
             uint32_t lastFinalPc = 0;
+            uint64_t liftedRuns = 0;   // runs and resumes that executed translated code (issue 025)
+            uint64_t liftedHostNs = 0; // their host time
         };
         std::string path;
         std::map<std::pair<uint64_t, uint32_t>, Entry> entries;
@@ -1854,12 +1856,12 @@ namespace
                 total += e.second.cycles;
             if (FILE *f = std::fopen(path.c_str(), "w"))
             {
-                std::fprintf(f, "# hash entryPC runs resumes cycles cumulative%% hostNs maxHostNs budgetExhaustions abnormalStops lastFinalPC\n");
+                std::fprintf(f, "# hash entryPC runs resumes cycles cumulative%% hostNs maxHostNs budgetExhaustions abnormalStops lastFinalPC liftedRuns liftedHostNs\n");
                 uint64_t running = 0;
                 for (const auto &e : sorted)
                 {
                     running += e.second.cycles;
-                    std::fprintf(f, "%016llx %04x %llu %llu %llu %.2f %llu %llu %llu %llu %04x\n", (unsigned long long)e.first.first,
+                    std::fprintf(f, "%016llx %04x %llu %llu %llu %.2f %llu %llu %llu %llu %04x %llu %llu\n", (unsigned long long)e.first.first,
                                  e.first.second, (unsigned long long)e.second.runs,
                                  (unsigned long long)e.second.resumes, (unsigned long long)e.second.cycles,
                                  total ? 100.0 * running / total : 0.0,
@@ -1867,7 +1869,9 @@ namespace
                                  (unsigned long long)e.second.maxHostNs,
                                  (unsigned long long)e.second.budgetExhaustions,
                                  (unsigned long long)e.second.abnormalStops,
-                                 e.second.lastFinalPc);
+                                 e.second.lastFinalPc,
+                                 (unsigned long long)e.second.liftedRuns,
+                                 (unsigned long long)e.second.liftedHostNs);
                 }
                 std::fclose(f);
             }
@@ -1936,6 +1940,8 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
         e.budgetExhaustions += c.lastRunBudgetExhausted ? 1u : 0u;
         e.abnormalStops += c.lastRunAbnormalStop ? 1u : 0u;
         e.lastFinalPc = m_state.pc;
+        e.liftedRuns += m_lastRunLifted ? 1u : 0u;
+        e.liftedHostNs += m_lastRunLifted ? hostNs : 0u;
         c.maybeDump();
         return;
     }
@@ -1955,11 +1961,13 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     {
         VuCensus &c = census(m_unit);
         const uint64_t before = m_cycle;
+        // Issue 025: a resume (MSCNT) is filed under the pc it continues from, so its program can be translated.
+        const uint32_t resumePc = m_state.pc;
         const auto hostBefore = std::chrono::steady_clock::now();
         run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
         const uint64_t hostNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - hostBefore).count());
-        VuCensus::Entry &e = c.entries[{c.lastHash, c.lastPc}];
+        VuCensus::Entry &e = c.entries[{c.lastHash, resumePc}];
         ++e.resumes;
         e.cycles += m_cycle - before;
         e.hostNs += hostNs;
@@ -1967,6 +1975,8 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
         e.budgetExhaustions += c.lastRunBudgetExhausted ? 1u : 0u;
         e.abnormalStops += c.lastRunAbnormalStop ? 1u : 0u;
         e.lastFinalPc = m_state.pc;
+        e.liftedRuns += m_lastRunLifted ? 1u : 0u;
+        e.liftedHostNs += m_lastRunLifted ? hostNs : 0u;
         c.maybeDump();
         return;
     }
@@ -2018,8 +2028,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             dump(".state", &m_state, sizeof(m_state));
         }
     }
+    m_lastRunLifted = false;
     if (!m_verifyShadow && runLiftedChecked(vuCode, codeSize, vuData, dataSize, gs, memory))
     {
+        m_lastRunLifted = true;
         if (useVuRounding && previousRoundingMode != -1)
             std::fesetround(previousRoundingMode);
         return;

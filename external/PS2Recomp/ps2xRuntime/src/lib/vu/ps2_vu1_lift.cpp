@@ -92,7 +92,23 @@ namespace vl
         {
             if (r.pc != pc || r.vu0 != vu0)
                 continue;
-            if (r.subSize == 0)
+            if (r.runCount != 0)
+            {
+                if (!vuCode)
+                    continue;
+                uint64_t h = 1469598103934665603ull;
+                bool inside = true;
+                for (uint32_t i = 0; i < r.runCount && inside; ++i)
+                {
+                    const uint32_t start = r.runs[2 * i], size = r.runs[2 * i + 1];
+                    inside = start + size <= codeSize;
+                    for (uint32_t b = 0; inside && b < size; ++b)
+                        h = (h ^ vuCode[start + b]) * 1099511628211ull;
+                }
+                if (inside && h == r.hash)
+                    return r.fn;
+            }
+            else if (r.subSize == 0)
             {
                 if (r.hash == hash)
                     return r.fn;
@@ -230,40 +246,72 @@ bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_
         return false;
     }
 
+    // Translation lookup per microcode image (issue 025). The game switches between a set of microcode images many
+    // times per frame; each image keeps its own per-pc table, found again by a fast hash and confirmed byte for
+    // byte, so a switch back to a known image costs no full-image FNV hash and no registry search.
+    struct ImageEntry
+    {
+        std::vector<uint8_t> bytes;
+        uint64_t hash = 0; // FNV-1a of the image, as registrations use it
+        std::array<vl::Segment, 2048> segments{};
+        std::array<bool, 2048> valid{};
+    };
     struct LookupCache
     {
         const uint8_t *code = nullptr;
         uint64_t generation = ~0ull;
-        uint64_t hash = 0;
-        std::array<vl::Segment, 2048> segments{};
-        std::array<bool, 2048> valid{};
+        ImageEntry *current = nullptr;
+        std::vector<std::pair<uint64_t, std::unique_ptr<ImageEntry>>> images; // (fast key, entry)
     };
     thread_local LookupCache s_cacheByUnit[2];
     LookupCache &cache = s_cacheByUnit[unitIndex];
-    const uint8_t *&cachedCode = cache.code;
-    uint64_t &cachedGeneration = cache.generation;
-    uint64_t &cachedHash = cache.hash;
-    std::array<vl::Segment, 2048> &s_pcCache = cache.segments;
-    std::array<bool, 2048> &s_pcCacheValid = cache.valid;
     const uint64_t generation = vu0 ? memory->getVU0CodeGeneration() : memory->getVU1CodeGeneration();
-    if (vuCode != cachedCode || generation != cachedGeneration)
+    if (vuCode != cache.code || generation != cache.generation || !cache.current)
     {
-        cachedHash = vl::hashCode(vuCode, codeSize);
-        cachedCode = vuCode;
-        cachedGeneration = generation;
-        s_pcCacheValid.fill(false);
+        // Four independent lanes over 64-bit words: ~2k multiplies, not 16k dependent ones.
+        uint64_t lane[4] = {0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull, 0x27D4EB2F165667C5ull};
+        for (uint32_t i = 0; i < codeSize; i += 32)
+            for (int k = 0; k < 4; ++k)
+            {
+                uint64_t w;
+                std::memcpy(&w, vuCode + i + 8 * k, sizeof(w));
+                lane[k] = (lane[k] ^ w) * 0x100000001B3ull;
+                lane[k] ^= lane[k] >> 29;
+            }
+        const uint64_t key = lane[0] ^ (lane[1] * 3u) ^ (lane[2] * 5u) ^ (lane[3] * 7u);
+        ImageEntry *entry = nullptr;
+        for (auto &[k, e] : cache.images)
+            if (k == key && e->bytes.size() == codeSize && std::memcmp(e->bytes.data(), vuCode, codeSize) == 0)
+            {
+                entry = e.get();
+                break;
+            }
+        if (!entry)
+        {
+            if (cache.images.size() >= 256u)
+                cache.images.clear(); // bounded: a scene uses a few dozen images
+            auto fresh = std::make_unique<ImageEntry>();
+            fresh->bytes.assign(vuCode, vuCode + codeSize);
+            fresh->hash = vl::hashCode(vuCode, codeSize);
+            entry = fresh.get();
+            cache.images.emplace_back(key, std::move(fresh));
+        }
+        cache.current = entry;
+        cache.code = vuCode;
+        cache.generation = generation;
     }
+    const uint64_t cachedHash = cache.current->hash;
     const uint32_t pcSlot = (m_state.pc >> 3) & 0x7FFu;
     vl::Segment segment = nullptr;
-    if (s_pcCacheValid[pcSlot])
+    if (cache.current->valid[pcSlot])
     {
-        segment = s_pcCache[pcSlot];
+        segment = cache.current->segments[pcSlot];
     }
     else
     {
         segment = vl::find(cachedHash, m_state.pc, vuCode, vu0);
-        s_pcCache[pcSlot] = segment;
-        s_pcCacheValid[pcSlot] = true;
+        cache.current->segments[pcSlot] = segment;
+        cache.current->valid[pcSlot] = true;
     }
     if (!segment)
     {

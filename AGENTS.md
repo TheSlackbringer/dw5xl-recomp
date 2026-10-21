@@ -152,7 +152,8 @@ sheet: `magick montage frame_*.png -tile 4x4 -geometry 256x179+2+2 -label '%f' s
 ### Debug switches (env, all optional)
 Pacing/perf: `PS2X_STATS` (vsync/s per second) · `PS2X_HUD_LOG` ([hud] fps/vsync/frameMs/maxFrameMs every 0.5 s) ·
 `PS2X_LATE_VBLANK` (fields >3 ms late) · `PS2X_VU1_ASYNC_TRACE` (device worker busy/drains per second; "explicit=N"
-render syncs = 2 x game FPS) · `PS2X_VU1_CENSUS=<file>` (per-VU1-program runs/cycles/host ns) · `PS2X_VU1_LIFT=0`
+render syncs = 2 x game FPS) · `PS2X_VU1_CENSUS=<file>` (per-VU1-program runs/cycles/host ns; columns
+liftedRuns/liftedHostNs = translated share; resumes filed under the pc they continue from) · `PS2X_VU1_LIFT=0`
 (interpret all VU1) · `PS2X_VU1_ASYNC=0` (synchronous device) · `PS2X_GS_ASYNC=0` (GS inline, no worker thread).
 VU0 microprograms (`VCALLMS`, issue 025): `PS2X_VU0_LIFT=0` (interpret them) · `PS2X_VU0_LIFT_VERIFY=1` (every
 native VU0 run repeated by the interpreter and compared; `[vu0verify]`) · `PS2X_VU0_CENSUS=<file>` (per-program
