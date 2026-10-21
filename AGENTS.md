@@ -36,9 +36,9 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
 3. **A test per issue, written first:** `notes/issues/tests/issue_NNN_*.py` prints PASS/FAIL and must FAIL on the bug
    before the fix (where measurable). Runner: `notes/issues/tests/run.py NNN|quick|standard|full|list`; helpers and routes in
    `tests/dw5test.py`. Closed issues keep their tests as regression guards.
-4. **Testing by change (owner 2026-10-21, replaces mandatory suite gates):** run only tests relevant to the
-   code and behaviour changed. Use CI to validate builds. Packaging/CI changes use the relevant build, setup
-   and release checks; gameplay/runtime changes use the affected issue tests and regression guards.
+4. **Testing by change (owner 2026-10-21, replaces mandatory suite gates):** run all fast automated checks
+   after every change: unit tests, Python unit tests and static checks. Also run checks relevant to the changed
+   code and behaviour. Use CI to validate builds. Slow gameplay runs are separate from the fast checks.
    **After fixing at least three specs, recommend a full-suite run and ask the owner directly before running it.**
    Never start the full suite without the owner's explicit approval or request. There is no automatic broad-suite
    requirement before commits, pushes or owner test sessions. Test thresholds, tick windows, repeats and pass
@@ -100,7 +100,7 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
 ## Essentials
 - Build: `cmake --build app/build` (all), `--target dw5xl` (game). Regenerate code: `tools/regen.sh main|ovl00|…`
   (needs the player's disc in `game/dw5xl/`). CTests: `cd app/build && ctest`.
-- Run checks relevant to the changed area (testing rule above). Available issue tiers: `run.py NNN|quick|standard|full`;
+- Run all fast checks plus checks relevant to the changed area (testing rule above). Available issue tiers: `run.py NNN|quick|standard|full`;
   recommend full after at least three specs are fixed and ask the owner before running it. Perf/stutter: `tools/heavy_battle_test.py` (no frame dumps when measuring timing).
 - Unsure how the original looks or behaves: compare with PCSX2 first (`tools/pcsx2_reference.py`), then ask the owner
   for what screenshots can't show (feel, sound timing).
