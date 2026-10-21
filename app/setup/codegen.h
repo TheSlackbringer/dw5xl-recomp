@@ -33,8 +33,10 @@ std::string rewriteRecompConfig(const std::string &config, const std::filesystem
 
 // Makes `target` hold exactly the files of `source`: copies new and changed files, leaves identical files untouched
 // (so an incremental build recompiles only what changed), removes files that are no longer generated. When
-// `target` does not exist yet, `source` is moved there in one step (and is gone afterwards).
-bool syncDirectory(const std::filesystem::path &source, const std::filesystem::path &target, std::string &error);
+// `target` does not exist yet, `source` is moved there in one step unless keepSource is true.
+// Relative symlinks are preserved (the Linux compiler uses them for its tool wrappers).
+bool syncDirectory(const std::filesystem::path &source, const std::filesystem::path &target, std::string &error,
+                   bool keepSource = false);
 
 // Runs the recompiler for every profile. Configurations and function lists come from `root` (the project or the
 // release package); the disc files are read from and the generated code is written to `dataDir` (empty: `root`;

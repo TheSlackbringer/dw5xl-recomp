@@ -4,6 +4,7 @@ the tools — never the compiled game (PS2Recomp is GPL-3.0; the player's PC bui
 The package holds nothing from the game, so any PC (and later CI) can make it; publishing is the owner's.
 
   tools/release/make_release.py windows --build app/build-release-win --recomp-build build-recomp-win [--test]
+  tools/release/build_linux.sh [--test]  # offline inputs: see tools/release/LINUX.md
 
 Checklist enforced here:
   * a clean working tree (--test skips this and names the package "...-test"; never publish a test package);
@@ -69,7 +70,11 @@ def fail(msg):
 
 
 def git(*args, cwd=REPO):
-    return subprocess.run(['git', '-C', str(cwd), *args], capture_output=True, text=True, check=True).stdout
+    # Packaging reads host-owned checkouts in a container. Trust only this checkout
+    # for this invocation; never change the user's global Git trust settings.
+    return subprocess.run(['git', '-c', f'safe.directory={cwd.resolve()}', '-C', str(cwd), *args],
+                          env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0'},
+                          capture_output=True, text=True, check=True).stdout
 
 
 def disc_file_names():
@@ -147,24 +152,34 @@ def apache_text():
 GAME_MARKER = b'menu verification disc='
 
 
-def scan(stage):
+def scan(stage, windows=True):
     """Nothing from the game may be in a release package."""
     forbidden_names = disc_file_names() | {'DW5XL.ELF'}
     bad = []
     for p in stage.rglob('*'):
         rel = p.relative_to(stage).as_posix()
         name = p.name
-        if any(c in name for c in '<>:"|?*\\'):
+        if windows and any(c in name for c in '<>:"|?*\\'):
             bad.append(f'{rel} (a character Windows does not allow in file names)')
         if p.is_dir():
             continue
         low = rel.lower()
         if (name.upper() in forbidden_names or low.endswith(('.iso', '.elf', '.irx')) or
-                re.search(r'(^|/)recomp/.*/output/', low) or re.search(r'(^|/)recomp/dw5xl/vu1/', low) or
-                re.match(r'fun_[0-9a-f]+_0x[0-9a-f]+\.cpp$', name.lower()) or 'vu1_lifted' in low):
+                re.search(r'(^|/)recomp/.*/output/', low) or
+                re.search(r'(^|/)recomp/[^/]+/(vu0|vu1|iop)/', low) or
+                re.match(r'fun_[0-9a-f]+_0x[0-9a-f]+\.cpp$', name.lower()) or
+                re.search(r'vu[01]_lifted', low)):
             bad.append(rel)
-        elif low.endswith(('.exe', '.dll')) and GAME_MARKER in p.read_bytes():
-            bad.append(f'{rel} (the compiled game)')
+        else:
+            with p.open('rb') as stream:
+                header = stream.read(4)
+                if header[:2] == b'MZ' or header == b'\x7fELF':
+                    previous = header
+                    while block := stream.read(1024 * 1024):
+                        if GAME_MARKER in previous + block:
+                            bad.append(f'{rel} (the compiled game)')
+                            break
+                        previous = block[-len(GAME_MARKER):]
     if bad:
         fail('not allowed in a release package: ' + ', '.join(sorted(bad)[:20]))
 
@@ -256,14 +271,114 @@ def windows(build, recomp_build, test):
     return archive
 
 
+def linux(build, recomp_build, sdk, ffmpeg, appimage_tools, test):
+    """Build an AppDir containing the setup launcher, sources and an offline SDK."""
+    launcher = build / 'dw5xl_setup'
+    recompiler = recomp_build / 'ps2xRecomp/ps2_recomp'
+    for path in (launcher, recompiler, sdk / 'bin/clang++', ffmpeg / 'include/libavcodec/avcodec.h',
+                 appimage_tools / 'linuxdeploy-x86_64.AppImage', appimage_tools / 'appimagetool-x86_64.AppImage'):
+        if not path.exists():
+            fail(f'{path} missing')
+    version = version_for(test)
+    name = f'DW5XL-{version}-linux-x86_64'
+    dist = REPO / 'dist'
+    stage = dist / f'{name}.AppDir'
+    if stage.exists():
+        shutil.rmtree(stage)
+    (stage / 'usr/bin').mkdir(parents=True)
+    (stage / 'usr/lib').mkdir()
+    copy_tracked(REPO, ['app', 'external/PS2Recomp', 'recomp', 'tools/linux', 'LICENSE'], stage,
+                 skip=('external/PS2Recomp/android/', 'external/PS2Recomp/vita/', 'external/PS2Recomp/ps2xStudio/'))
+    dep_root = Path(os.environ.get('DW5XL_PACKAGE_DEP_ROOT', REPO / 'app/deps'))
+    pgs = dep_root / 'parallel-gs'
+    copy_tracked(pgs, ['.'], stage / 'app/deps/parallel-gs')
+    for dep in ('raylib', 'imgui', 'rlimgui'):
+        source = build / '_deps' / f'{dep}-src'
+        if not source.exists():
+            source = dep_root / f'{dep}-src'
+        copy_tracked(source, ['.'], stage / 'app/deps' / f'{dep}-src')
+    shutil.copy2(launcher, stage / 'usr/bin/dw5xl_setup')
+    shutil.copy2(recompiler, stage / 'tools/ps2_recomp')
+    shutil.copytree(sdk, stage / 'tools/clang', symlinks=True)
+    shutil.copytree(ffmpeg, stage / 'tools/ffmpeg', symlinks=True)
+    (stage / 'tools/cmake/bin').mkdir(parents=True)
+    (stage / 'tools/cmake/bin/cmake').symlink_to('../../clang/bin/cmake')
+    (stage / 'tools/ninja').symlink_to('clang/bin/ninja')
+    for prefix in (sdk / 'lib', ffmpeg / 'lib'):
+        for library in prefix.glob('*.so*'):
+            shutil.copy2(library, stage / 'usr/lib' / library.name)
+    (stage / 'BUILD_ID').write_text(version + '\n')
+    (stage / 'README.txt').write_text(
+        'Dynasty Warriors 5 Xtreme Legends - Linux builder\n\n'
+        'Make the AppImage executable in your file manager and open it. Choose your PAL XL disc image\n'
+        '(SLES-53860); optional DW5 (SLES-53339) enables Load Original. The first start builds the game\n'
+        'from your own disc. The compiler and all build tools are included; no downloads are needed.\n'
+        'Later starts open the game directly. Saves, settings, game data and logs stay in\n'
+        '$XDG_DATA_HOME/dw5xl (normally ~/.local/share/dw5xl), separate from this AppImage.\n\n'
+        'Requires x86-64 with AVX2, Linux glibc 2.31 or newer and a Vulkan graphics driver.\n'
+        f'Source: https://github.com/TheSlackbringer/dw5xl-recomp, build {version}, GPL-3.0.\n'
+        'The download contains our sources and freely licensed tools, with no game data or game binary.\n')
+    licenses = stage / 'LICENSES'
+    licenses.mkdir()
+    for label, path in {
+        'DW5XL-GPL-3.0.txt': REPO / 'LICENSE',
+        'PS2Recomp-GPL-3.0.txt': REPO / 'external/PS2Recomp/LICENSE',
+        'parallel-gs-LGPL-3.0.txt': pgs / 'COPYING.LGPLv3',
+        'Granite-MIT.txt': pgs / 'Granite/LICENSE',
+        'volk-MIT.txt': pgs / 'Granite/third_party/volk/LICENSE.md',
+        'FFmpeg-LGPL-2.1.txt': ffmpeg / 'licenses/ffmpeg/COPYING.LGPLv2.1',
+    }.items():
+        shutil.copy2(path, licenses / label)
+    (licenses / 'TOOLCHAIN.txt').write_text('Compiler, SDK, CMake and Ninja copyright notices are in tools/clang/licenses.\n')
+    icon = REPO / 'tools/release/dw5xl.svg'
+    desktop = REPO / 'tools/release/dw5xl.desktop'
+    env = {**os.environ, 'APPIMAGE_EXTRACT_AND_RUN': '1',
+           'LD_LIBRARY_PATH': str(stage / 'usr/lib'), 'ARCH': 'x86_64'}
+    subprocess.run([str(appimage_tools / 'linuxdeploy-x86_64.AppImage'), '--appdir', str(stage),
+                    '-e', str(stage / 'usr/bin/dw5xl_setup'), '-d', str(desktop), '-i', str(icon)], env=env, check=True)
+    # linuxdeploy handles runtime dependencies; use our launcher to keep the release root explicit.
+    app_run = stage / 'AppRun'
+    app_run.unlink(missing_ok=True)
+    app_run.write_text('''#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export LD_LIBRARY_PATH="$root/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$root/usr/bin/dw5xl_setup" --root "$root" "$@"
+''')
+    app_run.chmod(0o755)
+    scan(stage, windows=False)
+    archive = dist / f'{name}.AppImage'
+    image_tool = appimage_tools / 'appimagetool-x86_64.AppImage'
+    # Reuse the runtime already present in the approved tool download. The tool's
+    # default is to fetch another runtime, which would break an offline build.
+    offset = int(subprocess.check_output([str(image_tool), '--appimage-offset'], text=True).strip())
+    runtime = build / 'appimage-runtime-x86_64'
+    with image_tool.open('rb') as stream:
+        runtime.write_bytes(stream.read(offset))
+    subprocess.run([str(image_tool), '--no-appstream', '--runtime-file', str(runtime), str(stage), str(archive)],
+                   env=env, check=True)
+    Path(str(archive) + '.sha256').write_text(f'{sha256(archive)}  {archive.name}\n')
+    print(f'{archive} ({archive.stat().st_size / 2**20:.0f} MB)')
+    return archive
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('target', choices=['windows'])
-    ap.add_argument('--build', required=True, type=Path, help='Windows build folder with dw5xl_setup.exe')
-    ap.add_argument('--recomp-build', required=True, type=Path, help='Windows build folder of the recompiler')
+    ap.add_argument('target', choices=['windows', 'linux'])
+    ap.add_argument('--build', required=True, type=Path, help='build folder with the setup launcher')
+    ap.add_argument('--recomp-build', required=True, type=Path, help='build folder of the native recompiler')
     ap.add_argument('--test', action='store_true', help='allow a dirty tree; the package is named "-test"')
+    ap.add_argument('--linux-sdk', type=Path)
+    ap.add_argument('--ffmpeg-root', type=Path)
+    ap.add_argument('--appimage-tools', type=Path, default=Path.home() / '.local/opt/appimage-tools')
     args = ap.parse_args()
-    windows(args.build.resolve(), args.recomp_build.resolve(), args.test)
+    if args.target == 'windows':
+        windows(args.build.resolve(), args.recomp_build.resolve(), args.test)
+    else:
+        if not args.linux_sdk or not args.ffmpeg_root:
+            ap.error('Linux requires --linux-sdk and --ffmpeg-root')
+        linux(args.build.resolve(), args.recomp_build.resolve(), args.linux_sdk.resolve(),
+              args.ffmpeg_root.resolve(), args.appimage_tools.resolve(), args.test)
 
 
 if __name__ == '__main__':

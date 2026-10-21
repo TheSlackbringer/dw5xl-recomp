@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Update the numbered Windows draft; publishing remains an owner action.
+"""Update the numbered builder draft; publishing remains an owner action.
 
 Keep updating alpha.N while it is a draft. Once published (including as a
 prerelease), leave it alone and create alpha.N+1 on the next successful build.
@@ -78,7 +78,11 @@ def select_release(releases, series='v0.1.0-alpha'):
 
 
 def package_for_version(source, version):
-    target = source.with_name(f'DW5XL-{version}-windows-x64.zip')
+    suffix = next((suffix for suffix in ('windows-x64.zip', 'linux-x86_64.AppImage')
+                   if source.name.endswith('-' + suffix)), None)
+    if suffix is None:
+        raise ValueError(f'unknown builder package: {source.name}')
+    target = source.with_name(f'DW5XL-{version}-{suffix}')
     if target != source:
         source.rename(target)
     checksum = Path(str(target) + '.sha256')
@@ -89,6 +93,8 @@ def package_for_version(source, version):
 
 
 def update_draft(github, source, commit, run_id, subject, series='v0.1.0-alpha'):
+    sources = [source] if isinstance(source, Path) else list(source)
+    platforms = 'Windows and Linux' if len(sources) > 1 else 'Windows'
     for _ in range(3):
         version, release = select_release(github.releases(), series)
         payload = {
@@ -96,7 +102,7 @@ def update_draft(github, source, commit, run_id, subject, series='v0.1.0-alpha')
             'target_commitish': commit,
             'name': f'DW5XL {version}',
             'body': (f'Built by GitHub Actions from {commit} (run {run_id}) after every test job passed.\n\n'
-                     'Windows builder package: launcher, compiler, sources and tools. '
+                     f'{platforms} builder packages: launcher, compiler, sources and tools. '
                      'The first start builds the game from your own disc.\n\n'
                      f'Latest commit: {subject.splitlines()[0] if subject else ""}\n\n'
                      'Draft packages are updated by CI until the owner publishes this version.'),
@@ -106,8 +112,9 @@ def update_draft(github, source, commit, run_id, subject, series='v0.1.0-alpha')
                 release = github.create(payload)
             else:
                 release = github.edit(release['id'], payload)
-            files = package_for_version(source, version)
-            source = files[0]  # A retry after owner publication uses the same package bytes.
+            packages = [package_for_version(source, version) for source in sources]
+            sources = [package[0] for package in packages]  # A publication retry keeps the same bytes.
+            files = [path for package in packages for path in package]
             github.upload(release['id'], files)
             keep = {path.name for path in files}
             for asset in github.require_draft(release['id']).get('assets', []):
@@ -128,10 +135,11 @@ def main():
     parser.add_argument('--run-id', default=os.environ.get('GITHUB_RUN_ID', 'local'))
     parser.add_argument('--series', default='v0.1.0-alpha')
     args = parser.parse_args()
-    packages = list(args.dist.glob('DW5XL-*-windows-x64.zip'))
-    if not args.repo or not args.commit or len(packages) != 1:
-        parser.error('repo, commit and exactly one Windows zip are required')
-    update_draft(GitHub(args.repo), packages[0], args.commit, args.run_id,
+    windows = list(args.dist.glob('DW5XL-*-windows-x64.zip'))
+    linux = list(args.dist.glob('DW5XL-*-linux-x86_64.AppImage'))
+    if not args.repo or not args.commit or len(windows) != 1 or len(linux) > 1:
+        parser.error('repo, commit, exactly one Windows zip and at most one Linux AppImage are required')
+    update_draft(GitHub(args.repo), windows + linux, args.commit, args.run_id,
                  os.environ.get('COMMIT_MESSAGE', ''), args.series)
 
 

@@ -249,6 +249,7 @@ else()
 endif()
 
 option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENABLE_FFMPEG_DEFAULT})
+set(PS2X_FFMPEG_ROOT "" CACHE PATH "Offline Linux FFmpeg prefix (include/ and lib/)")
 
 if(NOT PS2X_ENABLE_FFMPEG)
     message(STATUS "FFmpeg disabled; MPEG video decode falls back to stub frames")
@@ -345,6 +346,14 @@ elseif(WIN32)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CopyFfmpegDlls.cmake"
         CACHE INTERNAL
         "Script used to stage FFmpeg runtime DLLs beside executables")
+elseif(PS2X_FFMPEG_ROOT)
+    add_library(ffmpeg INTERFACE)
+    target_include_directories(ffmpeg INTERFACE "${PS2X_FFMPEG_ROOT}/include")
+    foreach(component avcodec avformat avutil swresample swscale)
+        find_library(PS2X_FFMPEG_${component}_LIBRARY NAMES ${component}
+            PATHS "${PS2X_FFMPEG_ROOT}/lib" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH REQUIRED)
+        target_link_libraries(ffmpeg INTERFACE "${PS2X_FFMPEG_${component}_LIBRARY}")
+    endforeach()
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET GLOBAL

@@ -1,0 +1,56 @@
+# Linux builder release
+
+The AppImage contains the graphical setup launcher, native PS2 recompiler, app
+and runtime sources, Clang, CMake, Ninja, a Linux SDK and minimal FFmpeg. It
+contains no game files, translated code or game executable. On first start the
+player selects their own PAL XL ISO, optionally adds DW5, and builds offline.
+Player files go to `$XDG_DATA_HOME/dw5xl` (normally `~/.local/share/dw5xl`).
+Build inputs are synchronized into its `builder/` folder before a first build
+or an update. Identical files keep their timestamps, so a changing AppImage
+mount path does not discard the player's compiled objects. Normal later starts
+skip this synchronization and launch the game directly.
+
+The target is x86-64 with AVX2, glibc 2.31 or newer, and a Vulkan graphics driver.
+The compiler baseline is built in the pinned Steam Runtime 3 SDK; it does not
+require a compiler, Git or Python on the player's system.
+
+## Build the package
+
+CI prepares the source dependencies and checked tool archives, then runs the
+same offline builder used locally. The Linux AppImage and Windows ZIP are
+uploaded to the same numbered draft only after all required jobs pass.
+Publishing remains an owner action.
+
+Local prerequisites are Podman, Python and the existing dependency sources.
+Build `tools/release/linux.Containerfile` as `dw5xl-release-linux` once. The
+release build itself runs with networking disabled and never installs host
+packages. Supply these already downloaded inputs:
+
+```sh
+export DW5XL_LINUX_LIBCXX_DEBS=/path/to/approved-libcxx-debs
+export DW5XL_DEP_ROOT=/path/to/app/deps
+export DW5XL_RECOMP_DEPS=/path/to/recompiler/build/_deps
+export DW5XL_FFMPEG_SOURCE=/path/to/ffmpeg-7.1.tar.xz
+export DW5XL_APPIMAGE_TOOLS=/path/to/appimage-tools
+export DW5XL_LINUX_SDK_WORK=/path/to/linux-sdk-work
+export DW5XL_BUILD_JOBS=2
+bash tools/release/build_linux.sh
+```
+
+`DW5XL_DEP_ROOT` holds patched `parallel-gs`, `raylib-src`, `imgui-src` and
+`rlimgui-src` source checkouts. `DW5XL_RECOMP_DEPS` holds the five dependency
+checkouts populated by configuring PS2Recomp. No game data is used.
+
+The approved libc++ packages are pinned in `linux-libcxx-packages.json`;
+`linux-tools.json` pins the AppImage tools and FFmpeg source. CI checks size and
+SHA-256 before use. Local builds never fetch missing inputs automatically.
+
+The script builds the launcher and recompiler, runs the setup tests, scans the
+AppDir for forbidden game content, and writes an AppImage and SHA-256 sidecar
+under `dist/`. SDK export, compiler, test and packaging logs stay in
+`DW5XL_LINUX_SDK_WORK`. A clean checkout is required; `--test` permits local
+changes and labels the resulting package for testing.
+
+For systems without FUSE, AppImage's standard `APPIMAGE_EXTRACT_AND_RUN=1`
+environment setting can be used. The launcher stays alive while its game child
+runs so the bundled runtime libraries remain available.

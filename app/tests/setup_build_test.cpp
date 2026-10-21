@@ -71,6 +71,18 @@ void layoutTests()
     require(findLayout(root, false, layout, error) && layout.tools.cmake == root / "tools" / "cmake" / "bin" / "cmake",
             "bundled cmake preferred");
 
+    touch(root / "BUILD_ID");
+    require(!findLayout(root, false, layout, error) && error.find("bundled Linux") != std::string::npos,
+            "Linux release refuses to fall back to tools on the player's PATH");
+    touch(root / "tools" / "ninja");
+    touch(root / "tools" / "clang" / "bin" / "clang");
+    touch(root / "tools" / "clang" / "bin" / "clang++");
+    touch(root / "tools" / "ffmpeg" / "include" / "libavcodec" / "avcodec.h");
+    require(findLayout(root, false, layout, error), "self-contained Linux release layout");
+    require(layout.tools.linuxToolchainRoot == root / "tools" / "clang" &&
+                layout.tools.ffmpegRoot == root / "tools" / "ffmpeg" &&
+                layout.tools.ninja == root / "tools" / "ninja", "Linux tools are selected from the release");
+
     touch(root / "tools" / "ps2_recomp.exe");
     require(!findLayout(root, true, layout, error) && error.find("compiler") != std::string::npos,
             "Windows without the bundled compiler is reported");
@@ -82,6 +94,40 @@ void layoutTests()
                 layout.tools.llvmMingwRoot == root / "tools" / "llvm-mingw" &&
                 layout.tools.ffmpegArchive == root / "tools" / "ffmpeg.zip", "Windows tools from tools/");
     fs::remove_all(root);
+}
+
+void linuxUpdateTests()
+{
+    const fs::path scratch = fs::temp_directory_path() / "dw5xl update sources Jürgen";
+    fs::remove_all(scratch);
+    const fs::path package = scratch / "first mount", data = scratch / "player";
+    for (const char *folder : {"app", "external", "recomp", "tools"})
+        touch(package / folder / "file");
+    touch(package / "BUILD_ID");
+#ifndef _WIN32
+    fs::create_symlink("file", package / "tools" / "alias");
+#endif
+    std::string error;
+    fs::path selected;
+    require(prepareLinuxBuildRoot(package, data, selected, error), "prepare Linux build sources");
+    require(selected == data / "builder" && fs::exists(package / "app" / "file"),
+            "Linux sources use a stable data path without moving package files");
+    const auto old = fs::file_time_type::clock::now() - std::chrono::hours(24);
+    fs::last_write_time(selected / "app" / "file", old);
+    touch(selected / "app" / "stale");
+    const fs::path moved = scratch / "second mount";
+    fs::rename(package, moved);
+    std::ofstream(moved / "external" / "file") << "updated";
+    require(prepareLinuxBuildRoot(moved, data, selected, error), "update from a different AppImage mount");
+    require(selected == data / "builder" && fs::last_write_time(selected / "app" / "file") == old,
+            "unchanged sources keep their path and timestamp across releases");
+    require(!fs::exists(selected / "app" / "stale") && fs::file_size(selected / "external" / "file") == 7,
+            "removed sources disappear and changed files update");
+#ifndef _WIN32
+    require(fs::is_symlink(selected / "tools" / "alias") && fs::read_symlink(selected / "tools" / "alias") == "file",
+            "relative tool wrapper links survive source caching");
+#endif
+    fs::remove_all(scratch);
 }
 
 // A program that runs 30 s is stopped within a few seconds of a cancel.
@@ -139,6 +185,15 @@ int main(int argc, char **argv)
         require(has(lnx, "-DCMAKE_CXX_COMPILER=clang++") && has(lnx, "-DCMAKE_LINKER_TYPE=LLD"), "clang + lld");
         require(!hasPrefix(lnx, "-DCMAKE_TOOLCHAIN_FILE="), "no toolchain file on Linux");
         require(!hasPrefix(lnx, "-DDW5XL_RECOMP_ROOT="), "developer tree: the generated code stays in recomp/");
+        BuildTools linuxRelease;
+        linuxRelease.linuxToolchainRoot = "/tmp/DW5XL package/tools/clang";
+        linuxRelease.ffmpegRoot = "/tmp/DW5XL package/tools/ffmpeg";
+        const auto linuxArgs = gameConfigureArgs("/tmp/DW5XL package", "/tmp/player build", linuxRelease);
+        require(has(linuxArgs, "-DCMAKE_TOOLCHAIN_FILE=/tmp/DW5XL package/tools/linux/clang.cmake") &&
+                    has(linuxArgs, "-DDW5XL_LINUX_TOOLCHAIN_ROOT=/tmp/DW5XL package/tools/clang"),
+                "Linux release uses its relocatable compiler toolchain, including paths with spaces");
+        require(has(linuxArgs, "-DPS2X_FFMPEG_ROOT=/tmp/DW5XL package/tools/ffmpeg") &&
+                    !hasPrefix(linuxArgs, "-DCMAKE_CXX_COMPILER="), "Linux release needs no host compiler or FFmpeg");
         const auto rel = gameConfigureArgs("C:/DW5XL", "C:/Users/p/AppData/Local/DW5XL/build", windows,
                                            "C:/Users/p/AppData/Local/DW5XL/recomp");
         require(has(rel, "-DDW5XL_RECOMP_ROOT=C:/Users/p/AppData/Local/DW5XL/recomp"),
@@ -158,6 +213,7 @@ int main(int argc, char **argv)
             fs::remove_all(b);
         }
         layoutTests();
+        linuxUpdateTests();
         cancelTest(argc > 0 ? argv[0] : "");
         std::cout << "setup build tests passed\n";
         return 0;

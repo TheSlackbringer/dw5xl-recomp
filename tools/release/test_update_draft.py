@@ -131,6 +131,32 @@ class DraftLifecycleTest(unittest.TestCase):
             github.edit(1, {'name': 'changed'})
         self.assertEqual(calls, [('releases/1', {})])
 
+    def test_windows_and_linux_packages_share_one_numbered_draft(self):
+        linux = Path(self.scratch.name) / 'DW5XL-123abcd-linux-x86_64.AppImage'
+        linux.write_bytes(b'synthetic Linux builder')
+        github = FakeGitHub([])
+        version = update_draft(github, [self.source, linux], '123abcd', '42', 'Linux builder')
+        self.assertEqual(version, 'v0.1.0-alpha.1')
+        expected = {'DW5XL-v0.1.0-alpha.1-windows-x64.zip',
+                    'DW5XL-v0.1.0-alpha.1-linux-x86_64.AppImage'}
+        self.assertEqual(set(github.uploads[0][1]), expected | {name + '.sha256' for name in expected})
+        for name in expected:
+            archive = Path(self.scratch.name) / name
+            digest, recorded_name = Path(str(archive) + '.sha256').read_text().split()
+            self.assertEqual(digest, hashlib.sha256(archive.read_bytes()).hexdigest())
+            self.assertEqual(recorded_name, name)
+
+    def test_publication_advances_both_platforms_together(self):
+        linux = Path(self.scratch.name) / 'DW5XL-123abcd-linux-x86_64.AppImage'
+        linux.write_bytes(b'synthetic Linux builder')
+        published = release('v0.1.0-alpha.1', True)
+        github = FakeGitHub([published])
+        github.publish_on_edit = True
+        version = update_draft(github, [self.source, linux], '123abcd', '42', 'Linux builder')
+        self.assertEqual(version, 'v0.1.0-alpha.2')
+        self.assertTrue(all('alpha.2' in name for name in github.uploads[0][1]))
+        self.assertEqual(len(github.uploads[0][1]), 4)
+
 
 if __name__ == '__main__':
     unittest.main()

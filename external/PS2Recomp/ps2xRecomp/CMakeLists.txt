@@ -8,6 +8,7 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 include(FetchContent)
+find_package(Threads REQUIRED)
 
 FetchContent_Declare(
     elfio
@@ -103,6 +104,7 @@ PRIVATE
 
 target_link_libraries(ps2_recomp_lib
 PUBLIC
+    Threads::Threads
     fmt::fmt
     toml11::toml11 
     dwarf

@@ -69,6 +69,11 @@ std::vector<std::string> gameConfigureArgs(const fs::path &root, const fs::path 
         args.push_back("-DCMAKE_TOOLCHAIN_FILE=" + utf8(root / "tools" / "windows" / "llvm-mingw.cmake"));
         args.push_back("-DLLVM_MINGW_ROOT=" + utf8(tools.llvmMingwRoot));
     }
+    else if (!tools.linuxToolchainRoot.empty())
+    {
+        args.push_back("-DCMAKE_TOOLCHAIN_FILE=" + utf8(root / "tools" / "linux" / "clang.cmake"));
+        args.push_back("-DDW5XL_LINUX_TOOLCHAIN_ROOT=" + utf8(tools.linuxToolchainRoot));
+    }
     else
     {
         args.push_back("-DCMAKE_C_COMPILER=clang");
@@ -77,6 +82,8 @@ std::vector<std::string> gameConfigureArgs(const fs::path &root, const fs::path 
     }
     if (!tools.ffmpegArchive.empty())
         args.push_back("-DPS2X_FFMPEG_PREBUILT_URL=" + utf8(tools.ffmpegArchive));
+    if (!tools.ffmpegRoot.empty())
+        args.push_back("-DPS2X_FFMPEG_ROOT=" + utf8(tools.ffmpegRoot));
     // The release ships the dependency sources next to app/ (no downloads while building).
     for (const char *dep : {"imgui", "raylib", "rlimgui"})
     {

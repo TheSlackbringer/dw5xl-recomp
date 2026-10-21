@@ -105,6 +105,14 @@ int main(int argc, char **argv)
     }
     const auto installed = [&] { return installState(data, kSupportedDiscs[0]) == InstallState::Installed; };
     const auto startGame = [&] {
+#ifndef _WIN32
+        // Keep the AppImage mount alive while the game uses its bundled libraries.
+        const ProcessResult result = runProcess(game, {}, data, data / "logs" / "game.log");
+        if (result.started)
+            return result.exitCode;
+        std::fprintf(stderr, "dw5xl_setup: %s\n", result.error.c_str());
+        return 1;
+#else
         std::string error;
         if (!launchDetached(game, {}, data, error))
         {
@@ -112,11 +120,26 @@ int main(int argc, char **argv)
             return 1;
         }
         return 0;
+#endif
     };
     const auto markBuilt = [&] { std::ofstream(stamp) << release << "\n"; };
     if (!release.empty() && layoutError.empty() && !args.rebuild && !args.noWindow && fs::exists(game) &&
         firstLine(stamp) == release && installed())
         return startGame(); // built for this release: play
+
+#ifndef _WIN32
+    if (!release.empty() && layoutError.empty())
+    {
+        fs::path cached;
+        if (prepareLinuxBuildRoot(root, data, cached, layoutError) &&
+            findLayout(cached, false, layout, layoutError))
+        {
+            options.root = cached;
+            options.recompiler = layout.recompiler;
+            options.tools = layout.tools;
+        }
+    }
+#endif
 
     if (args.noWindow)
     {

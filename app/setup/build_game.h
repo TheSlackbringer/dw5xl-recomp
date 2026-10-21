@@ -15,6 +15,8 @@ struct BuildTools
     std::filesystem::path ninja;                // empty: Ninja on PATH
     std::filesystem::path llvmMingwRoot;        // Windows: bundled llvm-mingw (empty on Linux)
     std::filesystem::path ffmpegArchive;        // Windows: bundled FFmpeg zip (empty: CMake downloads it)
+    std::filesystem::path linuxToolchainRoot;   // Linux release: clang, libc++, sysroot and linker
+    std::filesystem::path ffmpegRoot;           // Linux release: prebuilt include/ and lib/
 };
 
 struct BuildProgress

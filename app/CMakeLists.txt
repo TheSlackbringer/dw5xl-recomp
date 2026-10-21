@@ -155,10 +155,11 @@ target_link_libraries(dw5xl PRIVATE dw5xl_ovl02)
 endif() # DW5XL_BUILD_GAME
 
 # Setup wizard core (issue 011): reads the player's disc image, checks and extracts it. Needs no game data.
+find_package(Threads REQUIRED)
 add_library(dw5xl_setup_core STATIC setup/iso9660.cpp setup/disc_setup.cpp setup/run_process.cpp setup/codegen.cpp
     setup/build_game.cpp setup/install_state.cpp setup/setup_layout.cpp setup/setup_pipeline.cpp setup/vu1lift/vu1_timing.cpp setup/vu1lift/vu1_translator.cpp)
 target_include_directories(dw5xl_setup_core PUBLIC setup)
-target_link_libraries(dw5xl_setup_core PUBLIC ffmpeg)
+target_link_libraries(dw5xl_setup_core PUBLIC ffmpeg Threads::Threads)
 # VU1 lifter (port of tools/vu1_translator.py, disc mode): dw5xl_vu1lift <SLES_538.60> <output.cpp>
 add_executable(dw5xl_vu1lift setup/vu1lift/vu1lift_main.cpp)
 target_link_libraries(dw5xl_vu1lift PRIVATE dw5xl_setup_core)

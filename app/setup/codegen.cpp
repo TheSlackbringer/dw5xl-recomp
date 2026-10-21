@@ -80,12 +80,12 @@ std::string rewriteRecompConfig(const std::string &config, const fs::path &input
     return out;
 }
 
-bool syncDirectory(const fs::path &source, const fs::path &target, std::string &error)
+bool syncDirectory(const fs::path &source, const fs::path &target, std::string &error, bool keepSource)
 {
     std::error_code ec;
     // First build: nothing to keep, so move the whole folder in one step instead of copying tens of thousands of
     // files one by one (slow on Windows, where every new file is also scanned by the virus scanner).
-    if (!fs::exists(target, ec))
+    if (!keepSource && !fs::exists(target, ec))
     {
         fs::create_directories(target.parent_path(), ec);
         fs::rename(source, target, ec);
@@ -97,15 +97,29 @@ bool syncDirectory(const fs::path &source, const fs::path &target, std::string &
     std::set<fs::path> generated;
     for (const auto &entry : fs::recursive_directory_iterator(source, ec))
     {
-        if (!entry.is_regular_file())
+        const bool link = entry.is_symlink();
+        if (!link && !entry.is_regular_file())
             continue;
-        const fs::path rel = fs::relative(entry.path(), source);
+        const fs::path rel = entry.path().lexically_relative(source);
         generated.insert(rel);
         const fs::path dst = target / rel;
-        if (fs::exists(dst) && sameContent(entry.path(), dst))
+        const bool destLink = fs::is_symlink(dst, ec);
+        ec.clear();
+        if (link && destLink && fs::read_symlink(entry.path()) == fs::read_symlink(dst))
+            continue;
+        if (!link && !destLink && fs::exists(dst) && sameContent(entry.path(), dst))
             continue; // unchanged: keep the timestamp so the build does not recompile it
         fs::create_directories(dst.parent_path(), ec);
-        fs::copy_file(entry.path(), dst, fs::copy_options::overwrite_existing, ec);
+        if (link || destLink)
+            fs::remove(dst, ec);
+        if (link)
+            fs::copy_symlink(entry.path(), dst, ec);
+        else
+        {
+            fs::copy_file(entry.path(), dst, fs::copy_options::overwrite_existing, ec);
+            if (!ec && keepSource)
+                fs::permissions(dst, fs::perms::owner_write, fs::perm_options::add, ec);
+        }
         if (ec)
         {
             error = "cannot write " + dst.string() + ": " + ec.message();
@@ -119,7 +133,8 @@ bool syncDirectory(const fs::path &source, const fs::path &target, std::string &
     }
     std::vector<fs::path> stale;
     for (const auto &entry : fs::recursive_directory_iterator(target, ec))
-        if (entry.is_regular_file() && !generated.count(fs::relative(entry.path(), target)))
+        if ((entry.is_regular_file() || entry.is_symlink()) &&
+            !generated.count(entry.path().lexically_relative(target)))
             stale.push_back(entry.path());
     for (const auto &path : stale)
         fs::remove(path, ec);

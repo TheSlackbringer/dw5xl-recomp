@@ -23,4 +23,9 @@ std::filesystem::path findRoot(const std::filesystem::path &start);
 // the build needs is missing.
 bool findLayout(const std::filesystem::path &root, bool windows, SetupLayout &layout, std::string &error);
 
+// Linux AppImage mounts move between runs. Keep build inputs at one player-data
+// path, preserving identical files so updates can reuse compiler output.
+bool prepareLinuxBuildRoot(const std::filesystem::path &root, const std::filesystem::path &data,
+                           std::filesystem::path &buildRoot, std::string &error);
+
 } // namespace dw5xl::setup

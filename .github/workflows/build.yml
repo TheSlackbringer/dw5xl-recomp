@@ -1,5 +1,5 @@
 # Builds and tests everything that needs no game data, on Linux and for Windows (issue 011), and makes the
-# Windows release package (the builder: launcher, compiler, sources, tools - nothing from the game).
+# Windows and Linux release packages (builder: launcher, compiler, sources, tools - nothing from the game).
 # The game itself is never built here: it needs code generated from the player's own disc, which must never
 # reach GitHub. DW5XL_BUILD_GAME=OFF builds the runtime, the recompiler, the tools and the tests that use no
 # generated code. On main, a package that passed every job updates the current numbered draft.
@@ -42,7 +42,7 @@ jobs:
         run: python3 -m unittest discover -s tools/release -p 'test_*.py' -v
       - name: No game data in the repository
         run: |
-          bad=$(git ls-files | grep -iE '^(game|discs|ghidra|ghidra_iop|notes)/|/output/|^recomp/[^/]+/vu1/|vu1_lifted|\.iso$' || true)
+          bad=$(git ls-files | grep -iE '^(game|discs|ghidra|ghidra_iop|notes)/|/output/|^recomp/[^/]+/(vu[01]|iop)/|vu[01]_lifted|\.(iso|elf|irx)$' || true)
           if [ -n "$bad" ]; then echo "game-derived or local files are tracked:"; echo "$bad"; exit 1; fi
       - name: paraLLEl-GS (pinned) with the renderer patches
         run: |
@@ -67,6 +67,88 @@ jobs:
           && cmake --build build-recomp --target ps2_recomp
       - name: Test (no GPU, no game data)
         run: ctest --test-dir app/build-ci --output-on-failure
+      - name: Collect dependency sources for the Linux package
+        if: github.event_name != 'pull_request'
+        run: >
+          tar -cJf /tmp/linux-builder-inputs.tar.xz app/deps/parallel-gs
+          app/build-ci/_deps/raylib-src app/build-ci/_deps/imgui-src app/build-ci/_deps/rlimgui-src
+          build-recomp/_deps/elfio-src build-recomp/_deps/toml11-src build-recomp/_deps/fmt-src
+          build-recomp/_deps/libdwarf-src build-recomp/_deps/rabbitizer-src
+      - uses: actions/upload-artifact@v7
+        if: github.event_name != 'pull_request'
+        with:
+          name: linux-builder-inputs
+          path: /tmp/linux-builder-inputs.tar.xz
+          retention-days: 1
+          compression-level: 0
+
+  linux-package:
+    needs: linux
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-builder-inputs
+          path: /tmp
+      - name: Restore dependency sources
+        run: |
+          tar -xf /tmp/linux-builder-inputs.tar.xz
+          for dep in raylib imgui rlimgui; do
+            mv "app/build-ci/_deps/$dep-src" "app/deps/$dep-src"
+          done
+      - name: Download checked builder inputs (CI only; the player build is offline)
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, urllib.request
+          root = Path('/tmp/linux-builder-tools')
+          inputs = json.loads(Path('tools/release/linux-tools.json').read_text())
+          for item in json.loads(Path('tools/release/linux-libcxx-packages.json').read_text()):
+              inputs.append({'filename': 'libcxx/' + Path(item['Filename']).name,
+                             'url': 'https://apt.llvm.org/bullseye/' + item['Filename'],
+                             'size': int(item['Size']), 'sha256': item['SHA256']})
+          for item in inputs:
+              path = root / item['filename']
+              path.parent.mkdir(parents=True, exist_ok=True)
+              urllib.request.urlretrieve(item['url'], path)
+              if path.stat().st_size != item['size'] or hashlib.sha256(path.read_bytes()).hexdigest() != item['sha256']:
+                  raise SystemExit(f'input size or checksum mismatch: {path}')
+              if path.suffix == '.AppImage':
+                  path.chmod(0o755)
+          PY
+      - name: Build the Steam Runtime compiler container
+        run: |
+          if ! command -v podman >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y podman
+          fi
+          podman build -t dw5xl-release-linux -f tools/release/linux.Containerfile tools/release
+      - name: Build and package offline (no game data)
+        env:
+          DW5XL_LINUX_SDK_WORK: ${{ runner.temp }}/linux-sdk
+          DW5XL_LINUX_LIBCXX_DEBS: /tmp/linux-builder-tools/libcxx
+          DW5XL_RECOMP_DEPS: ${{ github.workspace }}/build-recomp/_deps
+          DW5XL_FFMPEG_SOURCE: /tmp/linux-builder-tools/ffmpeg-7.1.tar.xz
+          DW5XL_APPIMAGE_TOOLS: /tmp/linux-builder-tools/appimage-tools
+          DW5XL_BUILD_JOBS: '2'
+        run: bash tools/release/build_linux.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-package
+          path: |
+            dist/*.AppImage
+            dist/*.AppImage.sha256
+          retention-days: 14
+          compression-level: 0
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: linux-package-logs
+          path: ${{ runner.temp }}/linux-sdk/*.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   windows-build:
     runs-on: ubuntu-24.04
@@ -145,7 +227,6 @@ jobs:
       - name: "Package (checks: clean tree, nothing from the game)"
         if: github.event_name != 'pull_request'
         run: |
-          git config --global --add safe.directory "*" # the repo and the dependency checkouts
           rm -rf dist
           LLVM_MINGW_ROOT="/opt/$LLVM_MINGW" DW5XL_WIN_TOOLS=/opt/windows-builder-tools \
             DW5XL_FFMPEG_MIN=/opt/ffmpeg-min-windows \
@@ -196,7 +277,7 @@ jobs:
 
   draft:
     # Reuse the numbered draft until the owner publishes it, then start the next alpha.
-    needs: [linux, windows-build, windows-test]
+    needs: [linux, linux-package, windows-build, windows-test]
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
@@ -213,6 +294,10 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: windows-package
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-package
           path: dist
       - name: Update the numbered draft (never publishes)
         run: python3 tools/release/update_draft.py

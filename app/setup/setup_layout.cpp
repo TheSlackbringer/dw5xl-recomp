@@ -1,7 +1,35 @@
 #include "setup_layout.h"
+#include "codegen.h"
+
+#include <fstream>
+#include <iterator>
 
 namespace dw5xl::setup {
 namespace fs = std::filesystem;
+
+bool prepareLinuxBuildRoot(const fs::path &root, const fs::path &data, fs::path &buildRoot, std::string &error)
+{
+    buildRoot = data / "builder";
+    for (const char *folder : {"app", "external", "recomp", "tools"})
+        if (!syncDirectory(root / folder, buildRoot / folder, error, true))
+            return false;
+    const auto read = [](const fs::path &path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(in), {});
+    };
+    const std::string version = read(root / "BUILD_ID");
+    if (version != read(buildRoot / "BUILD_ID"))
+    {
+        std::ofstream out(buildRoot / "BUILD_ID", std::ios::binary | std::ios::trunc);
+        out << version;
+        if (!out.flush())
+        {
+            error = "cannot write the Linux builder version in " + buildRoot.string();
+            return false;
+        }
+    }
+    return true;
+}
 
 fs::path findRoot(const fs::path &start)
 {
@@ -51,6 +79,21 @@ bool findLayout(const fs::path &root, bool windows, SetupLayout &layout, std::st
         }
         if (fs::exists(tools / "ffmpeg.zip", ec))
             layout.tools.ffmpegArchive = tools / "ffmpeg.zip";
+    }
+    else if (fs::exists(root / "BUILD_ID", ec))
+    {
+        layout.tools.linuxToolchainRoot = tools / "clang";
+        layout.tools.ffmpegRoot = tools / "ffmpeg";
+        for (const fs::path &required : {cmake, ninja, tools / "clang" / "bin" / "clang",
+                                        tools / "clang" / "bin" / "clang++",
+                                        tools / "ffmpeg" / "include" / "libavcodec" / "avcodec.h"})
+        {
+            if (!fs::exists(required, ec))
+            {
+                error = "a bundled Linux build tool is missing (" + required.string() + ")";
+                return false;
+            }
+        }
     }
     return true;
 }

@@ -40,7 +40,7 @@ windows)
     ;;
 esac
 
-make -C "$src" -j"$(nproc)"
+make -C "$src" -j"${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}"
 rm -rf "$prefix"
 make -C "$src" install
 mkdir -p "$prefix/licenses/ffmpeg"
