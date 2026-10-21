@@ -2,8 +2,8 @@
 # Windows release package (the builder: launcher, compiler, sources, tools - nothing from the game).
 # The game itself is never built here: it needs code generated from the player's own disc, which must never
 # reach GitHub. DW5XL_BUILD_GAME=OFF builds the runtime, the recompiler, the tools and the tests that use no
-# generated code. On main, a package that passed every job replaces the files of the draft release
-# "windows-test-1" (owner tests); CI never publishes a release - that is the owner's.
+# generated code. On main, a package that passed every job updates the current numbered draft.
+# After the owner publishes it, the next successful build creates the next draft. CI never publishes.
 # Remove this file (one commit) to switch CI off again.
 name: build
 
@@ -27,8 +27,6 @@ env:
   CMAKE_WIN_SHA256: bace36e94b31c68ab6fa295f26dfa11219e0701cf7c94b0284a7d1cb13dac536
   NINJA_WIN_SHA256: 07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65
   FFMPEG_SRC_SHA256: 40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6 # ffmpeg-7.1.tar.xz
-  # CI only ever writes this draft; releases the owner publishes (windows-test-1, ...) are never touched.
-  DRAFT_TAG: windows-next
 
 jobs:
   linux:
@@ -40,6 +38,8 @@ jobs:
              libx11 libxrandr libxinerama libxcursor libxi xorgproto mesa libglvnd alsa-lib libpulse
              wayland libxkbcommon vulkan-headers
       - uses: actions/checkout@v7
+      - name: Test release draft lifecycle
+        run: python3 -m unittest discover -s tools/release -p 'test_*.py' -v
       - name: No game data in the repository
         run: |
           bad=$(git ls-files | grep -iE '^(game|discs|ghidra|ghidra_iop|notes)/|/output/|^recomp/[^/]+/vu1/|vu1_lifted|\.iso$' || true)
@@ -195,7 +195,7 @@ jobs:
           exit 0
 
   draft:
-    # A package from main that passed every job replaces the files of the draft release (owner tests).
+    # Reuse the numbered draft until the owner publishes it, then start the next alpha.
     needs: [linux, windows-build, windows-test]
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
@@ -209,25 +209,10 @@ jobs:
       GH_REPO: ${{ github.repository }}
       COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: windows-package
           path: dist
-      - name: Replace the draft's package (never publishes)
-        run: |
-          zip=$(ls dist/DW5XL-*-windows-x64.zip)
-          version=$(basename "$zip" -windows-x64.zip); version=${version#DW5XL-}
-          if ! gh release view "$DRAFT_TAG" --json isDraft --jq .isDraft > /tmp/draft 2>/dev/null; then
-            gh release create "$DRAFT_TAG" --draft --target "$GITHUB_SHA" --title "Windows test" --notes "Owner test."
-          elif [ "$(cat /tmp/draft)" != true ]; then
-            echo "$DRAFT_TAG is published: CI leaves published releases alone"; exit 1
-          fi
-          gh release upload "$DRAFT_TAG" "$zip" "$zip.sha256" --clobber
-          for old in $(gh release view "$DRAFT_TAG" --json assets --jq '.assets[].name' | grep '^DW5XL-' \
-                       | grep -v "^DW5XL-$version-windows-x64\.zip"); do
-            gh release delete-asset "$DRAFT_TAG" "$old" -y
-          done
-          subject=$(printf '%s\n' "$COMMIT_MESSAGE" | head -1)
-          gh release edit "$DRAFT_TAG" --draft --target "$GITHUB_SHA" \
-            --title "Windows test $version (owner test, not a release)" \
-            --notes "Built by GitHub Actions from $version (run $GITHUB_RUN_ID) after every test job passed. The builder package: launcher, compiler, sources and tools, nothing from the game; the first start builds the game from your own disc. Latest commit: $subject. Not for distribution."
+      - name: Update the numbered draft (never publishes)
+        run: python3 tools/release/update_draft.py
