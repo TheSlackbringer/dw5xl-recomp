@@ -39,7 +39,6 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
 4. **Testing by change (owner 2026-10-21, replaces mandatory suite gates):** run all fast automated checks
    after every change: unit tests, Python unit tests and static checks. Also run checks relevant to the changed
    code and behaviour. Use CI to validate builds. Slow gameplay runs are separate from the fast checks.
-   Do not add unit tests for an individual release note or a prose-only edit.
    **After fixing at least three specs, recommend a full-suite run and ask the owner directly before running it.**
    Never start the full suite without the owner's explicit approval or request. There is no automatic broad-suite
    requirement before commits, pushes or owner test sessions. Test thresholds, tick windows, repeats and pass
