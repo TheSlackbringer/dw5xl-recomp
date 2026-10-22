@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Recording profile (tools/profile). Only what the report needs: CPU samples, thread switches and
+     "ready thread" (who woke whom), each with call stacks, plus process/thread/module events for names and
+     symbols. No file, disk, registry or network events (privacy). Sampling interval: Windows
+     default 1 ms. Used as "dw5xl.wprp!DW5XL". -->
+<WindowsPerformanceRecorder Version="1.0" Author="dw5xl-recomp" Comments="issue 025 profiling">
+  <Profiles>
+    <SystemCollector Id="SC_DW5XL" Name="NT Kernel Logger">
+      <BufferSize Value="1024"/>
+      <Buffers Value="512"/>
+    </SystemCollector>
+    <SystemProvider Id="SP_DW5XL">
+      <Keywords>
+        <Keyword Value="ProcessThread"/>
+        <Keyword Value="Loader"/>
+        <Keyword Value="SampledProfile"/>
+        <Keyword Value="CSwitch"/>
+        <Keyword Value="ReadyThread"/>
+      </Keywords>
+      <Stacks>
+        <Stack Value="SampledProfile"/>
+        <Stack Value="CSwitch"/>
+        <Stack Value="ReadyThread"/>
+      </Stacks>
+    </SystemProvider>
+    <Profile Id="DW5XL.Verbose.File" Name="DW5XL" Description="DW5XL profiling (issue 025)" LoggingMode="File" DetailLevel="Verbose">
+      <Collectors>
+        <SystemCollectorId Value="SC_DW5XL">
+          <SystemProviderId Value="SP_DW5XL"/>
+        </SystemCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

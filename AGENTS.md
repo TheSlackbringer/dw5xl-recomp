@@ -190,6 +190,7 @@ Sound/IOP: `PS2X_SPU2_TRACE` · `PS2X_LIBSD_TRACE` · `PS2X_KSNG_TRACE` / `PS2X_
 Other: `PS2X_IPU_DUMP=<dir>` / `PS2X_IPU_TRACE` · `PS2X_MPG_TRACE` · `PS2X_VIF1_CHAIN_TRACE` · `PS2X_PAD2_TRACE` ·
 `PS2X_RAM_DUMP_TICKS=t1,t2` · `PS2X_RAM_WATCH=addr:len` · `PS2X_CTRL=<file>` (dev command file: press/shot/threads/quit).
 Debug code in the runtime is tagged `DW5XL-DEBUG`; temporary probes `TEMP-DEBUG` (remove before committing).
+Profiling (a debugging tool, not CI): `tools/profile/` (`CONTRACT.md`); markers only in `-DDW5XL_DEVELOPER_DIAGNOSTICS=ON` builds with `PS2X_PROFILE_MARKERS=<file>`.
 No `perf` on this machine: profile with `gprofng collect app` (see notes) or `tools/debug/gdb_sample_profile.sh`.
 
 ### Comparing with the original (PCSX2)
