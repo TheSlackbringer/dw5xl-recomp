@@ -1,0 +1,2 @@
+# Developer-only dependency; not used by the game or release builder.
+Pillow==13.0.0

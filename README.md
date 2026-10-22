@@ -178,6 +178,8 @@ Fixes live in handwritten app/runtime code, recompiler profiles and generation t
 
 Game data, analysis databases, generated main/overlay output, builds and local research notes are excluded from Git. Contributor and coding-agent workflows are described in `AGENTS.md` and `CLAUDE.md`.
 
+For offline graphics debugging, [compare saved frames exactly](tools/debug/compare_frames.md) with changed-pixel counts, locations and an optional difference image.
+
 Current priorities are Windows performance, long-session stability, broader gameplay testing and the Linux release.
 
 ### Making a release
