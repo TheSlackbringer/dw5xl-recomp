@@ -236,8 +236,10 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_field_history_test tests/field_history_test.cpp)
     target_include_directories(dw5xl_field_history_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
     add_test(NAME field_history COMMAND dw5xl_field_history_test)
-    # Issue 025 profiling markers: the first test compiles them in itself; the _off test checks that a build
-    # without DW5XL_DEVELOPER_DIAGNOSTICS only gets empty inline functions.
+    # Issue 025 profiling markers (a debugging tool, owner 2026-10-22: not part of CI or normal test runs): built and
+    # run only in diagnostic builds. The first test compiles them in itself; the _off test checks that a build without
+    # DW5XL_DEVELOPER_DIAGNOSTICS only gets empty inline functions.
+    if(DW5XL_DEVELOPER_DIAGNOSTICS)
     add_executable(dw5xl_profile_markers_test tests/profile_markers_test.cpp
         "${PS2RECOMP_DIR}/ps2xRuntime/src/lib/ps2_profile_markers.cpp")
     target_include_directories(dw5xl_profile_markers_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
@@ -247,6 +249,7 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_profile_markers_off_test tests/profile_markers_off_test.cpp)
     target_include_directories(dw5xl_profile_markers_off_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
     add_test(NAME profile_markers_off COMMAND dw5xl_profile_markers_off_test)
+    endif()
     add_executable(dw5xl_cd_iop_read_test tests/cd_iop_read_test.cpp)
     target_link_libraries(dw5xl_cd_iop_read_test PRIVATE ps2_runtime)
     target_compile_options(dw5xl_cd_iop_read_test PRIVATE ${DW5XL_ARCH_FLAGS})
