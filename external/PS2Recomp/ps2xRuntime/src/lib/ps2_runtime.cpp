@@ -9,6 +9,7 @@
 #include "gs/gs_trace.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_device_queue.h"
+#include "runtime/ps2_profile_markers.h"
 #include "vif1_capture.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -619,6 +620,7 @@ namespace ps2x_dev
                 {
                     std::cerr << "[dev] quit at tick " << tick << std::endl;
                     ps2x::device::quiesceAll(std::chrono::milliseconds(2000));
+                    ps2prof::flush(); // DW5XL-DEBUG issue 025: _Exit skips atexit
                     GSTrace::shutdown();
                     if (runtime) runtime->audioBackend().stopPcmStream();
                     std::cout.flush();
@@ -772,6 +774,7 @@ namespace ps2x_dev
                     writeThreads(std::cerr, runtime);
                 std::cerr << "[dev] exit tick " << tick << " reached" << std::endl;
                 ps2x::device::quiesceAll(std::chrono::milliseconds(2000));
+                ps2prof::flush(); // DW5XL-DEBUG issue 025: _Exit skips atexit
                 GSTrace::shutdown();
                 if (runtime) runtime->audioBackend().stopPcmStream();
                 std::cout.flush();
@@ -1419,6 +1422,7 @@ bool PS2Runtime::initialize(const char *title)
 {
     try
     {
+        ps2prof::openFromEnv(); // DW5XL-DEBUG issue 025: PS2X_PROFILE_MARKERS=<file> (diagnostic builds only)
         if (!m_memory.initialize())
         {
             std::cerr << "Failed to initialize PS2 memory" << std::endl;

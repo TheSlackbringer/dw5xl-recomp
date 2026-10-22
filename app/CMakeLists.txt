@@ -21,9 +21,23 @@ set(PS2X_BUILD_TEST OFF CACHE BOOL "" FORCE)
 set(PS2X_BUILD_STUDIO OFF CACHE BOOL "" FORCE)
 # MSVC/clang-cl only: keep the runtime's floating point like the Linux build.
 set(PS2X_MSVC_FAST_FLOAT OFF CACHE BOOL "" FORCE)
+# Issue 025 (DW5XL-DEBUG): profiling markers, debug info and frame pointers for OS recorders (WPR, perf). Use a
+# separate build directory (app/build-diagnostics); never for timing acceptance or releases.
+option(DW5XL_DEVELOPER_DIAGNOSTICS "Developer diagnostics build: profiling markers (issue 025)" OFF)
+if(DW5XL_DEVELOPER_DIAGNOSTICS)
+    add_compile_options(-g -fno-omit-frame-pointer)
+    if(WIN32)
+        add_compile_options(-gcodeview)
+        add_link_options(-Wl,--pdb=)
+    endif()
+endif()
 add_subdirectory("${PS2RECOMP_DIR}" ps2recomp EXCLUDE_FROM_ALL)
 # Runtime stubs also instantiate guest arithmetic helpers.
 target_compile_options(ps2_runtime PRIVATE ${DW5XL_STRICT_FP_FLAGS})
+if(DW5XL_DEVELOPER_DIAGNOSTICS)
+    target_sources(ps2_runtime PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib/ps2_profile_markers.cpp")
+    target_compile_definitions(ps2_runtime PUBLIC DW5XL_DEVELOPER_DIAGNOSTICS=1)
+endif()
 
 # The game itself needs the code generated from the player's own disc (tools/regen.sh). OFF builds only what needs
 # no game data: the runtime, the tools and the tests below that use no generated code (CI, issue 011).
@@ -222,6 +236,17 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_field_history_test tests/field_history_test.cpp)
     target_include_directories(dw5xl_field_history_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
     add_test(NAME field_history COMMAND dw5xl_field_history_test)
+    # Issue 025 profiling markers: the first test compiles them in itself; the _off test checks that a build
+    # without DW5XL_DEVELOPER_DIAGNOSTICS only gets empty inline functions.
+    add_executable(dw5xl_profile_markers_test tests/profile_markers_test.cpp
+        "${PS2RECOMP_DIR}/ps2xRuntime/src/lib/ps2_profile_markers.cpp")
+    target_include_directories(dw5xl_profile_markers_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    target_compile_definitions(dw5xl_profile_markers_test PRIVATE DW5XL_DEVELOPER_DIAGNOSTICS=1)
+    target_link_libraries(dw5xl_profile_markers_test PRIVATE Threads::Threads)
+    add_test(NAME profile_markers COMMAND dw5xl_profile_markers_test)
+    add_executable(dw5xl_profile_markers_off_test tests/profile_markers_off_test.cpp)
+    target_include_directories(dw5xl_profile_markers_off_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME profile_markers_off COMMAND dw5xl_profile_markers_off_test)
     add_executable(dw5xl_cd_iop_read_test tests/cd_iop_read_test.cpp)
     target_link_libraries(dw5xl_cd_iop_read_test PRIVATE ps2_runtime)
     target_compile_options(dw5xl_cd_iop_read_test PRIVATE ${DW5XL_ARCH_FLAGS})

@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_device_queue.h"
+#include "runtime/ps2_profile_markers.h"
 #include "ps2_vu1_detail.h"
 
 #include <algorithm>
@@ -1899,6 +1900,22 @@ namespace
     {
         return unit == VU1Interpreter::Unit::VU0 ? memory.getVU0CodeGeneration() : memory.getVU1CodeGeneration();
     }
+
+#if defined(DW5XL_DEVELOPER_DIAGNOSTICS) && DW5XL_DEVELOPER_DIAGNOSTICS
+    // DW5XL-DEBUG issue 025: the VU1 cycles of each run (not verifier shadow runs) for the device job markers.
+    struct ProfileVu1Run
+    {
+        bool counted;
+        uint32_t pc;
+        const uint64_t &cycle;
+        uint64_t before;
+        ~ProfileVu1Run()
+        {
+            if (counted)
+                ps2prof::addVu1(pc, cycle - before);
+        }
+    };
+#endif
 }
 
 void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
@@ -1922,6 +1939,9 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
     m_state.vf[0][3] = 1.0f;
+#if defined(DW5XL_DEVELOPER_DIAGNOSTICS) && DW5XL_DEVELOPER_DIAGNOSTICS
+    const ProfileVu1Run profileRun{m_unit == Unit::VU1 && !m_verifyShadow, m_state.pc, m_cycle, m_cycle};
+#endif
     if (census(m_unit).enabled() && memory)
     {
         VuCensus &c = census(m_unit);
@@ -1957,6 +1977,9 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     m_state.itop = itop;
     m_state.stoppedByD = false;
     m_state.stoppedByT = false;
+#if defined(DW5XL_DEVELOPER_DIAGNOSTICS) && DW5XL_DEVELOPER_DIAGNOSTICS
+    const ProfileVu1Run profileRun{m_unit == Unit::VU1 && !m_verifyShadow, m_state.pc, m_cycle, m_cycle};
+#endif
     if (census(m_unit).enabled())
     {
         VuCensus &c = census(m_unit);

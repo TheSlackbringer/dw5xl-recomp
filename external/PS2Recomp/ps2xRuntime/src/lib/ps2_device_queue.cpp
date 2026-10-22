@@ -1,6 +1,7 @@
 #include "runtime/ps2_device_queue.h"
 
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_profile_markers.h"
 #include "ThreadNaming.h"
 
 #include <array>
@@ -299,6 +300,8 @@ namespace ps2x::device
 
                 const bool hasGif = command->transfer.hadGif;
                 const bool hasVif1 = command->transfer.hadVif1;
+                const uint16_t kind = static_cast<uint16_t>(command->kind);
+                uint64_t submittedSeq = 0u;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     const uint64_t seq = submitted.load(std::memory_order_relaxed) + 1u;
@@ -309,7 +312,9 @@ namespace ps2x::device
                         lastVif1Seq.store(seq, std::memory_order_relaxed);
                     queue.push_back(std::move(command));
                     submitted.store(seq, std::memory_order_release);
+                    submittedSeq = seq;
                 }
+                ps2prof::record(ps2prof::Event::JobSubmit, submittedSeq, kind); // DW5XL-DEBUG issue 025
                 workCv.notify_one();
                 maybeReportTrace();
             }
@@ -358,11 +363,15 @@ namespace ps2x::device
                     if (completed.load(std::memory_order_acquire) < target)
                     {
                         blocked = true;
+                        ps2prof::record(ps2prof::Event::DeviceWaitStart, target, static_cast<uint16_t>(reason)); // DW5XL-DEBUG
                         const auto waitStart = Clock::now();
-                        std::unique_lock<std::mutex> lock(mutex);
-                        doneCv.wait(lock, [&]
-                                    { return completed.load(std::memory_order_acquire) >= target; });
+                        {
+                            std::unique_lock<std::mutex> lock(mutex);
+                            doneCv.wait(lock, [&]
+                                        { return completed.load(std::memory_order_acquire) >= target; });
+                        }
                         waitNs = nsSince(waitStart);
+                        ps2prof::record(ps2prof::Event::DeviceWaitEnd, target, static_cast<uint16_t>(reason)); // DW5XL-DEBUG
                     }
                     const uint64_t pendingBefore = submitted.load(std::memory_order_relaxed) - appliedNow;
                     applyCompleted();
@@ -371,7 +380,10 @@ namespace ps2x::device
                     {
                         const uint64_t field = mem.gs().vsyncTick.load(std::memory_order_relaxed);
                         if (g_lastFrameField.exchange(field, std::memory_order_relaxed) != field)
+                        {
                             g_gameFrames.fetch_add(1u, std::memory_order_relaxed);
+                            ps2prof::record(ps2prof::Event::GameFrame, field); // DW5XL-DEBUG issue 025
+                        }
                     }
                     if (blocked)
                     {
@@ -701,6 +713,9 @@ namespace ps2x::device
 
                     const uint64_t idleNs = nsSince(idleStart);
                     const auto busyStart = Clock::now();
+                    // DW5XL-DEBUG issue 025: job markers with the VU1 cycles this job ran.
+                    ps2prof::takeVu1();
+                    ps2prof::record(ps2prof::Event::JobStart, command->seq, static_cast<uint16_t>(command->kind));
                     std::fesetenv(&command->fenv);
                     try
                     {
@@ -710,6 +725,12 @@ namespace ps2x::device
                     catch (...)
                     {
                         command->error = std::current_exception();
+                    }
+                    if (ps2prof::kCompiledIn)
+                    {
+                        const ps2prof::Vu1Totals vu1 = ps2prof::takeVu1();
+                        ps2prof::record(ps2prof::Event::JobEnd, command->seq, static_cast<uint16_t>(command->kind),
+                                        vu1.longestPc, vu1.cycles > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<uint32_t>(vu1.cycles));
                     }
                     const uint64_t busyNs = nsSince(busyStart);
                     idleStart = Clock::now();

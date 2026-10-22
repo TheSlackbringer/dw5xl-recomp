@@ -5,6 +5,7 @@
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_device_queue.h"
+#include "runtime/ps2_profile_markers.h"
 
 #include <algorithm>
 #include <cassert>
@@ -2164,6 +2165,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
+        ps2prof::record(ps2prof::Event::FieldStart, m_vsyncTick); // DW5XL-DEBUG issue 025
         m_runtime.memory().vsyncTickNs().store(std::chrono::steady_clock::now().time_since_epoch().count(),
                                                   std::memory_order_relaxed);
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
