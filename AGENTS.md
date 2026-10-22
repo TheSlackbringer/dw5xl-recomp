@@ -7,90 +7,105 @@ Static recompilation of **Dynasty Warriors 5 Xtreme Legends** (PAL SLES_538.60) 
 Read first: this file → `notes/issues/README.md` (local: index, "Waiting for you", working agreement) → the current
 issue's `spec.md` and `work.md`. Setup/build commands: `notes/PROJECT_SETUP.md`. Look-ups (repo map, debug switches,
 Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. History only: `notes/BRINGUP.md`,
-`notes/CLAUDE_HANDOFF.md`, `notes/OWNER_TEST_CHECKLIST.md`.
+`notes/CLAUDE_HANDOFF.md`.
 
-## Hard rules (owner, 2026-10-19 — after an agent weakened tests to make them pass)
+## Hard rules (2026-10-19 — after an agent weakened tests to make them pass)
 - **Never change a test's pass criteria** (thresholds, tick windows, run mode) to make it pass. Changing criteria is
-  a spec change: the owner approves it first. A failing test is reported as failing.
+  a spec change: the user approves it first. A failing test is reported as failing.
 - **No timing workarounds:** no delays, sleeps or knobs tuned to one game routine or one machine. Fix the root cause.
 - **Every claimed result names its log** (`notes/issues/tests/out/...`). "Passes" means the run has finished.
-- **Only the owner approves a spec.** Write "approved" only after the owner said so, with the date.
-- **Pushing is the owner's:** push only after the owner agreed to that push.
+- **Only the user approves a spec.** Write "approved" only after the user said so, with the date.
+- **Pushing requires permission:** push only after the user agreed to that push.
 - Changes to `notes/` are tracked in its own local git repo (`git -C notes log`); commit your notes changes there.
 - Before relying on the game files, `notes/tools/check_game_files.sh` must pass (they must match the player's disc).
 
-## How we work with the owner (agreed 2026-10-16)
+## Working agreement (2026-10-16)
 1. **One folder per issue**, `notes/issues/NNN-short-name/` (local, never committed; templates in `notes/issues/`):
-   - `spec.md` — what the owner and you agreed. Copy `notes/issues/TEMPLATE-spec.md` and fill EVERY section:
-     what the owner sees; background (facts with numbers, what is ruled out); how to reproduce; **recommended fix**
+   - `spec.md` — what the user and you agreed. Copy `notes/issues/TEMPLATE-spec.md` and fill EVERY section:
+     what the user sees; background (facts with numbers, what is ruled out); how to reproduce; **recommended fix**
      (step by step, why it works, expected result); **native vs emulation** (a header line plus a section: which
      parts are native code, which stay emulated, anything moving between them); **main risks** (what could go wrong
-     or need an owner decision, and what then); alternatives considered (and why not); measurable pass criteria;
-     the automated test; the 1–3 "Owner test" items only the owner can judge; out of scope. Plain words, no
+     or need a user decision, and what then); alternatives considered (and why not); measurable pass criteria;
+     the automated test; the 1–3 manual checks that require human judgement; out of scope. Plain words, no
      unexplained jargon. Examples: issues 001 and 002.
    - `work.md` — stop/go milestones (not in the spec), all your findings, progress, measurements, conclusion, fix
      (commit) and history, kept current. Findings never live only in chat.
-2. **Spec approval before any work.** Draft the spec (fact-finding needed to write it is fine); the owner approves.
-   Push back with reasons when you think a spec is wrong; the owner decides and can overrule. No fixes or experimental
-   code changes without an approved spec. While away, the owner can allow work on an unapproved spec — explicitly.
+2. **Spec approval before any work.** Draft the spec (fact-finding needed to write it is fine); the user approves.
+   Push back with reasons when you think a spec is wrong; the user decides and can overrule. No fixes or experimental
+   code changes without an approved spec. While away, the user can allow work on an unapproved spec — explicitly.
 3. **A test per issue, written first:** `notes/issues/tests/issue_NNN_*.py` prints PASS/FAIL and must FAIL on the bug
    before the fix (where measurable). Runner: `notes/issues/tests/run.py NNN|quick|standard|full|list`; helpers and routes in
    `tests/dw5test.py`. Closed issues keep their tests as regression guards.
-4. **Testing by change (owner 2026-10-21, replaces mandatory suite gates):** run all fast automated checks
+4. **Testing by change (2026-10-21, replaces mandatory suite gates):** run all fast automated checks
    after every change: unit tests, Python unit tests and static checks. Also run checks relevant to the changed
    code and behaviour. Use CI to validate builds. Slow gameplay runs are separate from the fast checks.
-   **After fixing at least three specs, recommend a full-suite run and ask the owner directly before running it.**
-   Never start the full suite without the owner's explicit approval or request. There is no automatic broad-suite
-   requirement before commits, pushes or owner test sessions. Test thresholds, tick windows, repeats and pass
-   criteria stay unchanged; report failures and incomplete runs honestly, with logs. Owner tests cover the spec's
-   short "Owner test" list. Test window: `run.py window NNN ...` (full logging filed under the issues).
+   **After fixing at least three specs, recommend a full-suite run and ask the user directly before running it.**
+   Never start the full suite without the user's explicit approval or request. There is no automatic broad-suite
+   requirement before commits, pushes or manual test sessions. Test thresholds, tick windows, repeats and pass
+   criteria stay unchanged; report failures and incomplete runs honestly, with logs. Manual checks cover the spec's
+   short manual-validation list. Test window: `run.py window NNN ...` (full logging filed under the issues).
    Normal play: `run.py play`.
-5. **Commits and pushes:** one local commit per fixed issue ("Fix #00N: …") when it reaches "fixed — owner test".
-   Push only after the owner confirmed the issues in the batch and agreed to the push. Other commits only on command.
-6. **Stop/go:** split big work into milestones in `work.md`. Owner present: a two-line status per milestone, and an
-   immediate report (with the alternative) when an approach doesn't pay off. Owner away: keep going, log milestones.
-7. **While the owner is away** you may: work on approved specs in the agreed order; run automated tests off-screen;
+5. **Commits and pushes:** one local commit per fixed issue ("Fix #00N: …") when it is ready for manual validation.
+   Push only after the user confirmed the issues in the batch and agreed to the push. Other commits only on command.
+6. **Stop/go:** split big work into milestones in `work.md`. User present: a two-line status per milestone, and an
+   immediate report (with the alternative) when an approach doesn't pay off. User away: keep going, log milestones.
+7. **While the user is away** you may: work on approved specs in the agreed order; run automated tests off-screen;
    update `work.md` and the index; make local per-issue commits; capture PCSX2 references (headless); create NEW
-   issues (draft spec + findings) — but not fix them. Wait for the owner for: fixes without an approved spec, spec
+   issues (draft spec + findings) — but not fix them. Wait for the user for: fixes without an approved spec, spec
    changes, pushing, any visible window or desktop action, deleting outside your scratch space, downloads/installs/
    system settings, turning the PC off (only when asked that time). Stuck: write it under "Waiting for you" and
    continue with the next approved issue.
 
 ## Rules
-- **NEVER ASSUME — ask the owner, with a recommendation.** Need something opened, switched, installed or done
-  (a Ghidra tab, a PCSX2 screen, a file), or unsure what the owner has or wants: ask what, why, and what you recommend.
-- **Decisions are the owner's:** scope, requirements, priorities, library/function/graphics behaviour choices,
+- **NEVER ASSUME — ask the user, with a recommendation.** Need something opened, switched, installed or done
+  (a Ghidra tab, a PCSX2 screen, a file), or unsure what the user has or wants: ask what, why, and what you recommend.
+- **Decisions belong to the user:** scope, requirements, priorities, library/function/graphics behaviour choices,
   native-vs-emulation direction. Present 2–4 options with a recommendation; research and diagnosis may continue while
   waiting, applying the choice may not. A request to fix something is not agreement with a particular approach.
 - **Native over emulation;** model hardware only where the runtime must. Prefer the game's own SDK code over runtime
   HLE stubs. Find root causes; no workarounds that paper over symptoms. Survey existing approaches before inventing.
 - **Performance changes must give identical output** (same frames, same sound). Test at **1x**: every run passes
   `PS2X_GS_SCALE=1 PS2X_GS_SSAA=1` and you check the `[output] scale=1x` log line.
+- **Exact saved-frame comparison (2026-10-22):** Use `tools/debug/compare_frames.py` for renderer/shader,
+  VU graphics math, framebuffer/presentation changes, optimizations/refactors in those paths, and visual-regression
+  investigations. This is a targeted visual debugging/correctness check, not a requirement after every change.
+  Compare a small set of corresponding before/after frames covering the affected scene, with the same input/frame,
+  machine/GPU/driver, output kind and settings (Vulkan, scale=1, SSAA=1). For renderer changes, replay the same saved
+  GS recording in both builds. For game/VU changes, capture matching output from each build so the changed code
+  actually runs; replaying an old GS recording bypasses those changes. If matching evidence is unavailable,
+  record the comparison as pending and explain why; unrelated frames cannot establish output equality.
+  Output-preserving optimizations/refactors must be IDENTICAL. For intended graphics fixes, inspect the heatmap
+  and explain the expected differences against the approved spec. Record the report, heatmap and capture details
+  in the issue's work log; use `--context` to check declared correspondence. See `tools/debug/compare_frames.md`.
+  FPS/frame-time measurements assess performance; profilers locate costs and waits. This tool compares pixels,
+  not FPS. Capture images separately from timing runs: saving frames can itself cause stutter. Do not require this
+  comparison for documentation, packaging, CI, launcher-only, audio-only or other changes unrelated to rendered
+  output. It does not automatically trigger a full gameplay suite or replace existing sound/gameplay checks.
 - **GPU renderer only** (Vulkan/paraLLEl-GS) for development and tests; no CPU-renderer work unless asked.
-- **The port is not specific to the owner's hardware.** Keep fixes portable across supported hardware and the
-  planned Linux/Windows targets. The owner's CPU/GPU are test equipment, not product requirements. Label
+- **The port is not specific to one machine.** Keep fixes portable across supported hardware and the
+  planned Linux/Windows targets. The test machine's CPU/GPU are test equipment, not product requirements. Label
   performance measurements with their test hardware; do not generalize one machine's timings or introduce
-  machine-specific fixes. Correctness is defined by PS2 behaviour. (Owner reminder, 2026-10-18.)
-- **The owner's desktop is off limits:** never send synthetic input to it, never screenshot it (use frame dumps),
-  never unlock it, never edit `~/.config/PCSX2`. Visible windows only for an owner test session or when asked.
-- **One game at a time;** no builds or test runs while the owner has a window open. Tests use the silent sink
+  machine-specific fixes. Correctness is defined by PS2 behaviour. (Portability requirement, 2026-10-18.)
+- **The user's desktop is off limits:** never send synthetic input to it, never screenshot it (use frame dumps),
+  never unlock it, never edit `~/.config/PCSX2`. Visible windows only for a manual test session or when asked.
+- **One game at a time;** no builds or test runs while the user has a window open. Tests use the silent sink
   `dw5xl_codex_tests`; live play uses the default output. Never change audio defaults or route other apps.
 - **Downloads need explicit permission** (name, source, size).
 - **Nothing derived from the game in Git:** no game files (`game/`, `discs/`), Ghidra DBs, generated or lifted C++
   (`recomp/*/output/`, `recomp/dw5xl/vu1/`), frame dumps, captures, microcode `.bin`, screenshots. Scan before every
   commit/push. Hooks in `.githooks/` (`git config core.hooksPath .githooks`); never bypass them (`--no-verify`).
-- **Releases (owner decision 2026-10-19, issue 011 v5):** a release contains only our code and freely licensed
+- **Releases (2026-10-19, issue 011 v5):** a release contains only our code and freely licensed
   tools (the builder: wizard, recompiler, sources, compiler) — never the compiled game, disc files, an ISO,
   generated or lifted C++ or any other game-derived file. The player's PC builds the game (PS2Recomp is GPL-3.0; a
   shipped game binary would break it). Shipping the compiled game only with written permission from PS2Recomp's
-  authors. Releases are published only by the owner.
+  authors. Releases are published only by the user.
 - **Commit identity:** author/committer `TheSlackbringer <15327900+TheSlackbringer@users.noreply.github.com>`;
   end messages with `Co-Authored-By: Claude <model> <noreply@anthropic.com>`. Call our renderer fixes "runtime
   patches" (`vendor/`). `external/PS2Recomp/` is vendored: runtime changes are ordinary commits here.
 - **Use the Ghidra MCP whenever you can** (`mcp__ghidra__*` tools: decompile, xrefs, strings, renames/comments)
   for reverse engineering; call `get_program_info` first. Headless only when the MCP is unreachable (GUI closed),
   for batch jobs, or for parallel agents — always on a copy (see Reference → Ghidra). If the needed program is not
-  the active tab, ask the owner to switch it.
+  the active tab, ask the user to switch it.
 - **Parallel agents** get self-contained briefs and do analysis/patch-writing in their own worktree or scratch dir
   (Ghidra on their own copy); one integrator builds and runs the game. Each worktree gets its own `app/build-<task>`.
 - **Never delete build dirs containing `_deps`;** no `rm` with bare shell variables (use `"${VAR:?}"`).
@@ -101,8 +116,8 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
 - Build: `cmake --build app/build` (all), `--target dw5xl` (game). Regenerate code: `tools/regen.sh main|ovl00|…`
   (needs the player's disc in `game/dw5xl/`). CTests: `cd app/build && ctest`.
 - Run all fast checks plus checks relevant to the changed area (testing rule above). Available issue tiers: `run.py NNN|quick|standard|full`;
-  recommend full after at least three specs are fixed and ask the owner before running it. Perf/stutter: `tools/heavy_battle_test.py` (no frame dumps when measuring timing).
-- Unsure how the original looks or behaves: compare with PCSX2 first (`tools/pcsx2_reference.py`), then ask the owner
+  recommend full after at least three specs are fixed and ask the user before running it. Perf/stutter: `tools/heavy_battle_test.py` (no frame dumps when measuring timing).
+- Unsure how the original looks or behaves: compare with PCSX2 first (`tools/pcsx2_reference.py`), then ask the user
   for what screenshots can't show (feel, sound timing).
 - Debug code: `DW5XL-DEBUG` (kept, env-gated) and `TEMP-DEBUG` (remove before committing).
 
@@ -147,7 +162,7 @@ A host-input script disables real keyboard polling for the whole run: never set 
 manual play. Silent sink missing after a reboot: `pactl load-module module-null-sink sink_name=dw5xl_codex_tests`.
 Stop a game with `kill <pid>` (never `pkill -f dw5xl` from a shell whose own command line contains that string).
 Presented-window timing without touching the desktop: instead of `PS2X_HIDDEN=1`, prefix the game with
-`gamescope --backend headless -W 2560 -H 1440 -w 2560 -h 1440 -r 240 --` (the owner's monitor; used by
+`gamescope --backend headless -W 2560 -H 1440 -w 2560 -h 1440 -r 240 --` (example test display; used by
 `tools/heavy_battle_test.py` and the 007 test). Frame dumps are the presented frames (`frame_<tick>.png`); contact
 sheet: `magick montage frame_*.png -tile 4x4 -geometry 256x179+2+2 -label '%f' sheet.png`.
 
@@ -179,10 +194,10 @@ No `perf` on this machine: profile with `gprofng collect app` (see notes) or `to
 
 ### Comparing with the original (PCSX2)
 `tools/pcsx2_reference.py --out <scratch> --seconds <n> [--interval 0.5] [--keys "<sec>:<keysym>,..."]` runs the
-owner's PCSX2 headless on a private Xvfb display with a throwaway copy of the owner's config and the software renderer,
+local PCSX2 instance headless on a private Xvfb display with a throwaway copy of its config and the software renderer,
 taking F8 screenshots into `<out>/snaps` (keys: Cross=x, Start=Return, Circle=c, Square=z, Triangle=v, D-pad=arrows).
 Capture the same moment from the port and compare side by side. Screenshots are game-derived (scratch or
-`notes/evidence/` only). Never touch the owner's `~/.config/PCSX2` or send input to the real desktop.
+`notes/evidence/` only). Never touch the user's `~/.config/PCSX2` or send input to the real desktop.
 
 ### Rendering bugs: record and replay one frame
 `PS2X_GS_RECORD=<file> PS2X_GS_RECORD_FROM=<tick> PS2X_GS_RECORD_TO=<tick>` records every renderer call (starts with
