@@ -7,7 +7,7 @@ Function names: stack addresses are rebased to each module's file ImageBase and 
 only normalized.
 
 Usage: report.py <samples.jsonl> <out dir> [--markers markers.bin ...] [--programs a.exe,b.exe]"""
-import argparse, collections, json, ntpath, os, re, statistics, subprocess, sys
+import argparse, bisect, collections, json, ntpath, os, re, statistics, subprocess, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common
 
@@ -157,6 +157,10 @@ def build(records, marker_files, programs, search_dirs=()):
     # waits: switched out while Waiting -> switched in again; the waker is the last ReadyThread in between
     switches.sort(key=lambda r: r['t_ns'])
     readies.sort(key=lambda r: r['t_ns'])
+    woken = collections.defaultdict(list)       # woken thread -> its ReadyThread events, in time order
+    for r in readies:
+        woken[(r['rdy_pid'], r['rdy_tid'])].append(r)
+    woken_t = {k: [r['t_ns'] for r in v] for k, v in woken.items()}
     out_at = {}
     partners = set()
     for s in switches:
@@ -165,8 +169,9 @@ def build(records, marker_files, programs, search_dirs=()):
             out_at[old] = s['t_ns']
         if new in index and new in out_at:
             start, end = out_at.pop(new), s['t_ns']
-            wakers = [r for r in readies if (r['rdy_pid'], r['rdy_tid']) == new and start <= r['t_ns'] <= end]
-            w = wakers[-1] if wakers else None
+            ts = woken_t.get(new, [])
+            i = bisect.bisect_right(ts, end) - 1
+            w = woken[new][i] if i >= 0 and ts[i] >= start else None
             index[new]['waits'].append({
                 'start_ns': start, 'end_ns': end,
                 'waker_thread': (names.get((w['pid'], w['tid'])) or (str(w['tid']) if w['pid'] in ours else None)) if w else None,

@@ -39,6 +39,15 @@ def symbols_of(path):
     return 'none'
 
 
+def qpc_frequency():
+    """This PC's QueryPerformanceCounter ticks per second (Windows), the recorder's clock; None elsewhere."""
+    if not common.WINDOWS:
+        return None
+    import ctypes
+    f = ctypes.c_int64()
+    return f.value if ctypes.windll.kernel32.QueryPerformanceFrequency(ctypes.byref(f)) else None
+
+
 def parse_args(argv):
     if '--' in argv:
         i = argv.index('--')
@@ -177,7 +186,10 @@ def main(argv=None):
         manifest['anchors'] = anchors
         anchor_lines = [l for l in open(os.path.join(exported, 'anchors.txt'), encoding='utf-8', errors='replace')
                         if l.startswith('#')]
-        freq = next((x['os_freq'] for x in anchors if x.get('os_freq')), None) or etw_samples.estimate_freq(anchor_lines)
+        freq = next((x['os_freq'] for x in anchors if x.get('os_freq')), None) or qpc_frequency() or \
+            etw_samples.estimate_freq(anchor_lines)
+        if not freq:
+            raise CaptureError(1, 'QPC frequency unknown (no markers, no anchors)')
         samples = os.path.join(out, 'samples.jsonl')
         counts = etw_samples.convert(os.path.join(exported, 'events.txt'), anchor_lines, samples, freq,
                                      common.steady_offset_ns(anchors))
