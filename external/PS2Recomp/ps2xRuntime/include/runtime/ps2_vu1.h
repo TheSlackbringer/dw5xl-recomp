@@ -355,6 +355,7 @@ private:
     void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();
+    bool copyXgkickPayloadInBulk();
     void progressXgkick();
     void finishXgkick();
     uint64_t calculatePairReadyCycle(const DecodedInstructionPair &decoded) const;

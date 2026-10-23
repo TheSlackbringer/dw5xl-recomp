@@ -1114,12 +1114,61 @@ bool VU1Interpreter::pipelinesPending() const
            m_writebackHorizon > m_cycle;
 }
 
+// The PATH1 copy at the end of a run, several quadwords at a time (issue 025 v9, C3a). Only inside a GIFtag's
+// payload (tags take the stepped path) and only up to the cycle before the next pipeline commit, which could change
+// VU data the packet still reads. Bytes, cycle count and credit are exactly those of the stepped loop: one quadword
+// per two cycles (progressXgkick), the j-th of them on cycle m_cycle + 2j - credit.
+bool VU1Interpreter::copyXgkickPayloadInBulk()
+{
+    if (!m_activeVuData || m_activeVuDataSize == 0u || m_xgkick.currentTagEnd == 0u ||
+        m_xgkick.copiedBytes >= m_xgkick.currentTagEnd)
+        return false;
+    constexpr uint64_t kMaxQwords = 64u; // cancellation is checked between steps
+    const uint64_t credit = m_xgkick.cycleCredit;
+    uint64_t qwords = std::min<uint64_t>((m_xgkick.currentTagEnd - m_xgkick.copiedBytes) / 16u, kMaxQwords);
+    if (m_nextCommitCycle != std::numeric_limits<uint64_t>::max())
+    {
+        // A commit applies at the start of its cycle, before that cycle's copy: stay strictly before it.
+        if (m_nextCommitCycle <= m_cycle)
+            return false;
+        qwords = std::min(qwords, (m_nextCommitCycle - m_cycle - 1u + credit) / 2u);
+    }
+    if (qwords == 0u)
+        return false;
+
+    const uint32_t bytes = static_cast<uint32_t>(qwords * 16u);
+    for (uint32_t done = 0; done < bytes;)
+    {
+        const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + done) % m_activeVuDataSize;
+        const uint32_t n = std::min(bytes - done, m_activeVuDataSize - source);
+        std::memcpy(m_xgkick.packet.data() + m_xgkick.copiedBytes + done, m_activeVuData + source, n);
+        done += n;
+    }
+    m_xgkick.copiedBytes += bytes;
+    m_xgkick.cycleCredit = 0u;
+    m_cycle += 2u * qwords - credit;
+    m_state.cycles = m_cycle;
+    if (m_xgkick.copiedBytes >= m_xgkick.currentTagEnd)
+    {
+        if (m_xgkick.currentTagEop)
+            finishXgkick();
+        else
+        {
+            m_xgkick.currentTagEnd = 0u;
+            m_xgkick.currentTagEop = false;
+        }
+    }
+    return true;
+}
+
 void VU1Interpreter::flushPipelines()
 {
     while (pipelinesPending())
     {
         if (m_unit == Unit::VU1 && ps2x::device::workerShouldCancelVu1())
             break;
+        if (m_xgkick.active && copyXgkickPayloadInBulk())
+            continue;
         if (!m_xgkick.active)
         {
             uint64_t next = m_nextCommitCycle;
