@@ -6,6 +6,7 @@
 #include "gs_record.h"
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -542,7 +543,66 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     return request;
 }
 
-void GS::latchHostPresentationFrame()
+// DW5XL-DEBUG issue 023: draw counts for PS2X_VBL_DRAW_TRACE (printed and reset by the EE scheduler).
+std::atomic<uint64_t> g_dw5xlVblDisplayDraws{0}, g_dw5xlVblOtherDraws{0};
+extern const uint64_t *g_dw5xlEeCyclePtr;
+extern std::atomic<uint64_t> g_dw5xlDisplayFirstCycle, g_dw5xlDisplayLastCycle;
+
+GSPresentationRequest GS::captureFieldScanoutRequest(uint64_t fieldTick) const
+{
+    // Called where the game's privileged register writes are applied in order (device worker, or the EE thread when
+    // the device runs inline), so these are the display registers at the end of the field.
+    GSPresentationRequest captured{};
+    if (!m_privRegs)
+        return captured;
+    captured.pmode = m_privRegs->pmode;
+    captured.smode2 = m_privRegs->smode2;
+    captured.dispfb1 = m_privRegs->dispfb1;
+    captured.display1 = m_privRegs->display1;
+    captured.dispfb2 = m_privRegs->dispfb2;
+    captured.display2 = m_privRegs->display2;
+    captured.bgcolor = m_privRegs->bgcolor;
+    captured.vsyncTick = fieldTick;
+    return captured;
+}
+
+void GS::submitFieldScanout(const GSPresentationRequest &captured)
+{
+    // GS side, after every GS packet the game sent during the field: the display buffer holds this field's picture.
+    // Under the GS state lock like the draws on this thread (a backend is replaced only under it), not the backend
+    // lifetime lock: the window holds that one while it waits for and copies a field, and the GS must not wait.
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    if (!m_backend || !m_privRegs)
+        return;
+    GSPresentationRequest request = buildPresentationRequestUnlocked(); // GS-side state in stream order
+    request.pmode = captured.pmode;
+    request.smode2 = captured.smode2;
+    request.dispfb1 = captured.dispfb1;
+    request.display1 = captured.display1;
+    request.dispfb2 = captured.dispfb2;
+    request.display2 = captured.display2;
+    request.bgcolor = captured.bgcolor;
+    request.vsyncTick = captured.vsyncTick;
+
+    // DW5XL-DEBUG issue 023: draws into the displayed buffer since the last VBlank event when the field is read
+    // (needs PS2X_VBL_DRAW_TRACE).
+    static const bool s_copyTrace = [] { const char *v = std::getenv("PS2X_VBL_DRAW_TRACE"); return v && *v && *v != '0'; }();
+    if (s_copyTrace)
+        std::fprintf(stderr, "[field:read] field=%llu displayDraws=%llu\n",
+                     static_cast<unsigned long long>(request.vsyncTick),
+                     static_cast<unsigned long long>(g_dw5xlVblDisplayDraws.load(std::memory_order_relaxed)));
+    const bool submitted = m_backend->SubmitFieldScanout(request);
+    m_fieldScanouts.store(submitted, std::memory_order_release);
+    if (submitted)
+    {
+        std::lock_guard<std::mutex> lock(m_fieldScanoutMutex);
+        m_lastSubmittedField = request.vsyncTick;
+        m_hasSubmittedField = true;
+    }
+    m_fieldScanoutCv.notify_all();
+}
+
+void GS::latchHostPresentationFrame(uint64_t waitForField)
 {
     GSPresentationRequest request{};
     {
@@ -560,7 +620,32 @@ void GS::latchHostPresentationFrame()
     }
 
     bool updated = false;
+    if (m_fieldScanouts.load(std::memory_order_acquire))
     {
+        // Issue 023: the fields are read on the GS side at the end of each field; the window only collects them.
+        if (waitForField != UINT64_MAX)
+        {
+            // Field pacing shows each field once: wait until that field's read has started (bounded by one PAL
+            // field so a stalled game never freezes the window).
+            std::unique_lock<std::mutex> lock(m_fieldScanoutMutex);
+            m_fieldScanoutCv.wait_for(lock, std::chrono::milliseconds(20), [this, waitForField]
+                                      { return m_hasSubmittedField && m_lastSubmittedField >= waitForField; });
+        }
+        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+        if (m_backend)
+            updated = m_backend->CollectFieldScanouts(m_latchedFrame, waitForField);
+    }
+    else
+    {
+        // DW5XL-DEBUG issue 023: PS2X_LATCH_TRACE=1 logs the display registers each latch reads (field tick, frame
+        // buffer, display position). Separate from PS2X_WEAVE_TRACE: printing here, before the read, changes its timing.
+        static const bool s_latchTrace = [] { const char *v = std::getenv("PS2X_LATCH_TRACE"); return v && *v && *v != '0'; }();
+        if (s_latchTrace)
+            std::fprintf(stderr, "[latch] tick=%llu dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx pmode=%llx smode2=%llx\n",
+                         static_cast<unsigned long long>(request.vsyncTick), static_cast<unsigned long long>(request.dispfb1),
+                         static_cast<unsigned long long>(request.display1), static_cast<unsigned long long>(request.dispfb2),
+                         static_cast<unsigned long long>(request.display2), static_cast<unsigned long long>(request.pmode),
+                         static_cast<unsigned long long>(request.smode2));
         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
         if (m_backend)
         {
@@ -686,6 +771,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 
 // Set by GifArbiter::drain() for the packet being processed; 0 = direct call.
 extern thread_local int g_gifArbiterCurrentPath;
+
 
 GS::GifPathResumeState &GS::gifPathState()
 {
@@ -1687,6 +1773,24 @@ void GS::vertexKick(bool drawing)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
+        // DW5XL-DEBUG issue 023: PS2X_VBL_DRAW_TRACE=1 counts draws into the displayed frame buffer and elsewhere;
+        // the EE scheduler prints and resets the counts at every VBlankStart/VBlankEnd (guest order with
+        // PS2X_GS_ASYNC=0 PS2X_VU1_ASYNC=0).
+        {
+            static const bool s_vblDrawTrace = [] { const char *v = std::getenv("PS2X_VBL_DRAW_TRACE"); return v && *v && *v != '0'; }();
+            if (s_vblDrawTrace && m_privRegs)
+            {
+                const bool toDisplay = batch.state.context.frame.fbp == static_cast<uint32_t>(m_privRegs->dispfb1 & 0x1FFu);
+                (toDisplay ? g_dw5xlVblDisplayDraws : g_dw5xlVblOtherDraws).fetch_add(1u, std::memory_order_relaxed);
+                if (toDisplay && g_dw5xlEeCyclePtr)
+                {
+                    const uint64_t cycle = *g_dw5xlEeCyclePtr;
+                    if (g_dw5xlDisplayFirstCycle.load(std::memory_order_relaxed) == UINT64_MAX)
+                        g_dw5xlDisplayFirstCycle.store(cycle, std::memory_order_relaxed);
+                    g_dw5xlDisplayLastCycle.store(cycle, std::memory_order_relaxed);
+                }
+            }
+        }
         if (GSTrace::enabled())
         {
             const uint64_t traceTick = m_privRegs ? m_privRegs->vsyncTick.load(std::memory_order_acquire) : 0u;

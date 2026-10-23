@@ -22,6 +22,8 @@ struct GifArbiterPacket
     bool path2DirectHl = false;
     bool path3Image = false;
     std::vector<uint8_t> data;
+    // Set for an ordered call (submitCall) instead of a GIF packet.
+    std::function<void()> call;
 };
 
 // Arbitrates GIF PATH1/2/3 packets and hands them to the GS in arbitration order. By default the
@@ -46,6 +48,9 @@ public:
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
     void drain();
+    // Runs `call` on the GS side after every packet submitted before it and before any later one (issue 023: the
+    // end-of-field scanout). Same producer thread as submit(); inline when there is no GS worker.
+    void submitCall(std::function<void()> call);
     // Between beginBatch() and endBatch() (one device transfer, on the calling
     // thread) drained packets collect in an outbox, in exactly the order the
     // per-packet drains produce, and reach the GS worker in groups instead of

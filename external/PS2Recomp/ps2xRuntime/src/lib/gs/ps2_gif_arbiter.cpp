@@ -96,10 +96,33 @@ void GifArbiter::workerLoop()
             m_pending.pop_front();
             m_workerBusy = true;
         }
+        if (pkt.call)
+        {
+            pkt.call();
+            pkt.call = nullptr;
+            continue;
+        }
         g_gifArbiterCurrentPath = static_cast<int>(pkt.pathId);
         m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         g_gifArbiterCurrentPath = 0;
     }
+}
+
+void GifArbiter::submitCall(std::function<void()> call)
+{
+    if (!call)
+        return;
+    // Everything submitted so far goes to the GS first, in arbitration order.
+    drain();
+    if (!m_async)
+    {
+        call();
+        return;
+    }
+    GifArbiterPacket pkt;
+    pkt.call = std::move(call);
+    m_outbox.push_back(std::move(pkt));
+    flushOutbox();
 }
 
 void GifArbiter::flushOutbox()

@@ -127,6 +127,8 @@ void GS::serializeState(ps2x::StateArchive &a)
         m_latchedFrame = {};
         m_hasHostPresentationFrame = false;
         ++m_hostPresentationGeneration;
+        std::lock_guard fieldLock(m_fieldScanoutMutex);
+        m_hasSubmittedField = false;
     }
     if (!m_backend)
         throw ps2x::StateError("no GS renderer");

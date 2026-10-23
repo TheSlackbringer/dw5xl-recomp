@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -197,6 +199,14 @@ public:
                 }
             }
         }
+        // DW5XL-DEBUG issue 023: PS2X_WEAVE_TRACE=1 logs every weave: field, parity, mode and whether the picture was
+        // woven from a pair, a stale pair or line-doubled (a line-doubled odd field sits one line below an even one).
+        static const bool s_weaveTrace = [] { const char *v = std::getenv("PS2X_WEAVE_TRACE"); return v && *v && *v != '0'; }();
+        if (s_weaveTrace)
+            std::fprintf(stderr, "[weave] tick=%llu odd=%d mode=%d repeat=%d consecutive=%d pair=%d stale=%d oppTick=%lld out=%u\n",
+                         static_cast<unsigned long long>(tick), odd ? 1 : 0, static_cast<int>(mode), repeat ? 1 : 0,
+                         consecutive ? 1 : 0, pair ? 1 : 0, stalePair ? 1 : 0,
+                         oppositeTick == kNoTick ? -1ll : static_cast<long long>(oppositeTick), outputHeight);
         height = outputHeight;
         m_lastTick = tick;
         m_lastOdd = odd;

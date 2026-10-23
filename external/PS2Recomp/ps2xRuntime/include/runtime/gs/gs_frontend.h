@@ -2,6 +2,8 @@
 #define PS2_GS_FRONTEND_H
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -135,7 +137,15 @@ public:
     bool isDebugHistoryPaused() const;
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
-    void latchHostPresentationFrame();
+    // Issue 023: end-of-field scanout. At the end of each field (EE VBlankStart) the runtime captures the display
+    // registers in the order of the game's register writes (captureFieldScanoutRequest, device order) and hands
+    // them to the GS side behind the game's GS work (submitFieldScanout, GS worker order), which starts reading the
+    // field. The window then only collects finished field reads (latchHostPresentationFrame).
+    GSPresentationRequest captureFieldScanoutRequest(uint64_t fieldTick) const;
+    void submitFieldScanout(const GSPresentationRequest &captured);
+    bool fieldScanoutsActive() const { return m_fieldScanouts.load(std::memory_order_acquire); }
+    // waitForField: the field the window is about to show (field pacing), UINT64_MAX = take what is finished.
+    void latchHostPresentationFrame(uint64_t waitForField = UINT64_MAX);
     uint64_t hostPresentationGeneration() const;
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
@@ -263,6 +273,12 @@ private:
     bool m_hostPresentationUsedPreferred = false;
     bool m_hasHostPresentationFrame = false;
     uint64_t m_hostPresentationGeneration = 0;
+    // Issue 023: field scanouts run on the GS side (false: the window reads at host time, e.g. the CPU renderer).
+    std::atomic<bool> m_fieldScanouts{false};
+    std::mutex m_fieldScanoutMutex;
+    std::condition_variable m_fieldScanoutCv;
+    uint64_t m_lastSubmittedField = 0;
+    bool m_hasSubmittedField = false;
     uint64_t m_nativeImageUploadCount = 0;
     uint64_t m_nativePackedGIFPacketCount = 0;
 

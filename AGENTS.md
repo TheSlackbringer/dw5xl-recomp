@@ -190,6 +190,11 @@ local only). Translator: `DW5XL_VU1_STATIC=all|none|<segments>` (static timing, 
 Graphics: `PS2X_GS_SCALE` / `PS2X_GS_SSAA` · `PS2X_NO_WEAVE` · `PS2X_GS_SYNCREADBACK` · `PS2X_GS_TRACE=<file>` +
 `_FROM/_TO` · `PS2X_GS_RECORD=<file>` + `_FROM/_TO` · `PS2X_VRAM_DUMP=<file>` (decode: `tools/debug/gs_vram_ct32.py`) ·
 `PS2X_XGKICK_CAPTURE=<prefix>` + `_FROM/_TO` · `PS2X_DEBUG_ZALWAYS`, `PS2X_ZWATCH` (experiments only).
+Window/presentation (issue 023): `PS2X_HOST_FPS=field` (one window frame per PS2 field) · `PS2X_PRESENT_STATS` (window
+frames, new pictures, skipped fields per second; cheap) · `PS2X_FIELD_SCANOUT=0` (old window-time field read, A/B) ·
+`PS2X_WEAVE_TRACE` (per picture: weave, fingerprint, row profile `[upload:rows]` used by the 023 test; costs ~30 ms
+per 4x frame, never for timing) · `PS2X_VBL_DRAW_TRACE` (display-buffer draws per VBlank edge) · `PS2X_LATCH_TRACE` ·
+`PS2X_VSYNC=1` (swap-interval experiment).
 Sound/IOP: `PS2X_SPU2_TRACE` · `PS2X_LIBSD_TRACE` · `PS2X_KSNG_TRACE` / `PS2X_KSNH_TRACE` (sound RPCs) ·
 `PS2X_AUDIO_DUMP=<wav>` (s16 stereo 48 kHz) · `PS2X_AUDIO_TRACE` · `PS2X_SIFAUDIO_TRACE` · `PS2X_MPEGAUDIO_TRACE` ·
 `PS2X_IOP_HEAP_TRACE` · `PS2X_IO_TRACE`. Heavy IOP tracing starves audio streams: judge audio untraced.

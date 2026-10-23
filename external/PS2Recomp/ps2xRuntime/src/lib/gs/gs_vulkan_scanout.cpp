@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -54,6 +55,114 @@ bool noWeave()
     const char *value = std::getenv("PS2X_NO_WEAVE");
     return value && *value && *value != '0';
 }
+
+bool frameMetricsEnabled()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("PS2X_GS_FRAME_METRICS");
+        return value && *value && *value != '0';
+    }();
+    return enabled;
+}
+
+// At most this many mapped reads wait for the window; older ones are dropped (the window shows the newest field).
+constexpr size_t kMaxStagedReads = 4u;
+
+// Maps a completed readback for finishVulkanGsPresent; the copy happens after the device lock is released.
+// The read takes the slot's buffer with it: the slot's next readback gets another buffer (issue 023: reusing it
+// while the read is still staged or being copied would overwrite pixels the window has not copied yet).
+void consumeSlot(Vulkan::Device &device, VulkanGsScanoutState &state, VulkanGsScanoutState::RbSlot &slot)
+{
+    const auto *mapped = static_cast<const uint8_t *>(device.map_host_buffer(*slot.buf, Vulkan::MEMORY_ACCESS_READ_BIT));
+    if (!mapped)
+    {
+        slot.pending = false;
+        slot.image.reset();
+        slot.fence.reset();
+        return;
+    }
+
+    auto &metrics = state.metrics;
+    if (frameMetricsEnabled())
+    {
+        ++metrics.consumed;
+        if (metrics.hasConsumed && slot.vsyncTick < metrics.consumedTick)
+            ++metrics.consumeBackwards;
+        metrics.consumedTick = slot.vsyncTick;
+        metrics.hasConsumed = true;
+    }
+    if (state.staged.size() >= kMaxStagedReads)
+    {
+        auto &oldest = state.staged.front();
+        device.unmap_host_buffer(*oldest.buf, Vulkan::MEMORY_ACCESS_READ_BIT);
+        state.keepFreeBuffer(std::move(oldest.buf));
+        state.staged.erase(state.staged.begin());
+    }
+    VulkanGsScanoutState::StagedRead read;
+    read.buf = std::move(slot.buf);
+    read.mapped = mapped;
+    read.w = slot.w;
+    read.h = slot.h;
+    read.displayFbp = slot.displayFbp;
+    read.sourceFbp = slot.sourceFbp;
+    read.vsyncTick = slot.vsyncTick;
+    read.displayWidth = slot.displayWidth;
+    read.displayHeight = slot.displayHeight;
+    read.highResolution = slot.highResolution;
+    read.frameFields = slot.frameFields;
+    read.fieldMode = slot.fieldMode;
+    state.staged.push_back(std::move(read));
+
+    slot.buf.reset();
+    slot.pending = false;
+    slot.image.reset();
+    slot.fence.reset();
+}
+
+// A readback buffer of `bytes`: a free one of that size, else a new one.
+Vulkan::BufferHandle acquireReadbackBuffer(Vulkan::Device &device, VulkanGsScanoutState &state, VkDeviceSize bytes)
+{
+    for (size_t i = 0; i < state.freeBuffers.size(); ++i)
+    {
+        if (state.freeBuffers[i]->get_create_info().size == bytes)
+        {
+            Vulkan::BufferHandle buffer = std::move(state.freeBuffers[i]);
+            state.freeBuffers.erase(state.freeBuffers.begin() + static_cast<std::ptrdiff_t>(i));
+            return buffer;
+        }
+    }
+    Vulkan::BufferCreateInfo bufferInfo{};
+    bufferInfo.size = bytes;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.domain = Vulkan::BufferDomain::CachedHost;
+    return device.create_buffer(bufferInfo);
+}
+}
+
+void collectVulkanGsReads(Vulkan::Device &device, VulkanGsScanoutState &state)
+{
+    // Oldest pending readback first (the slot the next presentVulkanGs would reuse), in field order. A read that is
+    // not finished stops the walk, so the window never gets a newer field before an older one.
+    for (uint32_t k = 0; k < 3u; ++k)
+    {
+        auto &slot = state.slots[(state.ringIndex + k) % 3u];
+        if (!slot.pending || !slot.fence)
+            continue;
+        if (!slot.fence->wait_timeout(0))
+            break;
+        consumeSlot(device, state, slot);
+    }
+}
+
+Vulkan::Fence pendingFieldReadFence(VulkanGsScanoutState &state, uint64_t field)
+{
+    for (uint32_t k = 0; k < 3u; ++k)
+    {
+        auto &slot = state.slots[(state.ringIndex + k) % 3u];
+        if (slot.pending && slot.fence && slot.vsyncTick <= field && !slot.fence->wait_timeout(0))
+            return slot.fence;
+    }
+    return {};
 }
 
 void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
@@ -64,10 +173,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
 {
     using namespace ParallelGS;
     using namespace Vulkan;
-    static const bool metricsEnabled = [] {
-        const char *value = std::getenv("PS2X_GS_FRAME_METRICS");
-        return value && *value && *value != '0';
-    }();
+    const bool metricsEnabled = frameMetricsEnabled();
     auto nowNs = []() -> uint64_t {
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -152,45 +258,6 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
         return e && *e && *e != '0';
     }();
 
-    // Maps a completed readback for finishVulkanGsPresent; the copy happens after the device lock is released.
-    auto consumeSlot = [&](VulkanGsScanoutState::RbSlot &slot) {
-        const auto *mapped = static_cast<const uint8_t *>(device.map_host_buffer(*slot.buf, MEMORY_ACCESS_READ_BIT));
-        if (!mapped)
-        {
-            slot.pending = false;
-            slot.image.reset();
-            slot.fence.reset();
-            return;
-        }
-
-        if (metricsEnabled)
-        {
-            ++metrics.consumed;
-            if (metrics.hasConsumed && slot.vsyncTick < metrics.consumedTick)
-                ++metrics.consumeBackwards;
-            metrics.consumedTick = slot.vsyncTick;
-            metrics.hasConsumed = true;
-        }
-        VulkanGsScanoutState::StagedRead read;
-        read.buf = slot.buf;
-        read.mapped = mapped;
-        read.w = slot.w;
-        read.h = slot.h;
-        read.displayFbp = slot.displayFbp;
-        read.sourceFbp = slot.sourceFbp;
-        read.vsyncTick = slot.vsyncTick;
-        read.displayWidth = slot.displayWidth;
-        read.displayHeight = slot.displayHeight;
-        read.highResolution = slot.highResolution;
-        read.frameFields = slot.frameFields;
-        read.fieldMode = slot.fieldMode;
-        state.staged.push_back(std::move(read));
-
-        slot.pending = false;
-        slot.image.reset();
-        slot.fence.reset();
-    };
-
     // 1. Prepare current slot: it is the oldest slot in the ring (submitted 3 frames ago)
     // and must be retired first to maintain chronological presentation order.
     auto &curSlot = state.slots[state.ringIndex];
@@ -198,7 +265,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     {
         if (curSlot.fence && curSlot.fence->wait_timeout(0))
         {
-            consumeSlot(curSlot);
+            consumeSlot(device, state, curSlot);
         }
         else
         {
@@ -216,7 +283,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
                 }
             }
             if (curSlot.pending)
-                consumeSlot(curSlot);
+                consumeSlot(device, state, curSlot);
         }
     }
 
@@ -230,11 +297,11 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
             if (s_sync)
             {
                 nextSlot.fence->wait();
-                consumeSlot(nextSlot);
+                consumeSlot(device, state, nextSlot);
             }
             else if (nextSlot.fence->wait_timeout(0))
             {
-                consumeSlot(nextSlot);
+                consumeSlot(device, state, nextSlot);
             }
             else
             {
@@ -246,11 +313,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
 
     if (!curSlot.buf || curSlot.w != width || curSlot.h != height)
     {
-        BufferCreateInfo bufferInfo{};
-        bufferInfo.size = static_cast<VkDeviceSize>(width) * height * 4u;
-        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufferInfo.domain = BufferDomain::CachedHost;
-        curSlot.buf = device.create_buffer(bufferInfo);
+        curSlot.buf = acquireReadbackBuffer(device, state, static_cast<VkDeviceSize>(width) * height * 4u);
         if (!curSlot.buf) throw std::runtime_error("GPU scanout readback allocation failed");
         curSlot.w = width;
         curSlot.h = height;
@@ -288,7 +351,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     {
         if (curSlot.fence)
             curSlot.fence->wait();
-        consumeSlot(curSlot);
+        consumeSlot(device, state, curSlot);
     }
 
     static uint64_t s_lastLoggedTickVsync = 0;
@@ -334,6 +397,9 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     }
 }
 
+// DW5XL-DEBUG issue 023: field reads copied for the window, and copies that took more than one field (PS2X_PRESENT_STATS).
+std::atomic<uint64_t> g_dw5xlReadsCopied{0}, g_dw5xlMultiReadCopies{0};
+
 bool finishVulkanGsPresentInto(Vulkan::Device &device, VulkanGsScanoutState &state,
                                std::vector<VulkanGsScanoutState::StagedRead> &reads,
                                ReusableFieldWeaver *weaver,
@@ -341,8 +407,18 @@ bool finishVulkanGsPresentInto(Vulkan::Device &device, VulkanGsScanoutState &sta
 {
     if (reads.empty())
         return false;
+    g_dw5xlReadsCopied.fetch_add(reads.size(), std::memory_order_relaxed); // DW5XL-DEBUG
+    if (reads.size() > 1u)
+        g_dw5xlMultiReadCopies.fetch_add(1u, std::memory_order_relaxed); // DW5XL-DEBUG
 
     std::lock_guard<std::mutex> lock(state.frameMutex);
+    // DW5XL-DEBUG issue 023: PS2X_WEAVE_TRACE=1 also logs how many readbacks one presentation handles and their fields.
+    static const bool s_weaveTrace = [] { const char *v = std::getenv("PS2X_WEAVE_TRACE"); return v && *v && *v != '0'; }();
+    if (s_weaveTrace)
+        std::fprintf(stderr, "[weave:reads] n=%zu first=%llu last=%llu frameFields=%d fieldMode=%d\n", reads.size(),
+                     static_cast<unsigned long long>(reads.front().vsyncTick),
+                     static_cast<unsigned long long>(reads.back().vsyncTick), reads.back().frameFields ? 1 : 0,
+                     reads.back().fieldMode ? 1 : 0);
     // In high-resolution mode, paraLLEl-GS already reconstructs field-aware vertical samples on the GPU
     // and ReusableFieldWeaver runs in Progressive mode (a no-op on the pixel buffer). If multiple readbacks
     // completed together, earlier high-res reads would be immediately overwritten by the final read.
@@ -385,6 +461,25 @@ bool finishVulkanGsPresentInto(Vulkan::Device &device, VulkanGsScanoutState &sta
             std::memcpy(dst + last * 4u, &rgba, sizeof(rgba));
         }
         device.unmap_host_buffer(*read.buf, Vulkan::MEMORY_ACCESS_READ_BIT);
+        // DW5XL-DEBUG issue 023: with PS2X_WEAVE_TRACE=1 every raw field read logs its row profile (mean brightness
+        // per row, two hex digits) before it is woven.
+        if (s_weaveTrace)
+        {
+            static const char kHex[] = "0123456789abcdef";
+            std::string rows;
+            for (uint32_t y = 0; y < read.h; ++y)
+            {
+                const uint8_t *row = frame.pixels.data() + static_cast<size_t>(y) * read.w * 4u;
+                uint32_t sum = 0u;
+                for (uint32_t x = 0; x < read.w; ++x)
+                    sum += row[x * 4u] + row[x * 4u + 1u] + row[x * 4u + 2u];
+                const uint32_t mean = sum / (read.w * 3u);
+                rows.push_back(kHex[(mean >> 4) & 15u]);
+                rows.push_back(kHex[mean & 15u]);
+            }
+            std::fprintf(stderr, "[read:rows] tick=%llu w=%u h=%u %s\n", static_cast<unsigned long long>(read.vsyncTick),
+                         read.w, read.h, rows.c_str());
+        }
 
         if (weaver)
         {

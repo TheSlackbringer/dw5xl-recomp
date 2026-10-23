@@ -179,6 +179,19 @@ namespace
             return m_inner->PresentInto(request, out);
         }
 
+        bool SubmitFieldScanout(const GSPresentationRequest &request) override
+        {
+            if (!m_inner->SubmitFieldScanout(request))
+                return false;
+            recordPresent(request);
+            return true;
+        }
+
+        bool CollectFieldScanouts(PresentationFrame &out, uint64_t waitForField) override
+        {
+            return m_inner->CollectFieldScanouts(out, waitForField);
+        }
+
         bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override
         {
             std::lock_guard<std::mutex> lock(m_mutex);

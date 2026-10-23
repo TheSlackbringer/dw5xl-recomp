@@ -22,6 +22,8 @@ public:
     void Sync(GSSyncReason) override;
     PresentationFrame Present(const GSPresentationRequest &) override;
     bool PresentInto(const GSPresentationRequest &, PresentationFrame &) override;
+    bool SubmitFieldScanout(const GSPresentationRequest &) override;
+    bool CollectFieldScanouts(PresentationFrame &, uint64_t) override;
     bool ClearFramebuffer(const GSContext &, uint32_t) override;
     uint32_t ConsumeLocalToHostBytes(uint8_t *, uint32_t) override;
     uint32_t ReadVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) const override;

@@ -392,7 +392,7 @@ bool GSVulkanBackend::PresentInto(const GSPresentationRequest &request, Presenta
     bool gpuScanout = false;
     bool updated = false;
     // The previous presentation's copied reads release their buffers here, under the device lock.
-    p.scanoutState.retired.clear();
+    p.scanoutState.recycleRetired();
     try
     {
         presentVulkanGs(p.gs, p.device, p.scanoutState, request,
@@ -431,6 +431,56 @@ bool GSVulkanBackend::PresentInto(const GSPresentationRequest &request, Presenta
         PresentationFrame discarded;
         finishVulkanGsPresentInto(p.device, p.scanoutState, reads, &p.fieldWeaver, discarded);
     }
+    lock.lock();
+    p.scanoutState.retired = std::move(reads);
+    return updated;
+}
+bool GSVulkanBackend::SubmitFieldScanout(const GSPresentationRequest &request)
+{
+    // GS side, in order with the game's GS work (issue 023): reads the field the PS2 has just finished showing.
+    auto lock = m_impl->access(); auto &p = *m_impl;
+    try
+    {
+        presentVulkanGs(p.gs, p.device, p.scanoutState, request,
+                        p.currentScale.load(std::memory_order_relaxed), p.dirty);
+    }
+    catch (const std::exception &error)
+    {
+        // Display modes outside the GPU scanout bridge: the window reads them itself (PresentInto, CPU conversion,
+        // which also reports other errors as before). Never thrown across the GS worker.
+        static bool s_logged = false;
+        if (!s_logged)
+            std::fprintf(stderr, "[gs:vulkan] field scanout not supported, window reads instead: %s\n", error.what());
+        s_logged = true;
+        return false;
+    }
+    p.dirty = false;
+    ++p.gpuPresentations;
+    return true;
+}
+bool GSVulkanBackend::CollectFieldScanouts(PresentationFrame &out, uint64_t waitForField)
+{
+    auto lock = m_impl->access(); auto &p = *m_impl;
+    p.scanoutState.recycleRetired();
+    if (waitForField != UINT64_MAX)
+    {
+        // The window waits for the field it is about to show, without the device lock (the GS worker keeps drawing);
+        // bounded by one PAL field like the field wait itself.
+        Vulkan::Fence fence = pendingFieldReadFence(p.scanoutState, waitForField);
+        if (fence)
+        {
+            lock.unlock();
+            fence->wait_timeout(20'000'000ull);
+            lock.lock();
+            fence.reset();
+        }
+    }
+    collectVulkanGsReads(p.device, p.scanoutState);
+    // Copy without the device lock, as PresentInto does.
+    std::vector<VulkanGsScanoutState::StagedRead> reads = std::move(p.scanoutState.staged);
+    p.scanoutState.staged.clear();
+    lock.unlock();
+    const bool updated = finishVulkanGsPresentInto(p.device, p.scanoutState, reads, &p.fieldWeaver, out);
     lock.lock();
     p.scanoutState.retired = std::move(reads);
     return updated;

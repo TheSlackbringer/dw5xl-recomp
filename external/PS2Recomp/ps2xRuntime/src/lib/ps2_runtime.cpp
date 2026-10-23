@@ -938,8 +938,9 @@ static void applySavedOutputSettings(GS &gs)
 
 
 // Host window rate: a fixed 60 FPS by default. PS2X_HOST_FPS=<n> sets another fixed rate; PS2X_HOST_FPS=field
-// paces the window on every guest VBlankEnd instead (one host frame per field; issue 015 — makes the picture
-// jump up and down on a real desktop, owner 2026-10-19, so opt-in only).
+// paces the window on every guest VBlankEnd instead (one host frame per field; issue 015). Opt-in until issue 023
+// decides the default (its jump, owner 2026-10-19, was the field read racing the game's copy; fixed by reading each
+// field at its end on the GS side).
 static int configuredHostTargetFps()
 {
     if (const char *env = std::getenv("PS2X_HOST_FPS"))
@@ -971,15 +972,73 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static bool s_hasUploadedFrame = false;
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+    // DW5XL-DEBUG issue 023: PS2X_PRESENT_STATS=1 prints once a second the window frames, new pictures,
+    // field reads copied, copies of more than one field (skipped fields), frames over 25 ms and the longest gap.
+    {
+        extern std::atomic<uint64_t> g_dw5xlReadsCopied, g_dw5xlMultiReadCopies;
+        static const bool s_stats = [] { const char *v = std::getenv("PS2X_PRESENT_STATS"); return v && *v && *v != '0'; }();
+        static uint64_t s_frames = 0, s_slow = 0, s_windowStartNs = 0, s_lastNs = 0, s_lastGen = 0, s_newPictures = 0;
+        static double s_maxMs = 0.0;
+        if (s_stats)
+        {
+            const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            if (s_lastNs != 0u)
+            {
+                const double ms = static_cast<double>(now - s_lastNs) / 1e6;
+                s_maxMs = std::max(s_maxMs, ms);
+                s_slow += ms > 25.0 ? 1u : 0u;
+            }
+            if (s_windowStartNs == 0u)
+                s_windowStartNs = now;
+            const uint64_t gen = rt->gs().hostPresentationGeneration();
+            s_newPictures += gen != s_lastGen ? 1u : 0u;
+            s_lastGen = gen;
+            ++s_frames;
+            s_lastNs = now;
+            if (now - s_windowStartNs >= 1000000000ull)
+            {
+                std::fprintf(stderr, "[present:stats] tick=%llu frames=%llu newPictures=%llu readsCopied=%llu multiReadCopies=%llu slow=%llu maxMs=%.1f\n",
+                             static_cast<unsigned long long>(currentTick), static_cast<unsigned long long>(s_frames),
+                             static_cast<unsigned long long>(s_newPictures),
+                             static_cast<unsigned long long>(g_dw5xlReadsCopied.exchange(0u)),
+                             static_cast<unsigned long long>(g_dw5xlMultiReadCopies.exchange(0u)),
+                             static_cast<unsigned long long>(s_slow), s_maxMs);
+                s_frames = s_slow = s_newPictures = 0u;
+                s_maxMs = 0.0;
+                s_windowStartNs = now;
+            }
+        }
+    }
+    // Fields read on the GS side (issue 023) finish a little after their field ends: the window collects every frame,
+    // so a field finished between two field changes is not skipped (a frame without a new field uploads nothing).
+    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick ||
+                            rt->gs().fieldScanoutsActive();
     if (needsLatch)
     {
-        rt->gs().latchHostPresentationFrame();
+        // Field pacing shows the field that has just ended (issue 023: read on the GS side at its end).
+        static const bool s_fieldPaced = configuredHostTargetFps() == 0;
+        rt->gs().latchHostPresentationFrame(s_fieldPaced && currentTick > 0u ? currentTick - 1u
+                                                                               : std::numeric_limits<uint64_t>::max());
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
 
     const uint64_t generation = rt->gs().hostPresentationGeneration();
+    // DW5XL-DEBUG issue 023: PS2X_WEAVE_TRACE=1 also logs every window frame: field it shows, whether it latched a new
+    // picture and whether that picture was uploaded (a repeat shows the previous one again).
+    static const bool s_presentTrace = [] { const char *v = std::getenv("PS2X_WEAVE_TRACE"); return v && *v && *v != '0'; }();
+    if (s_presentTrace)
+    {
+        static uint64_t s_hostFrame = 0u;
+        const auto nowNs = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::fprintf(stderr, "[present] host=%llu us=%lld tick=%llu latched=%d gen=%llu upload=%d\n",
+                     static_cast<unsigned long long>(s_hostFrame++), static_cast<long long>(nowNs),
+                     static_cast<unsigned long long>(currentTick), needsLatch ? 1 : 0,
+                     static_cast<unsigned long long>(generation),
+                     (!s_hasUploadedFrame || (needsLatch && generation != s_lastUploadedGeneration)) ? 1 : 0);
+    }
     if (s_hasUploadedFrame && (!needsLatch || generation == s_lastUploadedGeneration))
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
@@ -1083,6 +1142,47 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         ps2x_dev::s_lastFrame.swap(s_paddedUploadBuffer);
     }
 
+    // DW5XL-DEBUG issue 023: PS2X_WEAVE_TRACE=1 logs a fingerprint of every uploaded picture (FNV-1a over the copied
+    // rows) and of its top and bottom half, so a picture that alternates between two versions shows up.
+    {
+        static const bool s_hashTrace = [] { const char *v = std::getenv("PS2X_WEAVE_TRACE"); return v && *v && *v != '0'; }();
+        if (s_hashTrace)
+        {
+            const size_t rowBytes = static_cast<size_t>(texWidth) * 4u;
+            auto fnv = [&](uint32_t y0, uint32_t y1)
+            {
+                uint64_t h = 1469598103934665603ull;
+                for (uint32_t y = y0; y < y1; ++y)
+                {
+                    const uint8_t *row = ps2x_dev::s_lastFrame.data() + static_cast<size_t>(y) * rowBytes;
+                    for (size_t i = 0; i < static_cast<size_t>(copyWidth) * 4u; ++i)
+                        h = (h ^ row[i]) * 1099511628211ull;
+                }
+                return h;
+            };
+            std::fprintf(stderr, "[upload:hash] tick=%llu all=%016llx top=%016llx bottom=%016llx h=%u\n",
+                         static_cast<unsigned long long>(currentTick), static_cast<unsigned long long>(fnv(0, copyHeight)),
+                         static_cast<unsigned long long>(fnv(0, copyHeight / 2u)),
+                         static_cast<unsigned long long>(fnv(copyHeight / 2u, copyHeight)), copyHeight);
+            // Row profile (mean brightness of every row, two hex digits per row): a picture that moves vertically shows
+            // up as a shifted profile without writing whole frames (PNG dumps change the timing and hide the jump).
+            static std::string s_rows;
+            s_rows.clear();
+            for (uint32_t y = 0; y < copyHeight; ++y)
+            {
+                const uint8_t *row = ps2x_dev::s_lastFrame.data() + static_cast<size_t>(y) * rowBytes;
+                uint32_t sum = 0u;
+                for (uint32_t x = 0; x < copyWidth; ++x)
+                    sum += row[x * 4u] + row[x * 4u + 1u] + row[x * 4u + 2u];
+                const uint32_t mean = sum / (copyWidth * 3u);
+                static const char kHex[] = "0123456789abcdef";
+                s_rows.push_back(kHex[(mean >> 4) & 15u]);
+                s_rows.push_back(kHex[mean & 15u]);
+            }
+            std::fprintf(stderr, "[upload:rows] tick=%llu w=%u h=%u %s\n", static_cast<unsigned long long>(currentTick),
+                         copyWidth, copyHeight, s_rows.c_str());
+        }
+    }
     ps2x_dev::s_lastFrameW = copyWidth;
     ps2x_dev::s_lastFrameH = copyHeight;
     ps2x_dev::s_lastFrameRows = texHeight;
@@ -1441,8 +1541,15 @@ bool PS2Runtime::initialize(const char *title)
 #else
         {
             const char *hidden = std::getenv("PS2X_HIDDEN");
+            // DW5XL-DEBUG issue 023 (step 3 experiment): PS2X_VSYNC=1 swaps on the display's refresh (swap interval 1)
+            // instead of immediately; with PS2X_HOST_FPS=field that is one picture per PS2 field, shown on a refresh.
+            const char *vsync = std::getenv("PS2X_VSYNC");
+            const bool vsyncOn = vsync && *vsync == '1';
             SetConfigFlags(FLAG_WINDOW_RESIZABLE |
-                           ((hidden && *hidden && *hidden != '0') ? FLAG_WINDOW_HIDDEN : 0));
+                           ((hidden && *hidden && *hidden != '0') ? FLAG_WINDOW_HIDDEN : 0) |
+                           (vsyncOn ? FLAG_VSYNC_HINT : 0));
+            if (vsyncOn)
+                std::fprintf(stderr, "[window] vsync on (PS2X_VSYNC=1)\n");
         }
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
@@ -3338,6 +3445,19 @@ void PS2Runtime::run()
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
+        // DW5XL-DEBUG issue 023: PS2X_WEAVE_TRACE=1 logs the window size and the picture rectangle whenever they change.
+        {
+            static const bool s_rectTrace = [] { const char *v = std::getenv("PS2X_WEAVE_TRACE"); return v && *v && *v != '0'; }();
+            static float s_lastRect[6] = {};
+            const float rect[6] = {screenWidth, screenHeight, dstRect.x, dstRect.y, dstRect.width, dstRect.height};
+            if (s_rectTrace && std::memcmp(rect, s_lastRect, sizeof(rect)) != 0)
+            {
+                std::fprintf(stderr, "[draw:rect] tick=%llu screen=%.0fx%.0f dst=%.1f,%.1f %.1fx%.1f src=%.0fx%.0f\n",
+                             static_cast<unsigned long long>(m_eeScheduler->currentVSyncTick()), screenWidth, screenHeight,
+                             dstRect.x, dstRect.y, dstRect.width, dstRect.height, srcWidth, srcHeight);
+                std::memcpy(s_lastRect, rect, sizeof(rect));
+            }
+        }
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         ps2_host_input::drawMouseCaptureIndicator(dstRect.x, dstRect.y, dstRect.width, dstRect.height);
         if (m_debugUiInitialized && m_debugUiDrawCallback)

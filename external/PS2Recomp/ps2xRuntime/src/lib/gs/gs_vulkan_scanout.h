@@ -6,6 +6,7 @@
 #include "fence.hpp"
 #include "image.hpp"
 
+#include <algorithm>
 #include <array>
 #include <mutex>
 #include <vector>
@@ -65,6 +66,32 @@ struct VulkanGsScanoutState
     std::vector<StagedRead> staged;
     // Copied reads keep their buffers until the next presentation releases them under the device lock.
     std::vector<StagedRead> retired;
+    // Readback buffers no read refers to any more (issue 023). A slot never reuses the buffer of a read that is
+    // still staged or being copied: it takes one from here or a new one.
+    std::vector<Vulkan::BufferHandle> freeBuffers;
+    // Caller holds the device lock: the copied reads' buffers become free again.
+    void recycleRetired()
+    {
+        for (auto &read : retired)
+            keepFreeBuffer(std::move(read.buf));
+        retired.clear();
+    }
+    // Keeps at most four free buffers, preferring the newest size (a size change, e.g. 4x 2560x1022 -> 2560x2048,
+    // must not leave the pool full of buffers nobody can use).
+    void keepFreeBuffer(Vulkan::BufferHandle &&buffer)
+    {
+        if (!buffer)
+            return;
+        if (freeBuffers.size() >= 4u)
+        {
+            auto other = std::find_if(freeBuffers.begin(), freeBuffers.end(), [&](const Vulkan::BufferHandle &free)
+                                      { return free->get_create_info().size != buffer->get_create_info().size; });
+            if (other == freeBuffers.end())
+                return;
+            freeBuffers.erase(other);
+        }
+        freeBuffers.push_back(std::move(buffer));
+    }
     // Guards lastFrame between finishVulkanGsPresent (no device lock) and reset() (device lock held).
     std::mutex frameMutex;
     PresentationFrame lastFrame{};
@@ -94,6 +121,7 @@ struct VulkanGsScanoutState
         ringIndex = 0;
         staged.clear();
         retired.clear();
+        freeBuffers.clear();
         {
             std::lock_guard<std::mutex> lock(frameMutex);
             lastFrame = {};
@@ -112,6 +140,12 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
                      const GSPresentationRequest &request,
                      uint32_t outputScale = 1,
                      bool flushBeforeVsync = true);
+
+// Issue 023. Caller holds the device lock. Stages the finished readbacks in field order without starting a new one.
+void collectVulkanGsReads(Vulkan::Device &device, VulkanGsScanoutState &state);
+// Caller holds the device lock. The fence of the oldest unfinished readback of field `field` or older (empty if
+// they are all finished): the window waits on it without the device lock.
+Vulkan::Fence pendingFieldReadFence(VulkanGsScanoutState &state, uint64_t field);
 
 // Caller has released the device lock. Copies the reads staged by presentVulkanGs, in order, into
 // outFrame (with the field weave), reusing outFrame.pixels capacity. Returns true if outFrame was updated.

@@ -2155,6 +2155,60 @@ void EeScheduler::processDueDeadlines()
 
 static unsigned g_dw5xlCbQueued = 0; // DW5XL-DEBUG
 extern std::atomic<uint32_t> g_dw5xlMpegDemux, g_dw5xlMpegGetPic, g_dw5xlMpegPictures, g_dw5xlStrEvents[8];
+extern std::atomic<uint64_t> g_dw5xlVblDisplayDraws, g_dw5xlVblOtherDraws; // DW5XL-DEBUG issue 023
+// DW5XL-DEBUG issue 023: guest cycle of the first/last draw into the displayed buffer since the last VBlankStart
+// (written by the GS frontend; only meaningful with PS2X_GS_ASYNC=0 PS2X_VU1_ASYNC=0, where draws run on this thread).
+const uint64_t *g_dw5xlEeCyclePtr = nullptr;
+std::atomic<uint64_t> g_dw5xlDisplayFirstCycle{UINT64_MAX}, g_dw5xlDisplayLastCycle{0};
+
+// DW5XL-DEBUG issue 023: PS2X_VBL_DRAW_TRACE=1 prints the GS draws since the previous VBlank event (into the displayed
+// frame buffer / elsewhere) at every VBlankStart and VBlankEnd; at VBlankStart also when (microseconds after the
+// previous VBlankStart, guest cycles) the first and last display-buffer draw of the field happened.
+static void dw5xlVblDrawTrace(const char *edge, uint64_t tick, const uint64_t &eeCycle)
+{
+    static const bool s_on = [] { const char *v = std::getenv("PS2X_VBL_DRAW_TRACE"); return v && *v && *v != '0'; }();
+    if (!s_on)
+        return;
+    static uint64_t s_fieldStartCycle = 0u;
+    g_dw5xlEeCyclePtr = &eeCycle;
+    const uint64_t display = g_dw5xlVblDisplayDraws.exchange(0u, std::memory_order_relaxed);
+    const uint64_t other = g_dw5xlVblOtherDraws.exchange(0u, std::memory_order_relaxed);
+    const auto us = [](uint64_t cycles) { return static_cast<double>(cycles) * 1e6 / static_cast<double>(EeScheduler::kEeClockHz); };
+    if (std::strcmp(edge, "start") == 0)
+    {
+        const uint64_t first = g_dw5xlDisplayFirstCycle.exchange(UINT64_MAX, std::memory_order_relaxed);
+        const uint64_t last = g_dw5xlDisplayLastCycle.exchange(0u, std::memory_order_relaxed);
+        const bool any = first != UINT64_MAX && first >= s_fieldStartCycle;
+        std::fprintf(stderr, "[vbl] %s tick=%llu display=%llu other=%llu fieldUs=%.0f firstDisplayUs=%.0f lastDisplayUs=%.0f\n",
+                     edge, static_cast<unsigned long long>(tick), static_cast<unsigned long long>(display),
+                     static_cast<unsigned long long>(other), us(eeCycle - s_fieldStartCycle),
+                     any ? us(first - s_fieldStartCycle) : -1.0, any ? us(last - s_fieldStartCycle) : -1.0);
+        s_fieldStartCycle = eeCycle;
+        return;
+    }
+    std::fprintf(stderr, "[vbl] %s tick=%llu display=%llu other=%llu atUs=%.0f\n", edge, static_cast<unsigned long long>(tick),
+                 static_cast<unsigned long long>(display), static_cast<unsigned long long>(other),
+                 us(eeCycle - s_fieldStartCycle));
+}
+
+void EeScheduler::requestFieldScanout(uint64_t field)
+{
+    // The CRTC has finished field `field`: the PS2 showed the display buffer as the game left it during the field
+    // (the game copies each field's picture at that field's VBlankEnd). The registers are captured after every
+    // register write the game queued before this point, the read runs after every GS packet it sent before it.
+    // DW5XL-DEBUG issue 023: PS2X_FIELD_SCANOUT=0 keeps the old window-time read (A/B comparisons).
+    static const bool s_off = [] { const char *v = std::getenv("PS2X_FIELD_SCANOUT"); return v && v[0] == '0'; }();
+    if (s_off)
+        return;
+    PS2Runtime &runtime = m_runtime;
+    auto captureAndQueue = [&runtime, field]
+    {
+        const GSPresentationRequest captured = runtime.gs().captureFieldScanoutRequest(field);
+        runtime.gifArbiter().submitCall([&runtime, captured] { runtime.gs().submitFieldScanout(captured); });
+    };
+    if (!ps2x::device::submitGsCall(runtime.memory(), captureAndQueue))
+        captureAndQueue();
+}
 
 void EeScheduler::processEvent(const EeEvent &event)
 {
@@ -2164,6 +2218,8 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+        dw5xlVblDrawTrace("start", m_vsyncTick + 1u, m_eeCycle); // DW5XL-DEBUG issue 023
+        requestFieldScanout(m_vsyncTick);
         ++m_vsyncTick;
         ps2prof::record(ps2prof::Event::FieldStart, m_vsyncTick); // DW5XL-DEBUG issue 025
         m_runtime.memory().vsyncTickNs().store(std::chrono::steady_clock::now().time_since_epoch().count(),
@@ -2246,6 +2302,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         completeExternalWait(event.id, event.value, KE_OK);
         break;
     case EeEventType::VBlankEnd:
+        dw5xlVblDrawTrace("end", m_vsyncTick, m_eeCycle); // DW5XL-DEBUG issue 023
         dispatchIrq(false, 3u);
         {
             std::lock_guard lock(m_presentationMutex);

@@ -96,6 +96,42 @@ namespace
         return seen;
     }
 
+    // Issue 023: an ordered call (submitCall, the end-of-field scanout) runs after every packet submitted before it —
+    // including packets not drained yet — and before every later one. Calls are recorded as path -1 with their number
+    // and the number of packets submitted before them.
+    std::vector<Seen> runWithCalls(Mode mode)
+    {
+        std::vector<Seen> seen;
+        GifArbiter arbiter([&](const uint8_t *data, uint32_t size)
+                           { seen.push_back({g_gifArbiterCurrentPath, std::vector<uint8_t>(data, data + size)}); });
+        if (mode != Mode::Inline)
+            arbiter.setWorkerEnabled(true);
+        if (mode == Mode::WorkerBatch)
+            arbiter.beginBatch();
+        uint32_t id = 1;
+        uint8_t call = 1;
+        for (const auto &group : script())
+        {
+            for (const auto &item : group)
+            {
+                const auto p = packet(id++, item.qwords, item.image);
+                arbiter.submit(item.path, p.data(), static_cast<uint32_t>(p.size()), item.directHl);
+            }
+            // Each call records its number and how many packets were submitted before it.
+            auto submitCall = [&] { arbiter.submitCall([&seen, n = call++, before = static_cast<uint8_t>(id - 1u)]
+                                                       { seen.push_back({-1, {n, before}}); }); };
+            if (id % 3u == 0u) // sometimes before the group's drain, sometimes after it
+                submitCall();
+            arbiter.drain();
+            if (id % 3u == 1u)
+                submitCall();
+        }
+        if (mode == Mode::WorkerBatch)
+            arbiter.endBatch();
+        arbiter.waitIdle();
+        return seen;
+    }
+
     uint64_t fnv(const std::vector<Seen> &stream)
     {
         uint64_t h = 1469598103934665603ull;
@@ -140,6 +176,47 @@ int main()
         {
             ++failures;
             std::cout << "FAIL gif_arbiter_order " << m.name << ": " << e.what() << "\n";
+        }
+    }
+    // Ordered calls (issue 023): the packets around them keep the recorded stream, and each call sits exactly where
+    // it was submitted, in every mode.
+    std::vector<Seen> inlineCalls;
+    for (const auto &m : modes)
+    {
+        const auto stream = runWithCalls(m.mode);
+        try
+        {
+            std::vector<Seen> packets;
+            size_t calls = 0;
+            for (const auto &s : stream)
+            {
+                if (s.path == -1)
+                {
+                    if (s.bytes.size() != 2u || s.bytes[0] != calls + 1u)
+                        throw std::runtime_error("call " + std::to_string(calls + 1u) + " out of order");
+                    if (packets.size() != s.bytes[1])
+                        throw std::runtime_error("call " + std::to_string(calls + 1u) + " ran after " +
+                                                 std::to_string(packets.size()) + " packets, submitted after " +
+                                                 std::to_string(s.bytes[1]));
+                    ++calls;
+                }
+                else
+                    packets.push_back(s);
+            }
+            if (calls == 0u)
+                throw std::runtime_error("no call ran");
+            if (!(packets == inlineStream))
+                throw std::runtime_error("packets around the calls differ from the recorded stream");
+            if (m.mode == Mode::Inline)
+                inlineCalls = stream;
+            else if (!(stream == inlineCalls))
+                throw std::runtime_error("calls sit elsewhere than inline");
+            std::cout << "PASS gif_arbiter_order calls " << m.name << " (" << calls << " calls)\n";
+        }
+        catch (const std::exception &e)
+        {
+            ++failures;
+            std::cout << "FAIL gif_arbiter_order calls " << m.name << ": " << e.what() << "\n";
         }
     }
     return failures ? 1 : 0;

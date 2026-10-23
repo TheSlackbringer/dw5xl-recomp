@@ -403,6 +403,9 @@ private:
     void processPendingEvents();
     void processDueDeadlines();
     void processEvent(const EeEvent &event);
+    // Issue 023: at the end of field `field` the window's picture of it is read on the GS side, in order with the
+    // game's GS work (display registers in device order, the read in GS worker order).
+    void requestFieldScanout(uint64_t field);
     void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
     [[nodiscard]] static bool eventCondition(uint32_t current, uint32_t requested, uint32_t mode);
     static int waitObjectId(const EeWaitState &wait);
