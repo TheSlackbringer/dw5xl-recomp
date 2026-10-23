@@ -595,6 +595,16 @@ int main(int argc, char **argv)
         }
         testRegistrations();
 
+        // Each check below uses fresh runtimes; the translation lookup is cached per thread by code pointer and
+        // generation, so two memories (possibly at the same address) must never share a generation (issue 023).
+        {
+            PS2Runtime first, second;
+            require(first.memory().initialize() && second.memory().initialize(), "memories initialise");
+            require(first.memory().getVU1CodeGeneration() != second.memory().getVU1CodeGeneration() &&
+                        first.memory().getVU0CodeGeneration() != second.memory().getVU0CodeGeneration(),
+                    "two memories must not share a VU code generation");
+        }
+
         testSegment("1ad6eefff0c2e7e5",
                     0x1ad6eefff0c2e7e5ull, 0x0800, 0x0a78);
 

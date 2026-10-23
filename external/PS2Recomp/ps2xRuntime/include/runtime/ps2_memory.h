@@ -457,8 +457,16 @@ public:
 
     bool isAddressInRegion(uint32_t address, const CodeRegion &region);
     void markModified(uint32_t address, uint32_t size);
-    void markVU0CodeModified() { m_vu0CodeGeneration.fetch_add(1, std::memory_order_relaxed); }
-    void markVU1CodeModified() { m_vu1CodeGeneration.fetch_add(1, std::memory_order_relaxed); }
+    // Code generations come from one process-wide counter: two memories (two runtimes on one thread, as in the
+    // vu1_lift test) never share a generation, so the per-thread translation lookup cache, keyed by code pointer and
+    // generation, cannot take one memory's image for another's at the same address (issue 023).
+    static uint64_t nextCodeGeneration()
+    {
+        static std::atomic<uint64_t> s_next{1};
+        return s_next.fetch_add(1, std::memory_order_relaxed);
+    }
+    void markVU0CodeModified() { m_vu0CodeGeneration.store(nextCodeGeneration(), std::memory_order_relaxed); }
+    void markVU1CodeModified() { m_vu1CodeGeneration.store(nextCodeGeneration(), std::memory_order_relaxed); }
     bool isScratchpad(uint32_t address) const;
     uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit);
     const uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit) const;
