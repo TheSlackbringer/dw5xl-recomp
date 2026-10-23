@@ -118,3 +118,22 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     EnableFastReleaseMode(ps2_test_lib)
     EnableFastReleaseMode(ps2x_tests)
 endif()
+
+# Focused callback-fed MPEG regressions; same production runtime and synthetic function table.
+add_executable(ps2x_mpeg_input_tests src/mpeg_input_tests.cpp $<TARGET_OBJECTS:ps2_test_function_table>)
+target_include_directories(ps2x_mpeg_input_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib/Kernel)
+target_link_libraries(ps2x_mpeg_input_tests PRIVATE ps2_runtime ps2_iop)
+if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
+    ps2x_stage_ffmpeg_runtime_dlls(ps2x_mpeg_input_tests)
+endif()
+if(MSVC)
+    target_link_options(ps2x_mpeg_input_tests PRIVATE "/STACK:8388608")
+elseif(MINGW)
+    target_link_options(ps2x_mpeg_input_tests PRIVATE "-Wl,--stack,8388608")
+endif()
+if(BUILD_TESTING)
+    add_test(NAME mpeg_input_service COMMAND ps2x_mpeg_input_tests)
+endif()

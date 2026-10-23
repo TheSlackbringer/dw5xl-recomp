@@ -313,10 +313,11 @@ namespace
         ctx->pc = ::getRegU32(ctx, 31);
     }
 
-    void testNodataVsync(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    void testNodataInputReady(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
     {
-        // Simula el siguiente VSync mientras GetPicture espera tras un callback sin datos.
+        // Only actual input readiness may retry the blocked callback; VSync alone does not.
         runtime->eeScheduler().completeVSync(runtime->eeScheduler().currentVSyncTick() + 1u);
+        ps2_stubs::notifyMpegInputReady(kNodataHandle, runtime);
         ctx->pc = 0u;
     }
 
@@ -949,8 +950,8 @@ void register_ps2_runtime_expansion_tests()
             ee.reset(rdram.data(), mainContext);
             runSchedulerWithWatchdog(runtime, t);
 
-            t.Equals(gNodataCalls.load(std::memory_order_acquire), 1u,
-                     "GetPicture should call sceMpegCbNodata once when no frame is queued");
+            t.Equals(gNodataCalls.load(std::memory_order_acquire), 2u,
+                     "GetPicture must service startup input and preserve its after-output NODATA callback");
             t.Equals(gNodataSeenMpeg.load(std::memory_order_acquire), kNodataHandle,
                      "the Nodata callback should receive the MPEG handle");
             t.Equals(gNodataSeenType.load(std::memory_order_acquire), 1u,
@@ -963,7 +964,7 @@ void register_ps2_runtime_expansion_tests()
                      "the callback frame should be served as picture 0");
         });
 
-        tc.Run("sceMpegGetPicture retries sceMpegCbNodata after a VSync when it produced no data", [](TestCase &t)
+        tc.Run("sceMpegGetPicture retries sceMpegCbNodata after actual input progress", [](TestCase &t)
         {
             PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
@@ -972,7 +973,7 @@ void register_ps2_runtime_expansion_tests()
             runtime.registerFunction(kNodataMainPc, testNodataMain);
             runtime.registerFunction(kNodataResumePc, testNodataResume);
             runtime.registerFunction(kNodataCallbackPc, testNodataCallback);
-            runtime.registerFunction(kNodataVsyncPc, testNodataVsync);
+            runtime.registerFunction(kNodataVsyncPc, testNodataInputReady);
             gNodataCalls.store(0u, std::memory_order_release);
             gNodataProduceOnCall.store(2u, std::memory_order_release);
             gNodataResult.store(-999, std::memory_order_release);
@@ -995,8 +996,8 @@ void register_ps2_runtime_expansion_tests()
                      "VSync guest thread should become ready");
             runSchedulerWithWatchdog(runtime, t);
 
-            t.Equals(gNodataCalls.load(std::memory_order_acquire), 2u,
-                     "an empty Nodata callback should be retried once after the next VSync, not spun");
+            t.Equals(gNodataCalls.load(std::memory_order_acquire), 3u,
+                     "one real input event must retry once, then preserve after-output NODATA service");
             t.Equals(gNodataResult.load(std::memory_order_acquire), 0,
                      "GetPicture should return once the retried callback produces a frame");
         });

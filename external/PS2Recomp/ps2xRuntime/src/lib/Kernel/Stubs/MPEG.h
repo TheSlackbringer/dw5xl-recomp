@@ -7,7 +7,9 @@ namespace ps2_stubs
     void resetMpegStubState();
     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr);
     void notifyMpegCdStreamStart(PS2Runtime *runtime = nullptr);
-    void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream);
+    // Signal an actual input-ready event on the EE executor; never called as a periodic poll.
+    void notifyMpegInputReady(uint32_t mpegAddr, PS2Runtime *runtime);
+    void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream, PS2Runtime *runtime = nullptr);
     void notifyMpegCdStreamEof(PS2Runtime *runtime = nullptr);
     void sceMpegFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegAddBs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

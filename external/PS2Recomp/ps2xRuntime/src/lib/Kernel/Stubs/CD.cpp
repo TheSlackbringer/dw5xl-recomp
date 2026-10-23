@@ -920,7 +920,7 @@ namespace ps2_stubs
                 state.sectorsRead += sectors;
 
                 const bool hitStreamEnd = g_cdStreamingEndLbn != 0xFFFFFFFFu && g_cdStreamingLbn >= g_cdStreamingEndLbn;
-                notifyMpegCdStreamDataProduced(static_cast<uint32_t>(readBytes), hitStreamEnd);
+                notifyMpegCdStreamDataProduced(static_cast<uint32_t>(readBytes), hitStreamEnd, runtime);
 
                 if (g_cdStReadTraceCount < 32u)
                 {

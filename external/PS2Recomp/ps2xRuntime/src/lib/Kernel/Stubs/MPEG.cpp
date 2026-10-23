@@ -539,6 +539,9 @@ namespace ps2_stubs
             uint64_t lastOutputServiceTick = std::numeric_limits<uint64_t>::max();
             uint64_t lastInputServiceTick = std::numeric_limits<uint64_t>::max();
             uint64_t acceptedVideoPayloadBytes = 0u;
+            // Transient event revision: only compared across an active guest
+            // callback (which cannot be saved). No persistent decoder state.
+            uint64_t inputProgress = 0u;
         };
 
         struct MpegStreamCallbackEvent
@@ -919,7 +922,12 @@ namespace ps2_stubs
         {
             MpegPlaybackState &playback = g_mpeg_stub_state.playbackByMpeg[mpegAddr];
             if (playback.callbackGeneration == 0u)
+            {
                 playback.callbackGeneration = g_nextPlaybackGeneration++;
+                // First input belongs to the already active stream; attaching
+                // it must not look like cancellation of the startup callback.
+                playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
+            }
             return playback;
         }
 
@@ -1471,7 +1479,8 @@ namespace ps2_stubs
                                          const MpegStreamCallbackEvent &event,
                                          const MpegRegisteredCallback &callback,
                                          std::function<void(int32_t)> completion = {},
-                                         std::shared_ptr<MpegDemuxTransaction> transaction = {})
+                                         std::shared_ptr<MpegDemuxTransaction> transaction = {},
+                                         std::function<void(int32_t, R5900Context &)> ownerCompletion = {})
         {
             if (!rdram || !callerCtx || !runtime || callback.func == 0u || !runtime->hasFunction(callback.func))
             {
@@ -1517,11 +1526,13 @@ namespace ps2_stubs
                 *executed = valid;
                 return valid;
             };
+            const bool invokeOwner = static_cast<bool>(ownerCompletion);
             invocation.onComplete = [runtime, cbDataAddr, cbFromHeap, function = callback.func,
                                      rdram, mpeg = event.mpegAddr,
                                      type = event.streamType, bytes = event.len,
                                      executed,
-                                     completion = std::move(completion)](const R5900Context &result, R5900Context &)
+                                     completion = std::move(completion),
+                                     ownerCompletion = std::move(ownerCompletion)](const R5900Context &result, R5900Context &owner)
             {
                 if (*executed && mpegTraceEnabled())
                 {
@@ -1564,9 +1575,16 @@ namespace ps2_stubs
                     }
                 }
                 freeMpegCallbackData(runtime, cbDataAddr, cbFromHeap);
+                const int32_t value = *executed ? static_cast<int32_t>(getRegU32(&result, 2)) : KE_WAIT_DELETE;
                 if (completion)
-                    completion(*executed ? static_cast<int32_t>(getRegU32(&result, 2)) : KE_WAIT_DELETE);
+                    completion(value);
+                if (ownerCompletion)
+                    ownerCompletion(value, owner);
             };
+            // Startup input service belongs to this GetPicture caller. It must
+            // return to that continuation, even when the callback itself yields.
+            if (invokeOwner)
+                runtime->eeScheduler().invokeCurrent(std::move(invocation));
             runtime->eeScheduler().queueInvocation(std::move(invocation));
             return true;
         }
@@ -1869,6 +1887,7 @@ namespace ps2_stubs
                             {
                                 consumedVideoBytes += transaction->packetEnd - transaction->payloadStart;
                                 playback.acceptedVideoPayloadBytes += transaction->packetEnd - transaction->payloadStart;
+                                ++playback.inputProgress;
                             }
                         }
                         playback.retryPacket = false;
@@ -2266,6 +2285,7 @@ namespace ps2_stubs
     void notifyMpegCdStreamStart(PS2Runtime *runtime)
     {
         std::vector<uint64_t> cancelled;
+        std::vector<uint32_t> cancelledPictures;
         {
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         ++g_mpeg_stub_state.cdStreamGeneration;
@@ -2282,6 +2302,7 @@ namespace ps2_stubs
 
         for (auto &[mpegAddr, playback] : g_mpeg_stub_state.playbackByMpeg)
         {
+            cancelledPictures.push_back(mpegAddr);
             if (playback.demuxTransaction)
             {
                 playback.demuxTransaction->finished = true;
@@ -2301,22 +2322,47 @@ namespace ps2_stubs
         if (runtime)
         {
             runtime->memory().resetIpuInputConsumption();
+            for (uint32_t mpeg : cancelledPictures)
+                runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpeg, KE_WAIT_DELETE);
             for (uint64_t token : cancelled)
                 runtime->eeScheduler().completeExternalWait(kMpegDemuxWaitType, token, KE_WAIT_DELETE);
         }
     }
 
-    void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream)
+    void notifyMpegInputReady(uint32_t mpegAddr, PS2Runtime *runtime)
     {
-        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
-        g_mpeg_stub_state.cdStreamBytesProduced += byteCount;
-        if (endOfStream)
+        // Called on the EE executor by a producer after actual data progress.
+        // Readiness wakes GetPicture; only accepted PES data earns DMA credit.
         {
-            g_mpeg_stub_state.cdStreamEofPending = true;
-            if (mpegTraceEnabled())
-                std::cerr << "[MPEG:ProducerEof] produced=" << g_mpeg_stub_state.cdStreamBytesProduced
-                          << " demuxed=" << g_mpeg_stub_state.cdStreamBytesDemuxed << std::endl;
+            std::lock_guard lock(g_mpeg_stub_mutex);
+            const auto found = g_mpeg_stub_state.playbackByMpeg.find(mpegAddr);
+            if (found == g_mpeg_stub_state.playbackByMpeg.end())
+                return;
+            ++found->second.inputProgress;
         }
+        if (runtime)
+            runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
+    }
+
+    void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream, PS2Runtime *runtime)
+    {
+        std::vector<uint32_t> ready;
+        {
+            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            g_mpeg_stub_state.cdStreamBytesProduced += byteCount;
+            if (endOfStream)
+            {
+                g_mpeg_stub_state.cdStreamEofPending = true;
+                if (mpegTraceEnabled())
+                    std::cerr << "[MPEG:ProducerEof] produced=" << g_mpeg_stub_state.cdStreamBytesProduced
+                              << " demuxed=" << g_mpeg_stub_state.cdStreamBytesDemuxed << std::endl;
+            }
+            if (byteCount != 0u || endOfStream)
+                for (const auto &[mpeg, playback] : g_mpeg_stub_state.playbackByMpeg)
+                    ready.push_back(mpeg);
+        }
+        for (uint32_t mpeg : ready)
+            notifyMpegInputReady(mpeg, runtime);
     }
 
     void notifyMpegCdStreamEof(PS2Runtime *runtime)
@@ -2404,7 +2450,9 @@ namespace ps2_stubs
                 feedElementaryStream(playback, src, chunk);
                 copied += chunk;
             }
-            wakePictureWaiter = playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
+            if (copied != 0u && !playback.decoderFailed)
+                ++playback.inputProgress;
+            wakePictureWaiter = copied != 0u || playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
             publishSdkDecoderStatus(playback);
         }
 
@@ -2530,6 +2578,7 @@ namespace ps2_stubs
         if (runtime)
         {
             runtime->memory().resetIpuInputConsumption();
+            runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, param_1, KE_WAIT_DELETE);
             if (cancelled != 0u)
                 runtime->eeScheduler().completeExternalWait(kMpegDemuxWaitType, cancelled, KE_WAIT_DELETE);
         }
@@ -2682,187 +2731,252 @@ namespace ps2_stubs
         return g_moviePictures.load(std::memory_order_relaxed);
     }
 
-    void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    namespace
     {
-        g_dw5xlMpegGetPic.fetch_add(1u, std::memory_order_relaxed); // DW5XL-DEBUG
-        const uint32_t mpegAddr = getRegU32(ctx, 4);
-        const uint32_t imageAddr = getRegU32(ctx, 5);
-        uint32_t width = kStubMovieWidth;
-        uint32_t height = kStubMovieHeight;
-        uint32_t frameCount = 0u;
-        bool haveFrame = false;
-        MpegDecodedFrame frame;
-        std::vector<MpegStreamCallbackEvent> pictureCallbacks;
+        void getPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, bool serviceInput);
+
+        void serviceStarvedPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+                                   const MpegStreamCallbackEvent &event, size_t index, uint64_t progress)
         {
-            std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
-            MpegPlaybackState &playback = getPlaybackState(mpegAddr);
-            if (playback.decodedFrames.empty() &&
-                !g_mpeg_stub_state.currentCdStreamEofSeen &&
-                !playback.streamEnded &&
-                !playback.sequenceEndDecoded &&
-                !playback.decoderFailed)
+            bool progressed = false;
             {
-                static std::atomic<uint64_t> waitCount{0u};
-                if (mpegTraceSample(waitCount.fetch_add(1u, std::memory_order_relaxed)))
-                    std::cerr << "[MPEG:GetPictureWait] mpeg=0x" << std::hex << mpegAddr << std::dec
-                              << " sawInput=" << playback.sawInput << std::endl;
-                if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
+                std::lock_guard lock(g_mpeg_stub_mutex);
+                const auto found = g_mpeg_stub_state.playbackByMpeg.find(event.mpegAddr);
+                if (found == g_mpeg_stub_state.playbackByMpeg.end() ||
+                    found->second.callbackGeneration != event.callbackGeneration)
                 {
-                    PS2_IF_AGRESSIVE_LOGS({
-                        std::cerr << "[MPEG:GetPicture] waiting for frames, mpeg=0x" << std::hex << mpegAddr
-                                  << std::dec << " ended=" << playback.streamEnded
-                                  << " failed=" << playback.decoderFailed
-                                  << " sawInput=" << playback.sawInput << std::endl;
-                    });
-                    ++g_mpeg_stub_state.getPictureWaitTraceCount;
+                    setReturnS32(ctx, KE_WAIT_DELETE);
+                    return;
                 }
-                lock.unlock();
-                runtime->eeScheduler().waitExternal(
-                    EeWaitReason::Mpeg,
-                    kMpegPictureWaitType,
-                    mpegAddr,
-                    [rdram, runtime](R5900Context &resumeContext)
+                progressed = found->second.inputProgress != progress;
+            }
+            if (index == event.callbacks.size())
+            {
+                // A nested producer may have advanced before we installed the
+                // wait. Observe its revision so that readiness cannot be lost.
+                getPicture(rdram, ctx, runtime, progressed);
+                return;
+            }
+            if (!dispatchGuestStreamCallback(rdram, ctx, runtime, event, event.callbacks[index], {}, {},
+                    [rdram, runtime, event, index, progress](int32_t, R5900Context &owner)
+                    { serviceStarvedPicture(rdram, &owner, runtime, event, index + 1u, progress); }))
+                serviceStarvedPicture(rdram, ctx, runtime, event, index + 1u, progress);
+        }
+
+        void getPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, bool serviceInput)
+        {
+            g_dw5xlMpegGetPic.fetch_add(1u, std::memory_order_relaxed); // DW5XL-DEBUG
+            const uint32_t mpegAddr = getRegU32(ctx, 4);
+            const uint32_t imageAddr = getRegU32(ctx, 5);
+            uint32_t width = kStubMovieWidth;
+            uint32_t height = kStubMovieHeight;
+            uint32_t frameCount = 0u;
+            bool haveFrame = false;
+            MpegDecodedFrame frame;
+            std::vector<MpegStreamCallbackEvent> pictureCallbacks;
+            {
+                std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
+                MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+                if (playback.decodedFrames.empty() &&
+                    !g_mpeg_stub_state.currentCdStreamEofSeen &&
+                    !playback.streamEnded &&
+                    !playback.sequenceEndDecoded &&
+                    !playback.decoderFailed)
+                {
+                    if (serviceInput)
                     {
-                        if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
+                        MpegStreamCallbackEvent input{};
+                        input.mpegAddr = mpegAddr;
+                        input.callbackGeneration = playback.callbackGeneration;
+                        input.streamType = 1u;
+                        input.callbacks = matchingOrdinaryCallbacks(mpegAddr, 1u);
+                        if (!input.callbacks.empty())
                         {
+                            const uint64_t progress = playback.inputProgress;
+                            lock.unlock();
+                            serviceStarvedPicture(rdram, ctx, runtime, input, 0u, progress);
                             return;
                         }
-                        sceMpegGetPicture(rdram, &resumeContext, runtime);
-                    });
-            }
-
-            if (!playback.decodedFrames.empty())
-            {
-                const uint64_t currentTick = runtime->eeScheduler().currentVSyncTick();
-                const uint64_t currentTickQ32 = currentTick << 32u;
-                const MpegDecodedFrame &nextFrame = playback.decodedFrames.front();
-                const bool pal = runtime->eeScheduler().palVideoMode();
-                const uint64_t frameIntervalQ32 = decodedFrameIntervalQ32(playback, nextFrame, pal);
-                uint64_t presentationTargetQ32 = presentationTickForFrame(playback, nextFrame, currentTickQ32, pal);
-
-                if (currentTickQ32 > presentationTargetQ32 && currentTickQ32 - presentationTargetQ32 >= frameIntervalQ32)
-                {
-                    const uint64_t correction = currentTickQ32 - presentationTargetQ32;
-                    presentationTargetQ32 = currentTickQ32;
-                    if (nextFrame.pts90k >= 0 && playback.firstPresentedPts90k >= 0)
-                    {
-                        playback.ptsPresentationBaseTickQ32 += correction;
                     }
-                    playback.nextPictureTickQ32 = currentTickQ32;
-                }
-
-                if (currentTickQ32 < presentationTargetQ32)
-                {
-                    const uint64_t eligibleTick = (presentationTargetQ32 + kPictureClockOne - 1u) >> 32u;
+                    const uint64_t generation = playback.callbackGeneration;
+                    static std::atomic<uint64_t> waitCount{0u};
+                    if (mpegTraceSample(waitCount.fetch_add(1u, std::memory_order_relaxed)))
+                        std::cerr << "[MPEG:GetPictureWait] mpeg=0x" << std::hex << mpegAddr << std::dec
+                                  << " sawInput=" << playback.sawInput << std::endl;
+                    if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
+                    {
+                        PS2_IF_AGRESSIVE_LOGS({
+                            std::cerr << "[MPEG:GetPicture] waiting for frames, mpeg=0x" << std::hex << mpegAddr
+                                      << std::dec << " ended=" << playback.streamEnded
+                                      << " failed=" << playback.decoderFailed
+                                      << " sawInput=" << playback.sawInput << std::endl;
+                        });
+                        ++g_mpeg_stub_state.getPictureWaitTraceCount;
+                    }
                     lock.unlock();
-                    runtime->eeScheduler().waitVSync(
-                        eligibleTick - 1u,
-                        -1,
-                        [rdram, runtime](R5900Context &resumeContext)
+                    runtime->eeScheduler().waitExternal(
+                        EeWaitReason::Mpeg,
+                        kMpegPictureWaitType,
+                        mpegAddr,
+                        [rdram, runtime, mpegAddr, generation](R5900Context &resumeContext)
                         {
                             if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
                             {
                                 return;
                             }
-                            sceMpegGetPicture(rdram, &resumeContext, runtime);
+                            {
+                                std::lock_guard lock(g_mpeg_stub_mutex);
+                                const auto found = g_mpeg_stub_state.playbackByMpeg.find(mpegAddr);
+                                if (found == g_mpeg_stub_state.playbackByMpeg.end() ||
+                                    found->second.callbackGeneration != generation)
+                                {
+                                    setReturnS32(&resumeContext, KE_WAIT_DELETE);
+                                    return;
+                                }
+                            }
+                            getPicture(rdram, &resumeContext, runtime, true);
                         });
                 }
 
-                frame = std::move(playback.decodedFrames.front());
-                playback.decodedFrames.pop_front();
-                playback.width = static_cast<uint32_t>(frame.width);
-                playback.height = static_cast<uint32_t>(frame.height);
-                width = playback.width;
-                height = playback.height;
-                frameCount = playback.picturesServed;
-                playback.picturesServed += 1u;
-                playback.nextPictureTickQ32 = presentationTargetQ32 + frameIntervalQ32;
-                playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
-                haveFrame = true;
-                playback.lastOutputServiceTick = currentTick;
-                // The SDK emits callback type 4 during decoded picture DMA
-                // output. Its tuple contains the callback type; the registered
-                // user data is the third argument. Retail movie clients use
-                // this service boundary to pump their accompanying audio.
-                MpegStreamCallbackEvent update{};
-                update.mpegAddr = mpegAddr;
-                update.callbackGeneration = playback.callbackGeneration;
-                update.streamType = 4u;
-                update.callbacks = matchingOrdinaryCallbacks(mpegAddr, 4u);
-                if (!update.callbacks.empty())
-                    pictureCallbacks.push_back(std::move(update));
-                // The SDK services NODATA after the picture's output DMA.
-                // Let the registered input consumer reconcile real DMA
-                // progress and prime the next batch after UPDATE completes.
-                MpegStreamCallbackEvent input{};
-                input.mpegAddr = mpegAddr;
-                input.callbackGeneration = playback.callbackGeneration;
-                input.streamType = 1u;
-                input.callbacks = matchingOrdinaryCallbacks(mpegAddr, 1u);
-                if (!input.callbacks.empty())
-                    pictureCallbacks.push_back(std::move(input));
-                if (g_mpeg_stub_state.pictureTraceCount < 32u)
+                if (!playback.decodedFrames.empty())
                 {
-                    PS2_IF_AGRESSIVE_LOGS({
-                        std::cerr << "[MPEG:GetPicture:FRAME] mpeg=0x" << std::hex << mpegAddr
-                                  << std::dec << " generation=" << g_mpeg_stub_state.cdStreamGeneration
-                                  << " frame=" << frameCount
-                                  << " queued=" << playback.decodedFrames.size()
-                                  << " size=" << width << "x" << height << std::endl;
-                    });
-                    ++g_mpeg_stub_state.pictureTraceCount;
+                    const uint64_t currentTick = runtime->eeScheduler().currentVSyncTick();
+                    const uint64_t currentTickQ32 = currentTick << 32u;
+                    const MpegDecodedFrame &nextFrame = playback.decodedFrames.front();
+                    const bool pal = runtime->eeScheduler().palVideoMode();
+                    const uint64_t frameIntervalQ32 = decodedFrameIntervalQ32(playback, nextFrame, pal);
+                    uint64_t presentationTargetQ32 = presentationTickForFrame(playback, nextFrame, currentTickQ32, pal);
+
+                    if (currentTickQ32 > presentationTargetQ32 && currentTickQ32 - presentationTargetQ32 >= frameIntervalQ32)
+                    {
+                        const uint64_t correction = currentTickQ32 - presentationTargetQ32;
+                        presentationTargetQ32 = currentTickQ32;
+                        if (nextFrame.pts90k >= 0 && playback.firstPresentedPts90k >= 0)
+                        {
+                            playback.ptsPresentationBaseTickQ32 += correction;
+                        }
+                        playback.nextPictureTickQ32 = currentTickQ32;
+                    }
+
+                    if (currentTickQ32 < presentationTargetQ32)
+                    {
+                        const uint64_t eligibleTick = (presentationTargetQ32 + kPictureClockOne - 1u) >> 32u;
+                        lock.unlock();
+                        runtime->eeScheduler().waitVSync(
+                            eligibleTick - 1u,
+                            -1,
+                            [rdram, runtime](R5900Context &resumeContext)
+                            {
+                                if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
+                                {
+                                    return;
+                                }
+                                sceMpegGetPicture(rdram, &resumeContext, runtime);
+                            });
+                    }
+
+                    frame = std::move(playback.decodedFrames.front());
+                    playback.decodedFrames.pop_front();
+                    playback.width = static_cast<uint32_t>(frame.width);
+                    playback.height = static_cast<uint32_t>(frame.height);
+                    width = playback.width;
+                    height = playback.height;
+                    frameCount = playback.picturesServed;
+                    playback.picturesServed += 1u;
+                    playback.nextPictureTickQ32 = presentationTargetQ32 + frameIntervalQ32;
+                    playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
+                    haveFrame = true;
+                    playback.lastOutputServiceTick = currentTick;
+                    // The SDK emits callback type 4 during decoded picture DMA
+                    // output. Its tuple contains the callback type; the registered
+                    // user data is the third argument. Retail movie clients use
+                    // this service boundary to pump their accompanying audio.
+                    MpegStreamCallbackEvent update{};
+                    update.mpegAddr = mpegAddr;
+                    update.callbackGeneration = playback.callbackGeneration;
+                    update.streamType = 4u;
+                    update.callbacks = matchingOrdinaryCallbacks(mpegAddr, 4u);
+                    if (!update.callbacks.empty())
+                        pictureCallbacks.push_back(std::move(update));
+                    // The SDK services NODATA after the picture's output DMA.
+                    // Let the registered input consumer reconcile real DMA
+                    // progress and prime the next batch after UPDATE completes.
+                    MpegStreamCallbackEvent input{};
+                    input.mpegAddr = mpegAddr;
+                    input.callbackGeneration = playback.callbackGeneration;
+                    input.streamType = 1u;
+                    input.callbacks = matchingOrdinaryCallbacks(mpegAddr, 1u);
+                    if (!input.callbacks.empty())
+                        pictureCallbacks.push_back(std::move(input));
+                    if (g_mpeg_stub_state.pictureTraceCount < 32u)
+                    {
+                        PS2_IF_AGRESSIVE_LOGS({
+                            std::cerr << "[MPEG:GetPicture:FRAME] mpeg=0x" << std::hex << mpegAddr
+                                      << std::dec << " generation=" << g_mpeg_stub_state.cdStreamGeneration
+                                      << " frame=" << frameCount
+                                      << " queued=" << playback.decodedFrames.size()
+                                      << " size=" << width << "x" << height << std::endl;
+                        });
+                        ++g_mpeg_stub_state.pictureTraceCount;
+                    }
+                }
+                else
+                {
+                    width = playback.width;
+                    height = playback.height;
+                    frameCount = playback.picturesServed;
+                }
+                // This SDK word reports decoder handoff, not the final scanout
+                // time. The retail consumer drains its own output queue after it
+                // observes completion; sceMpegIsEnd retains host presentation
+                // timing for callers which use the native query directly.
+                publishSdkDecoderStatus(playback);
+                static std::atomic<uint64_t> pictureCount{0u};
+                if (mpegTraceSample(pictureCount.fetch_add(1u, std::memory_order_relaxed)))
+                    std::cerr << "[MPEG:GetPicture] mpeg=0x" << std::hex << mpegAddr << std::dec
+                              << " frame=" << frameCount << " haveFrame=" << haveFrame
+                              << " remaining=" << playback.decodedFrames.size()
+                              << " eof=" << g_mpeg_stub_state.currentCdStreamEofSeen
+                              << " sdkComplete=" << decoderComplete(playback)
+                              << " size=" << width << 'x' << height << std::endl;
+            }
+
+            mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
+            mpegGuestWrite32(rdram, mpegAddr + 0x04u, height);
+            mpegGuestWrite32(rdram, mpegAddr + 0x08u, frameCount);
+
+            if (uint8_t *base = getMemPtr(rdram, mpegAddr))
+            {
+                const uint32_t iVar1 = *reinterpret_cast<uint32_t *>(base + 0x40);
+                if (uint8_t *inner = getMemPtr(rdram, iVar1))
+                {
+                    *reinterpret_cast<uint32_t *>(inner + 0xb0) = 1;
+                    *reinterpret_cast<uint32_t *>(inner + 0xd8) = (getRegU32(ctx, 5) & 0x0FFFFFFFu) | 0x20000000u;
+                    *reinterpret_cast<uint32_t *>(inner + 0xe4) = getRegU32(ctx, 6);
+                    *reinterpret_cast<uint32_t *>(inner + 0xdc) = 0;
+                    *reinterpret_cast<uint32_t *>(inner + 0xe0) = 0;
                 }
             }
-            else
+
+            if (haveFrame)
             {
-                width = playback.width;
-                height = playback.height;
-                frameCount = playback.picturesServed;
+                writeDecodedFrameToGuest(rdram, imageAddr, frame);
+                g_moviePictures.fetch_add(1u, std::memory_order_relaxed);
+                dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, pictureCallbacks);
             }
-            // This SDK word reports decoder handoff, not the final scanout
-            // time. The retail consumer drains its own output queue after it
-            // observes completion; sceMpegIsEnd retains host presentation
-            // timing for callers which use the native query directly.
-            publishSdkDecoderStatus(playback);
-            static std::atomic<uint64_t> pictureCount{0u};
-            if (mpegTraceSample(pictureCount.fetch_add(1u, std::memory_order_relaxed)))
-                std::cerr << "[MPEG:GetPicture] mpeg=0x" << std::hex << mpegAddr << std::dec
-                          << " frame=" << frameCount << " haveFrame=" << haveFrame
-                          << " remaining=" << playback.decodedFrames.size()
-                          << " eof=" << g_mpeg_stub_state.currentCdStreamEofSeen
-                          << " sdkComplete=" << decoderComplete(playback)
-                          << " size=" << width << 'x' << height << std::endl;
-        }
-
-        mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
-        mpegGuestWrite32(rdram, mpegAddr + 0x04u, height);
-        mpegGuestWrite32(rdram, mpegAddr + 0x08u, frameCount);
-
-        if (uint8_t *base = getMemPtr(rdram, mpegAddr))
-        {
-            const uint32_t iVar1 = *reinterpret_cast<uint32_t *>(base + 0x40);
-            if (uint8_t *inner = getMemPtr(rdram, iVar1))
+            else if (frameCount == 0u)
             {
-                *reinterpret_cast<uint32_t *>(inner + 0xb0) = 1;
-                *reinterpret_cast<uint32_t *>(inner + 0xd8) = (getRegU32(ctx, 5) & 0x0FFFFFFFu) | 0x20000000u;
-                *reinterpret_cast<uint32_t *>(inner + 0xe4) = getRegU32(ctx, 6);
-                *reinterpret_cast<uint32_t *>(inner + 0xdc) = 0;
-                *reinterpret_cast<uint32_t *>(inner + 0xe0) = 0;
+                writeBlankMpegFrame(rdram, imageAddr, width, height);
             }
+
+            setReturnS32(ctx, 0);
         }
 
-        if (haveFrame)
-        {
-            writeDecodedFrameToGuest(rdram, imageAddr, frame);
-            g_moviePictures.fetch_add(1u, std::memory_order_relaxed);
-            dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, pictureCallbacks);
-        }
-        else if (frameCount == 0u)
-        {
-            writeBlankMpegFrame(rdram, imageAddr, width, height);
-        }
+    } // namespace
 
-        setReturnS32(ctx, 0);
+    void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        getPicture(rdram, ctx, runtime, true);
     }
 
     void sceMpegGetPictureRAW8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2879,14 +2993,18 @@ namespace ps2_stubs
     {
         (void)rdram;
         std::vector<uint64_t> cancelled;
+        std::vector<uint32_t> cancelledPictures;
         {
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         for (auto &[mpegAddr, playback] : g_mpeg_stub_state.playbackByMpeg)
+        {
+            cancelledPictures.push_back(mpegAddr);
             if (playback.demuxTransaction)
             {
                 playback.demuxTransaction->finished = true;
                 cancelled.push_back(playback.demuxTransaction->waitToken);
             }
+        }
         const uint64_t cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
         const uint64_t cdStreamBytesProduced = g_mpeg_stub_state.cdStreamBytesProduced;
         const uint64_t cdStreamBytesDemuxed = g_mpeg_stub_state.cdStreamBytesDemuxed;
@@ -2903,6 +3021,8 @@ namespace ps2_stubs
         if (runtime)
         {
             runtime->memory().resetIpuInputConsumption();
+            for (uint32_t mpeg : cancelledPictures)
+                runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpeg, KE_WAIT_DELETE);
             for (uint64_t token : cancelled)
                 runtime->eeScheduler().completeExternalWait(kMpegDemuxWaitType, token, KE_WAIT_DELETE);
         }
@@ -2994,6 +3114,7 @@ namespace ps2_stubs
         if (runtime)
         {
             runtime->memory().resetIpuInputConsumption();
+            runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, param_1, KE_WAIT_DELETE);
             if (cancelled != 0u)
                 runtime->eeScheduler().completeExternalWait(kMpegDemuxWaitType, cancelled, KE_WAIT_DELETE);
         }
