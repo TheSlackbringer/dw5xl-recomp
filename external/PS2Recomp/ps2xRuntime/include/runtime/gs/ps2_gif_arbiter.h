@@ -90,6 +90,18 @@ private:
 
     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
     static uint8_t pathPriority(GifPathId id);
+
+    // DW5XL-DEBUG issue 025 (C3b step 1): PS2X_GIF_STATS=1 prints per-second counts of the per-packet work
+    // ([gifstats]); producer-side counters, read once at start, no effect when off.
+    struct Stats
+    {
+        uint64_t submits[4] = {};
+        uint64_t drains = 0, drainsMulti = 0, handovers = 0, wakes = 0, spareMisses = 0, grows = 0;
+        size_t pendingMax = 0;
+    };
+    Stats m_stats;
+    int64_t m_statsWindowStart = 0;
+    void statsTick();
 };
 
 #endif

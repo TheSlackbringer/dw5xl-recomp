@@ -1,8 +1,15 @@
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "ThreadNaming.h"
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+namespace
+{
+    const bool kGifStats = [] { const char *v = std::getenv("PS2X_GIF_STATS"); return v && *v && *v != '0'; }(); // DW5XL-DEBUG
+}
 
 // Path of the packet currently handed to the GS (read by gs_frontend.cpp to
 // keep per-path GIFtag continuation state); 0 outside drain().
@@ -106,12 +113,44 @@ void GifArbiter::flushOutbox()
         wake = !m_workerBusy && m_pending.empty();
         for (auto &pkt : m_outbox)
             m_pending.push_back(std::move(pkt));
+        if (kGifStats) // DW5XL-DEBUG issue 025
+            m_stats.pendingMax = std::max(m_stats.pendingMax, m_pending.size());
         if (m_spare.empty())
             m_spare.swap(m_returned);
     }
     if (wake)
         m_workCv.notify_one();
     m_outbox.clear();
+    if (kGifStats) // DW5XL-DEBUG issue 025
+    {
+        ++m_stats.handovers;
+        m_stats.wakes += wake ? 1u : 0u;
+        statsTick();
+    }
+}
+
+void GifArbiter::statsTick() // DW5XL-DEBUG issue 025: one [gifstats] line per second of host time
+{
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (m_statsWindowStart == 0)
+        m_statsWindowStart = now;
+    if (now - m_statsWindowStart < 1000)
+        return;
+    size_t pending = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_workerMutex);
+        pending = m_pending.size();
+    }
+    std::fprintf(stderr, "[gifstats] ms=%lld path1=%llu path2=%llu path3=%llu drains=%llu multi=%llu handovers=%llu "
+                         "wakes=%llu spareMiss=%llu grow=%llu pendingMax=%zu pendingNow=%zu\n",
+                 static_cast<long long>(now - m_statsWindowStart), (unsigned long long)m_stats.submits[1],
+                 (unsigned long long)m_stats.submits[2], (unsigned long long)m_stats.submits[3],
+                 (unsigned long long)m_stats.drains, (unsigned long long)m_stats.drainsMulti,
+                 (unsigned long long)m_stats.handovers, (unsigned long long)m_stats.wakes,
+                 (unsigned long long)m_stats.spareMisses, (unsigned long long)m_stats.grows, m_stats.pendingMax, pending);
+    m_stats = {};
+    m_statsWindowStart = now;
 }
 
 void GifArbiter::beginBatch()
@@ -172,11 +211,29 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
+    if (m_spare.empty() && m_async)
+    {
+        // Take back the buffers the GS worker has finished with before allocating a new one (issue 025 C3b).
+        std::lock_guard<std::mutex> lock(m_workerMutex);
+        m_spare.swap(m_returned);
+    }
     if (!m_spare.empty())
     {
         pkt.data = std::move(m_spare.back());
         m_spare.pop_back();
     }
+    if (kGifStats) // DW5XL-DEBUG issue 025
+    {
+        ++m_stats.submits[static_cast<int>(pathId) & 3];
+        if (pkt.data.capacity() == 0u)
+            ++m_stats.spareMisses;
+        else if (pkt.data.capacity() < sizeBytes)
+            ++m_stats.grows;
+    }
+    // A buffer that must grow gets room for a typical packet at least, so reused buffers rarely grow again (C3b).
+    constexpr size_t kMinPacketCapacity = 16u * 1024u;
+    if (pkt.data.capacity() < sizeBytes)
+        pkt.data.reserve(std::max<size_t>(sizeBytes, kMinPacketCapacity));
     pkt.data.assign(data, data + sizeBytes);
     m_queue.push_back(std::move(pkt));
 }
@@ -185,20 +242,29 @@ void GifArbiter::drain()
 {
     if (!m_processFn)
         return;
+    if (kGifStats) // DW5XL-DEBUG issue 025
+    {
+        ++m_stats.drains;
+        m_stats.drainsMulti += m_queue.size() > 1u ? 1u : 0u;
+    }
 
-    std::stable_sort(m_queue.begin(), m_queue.end(),
-                     [](const GifArbiterPacket &a, const GifArbiterPacket &b)
-                     {
-                         // DIRECTHL cannot preempt PATH3 IMAGE transfers.
-                         if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
+    // A single packet cannot change order: skip the sort (issue 025 C3b; the usual case is one VU1 packet).
+    if (m_queue.size() > 1u)
+    {
+        std::stable_sort(m_queue.begin(), m_queue.end(),
+                         [](const GifArbiterPacket &a, const GifArbiterPacket &b)
                          {
-                             if (a.path3Image && b.path2DirectHl)
-                                 return true;
-                             if (a.path2DirectHl && b.path3Image)
-                                 return false;
-                         }
-                         return pathPriority(a.pathId) < pathPriority(b.pathId);
-                     });
+                             // DIRECTHL cannot preempt PATH3 IMAGE transfers.
+                             if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
+                             {
+                                 if (a.path3Image && b.path2DirectHl)
+                                     return true;
+                                 if (a.path2DirectHl && b.path3Image)
+                                     return false;
+                             }
+                             return pathPriority(a.pathId) < pathPriority(b.pathId);
+                         });
+    }
 
     if (m_async)
     {
