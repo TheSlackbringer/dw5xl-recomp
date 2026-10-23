@@ -530,6 +530,61 @@ uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
     return nearest;
 }
 
+namespace
+{
+    constexpr size_t kChainPoolDepth = 4;
+
+    size_t chainPoolIndex(uint32_t channelBase)
+    {
+        return channelBase == 0x10008000u ? 0u : (channelBase == 0x10009000u ? 1u : 2u);
+    }
+}
+
+std::vector<uint8_t> PS2Memory::takeChainBuffer(uint32_t channelBase)
+{
+    const size_t i = chainPoolIndex(channelBase);
+    std::vector<uint8_t> buffer;
+    size_t hint = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_chainPoolMutex);
+        auto &pool = m_chainPool[i];
+        if (!pool.empty())
+        {
+            buffer = std::move(pool.back());
+            pool.pop_back();
+        }
+        hint = m_chainSizeHint[i];
+    }
+    buffer.clear();
+    buffer.reserve(hint);
+    return buffer;
+}
+
+void PS2Memory::noteChainSize(uint32_t channelBase, size_t bytes)
+{
+    std::lock_guard<std::mutex> lock(m_chainPoolMutex);
+    m_chainSizeHint[chainPoolIndex(channelBase)] = bytes;
+}
+
+void PS2Memory::recycleChainBuffer(uint32_t channelBase, std::vector<uint8_t> &&buffer)
+{
+    if (buffer.capacity() == 0)
+        return;
+    buffer.clear();
+    std::lock_guard<std::mutex> lock(m_chainPoolMutex);
+    auto &pool = m_chainPool[chainPoolIndex(channelBase)];
+    if (pool.size() < kChainPoolDepth)
+    {
+        pool.push_back(std::move(buffer));
+        return;
+    }
+    // Full: keep the larger buffers (a small normal-mode chunk must not push out a chain-sized one).
+    auto smallest = std::min_element(pool.begin(), pool.end(), [](const auto &a, const auto &b)
+                                     { return a.capacity() < b.capacity(); });
+    if (smallest->capacity() < buffer.capacity())
+        *smallest = std::move(buffer);
+}
+
 bool PS2Memory::isScratchpad(uint32_t address) const
 {
     return ps2IsScratchpadAddress(address);
@@ -1483,7 +1538,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    std::vector<uint8_t> chainBuf;
+                    std::vector<uint8_t> chainBuf = takeChainBuffer(channelBase); // empty, room for the last chain
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1554,6 +1609,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
                     struct Dw5Tag { uint32_t at, id, qwc, addr; uint64_t upper; };
                     static const bool dw5TagTrace = std::getenv("PS2X_VIF1_CHAIN_TRACE") != nullptr; // DW5XL-DEBUG
+                    static const bool vifParseDump = std::getenv("PS2X_VIF_PARSE_DUMP") != nullptr;  // DW5XL-DEBUG (read once: issue 025)
                     std::vector<Dw5Tag> dw5Tags;
 
                     while (true)
@@ -1676,7 +1732,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                         if (dw5TagTrace && dw5Tags.size() < 64u) // DW5XL-DEBUG
                             dw5Tags.push_back({currentTagAddr, id, tagQwc, addr, loadScalar<uint64_t>(tp, 8, 16, "dma tag upper", tagAddr)});
-                        if (std::getenv("PS2X_VIF_PARSE_DUMP") && channelBase == 0x10009000u &&
+                        if (vifParseDump && channelBase == 0x10009000u &&
                             gs_regs.vsyncTick.load(std::memory_order_acquire) >= 2008u && gs_regs.vsyncTick.load(std::memory_order_acquire) <= 2020u &&
                             chainBuf.size() >= 280000u && chainBuf.size() <= 285000u)
                             std::fprintf(stderr, "[vif:source] offset=%zu tag=%08x id=%u qwc=%u payload=%08x vif=%08x,%08x\n",
@@ -1713,7 +1769,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             std::fprintf(stderr, "\n");
                         }
                     }
-                    if (!chainBuf.empty())
+                    noteChainSize(channelBase, chainBuf.size());
+                    if (chainBuf.empty())
+                        recycleChainBuffer(channelBase, std::move(chainBuf));
+                    else
                     {
                         PendingTransfer pt;
                         pt.fromScratchpad = false;

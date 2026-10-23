@@ -290,6 +290,7 @@ namespace ps2x::device
                     completed.store(command->seq, std::memory_order_relaxed);
                     applied.store(command->seq, std::memory_order_relaxed);
                     applyResults(*command);
+                    recycleBuffers(*command);
                     return;
                 }
 
@@ -624,6 +625,19 @@ namespace ps2x::device
                 }
             }
 
+            // EE side, after the command's results are applied: the device no longer reads its transfer chunks
+            // (a paused transfer moved or copied what it still needs into its own retained tail), so the buffers
+            // go back to the chain-snapshot pool (issue 025).
+            void recycleBuffers(Command &command)
+            {
+                if (command.kind != Command::Kind::Transfer)
+                    return;
+                for (auto &chunk : command.transfer.vif1Chunks)
+                    mem.recycleChainBuffer(kVif1Channel, std::move(chunk));
+                for (auto &chunk : command.transfer.gifChunks)
+                    mem.recycleChainBuffer(kGifChannel, std::move(chunk));
+            }
+
             void applyResults(Command &command)
             {
                 if (command.error)
@@ -664,6 +678,7 @@ namespace ps2x::device
                     }
                     applied.store(command->seq, std::memory_order_relaxed);
                     applyResults(*command);
+                    recycleBuffers(*command);
                     any = true;
                 }
                 return any;

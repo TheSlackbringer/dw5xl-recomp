@@ -1719,7 +1719,8 @@ namespace ps2_stubs
                 if (found == g_mpeg_stub_state.playbackByMpeg.end() ||
                     found->second.demuxTransaction != transaction || transaction->finished)
                     return;
-                if (std::getenv("PS2X_MPEGAUDIO_TRACE") && transaction->eventIndex < transaction->events.size()) // DW5XL-DEBUG
+                static const bool mpegAudioTrace = std::getenv("PS2X_MPEGAUDIO_TRACE") != nullptr; // DW5XL-DEBUG (read once: issue 025)
+                if (mpegAudioTrace && transaction->eventIndex < transaction->events.size()) // DW5XL-DEBUG
                 {
                     const auto &ev = transaction->events[transaction->eventIndex];
                     if (ev.streamType == kMpegStrADPCM)
@@ -2000,7 +2001,8 @@ namespace ps2_stubs
                             // PSS private stream 1 carries a 4-byte prefix whose second byte is the
                             // sub-stream id: 0xA0-0xAF are audio (SShd/SSbd ADPCM or PCM). Other ids
                             // (e.g. DW5XL's 0x90 data track) must not reach audio callbacks.
-                            if (std::getenv("PS2X_MPEGAUDIO_TRACE")) // DW5XL-DEBUG: audio sub-stream bytes
+                            static const bool subStreamTrace = std::getenv("PS2X_MPEGAUDIO_TRACE") != nullptr; // DW5XL-DEBUG (read once: issue 025)
+                            if (subStreamTrace) // DW5XL-DEBUG: audio sub-stream bytes
                             {
                                 static unsigned logged = 0;
                                 static uint32_t lastPrefix = 0;

@@ -1,4 +1,5 @@
 #include "ps2x/state_archive.h"
+#include "ps2x/iop/iop_ascii.h"
 #include <cstdio>
 #include "iop_emulator.h"
 #include "imports/iop_cdvd.h"
@@ -61,15 +62,13 @@ namespace ps2x::iop::detail
 
         bool iequals(std::string_view lhs, std::string_view rhs)
         {
-            if (lhs.size() != rhs.size())
-                return false;
-            for (size_t i = 0; i < lhs.size(); ++i)
-            {
-                if (std::tolower(static_cast<unsigned char>(lhs[i])) !=
-                    std::tolower(static_cast<unsigned char>(rhs[i])))
-                    return false;
-            }
-            return true;
+            return asciiEqualsIgnoreCase(lhs, rhs); // no C-runtime call per character (issue 025)
+        }
+
+        bool libsdTrace()
+        {
+            static const bool on = std::getenv("PS2X_LIBSD_TRACE") != nullptr; // DW5XL-DEBUG (read once: issue 025)
+            return on;
         }
 
     }
@@ -214,7 +213,7 @@ namespace ps2x::iop::detail
             if (const auto dma = memory.takeDmaStart())
             {
                 pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
-                if (std::getenv("PS2X_LIBSD_TRACE")) // DW5XL-DEBUG
+                if (libsdTrace()) // DW5XL-DEBUG
                     std::fprintf(stderr, "[dw5xl:iopdma] start irq=0x%x at=%llu due=%llu\n", dma->irq,
                                  (unsigned long long)totalCycles, (unsigned long long)(totalCycles + dma->delayCycles));
             }
@@ -310,7 +309,7 @@ namespace ps2x::iop::detail
                 cpu.gpr[2] = value;
             };
 
-            if (iequals(call.library, "libsd") && std::getenv("PS2X_LIBSD_TRACE")) // DW5XL-DEBUG
+            if (iequals(call.library, "libsd") && libsdTrace()) // DW5XL-DEBUG
             {
                 static unsigned traced = 0;
                 const uint32_t ord = call.ordinal;
@@ -612,13 +611,13 @@ namespace ps2x::iop::detail
                 {
                     if (!memory.soundDmaActive(irq))
                     {
-                        if (std::getenv("PS2X_LIBSD_TRACE")) // DW5XL-DEBUG
+                        if (libsdTrace()) // DW5XL-DEBUG
                             std::fprintf(stderr, "[dw5xl:iopdma] skip inactive irq=0x%x\n", irq);
                         continue;
                     }
                     memory.completeSoundDma(irq);
                     const auto dispatched = intrman.dispatchInterrupt(irq, *this);
-                    if (std::getenv("PS2X_LIBSD_TRACE")) // DW5XL-DEBUG
+                    if (libsdTrace()) // DW5XL-DEBUG
                         std::fprintf(stderr, "[dw5xl:iopdma] complete irq=0x%x at=%llu dispatched=%d\n", irq,
                                      (unsigned long long)totalCycles, static_cast<int>(dispatched));
                 }

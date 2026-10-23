@@ -584,7 +584,8 @@ namespace ps2_syscalls
             request.endParameter = endParameter;
 
             uint32_t dw5Pre[4] = {}; // DW5XL-DEBUG: KSNH request words before the reply overwrites them
-            const bool dw5Ksnh = sid == 0x4B534E48u && sendBuf && std::getenv("PS2X_KSNH_TRACE");
+            static const bool ksnhTrace = std::getenv("PS2X_KSNH_TRACE") != nullptr; // DW5XL-DEBUG (read once: issue 025)
+            const bool dw5Ksnh = sid == 0x4B534E48u && sendBuf && ksnhTrace;
             if (dw5Ksnh)
                 std::memcpy(dw5Pre, getMemPtr(rdram, sendBuf), std::min<uint32_t>(sendSize, 16u));
             // Optional bounded SFX trace: capture before the IOP reply can
@@ -644,7 +645,8 @@ namespace ps2_syscalls
                 const uint64_t key = (static_cast<uint64_t>(sid) << 32) | rpcNum;
                 auto [it, inserted] = seen.try_emplace(key, std::make_pair(reply0, 0ull));
                 ++it->second.second;
-                if (inserted || it->second.first != reply0 || ((sid == 0x4B534E47u || sid == 0x4B534E48u) && std::getenv("PS2X_KSNG_TRACE")))
+                static const bool ksngTrace = std::getenv("PS2X_KSNG_TRACE") != nullptr; // DW5XL-DEBUG (read once: issue 025)
+                if (inserted || it->second.first != reply0 || ((sid == 0x4B534E47u || sid == 0x4B534E48u) && ksngTrace))
                 {
                     it->second.first = reply0;
                     std::cerr << "[dw5xl:rpc] sid=0x" << std::hex << sid << " rpc=0x" << rpcNum << " #" << std::dec

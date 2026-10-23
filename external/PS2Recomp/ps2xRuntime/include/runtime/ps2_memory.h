@@ -435,6 +435,15 @@ public:
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;
+    // DMA chain snapshots (issue 025): finished transfers hand their buffers back, so a chain walk normally fills a
+    // buffer that already has room (no regrowth copies, no fresh large allocation per kick). Host bookkeeping only:
+    // the bytes and their order are unchanged, and none of this is part of a saved state.
+    std::vector<uint8_t> takeChainBuffer(uint32_t channelBase);
+    void noteChainSize(uint32_t channelBase, size_t bytes);
+    void recycleChainBuffer(uint32_t channelBase, std::vector<uint8_t> &&buffer);
+    std::mutex m_chainPoolMutex;
+    std::array<std::vector<std::vector<uint8_t>>, 3> m_chainPool; // VIF0, VIF1, GIF; at most kChainPoolDepth each
+    std::array<size_t, 3> m_chainSizeHint{};                      // bytes of the last chain on that channel
     std::mutex m_completedDmacMutex;
     std::vector<uint32_t> m_completedDmacCauses;
 

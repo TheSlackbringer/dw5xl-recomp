@@ -113,7 +113,8 @@ namespace
 
         for (size_t i = 0; i < pixels.size(); ++i)
             *getMemPtr(rdram, output + static_cast<uint32_t>(i)) = pixels[i];
-        if (std::getenv("PS2X_IPU_TRACE"))
+        static const bool ipuTrace = std::getenv("PS2X_IPU_TRACE") != nullptr; // DW5XL-DEBUG (read once: issue 025)
+        if (ipuTrace)
             std::fprintf(stderr, "[dw5xl:ipu] slot %u image %u %ux%u archive=0x%x data=0x%x+%u out=0x%x..0x%x\n", slot, image,
                          width, height, archive, archive + offset, size, output, output + macroblocks * 1024u);
 

@@ -725,7 +725,8 @@ namespace ps2_stubs
             setReturnS32(ctx, 0);
             return;
         }
-        if (std::getenv("PS2X_SIFAUDIO_TRACE")) // DW5XL-DEBUG: movie audio chunks into KOEISND staging
+        static const bool sifAudioTrace = std::getenv("PS2X_SIFAUDIO_TRACE") != nullptr; // DW5XL-DEBUG (read once: issue 025)
+        if (sifAudioTrace) // DW5XL-DEBUG: movie audio chunks into KOEISND staging
         {
             const uint32_t src = READ32(dmatAddr + 0), dst = READ32(dmatAddr + 4), size = READ32(dmatAddr + 8);
             if (dst == 0x152580u && size >= 32u)
