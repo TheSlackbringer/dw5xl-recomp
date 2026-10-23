@@ -381,10 +381,16 @@ if(DW5XL_BUILD_TESTS)
 
     if(EXISTS "${DW5XL_VU1_LIFTED_SRC}")
         add_executable(dw5xl_vu1_lift_test tests/vu1_lift_test.cpp "${DW5XL_VU1_LIFTED_SRC}")
-        target_link_libraries(dw5xl_vu1_lift_test PRIVATE ps2_runtime)
-        target_include_directories(dw5xl_vu1_lift_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
+        target_link_libraries(dw5xl_vu1_lift_test PRIVATE ps2_runtime dw5xl_setup_core)
+        target_include_directories(dw5xl_vu1_lift_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}")
         target_compile_options(dw5xl_vu1_lift_test PRIVATE ${DW5XL_ARCH_FLAGS} ${DW5XL_STRICT_FP_FLAGS})
         add_test(NAME vu1_lift COMMAND dw5xl_vu1_lift_test)
+        # Issue 036: the test rebuilds its VU1 images from the player's executable (the one the translated code
+        # came from), like the translator; the game folder sits next to the generated code on Linux and Windows.
+        set(DW5XL_TEST_GAME_ELF "${DW5XL_RECOMP_ROOT}/../game/dw5xl/SLES_538.60" CACHE FILEPATH
+            "Player's PAL executable for the vu1_lift test")
+        set_tests_properties(vu1_lift PROPERTIES ENVIRONMENT "DW5XL_TEST_ELF=${DW5XL_TEST_GAME_ELF}")
         add_test(NAME vu1_dma_reset_interpreter COMMAND dw5xl_vu1_lift_test dma-cancel-interpreter)
         add_test(NAME vu1_dma_reset_lift COMMAND dw5xl_vu1_lift_test dma-cancel-lift)
         set_tests_properties(vu1_dma_reset_interpreter vu1_dma_reset_lift PROPERTIES TIMEOUT 20)

@@ -3,6 +3,8 @@
 #include "runtime/ps2_vu1_lift.h"
 #include "ps2_runtime.h"
 #include "runtime/ps2_device_queue.h"
+#include "setup/vu1lift/vu1_translator.h"
+#include <map>
 #include <condition_variable>
 #include <mutex>
 #include <string>
@@ -178,11 +180,29 @@ void verifyEquivalence(const char *name, const VU1State &sInterp, const uint8_t 
     std::cout << "       State and memory identical bit-for-bit!" << std::endl;
 }
 
-// Equivalence test for a segment
-void testSegment(const std::string &binPath, uint64_t hash, uint32_t entryPc, uint32_t expectedFinalPc)
+// The VU1 code images the translated programs come from, rebuilt from the player's own executable exactly as the
+// translator reads them (issue 036; path from DW5XL_TEST_ELF, set by CTest). Offsets and checksums only: no game data
+// is stored with the test.
+const std::vector<uint8_t> &discImage(const std::string &key)
 {
-    auto code = loadFile(binPath);
-    require(code.size() == 16384, "Code size 16KB");
+    static const std::map<std::string, std::vector<uint8_t>> images = []
+    {
+        const char *elf = std::getenv("DW5XL_TEST_ELF");
+        require(elf && *elf, "DW5XL_TEST_ELF must name the player's SLES_538.60 (set by CTest)");
+        std::map<std::string, std::vector<uint8_t>> loaded;
+        std::string error;
+        require(dw5xl::vu1lift::loadVu1Images(elf, loaded, error), (std::string("VU1 images from ") + elf + ": " + error).c_str());
+        return loaded;
+    }();
+    const auto it = images.find(key);
+    require(it != images.end() && it->second.size() == 16384, ("no 16 KB VU1 image for " + key).c_str());
+    return it->second;
+}
+
+// Equivalence test for a segment
+void testSegment(const std::string &key, uint64_t hash, uint32_t entryPc, uint32_t expectedFinalPc)
+{
+    const auto &code = discImage(key);
 
     auto fn = vl::find(hash, entryPc);
     require(fn != nullptr, "Segment must be registered");
@@ -291,6 +311,8 @@ void testSegment(const std::string &binPath, uint64_t hash, uint32_t entryPc, ui
                          rtLift.gs(), &rtLift.memory(),
                          entryPc, 0, 0, 100000);
     vl::setEnabledOverride(-1);
+    // A lookup miss would run the interpreter twice and compare it with itself (issue 036).
+    require(rtLift.vu1().lastRunLifted(), "the translated program must have run (lookup on the rebuilt image)");
     const VU1State &sLiftOut = rtLift.vu1().state();
 
     std::cout << "[DEBUG] Lifted PC=0x" << std::hex << sLiftOut.pc
@@ -298,7 +320,7 @@ void testSegment(const std::string &binPath, uint64_t hash, uint32_t entryPc, ui
               << " VI[1]=" << sLiftOut.vi[1] << std::endl;
     require(sLiftOut.cycles == sInterp.cycles, "lifted run must take the interpreter's cycle count");
 
-    verifyEquivalence(binPath.c_str(), sInterp, dataInterp, sLiftOut, rtLift.memory().getVU1Data(), expectedFinalPc);
+    verifyEquivalence(key.c_str(), sInterp, dataInterp, sLiftOut, rtLift.memory().getVU1Data(), expectedFinalPc);
 }
 
 // Synthetic SDK-independent microcode: XGKICK A, NOP runway, SQ sentinel,
@@ -414,10 +436,9 @@ void testRealVuDmaCancellation(bool lifted)
 
 // Timing benchmark (not run by CTest): repeatedly executes one captured
 // program through the real dispatch, lifted and interpreted.
-void benchSegment(const std::string &binPath, uint32_t entryPc, int iterations, bool liftedOnly)
+void benchSegment(const std::string &key, uint32_t entryPc, int iterations, bool liftedOnly)
 {
-    auto code = loadFile(binPath);
-    require(code.size() == 16384, "Code size 16KB");
+    const auto &code = discImage(key);
     for (int lifted : {1, 0})
     {
         if (liftedOnly && !lifted)
@@ -563,7 +584,7 @@ int main(int argc, char **argv)
         }
         if (argc >= 2 && std::string(argv[1]) == "bench")
         {
-            benchSegment("notes/evidence/battle-black-agent-20261014/dispatch-observations/vu-census.tsv.da28291ffe0b3334.bin", 0x0010,
+            benchSegment("da28291ffe0b3334", 0x0010,
                          argc >= 3 ? std::atoi(argv[2]) : 20000, argc >= 4);
             return 0;
         }
@@ -574,16 +595,16 @@ int main(int argc, char **argv)
         }
         testRegistrations();
 
-        testSegment("notes/evidence/battle-black-agent-20261014/dispatch-observations/vu-census.tsv.1ad6eefff0c2e7e5.bin",
+        testSegment("1ad6eefff0c2e7e5",
                     0x1ad6eefff0c2e7e5ull, 0x0800, 0x0a78);
 
-        testSegment("notes/evidence/battle-black-agent-20261014/dispatch-observations/vu-census.tsv.1ad6eefff0c2e7e5.bin",
+        testSegment("1ad6eefff0c2e7e5",
                     0x1ad6eefff0c2e7e5ull, 0x1000, 0x12b0);
 
-        testSegment("notes/evidence/battle-black-agent-20261014/dispatch-observations/vu-census.tsv.1b91674603e323f2.bin",
+        testSegment("1b91674603e323f2",
                     0x1b91674603e323f2ull, 0x0800, 0x0c48);
 
-        testSegment("notes/evidence/battle-black-agent-20261014/dispatch-observations/vu-census.tsv.da28291ffe0b3334.bin",
+        testSegment("da28291ffe0b3334",
                     0xda28291ffe0b3334ull, 0x0010, 0x0950);
 
         // The translator's timing mirror must match the interpreter's decode,

@@ -1711,4 +1711,19 @@ bool generateLiftedVu0(const std::filesystem::path &elf, std::string &text, std:
     }
 }
 
+bool loadVu1Images(const std::filesystem::path &elf, std::map<std::string, std::vector<uint8_t>> &images,
+                   std::string &error)
+{
+    try
+    {
+        images = loadDiscBins(elf).bins;
+        return true;
+    }
+    catch (const std::exception &e)
+    {
+        error = e.what();
+        return false;
+    }
+}
+
 } // namespace dw5xl::vu1lift

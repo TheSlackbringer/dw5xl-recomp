@@ -102,6 +102,8 @@ public:
                 uint32_t top = 0, uint32_t itop = 0, uint32_t maxCycles = 65536);
 
     VU1State &state() { return m_state; }
+    // The last run() executed translated (native) code, not the interpreter (tests: issue 036).
+    bool lastRunLifted() const { return m_lastRunLifted; }
     const VU1State &state() const { return m_state; }
 
 private:

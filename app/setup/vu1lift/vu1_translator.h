@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -29,5 +30,12 @@ bool generateLiftedVu1(const std::filesystem::path &elf, std::string &text, std:
 bool generateLiftedVu0(const std::filesystem::path &elf, std::string &text, std::string &error,
                        const std::function<void(const std::string &)> &log = {},
                        const std::function<bool(const std::string &)> &staticTiming = {});
+
+// The 16 KiB VU1 code images the translated programs come from, rebuilt from the executable at `elf` (OVL_00.BIN from
+// the same folder) exactly as the translator reads them (load_disc_bins: executable, disc-file and range SHA-256
+// checked), keyed by provenance key. Used by the vu1_lift test (issue 036). false + `error` if a file is missing or
+// does not match.
+bool loadVu1Images(const std::filesystem::path &elf, std::map<std::string, std::vector<uint8_t>> &images,
+                   std::string &error);
 
 } // namespace dw5xl::vu1lift
