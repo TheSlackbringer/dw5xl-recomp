@@ -5,6 +5,7 @@
 #include "runtime/ps2_device_queue.h"
 #include "runtime/ps2_profile_markers.h"
 #include "ps2_vu1_detail.h"
+#include "ps2_runtime_macros.h"
 
 #include <algorithm>
 #include <bit>
@@ -2020,8 +2021,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         census(m_unit).lastRunBudgetExhausted = false;
         census(m_unit).lastRunAbnormalStop = false;
     }
-    const int previousRoundingMode = std::fegetround();
-    const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+    // VU arithmetic rounds toward zero. Switch only when the caller's mode differs (on the device thread it
+    // already is: the EE runs in round-toward-zero), keeping x87 and SSE coherent; restored on every return
+    // (issue 025 v9, C2: MinGW's fesetround rewrote both control registers twice per run).
+    const Ps2ScopedHostRounding vuRounding(FE_TOWARDZERO);
     // A lifted segment runs to its end; the cycle budget only bounds the
     // interpreter's time slice.
     // PS2X_VU1_RUN_CAPTURE=<prefix> (+ _PC=<entry pc>, _FROM=<tick>, _COUNT=<n>, default 8): saves the start of
@@ -2055,8 +2058,6 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     if (!m_verifyShadow && runLiftedChecked(vuCode, codeSize, vuData, dataSize, gs, memory))
     {
         m_lastRunLifted = true;
-        if (useVuRounding && previousRoundingMode != -1)
-            std::fesetround(previousRoundingMode);
         return;
     }
     const uint64_t budgetEnd = m_cycle + maxCycles;
@@ -2218,6 +2219,4 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltT = false;
     }
     m_state.cycles = m_cycle;
-    if (useVuRounding && previousRoundingMode != -1)
-        std::fesetround(previousRoundingMode);
 }
