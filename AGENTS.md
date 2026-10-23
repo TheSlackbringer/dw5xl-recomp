@@ -81,6 +81,12 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
   not FPS. Capture images separately from timing runs: saving frames can itself cause stutter. Do not require this
   comparison for documentation, packaging, CI, launcher-only, audio-only or other changes unrelated to rendered
   output. It does not automatically trigger a full gameplay suite or replace existing sound/gameplay checks.
+- **Function-map and generated-code validation (2026-10-24):** Use `tools/debug/validate_function_map.py`
+  when changing function maps, Ghidra exports, entry-point configuration, or recompiler logic affecting
+  boundaries, branch exits or delay slots. Also use it during missing-target or omitted-instruction
+  investigations. Check edited maps before regeneration; audit corresponding generated output afterwards.
+  Record the selected passes, findings and coverage limits in the issue's work log. Unrelated changes,
+  ordinary play and FPS profiling do not require it. See `tools/debug/validate_function_map.md`.
 - **GPU renderer only** (Vulkan/paraLLEl-GS) for development and tests; no CPU-renderer work unless asked.
 - **The port is not specific to one machine.** Keep fixes portable across supported hardware and the
   planned Linux/Windows targets. The test machine's CPU/GPU are test equipment, not product requirements. Label
