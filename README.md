@@ -180,6 +180,8 @@ Game data, analysis databases, generated main/overlay output, builds and local r
 
 For offline graphics debugging, [compare saved frames exactly](tools/debug/compare_frames.md) with changed-pixel counts, locations and an optional difference image.
 
+For map/export and missing-instruction investigations, [validate function maps and generated output](tools/debug/validate_function_map.md). The tool reports boundary, path and emission evidence without changing maps or running the game.
+
 Current priorities are Windows performance, long-session stability, broader gameplay testing and the Linux release.
 
 ### Making a release

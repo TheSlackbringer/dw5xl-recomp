@@ -40,6 +40,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Test release draft lifecycle
         run: python3 -m unittest discover -s tools/release -p 'test_*.py' -v
+      - name: Test function-map diagnostics (synthetic inputs only)
+        run: python3 -m unittest discover -s tools/tests -p 'test_validate_function_map.py' -v
       - name: No game data in the repository
         run: |
           bad=$(git ls-files | grep -iE '^(game|discs|ghidra|ghidra_iop|notes)/|/output/|^recomp/[^/]+/(vu[01]|iop)/|vu[01]_lifted|\.(iso|elf|irx)$' || true)
