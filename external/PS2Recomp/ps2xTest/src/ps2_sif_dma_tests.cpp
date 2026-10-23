@@ -200,8 +200,14 @@ void register_ps2_sif_dma_tests()
             setRegU32(env.ctx, 4, kIopBlockSize);
             ps2_stubs::sceSifAllocIopHeap(env.rdram.data(), &env.ctx, &env.runtime);
             const uint32_t iopAddress = ::getRegU32(&env.ctx, 2);
-            t.IsTrue(iopAddress >= 0x00120000u && iopAddress < 0x00200000u,
-                     "sceSifAllocIopHeap should return an address in physical IOP RAM");
+            t.IsTrue(iopAddress != 0u && iopAddress <= 0x00200000u - kIopBlockSize,
+                     "sceSifAllocIopHeap must allocate the complete block in physical IOP RAM");
+            t.Equals(iopAddress % 64u, 0u, "SIF heap allocations must retain their requested alignment");
+            t.IsTrue(env.runtime.isIopMemoryRange(iopAddress, kIopBlockSize),
+                     "the complete allocation must belong to the IOP memory subsystem");
+            if (iopAddress == 0u || iopAddress > 0x00200000u - kIopBlockSize ||
+                !env.runtime.isIopMemoryRange(iopAddress, kIopBlockSize))
+                return; // The assertions above already failed; do not dereference an invalid result.
             std::memset(env.rdram.data() + iopAddress, 0x5Au, payload.size());
 
             Ps2SifDmaTransfer desc{

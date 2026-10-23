@@ -193,14 +193,24 @@ void register_ps2_sif_rpc_tests()
         {
             TestEnv env;
 
-            env.runtime.eeScheduler().accountCycles(80u);
+            // A host clock's first observation establishes its epoch; advancing
+            // a tiny EE budget need not execute the IOP. Seed observable state
+            // instead, so a reset is detected without a host delay or timing guess.
+            const uint32_t allocation = env.runtime.allocateIopMemory(64u, 64u);
+            const std::array<uint8_t, 8> canary{0x53u, 0x49u, 0x46u, 0x52u, 0x50u, 0x43u, 0x37u, 0x22u};
+            t.IsTrue(allocation != 0u, "IOP fixture allocation must succeed");
+            t.IsTrue(env.runtime.writeIopMemory(allocation, canary.data(), canary.size()),
+                     "IOP state canary must be written before RPC initialization");
             const uint64_t cyclesBeforeInit = env.runtime.iopDebugSnapshot().emulatorCycles;
-            t.IsTrue(cyclesBeforeInit != 0u, "IOP cycle counter should advance before RPC initialization");
 
             SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
 
             t.Equals(env.runtime.iopDebugSnapshot().emulatorCycles, cyclesBeforeInit,
                      "SifInitRpc must not reboot or reset the IOP");
+            std::array<uint8_t, 8> actual{};
+            t.IsTrue(env.runtime.isIopMemoryRange(allocation, 64u), "SifInitRpc must preserve IOP allocation ownership");
+            t.IsTrue(env.runtime.readIopMemory(allocation, actual.data(), actual.size()) && actual == canary,
+                     "SifInitRpc must preserve the existing IOP memory contents");
         });
 
         tc.Run("SifLoadModule validates ROM modules and activates their HLE service", [](TestCase &t)

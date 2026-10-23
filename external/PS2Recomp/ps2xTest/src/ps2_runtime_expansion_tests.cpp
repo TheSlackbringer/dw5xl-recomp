@@ -18,10 +18,14 @@
 #include "Stubs/VU.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace ps2recomp;
@@ -37,6 +41,46 @@ namespace
     constexpr uint32_t EXCEPTION_VECTOR_BOOT = 0xBFC00200u;
 
     constexpr int KE_OK = 0;
+
+    // A broken scheduler fixture must fail instead of hiding every later test.
+    // Cancellation is always a failure; it cannot satisfy the callback assertions.
+    void runSchedulerWithWatchdog(PS2Runtime &runtime, TestCase &test)
+    {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool finished = false;
+        bool cancelled = false;
+        std::thread watchdog([&]()
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (!changed.wait_for(lock, std::chrono::seconds(5), [&]() { return finished; }))
+            {
+                cancelled = true;
+                lock.unlock();
+                runtime.requestStop();
+            }
+        });
+        auto finish = [&]()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                finished = true;
+            }
+            changed.notify_one();
+            watchdog.join();
+        };
+        try
+        {
+            runtime.eeScheduler().run();
+        }
+        catch (...)
+        {
+            finish();
+            throw;
+        }
+        finish();
+        test.IsTrue(!cancelled, "scheduler fixture must complete without watchdog cancellation");
+    }
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -180,6 +224,9 @@ namespace
     std::atomic<uint32_t> gMpegStreamCallbackLen{0u};
     std::atomic<uint32_t> gMpegStreamCallbackUserData{0u};
     constexpr uint32_t kMpegCallbackStopPc = 0x00124FF0u;
+    constexpr uint32_t kMpegDemuxEntryPc = 0x00124FE0u;
+    R5900Context *gMpegDemuxReturnContext = nullptr;
+    bool gMpegDemuxCompleted = false;
     std::atomic<int32_t> gMpegWaitResult{-999};
     std::atomic<uint32_t> gMpegWaitStage{0u};
     std::atomic<uint32_t> gMpegNoDuplicateStage{0u};
@@ -292,8 +339,17 @@ namespace
 
     void testStopAfterMpegCallback(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (gMpegDemuxReturnContext)
+            *gMpegDemuxReturnContext = *ctx;
+        gMpegDemuxCompleted = true;
         ctx->pc = 0u;
         runtime->requestStop();
+    }
+
+    void testMpegDemuxEntry(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = kMpegCallbackStopPc;
+        ps2_stubs::sceMpegDemuxPssRing(rdram, ctx, runtime);
     }
 
     void testMpegWaitProducer(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
@@ -356,8 +412,9 @@ namespace
         gMpegStreamCallbackLen.store(len, std::memory_order_release);
         gMpegStreamCallbackUserData.store(::getRegU32(ctx, 6), std::memory_order_release);
         gMpegStreamCallbackCount.fetch_add(1u, std::memory_order_acq_rel);
+        // A stream consumer accepts the offered packet by returning success.
+        setRegU32(*ctx, 2, 1u);
         ctx->pc = 0u;
-        runtime->requestStop();
     }
 
 }
@@ -636,11 +693,27 @@ void register_ps2_runtime_expansion_tests()
 
             runtime.registerFunction(kCallbackEntry, &testRecordMpegStreamCallback);
             runtime.registerFunction(kMpegCallbackStopPc, &testStopAfterMpegCallback);
-            auto prepareCallbackDispatch = [&]()
+            runtime.registerFunction(kMpegDemuxEntryPc, &testMpegDemuxEntry);
+            auto runDemux = [&](R5900Context &caller)
             {
-                R5900Context idleContext{};
-                idleContext.pc = kMpegCallbackStopPc;
-                runtime.eeScheduler().reset(rdram.data(), idleContext);
+                // The HLE can yield through EeDispatcherTransfer. Enter it on
+                // the guest executor and wait for its real return continuation.
+                R5900Context entry = caller;
+                entry.pc = kMpegDemuxEntryPc;
+                runtime.eeScheduler().reset(rdram.data(), entry);
+                gMpegDemuxReturnContext = &caller;
+                gMpegDemuxCompleted = false;
+                try
+                {
+                    runSchedulerWithWatchdog(runtime, t);
+                }
+                catch (...)
+                {
+                    gMpegDemuxReturnContext = nullptr;
+                    throw;
+                }
+                gMpegDemuxReturnContext = nullptr;
+                t.IsTrue(gMpegDemuxCompleted, "demux must reach its guest return continuation");
             };
 
             auto registerGenericCallback = [&](uint32_t callbackType, uint32_t userData)
@@ -687,15 +760,13 @@ void register_ps2_runtime_expansion_tests()
             const uint32_t videoPacketSize = writePesPacket(kVideoPacketAddr, 0xE0u, videoPayload);
 
             gMpegStreamCallbackCount.store(0u, std::memory_order_release);
-            prepareCallbackDispatch();
             R5900Context videoDemuxCtx{};
             setRegU32(videoDemuxCtx, 4, kMpegAddr);
             setRegU32(videoDemuxCtx, 5, kVideoPacketAddr);
             setRegU32(videoDemuxCtx, 6, videoPacketSize);
             setRegU32(videoDemuxCtx, 7, kVideoPacketAddr);
             setRegU32(videoDemuxCtx, 8, videoPacketSize);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &videoDemuxCtx, &runtime);
-            runtime.eeScheduler().run();
+            runDemux(videoDemuxCtx);
 
             t.Equals(getRegS32(videoDemuxCtx, 2), static_cast<int32_t>(videoPacketSize),
                      "sceMpegDemuxPssRing should consume the video PES packet");
@@ -713,19 +784,17 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(gMpegStreamCallbackUserData.load(std::memory_order_acquire), kVideoUserData,
                      "video callback should receive registered user data");
 
-            const std::vector<uint8_t> audioPayload = {0x80u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u};
+            const std::vector<uint8_t> audioPayload = {0x00u, 0xA0u, 0x02u, 0x03u, 0x04u, 0x05u};
             const uint32_t audioPacketSize = writePesPacket(kAudioPacketAddr, 0xBDu, audioPayload);
 
             gMpegStreamCallbackCount.store(0u, std::memory_order_release);
-            prepareCallbackDispatch();
             R5900Context audioDemuxCtx{};
             setRegU32(audioDemuxCtx, 4, kMpegAddr);
             setRegU32(audioDemuxCtx, 5, kAudioPacketAddr);
             setRegU32(audioDemuxCtx, 6, audioPacketSize);
             setRegU32(audioDemuxCtx, 7, kAudioPacketAddr);
             setRegU32(audioDemuxCtx, 8, audioPacketSize);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &audioDemuxCtx, &runtime);
-            runtime.eeScheduler().run();
+            runDemux(audioDemuxCtx);
 
             t.Equals(getRegS32(audioDemuxCtx, 2), static_cast<int32_t>(audioPacketSize),
                      "sceMpegDemuxPssRing should consume the audio PES packet");
@@ -750,7 +819,7 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(afterEofDemuxCtx, 6, videoPacketSize);
             setRegU32(afterEofDemuxCtx, 7, kVideoPacketAddr);
             setRegU32(afterEofDemuxCtx, 8, videoPacketSize);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &afterEofDemuxCtx, &runtime);
+            runDemux(afterEofDemuxCtx);
 
             t.Equals(getRegS32(afterEofDemuxCtx, 2), static_cast<int32_t>(videoPacketSize),
                      "post-EOF demux should continue consuming caller data");
@@ -768,7 +837,7 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(afterResetDemuxCtx, 6, videoPacketSize);
             setRegU32(afterResetDemuxCtx, 7, kVideoPacketAddr);
             setRegU32(afterResetDemuxCtx, 8, videoPacketSize);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &afterResetDemuxCtx, &runtime);
+            runDemux(afterResetDemuxCtx);
 
             t.Equals(getRegS32(afterResetDemuxCtx, 2), static_cast<int32_t>(videoPacketSize),
                      "post-EOF reset demux should still drain caller data");
@@ -778,15 +847,13 @@ void register_ps2_runtime_expansion_tests()
             ps2_stubs::notifyMpegCdStreamStart();
 
             gMpegStreamCallbackCount.store(0u, std::memory_order_release);
-            prepareCallbackDispatch();
             R5900Context afterNewStreamDemuxCtx{};
             setRegU32(afterNewStreamDemuxCtx, 4, kMpegAddr);
             setRegU32(afterNewStreamDemuxCtx, 5, kVideoPacketAddr);
             setRegU32(afterNewStreamDemuxCtx, 6, videoPacketSize);
             setRegU32(afterNewStreamDemuxCtx, 7, kVideoPacketAddr);
             setRegU32(afterNewStreamDemuxCtx, 8, videoPacketSize);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &afterNewStreamDemuxCtx, &runtime);
-            runtime.eeScheduler().run();
+            runDemux(afterNewStreamDemuxCtx);
 
             t.Equals(getRegS32(afterNewStreamDemuxCtx, 2), static_cast<int32_t>(videoPacketSize),
                      "new CD stream demux should reopen an ended MPEG handle");
@@ -803,18 +870,20 @@ void register_ps2_runtime_expansion_tests()
                      "sceMpegCreate should reopen the MPEG handle after an ended reset");
 
             gMpegStreamCallbackCount.store(0u, std::memory_order_release);
-            prepareCallbackDispatch();
             R5900Context afterCreateDemuxCtx{};
             setRegU32(afterCreateDemuxCtx, 4, kMpegAddr);
             setRegU32(afterCreateDemuxCtx, 5, kVideoPacketAddr);
             setRegU32(afterCreateDemuxCtx, 6, videoPacketSize);
             setRegU32(afterCreateDemuxCtx, 7, kVideoPacketAddr);
             setRegU32(afterCreateDemuxCtx, 8, videoPacketSize);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &afterCreateDemuxCtx, &runtime);
-            runtime.eeScheduler().run();
+            runDemux(afterCreateDemuxCtx);
 
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 0u,
+                     "new MPEG create must clear the previous stream callback registrations");
+            registerStreamCallback(0u, kVideoUserData);
+            runDemux(afterCreateDemuxCtx);
             t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
-                     "new MPEG create should allow callbacks for the next stream");
+                     "a newly registered callback must receive the next stream after create");
 
             runtime.requestStop();
         });
@@ -878,7 +947,7 @@ void register_ps2_runtime_expansion_tests()
             mainContext.pc = kNodataMainPc;
             EeScheduler &ee = runtime.eeScheduler();
             ee.reset(rdram.data(), mainContext);
-            ee.run();
+            runSchedulerWithWatchdog(runtime, t);
 
             t.Equals(gNodataCalls.load(std::memory_order_acquire), 1u,
                      "GetPicture should call sceMpegCbNodata once when no frame is queued");
@@ -924,7 +993,7 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(vsyncId > 1, "VSync guest thread should be created");
             t.Equals(ee.startThread(vsyncId, 0u, mainContext, false), 0,
                      "VSync guest thread should become ready");
-            ee.run();
+            runSchedulerWithWatchdog(runtime, t);
 
             t.Equals(gNodataCalls.load(std::memory_order_acquire), 2u,
                      "an empty Nodata callback should be retried once after the next VSync, not spun");
@@ -1448,9 +1517,10 @@ void register_ps2_runtime_expansion_tests()
             // With XYOFFSET=(1,1), vertex at (2,2) draws to pixel (1,1).
             const uint64_t xyz = (32ull) | (32ull << 16) | (0ull << 32);
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyz + 16ull + (16ull << 16));
 
             const uint32_t insideOff = frameOffsetBytes(1u, 1u, 1u);
+            (void)gs.ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u);
             t.Equals(vram[insideOff + 0u], static_cast<uint8_t>(200u), "inside draw should write R");
             t.Equals(vram[insideOff + 1u], static_cast<uint8_t>(20u), "inside draw should write G");
             t.Equals(vram[insideOff + 2u], static_cast<uint8_t>(50u), "inside draw should write B");
@@ -1462,8 +1532,9 @@ void register_ps2_runtime_expansion_tests()
             const uint64_t scissorOutside = (3ull) | (4ull << 16) | (3ull << 32) | (4ull << 48);
             gs.writeRegister(GS_REG_SCISSOR_1, scissorOutside);
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyz + 16ull + (16ull << 16));
 
+            (void)gs.ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u);
             bool anyWrite = false;
             for (size_t i = 0; i < 1024u; ++i)
             {
@@ -1511,9 +1582,10 @@ void register_ps2_runtime_expansion_tests()
 
             const uint64_t xyz = (16ull) | (16ull << 16) | (0ull << 32); // pixel (1,1)
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyz + 16ull + (16ull << 16));
 
             // ((200 - 40) * 64 >> 7) + 40 = 120
+            (void)gs.ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u);
             t.Equals(vram[pxOff + 0u], static_cast<uint8_t>(120u), "alpha blend should update R with FIX factor");
             t.Equals(vram[pxOff + 1u], static_cast<uint8_t>(120u), "alpha blend should update G with FIX factor");
             t.Equals(vram[pxOff + 2u], static_cast<uint8_t>(120u), "alpha blend should update B with FIX factor");

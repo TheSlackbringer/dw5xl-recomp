@@ -1059,7 +1059,8 @@ void register_ps2_runtime_kernel_tests()
 
             setRegU32(env.ctx, 4, 0x7FFFu);
             PollSema(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_UNKNOWN_SEMID, "PollSema should reject unknown semaphore ids");
+            t.Equals(getRegS32(env.ctx, 2), KE_ERROR, "EE PollSema should return exactly -1 for an unknown id");
+            t.Equals(GPR_U64((&env.ctx), 2), UINT64_MAX, "PollSema failure must be sign extended to 64 bits");
 
             setRegU32(env.ctx, 4, 0xFFFFFFFFu);
             t.IsTrue(callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime), "SetupHeap syscall should dispatch");

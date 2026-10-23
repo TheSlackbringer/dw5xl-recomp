@@ -20,7 +20,21 @@ target_include_directories(ps2_test_function_table PRIVATE
     ${CMAKE_SOURCE_DIR}/ps2xIOP/include
 )
 
+# Execute synthetic CodeGenerator output instead of matching its formatting.
+add_executable(ps2x_vu0_fixture_generator EXCLUDE_FROM_ALL src/vu0_fixture_generator.cpp)
+target_link_libraries(ps2x_vu0_fixture_generator PRIVATE ps2_recomp_lib)
+set(vu0_fixtures "${CMAKE_CURRENT_BINARY_DIR}/vu0_test_fixtures.cpp")
+add_custom_command(OUTPUT "${vu0_fixtures}"
+    COMMAND $<TARGET_FILE:ps2x_vu0_fixture_generator> "${vu0_fixtures}"
+    DEPENDS ps2x_vu0_fixture_generator
+    VERBATIM)
+
+if(NOT MSVC)
+    set_source_files_properties("${vu0_fixtures}" PROPERTIES COMPILE_OPTIONS "-msse4.1")
+endif()
+
 add_library(ps2_test_lib STATIC
+    "${vu0_fixtures}"
     src/code_generator_tests.cpp
     src/r5900_decoder_tests.cpp
     src/elf_analyzer_tests.cpp

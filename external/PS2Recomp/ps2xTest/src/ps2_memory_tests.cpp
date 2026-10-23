@@ -947,9 +947,9 @@ void register_ps2_memory_tests()
             bool secondOk = true;
             for (uint32_t i = 0; i < 16u; ++i)
             {
-                if (captured[0][i] != static_cast<uint8_t>(0x10u + i))
+                if (captured.at(0).at(i) != static_cast<uint8_t>(0x10u + i))
                     firstOk = false;
-                if (captured[1][i] != static_cast<uint8_t>(0x40u + i))
+                if (captured.at(1).at(i) != static_cast<uint8_t>(0x40u + i))
                     secondOk = false;
             }
             t.IsTrue(firstOk, "first queued PATH3 packet should flush in-order");
@@ -1041,12 +1041,12 @@ void register_ps2_memory_tests()
             mem.processPendingTransfers();
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "GIF DMA should emit one packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(kQwc * 16u), "GIF packet size should match QWC");
+            t.Equals(captured.at(0).size(), static_cast<size_t>(kQwc * 16u), "GIF packet size should match QWC");
 
             bool contentOk = true;
             for (uint32_t i = 0; i < kQwc * 16u; ++i)
             {
-                if (captured[0][i] != static_cast<uint8_t>((0x40u + i) & 0xFFu))
+                if (captured.at(0).at(i) != static_cast<uint8_t>((0x40u + i) & 0xFFu))
                 {
                     contentOk = false;
                     break;
@@ -1087,11 +1087,11 @@ void register_ps2_memory_tests()
             mem.processPendingTransfers();
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "scratchpad GIF DMA should emit one packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(16u), "scratchpad GIF DMA packet should be 16 bytes");
+            t.Equals(captured.at(0).size(), static_cast<size_t>(16u), "scratchpad GIF DMA packet should be 16 bytes");
             bool contentOk = true;
             for (uint32_t i = 0; i < 16u; ++i)
             {
-                if (captured[0][i] != static_cast<uint8_t>((0xA0u + i) & 0xFFu))
+                if (captured.at(0).at(i) != static_cast<uint8_t>((0xA0u + i) & 0xFFu))
                 {
                     contentOk = false;
                     break;
@@ -1130,12 +1130,12 @@ void register_ps2_memory_tests()
             mem.processPendingTransfers();
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "scratchpad alias chain should emit one packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(16u), "scratchpad alias chain should emit one qword");
+            t.Equals(captured.at(0).size(), static_cast<size_t>(16u), "scratchpad alias chain should emit one qword");
 
             bool contentOk = true;
             for (uint32_t i = 0; i < 16u; ++i)
             {
-                if (captured[0][i] != static_cast<uint8_t>(0xC0u + i))
+                if (captured.at(0).at(i) != static_cast<uint8_t>(0xC0u + i))
                 {
                     contentOk = false;
                     break;
@@ -1183,6 +1183,7 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kGifCh + 0x00u) & 0x70000000u, 0x70000000u,
                      "native GIF DMA chain should latch the terminal END tag id");
 
+            (void)gs.ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u);
             bool pixelsOk = true;
             for (uint32_t x = 0; x < 4u && pixelsOk; ++x)
             {
@@ -1343,6 +1344,7 @@ void register_ps2_memory_tests()
             }
             t.IsTrue(ct32PayloadOk, "flattened GIF chain should preserve CT32 REF bytes after the T4 REF payload");
 
+            (void)gs.ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u);
             const uint32_t row1Off = GSPSMCT32::addrPSMCT32(kCt32Dbp, 1u, 0u, 1u);
             uint32_t actualRow1X0 = 0u;
             uint32_t expectedRow1X0 = 0u;
@@ -1398,16 +1400,16 @@ void register_ps2_memory_tests()
 
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x10u, kSrc), "write VIF1 MADR should succeed");
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x20u, kQwc), "write VIF1 QWC should succeed");
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x100u), "write VIF1 CHCR STR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x101u), "write VIF1 CHCR STR should succeed");
 
             mem.processPendingTransfers();
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "VIF1 DIRECT should emit one GIF packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(16u), "VIF1 DIRECT packet should be 1 QW");
+            t.Equals(captured.at(0).size(), static_cast<size_t>(16u), "VIF1 DIRECT packet should be 1 QW");
             bool contentOk = true;
             for (uint32_t i = 0; i < 16u; ++i)
             {
-                if (captured[0][i] != static_cast<uint8_t>((0x11u + i) & 0xFFu))
+                if (captured.at(0).at(i) != static_cast<uint8_t>((0x11u + i) & 0xFFu))
                 {
                     contentOk = false;
                     break;
@@ -1453,12 +1455,12 @@ void register_ps2_memory_tests()
             mem.processPendingTransfers();
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "compact VIF1 chain should emit one GIF packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(16u), "compact VIF1 DIRECT packet should be 1 QW");
+            t.Equals(captured.at(0).size(), static_cast<size_t>(16u), "compact VIF1 DIRECT packet should be 1 QW");
 
             bool payloadOk = true;
             for (uint32_t i = 0; i < 16u; ++i)
             {
-                if (captured[0][i] != static_cast<uint8_t>(0x70u + i))
+                if (captured.at(0).at(i) != static_cast<uint8_t>(0x70u + i))
                 {
                     payloadOk = false;
                     break;
@@ -1537,13 +1539,13 @@ void register_ps2_memory_tests()
                      "REF tag high-half DIRECT should emit one GIF packet");
             if (!captured.empty())
             {
-                t.Equals(captured[0].size(), static_cast<size_t>(16u),
+                t.Equals(captured.at(0).size(), static_cast<size_t>(16u),
                          "REF tag high-half DIRECT packet should be 1 QW");
 
                 bool payloadOk = true;
                 for (uint32_t i = 0; i < 16u; ++i)
                 {
-                    if (captured[0][i] != static_cast<uint8_t>(0xA0u + i))
+                    if (captured.at(0).at(i) != static_cast<uint8_t>(0xA0u + i))
                     {
                         payloadOk = false;
                         break;
@@ -1634,12 +1636,12 @@ void register_ps2_memory_tests()
             mem.processPendingTransfers();
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "live VIF1 packet should emit one GIF packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(16u), "live VIF1 packet should emit one qword");
+            t.Equals(captured.at(0).size(), static_cast<size_t>(16u), "live VIF1 packet should emit one qword");
 
             bool payloadOk = true;
             for (uint32_t i = 0; i < 16u; ++i)
             {
-                if (captured[0][i] != static_cast<uint8_t>(0x30u + i))
+                if (captured.at(0).at(i) != static_cast<uint8_t>(0x30u + i))
                 {
                     payloadOk = false;
                     break;
@@ -1708,15 +1710,15 @@ void register_ps2_memory_tests()
             mem.processPendingTransfers();
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "chain CALL should emit one packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(32u), "CALL+END should emit two qwords");
+            t.Equals(captured.at(0).size(), static_cast<size_t>(32u), "CALL+END should emit two qwords");
 
             bool firstQwOk = true;
             bool secondQwOk = true;
             for (uint32_t i = 0; i < 16u; ++i)
             {
-                if (captured[0][i] != static_cast<uint8_t>(0x40u + i))
+                if (captured.at(0).at(i) != static_cast<uint8_t>(0x40u + i))
                     firstQwOk = false;
-                if (captured[0][16u + i] != static_cast<uint8_t>(0x80u + i))
+                if (captured.at(0).at(16u + i) != static_cast<uint8_t>(0x80u + i))
                     secondQwOk = false;
             }
             t.IsTrue(firstQwOk, "CALL must transfer from TADR+16, not DMAtag ADDR");
@@ -1761,18 +1763,18 @@ void register_ps2_memory_tests()
             mem.processPendingTransfers();
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "CALL/RET chain should emit one packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(48u), "CALL+RET+END should emit three qwords");
+            t.Equals(captured.at(0).size(), static_cast<size_t>(48u), "CALL+RET+END should emit three qwords");
 
             bool q0 = true;
             bool q1 = true;
             bool q2 = true;
             for (uint32_t i = 0; i < 16u; ++i)
             {
-                if (captured[0][i] != static_cast<uint8_t>(0x11u + i))
+                if (captured.at(0).at(i) != static_cast<uint8_t>(0x11u + i))
                     q0 = false;
-                if (captured[0][16u + i] != static_cast<uint8_t>(0x22u + i))
+                if (captured.at(0).at(16u + i) != static_cast<uint8_t>(0x22u + i))
                     q1 = false;
-                if (captured[0][32u + i] != static_cast<uint8_t>(0x33u + i))
+                if (captured.at(0).at(32u + i) != static_cast<uint8_t>(0x33u + i))
                     q2 = false;
             }
             t.IsTrue(q0, "CALL payload should be first");
@@ -1814,7 +1816,7 @@ void register_ps2_memory_tests()
                 mem.processPendingTransfers();
                 if (captured.empty())
                     return false;
-                packetOut = captured[0];
+                packetOut = captured.at(0);
                 return true;
             };
 
@@ -1908,7 +1910,7 @@ void register_ps2_memory_tests()
             t.Equals(captured.size(), static_cast<size_t>(1u), "DMAE=1 should allow GIF DMA transfer");
             if (!captured.empty())
             {
-                t.Equals(captured[0].size(), static_cast<size_t>(16u), "GIF DMA transfer should emit one qword");
+                t.Equals(captured.at(0).size(), static_cast<size_t>(16u), "GIF DMA transfer should emit one qword");
             }
         });
 
@@ -2091,10 +2093,11 @@ void register_ps2_memory_tests()
 
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x10u, kSrc), "write VIF1 MADR should succeed");
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x20u, kQwc), "write VIF1 QWC should succeed");
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x100u), "write VIF1 CHCR STR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x101u), "write VIF1 CHCR STR should succeed");
 
             mem.processPendingTransfers();
 
+            (void)gs.ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u);
             const uint8_t *vramOut = mem.getGSVRAM();
             bool imageOk = true;
             for (uint32_t x = 0; x < 4u && imageOk; ++x)
@@ -2141,6 +2144,8 @@ void register_ps2_memory_tests()
             appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT 1 QW payload: GIF IMAGE tag only.
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
+            // Each continuation is still carried by its own VIF DIRECT command.
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u));
             for (uint32_t i = 0; i < 16u; ++i)
             {
                 packet.push_back(static_cast<uint8_t>(0xA0u + i));
@@ -2148,6 +2153,7 @@ void register_ps2_memory_tests()
 
             mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
 
+            (void)gs.ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u);
             const uint8_t *vramOut = mem.getGSVRAM();
             bool imageOk = true;
             for (uint32_t x = 0; x < 4u && imageOk; ++x)
@@ -2194,11 +2200,14 @@ void register_ps2_memory_tests()
             appendU64(packet, GS_REG_TEXA);
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
+            // Each continuation is still carried by its own VIF DIRECT command.
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u));
             for (uint32_t i = 0; i < 16u; ++i)
                 packet.push_back(static_cast<uint8_t>(0xC0u + i));
 
             mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
 
+            (void)gs.ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u);
             const uint8_t *vramOut = mem.getGSVRAM();
             bool imageOk = true;
             for (uint32_t x = 0; x < 4u && imageOk; ++x)

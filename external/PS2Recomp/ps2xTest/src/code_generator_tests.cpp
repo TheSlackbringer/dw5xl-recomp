@@ -1,4 +1,6 @@
 #include "MiniTest.h"
+#include "vu0_test_fixtures.h"
+#include <array>
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/ps2_recompiler.h"
@@ -11,6 +13,42 @@
 #include <utility>
 
 using namespace ps2recomp;
+
+namespace {
+R5900Context seededVu0()
+{
+    R5900Context ctx{};
+    ctx.vu0_vf[11] = ctx.vu0_vf[13] = _mm_setr_ps(2, 3, 5, 7);
+    ctx.vu0_vf[7] = _mm_setr_ps(11, 13, 17, 19);
+    ctx.vu0_vf[3] = ctx.vu0_vf[4] = _mm_setr_ps(101, 103, 107, 109);
+    ctx.vu0_vf[25] = ctx.vu0_vf[27] = _mm_set1_ps(-999);
+    ctx.vu0_acc = _mm_setr_ps(23, 29, 31, 37);
+    ctx.vu0_q = 3; ctx.vu0_i = 5;
+    ctx.vu0_status = 0x103; // Sticky U survives; stale current Z/S must clear.
+    ctx.vu0_mac_flags = 0xFFFF;
+    return ctx;
+}
+void expectVector(TestCase &t, __m128 actual, std::array<float, 4> expected, const char *label)
+{
+    float lanes[4]; _mm_storeu_ps(lanes, actual);
+    for (int lane = 0; lane < 4; ++lane) t.Equals(lanes[lane], expected[lane], label);
+}
+void expectNormalFlags(TestCase &t, const R5900Context &ctx,
+                       std::array<float, 4> result, unsigned mask)
+{
+    // Independent oracle for these finite, integral, non-overflowing operands.
+    unsigned mac = 0, current = 0;
+    for (unsigned lane = 0; lane < 4; ++lane) {
+        const unsigned bit = 8u >> lane;
+        if (!(mask & bit)) continue;
+        if (result[lane] == 0) { mac |= bit; current |= 1; }
+        if (result[lane] < 0) { mac |= bit << 4; current |= 2; }
+    }
+    t.Equals(ctx.vu0_mac_flags, mac, "generated instruction must set exact MAC flags");
+    t.Equals(static_cast<unsigned>(ctx.vu0_status), 0x100u | current | (current << 6),
+             "generated instruction must update current and preserve sticky status");
+}
+}
 
 static Instruction makeBranch(uint32_t address, uint32_t targetOffsetWords)
 {
@@ -1356,105 +1394,67 @@ void register_code_generator_tests()
         });
 
         tc.Run("VU0 S1 uses fd/fs/ft fields (sa/rd/rt)", [](TestCase &t) {
-            Instruction inst{};
-            inst.opcode = OPCODE_COP2;
-            inst.rs = COP2_CO | 0xB; // format + destination mask bits, not a VF register index
-            inst.rt = 7;
-            inst.rd = 11;
-            inst.sa = 3;
-            inst.function = VU0_S1_VADD;
-            inst.vectorInfo.vectorField = 0xF;
-
-            CodeGenerator gen({}, {});
-            std::string out = gen.translateInstruction(inst);
-
-            t.IsTrue(out.find("ctx->vu0_vf[11]") != std::string::npos, "S1 fs should come from rd");
-            t.IsTrue(out.find("ctx->vu0_vf[7]") != std::string::npos, "S1 ft should come from rt");
-            t.IsTrue(out.find("ctx->vu0_vf[3]") != std::string::npos, "S1 fd should come from sa");
-            t.IsTrue(out.find("ctx->vu0_vf[27]") == std::string::npos, "S1 must not use rs(format) as register index");
+            auto ctx = seededVu0();
+            synthetic_vu0::s1_add(&ctx);
+            const std::array<float, 4> expected{13, 16, 22, 26};
+            expectVector(t, ctx.vu0_vf[3], expected, "S1 must map sa/rd/rt to fd/fs/ft");
+            expectVector(t, ctx.vu0_vf[11], {2,3,5,7}, "source fs must survive");
+            expectVector(t, ctx.vu0_vf[7], {11,13,17,19}, "source ft must survive");
+            expectVector(t, ctx.vu0_vf[27], {-999,-999,-999,-999}, "format bits must not select VF27");
+            expectNormalFlags(t, ctx, expected, 15);
         });
 
         tc.Run("VU0 S1 q/i forms keep mask and use sa as destination", [](TestCase &t) {
-            Instruction inst{};
-            inst.opcode = OPCODE_COP2;
-            inst.rs = COP2_CO | 0x9; // format + destination mask bits
-            inst.rt = 5;
-            inst.rd = 13;
-            inst.sa = 4;
-            inst.function = VU0_S1_VADDq;
-            inst.vectorInfo.vectorField = 0x9;
-
-            CodeGenerator gen({}, {});
-            std::string out = gen.translateInstruction(inst);
-
-            t.IsTrue(out.find("_mm_blendv_ps") != std::string::npos, "S1 q/i form should honor destination mask");
-            t.IsTrue(out.find("ctx->vu0_vf[13]") != std::string::npos, "S1 q/i source should come from rd");
-            t.IsTrue(out.find("ctx->vu0_vf[4]") != std::string::npos, "S1 q/i destination should come from sa");
-            t.IsTrue(out.find("ctx->vu0_vf[25]") == std::string::npos, "S1 q/i must not use rs(format) as register index");
+            for (bool immediate : {false, true}) {
+                auto ctx = seededVu0();
+                (immediate ? synthetic_vu0::s1_addi : synthetic_vu0::s1_addq)(&ctx);
+                const std::array<float, 4> expected = immediate
+                    ? std::array<float,4>{7,103,107,12} : std::array<float,4>{5,103,107,10};
+                expectVector(t, ctx.vu0_vf[4], expected, "q/i must read scalar and preserve masked lanes");
+                expectVector(t, ctx.vu0_vf[13], {2,3,5,7}, "q/i fs must come from rd");
+                expectVector(t, ctx.vu0_vf[25], {-999,-999,-999,-999}, "format bits must not select VF25");
+                expectNormalFlags(t, ctx, expected, 9);
+            }
         });
 
         tc.Run("VU0 destination MADD and MSUB forms preserve ACC", [](TestCase &t) {
-            Instruction inst{};
-            inst.rt = 7;
-            inst.rd = 11;
-            inst.sa = 3;
-            inst.function = 0;
-            inst.vectorInfo.vectorField = 0xE;
-
-            CodeGenerator gen({}, {});
-            const std::vector<std::pair<const char *, std::string>> emitted = {
-                {"MADD field", gen.translateVU_VMADD_Field(inst)},
-                {"MADD", gen.translateVU_VMADD(inst)},
-                {"MADDq", gen.translateVU_VMADDq(inst)},
-                {"MADDi", gen.translateVU_VMADDi(inst)},
-                {"MSUB field", gen.translateVU_VMSUB_Field(inst)},
-                {"MSUB", gen.translateVU_VMSUB(inst)},
-                {"MSUBq", gen.translateVU_VMSUBq(inst)},
-                {"MSUBi", gen.translateVU_VMSUBi(inst)},
-                {"OPMSUB", gen.translateVU_VOPMSUB(inst)},
+            struct Row { void (*run)(R5900Context *); std::array<float,4> expected; };
+            const Row rows[] = {
+                {synthetic_vu0::madd_field, {45,62,86,109}},
+                {synthetic_vu0::madd, {45,68,116,109}},
+                {synthetic_vu0::maddq, {29,38,46,109}},
+                {synthetic_vu0::maddi, {33,44,56,109}},
+                {synthetic_vu0::msub_field, {1,-4,-24,109}},
+                {synthetic_vu0::msub, {1,-10,-54,109}},
+                {synthetic_vu0::msubq, {17,20,16,109}},
+                {synthetic_vu0::msubi, {13,14,6,109}},
+                {synthetic_vu0::opmsub, {-28,-26,5,109}},
             };
-
-            for (const auto &[name, code] : emitted)
-            {
-                const std::string message =
-                    std::string(name) + " writes VF and must not overwrite ACC";
-                t.IsTrue(code.find("ctx->vu0_acc = res") == std::string::npos,
-                         message.c_str());
-                t.IsTrue(code.find("PS2_VADD(ctx->vu0_acc") != std::string::npos ||
-                             code.find("PS2_VSUB(ctx->vu0_acc") != std::string::npos,
-                         (std::string(name) + " must still read ACC").c_str());
+            for (const auto &row : rows) {
+                auto ctx = seededVu0(); row.run(&ctx);
+                expectVector(t, ctx.vu0_vf[3], row.expected, "generated MADD/MSUB result and mask");
+                expectVector(t, ctx.vu0_acc, {23,29,31,37}, "VF destination must preserve ACC");
+                expectNormalFlags(t, ctx, row.expected, 14);
             }
-
-            const std::string madda = gen.translateVU_VMADDA(inst);
-            t.IsTrue(madda.find("ctx->vu0_acc =") != std::string::npos,
-                     "MADDA must continue writing ACC");
+            auto ctx = seededVu0(); synthetic_vu0::madda(&ctx);
+            expectVector(t, ctx.vu0_acc, {45,68,116,37}, "MADDA must write masked ACC");
+            expectVector(t, ctx.vu0_vf[3], {101,103,107,109}, "MADDA must preserve VF");
+            expectNormalFlags(t, ctx, {45,68,116,37}, 14);
+            ctx = seededVu0(); ctx.vu0_acc = _mm_setr_ps(22,39,85,37);
+            synthetic_vu0::msub(&ctx);
+            expectVector(t, ctx.vu0_vf[3], {0,0,0,109}, "cancellation must produce zero");
+            expectNormalFlags(t, ctx, {0,0,0,109}, 14);
         });
 
         tc.Run("VU0 OPMULA and OPMSUB use cross-product lane permutations", [](TestCase &t) {
-            Instruction inst{};
-            inst.rt = 7;
-            inst.rd = 11;
-            inst.sa = 3;
-            inst.vectorInfo.vectorField = 0xE;
-
-            CodeGenerator gen({}, {});
-            const std::string opmula = gen.translateVU_VOPMULA(inst);
-            const std::string opmsub = gen.translateVU_VOPMSUB(inst);
-
-            for (const std::string *code : {&opmula, &opmsub})
-            {
-                t.IsTrue(code->find("_MM_SHUFFLE(3,0,2,1)") != std::string::npos,
-                         "OPM source Fs must be permuted to y,z,x");
-                t.IsTrue(code->find("_MM_SHUFFLE(3,1,0,2)") != std::string::npos,
-                         "OPM source Ft must be permuted to z,x,y");
-                t.IsTrue(code->find("PS2_VMUL(fs_yzx, ft_zxy)") != std::string::npos,
-                         "OPM product must use the permuted operands");
-            }
-
-            t.IsTrue(opmula.find("ctx->vu0_acc =") != std::string::npos,
-                     "OPMULA must write the permuted product to ACC");
-            t.IsTrue(opmsub.find("ctx->vu0_acc = res") == std::string::npos,
-                     "OPMSUB must preserve ACC after producing the cross product");
+            auto ctx = seededVu0(); synthetic_vu0::opmula(&ctx);
+            expectVector(t, ctx.vu0_acc, {51,55,26,37}, "OPMULA must multiply Fs.yzx by Ft.zxy");
+            expectVector(t, ctx.vu0_vf[3], {101,103,107,109}, "OPMULA must preserve VF");
+            expectNormalFlags(t, ctx, {51,55,26,37}, 14);
+            ctx = seededVu0(); synthetic_vu0::opmsub(&ctx);
+            expectVector(t, ctx.vu0_vf[3], {-28,-26,5,109}, "OPMSUB must subtract permuted product from ACC");
+            expectVector(t, ctx.vu0_acc, {23,29,31,37}, "OPMSUB must preserve ACC");
+            expectNormalFlags(t, ctx, {-28,-26,5,109}, 14);
         });
 
         tc.Run("VU0 S2 vector ops use rd as source and rt as destination", [](TestCase &t) {
@@ -1910,7 +1910,7 @@ void register_code_generator_tests()
             Instruction target0 = makeNop(0x1620);
             Instruction target1 = makeNop(0x1630);
 
-            JumpTable configured{};
+            ps2recomp::JumpTable configured{};
             configured.address = tableAddress;
             configured.entries.push_back({0u, 0x1620u});
             configured.entries.push_back({1u, 0x1630u});

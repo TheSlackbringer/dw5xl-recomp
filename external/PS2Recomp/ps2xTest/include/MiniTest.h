@@ -160,7 +160,7 @@ public:
 
                 try
                 {
-                    std::cout << "\033[33m" << "  [Run]: " << "\033[0m" << testName << " ";
+                    std::cout << "\033[33m" << "  [Run]: " << "\033[0m" << testName << " " << std::flush;
                     testFn(testCase);
 
                     if (!testCase.m_failReason.empty())
@@ -180,6 +180,10 @@ public:
                 catch (const std::exception& ex)
                 {
                     std::cout << "  [Error]: " << ex.what() << std::endl;
+                    for (const auto& reason : testCase.m_failReason)
+                    {
+                        std::cerr << "      - " << reason << std::endl;
+                    }
                     failedCount++;
                 }
                 catch (...)
