@@ -26,7 +26,7 @@ A native PC port of **Dynasty Warriors 5: Xtreme Legends** for the PlayStation 2
 | Input | ✅ | Keyboard and gamepad input work. |
 | Audio and movies | ✅ | Intro and event movies play with audio; menu music, battle BGM, voice lines, and sound effects play throughout menus and battles. |
 | Saves | ✅ | Saving and loading work. |
-| Windows | 🚧 | The release builds and runs the game on Windows 10/11; frame rate on Windows is being worked on. |
+| Windows | 🚧 | The release builds and runs the game on Windows 10/11; chopyness on Windows is being worked on. |
 | Legend Mode | ✅ | Scenario selection, briefing, and preparation render; battles run at 50 FPS with full movement, combat, Musou, and crowd rendering at native resolution. |
 | Other modes | 🚧 | Edit Mode works. Destiny, Challenge, and Xtreme Modes reach battle, with further mode testing ongoing. |
 | Load Original | ✅ | Original disc verification works; Musou and Free Modes unlock when the original DW5 files are present. |
