@@ -242,6 +242,60 @@ class FunctionMap(unittest.TestCase):
         prov=self.root/'generation.json';prov.write_text(json.dumps(provenance))
         return folder,prov
 
+    def implicit_fixture(self, interior=True, continuation=False):
+        self.configure([RETURN,NOP,0x24840004,RETURN,NOP], [('owner',BASE,BASE+12)],
+                       entries=['0x1008'] if interior else [])
+        folder=self.root/'implicit';folder.mkdir()
+        label='case 0x1008u: goto label_1008;' if interior else ''
+        (folder/'owner.cpp').write_text('void owner_0x1000(uint8_t* rdram,R5900Context* ctx,PS2Runtime* runtime) {\n'
+            'switch(ctx->pc) {'+label+'}\nctx->pc=0x1000u;\nctx->pc=GPR_U32(ctx,31);return;\n'
+            'label_1008: ctx->pc=0x1008u; SET_GPR_S32(ctx,4,(int32_t)ADD32(GPR_U32(ctx,4),4));\n'
+            'ctx->pc=0x100cu;\n}\n')
+        entries='{0x1000u,owner_0x1000},'+('{0x1008u,owner_0x1000},' if interior else '')
+        if continuation:
+            entries+='{0x100cu,tail_0x100c},'
+            (folder/'tail.cpp').write_text('void tail_0x100c(uint8_t* rdram,R5900Context* ctx,PS2Runtime* runtime) {'
+                'ctx->pc=0x100cu;ctx->pc=GPR_U32(ctx,31);return;}')
+        (folder/'register_functions.cpp').write_text('RecompiledModuleEntry entries[]={'+entries+'};')
+        prov=self.root/'implicit-provenance.json'
+        prov.write_text(json.dumps(dict(schema_version=1,
+            inputs={k:digest(v) for k,v in [('binary',self.binary),('csv',self.csv),('profile',self.profile)]},
+            outputs={p.name:digest(p) for p in folder.iterdir()},
+            generation=dict(exit_code=0,command=['independent fixture'],recompiler_sha256='a'*64,source_revision='synthetic'))))
+        return folder,prov
+
+    def test_generated_implicit_interior_exit_is_not_hidden_by_registration(self):
+        folder,prov=self.implicit_fixture()
+        _,r,_=self.invoke('--generation-provenance',str(prov),generated=folder)
+        missing=[f for f in r['findings'] if f['code']=='GENERATED_FALLTHROUGH_UNREGISTERED']
+        self.assertEqual(len(missing),1)
+        self.assertEqual(missing[0]['target'],BASE+12)
+        self.assertEqual(missing[0]['root'],BASE+8)
+
+    def test_generated_dead_epilogue_does_not_invent_an_exit(self):
+        folder,prov=self.implicit_fixture(interior=False)
+        _,r,_=self.invoke('--generation-provenance',str(prov),generated=folder)
+        self.assertNotIn('GENERATED_FALLTHROUGH_UNREGISTERED',self.codes(r))
+
+    def test_generated_registered_implicit_continuation_is_reported(self):
+        folder,prov=self.implicit_fixture(continuation=True)
+        _,r,_=self.invoke('--generation-provenance',str(prov),generated=folder)
+        self.assertNotIn('GENERATED_FALLTHROUGH_UNREGISTERED',self.codes(r))
+        checked=r['audit'].get('implicit_exits',[])
+        self.assertTrue(any(x['target']==BASE+12 and x['registered'] for x in checked))
+
+    def test_speculative_resume_label_is_not_a_proved_implicit_exit(self):
+        folder,prov=self.implicit_fixture()
+        # Keep the actual generated resume registration, remove its declared
+        # profile justification. The only real entry returns before this label.
+        self.profile.write_text(self.profile.read_text().replace('["0x1008"]','[]'))
+        provenance=json.loads(prov.read_text());provenance['inputs']['profile']=digest(self.profile)
+        prov.write_text(json.dumps(provenance))
+        _,r,_=self.invoke('--generation-provenance',str(prov),generated=folder)
+        self.assertNotIn('GENERATED_FALLTHROUGH_UNREGISTERED',self.codes(r))
+        scope=r['audit'].get('uncorroborated_resume_entries',[])
+        self.assertTrue(any(BASE+8 in x['entries'] for x in scope))
+
     def test_generated_registration_does_not_mask_missing_operation(self):
         folder,prov=self.generated()
         _, report, _ = self.invoke('--generation-provenance',str(prov),generated=folder,code=1)

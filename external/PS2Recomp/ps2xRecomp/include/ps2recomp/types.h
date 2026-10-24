@@ -43,6 +43,9 @@ namespace ps2recomp
         uint8_t pmfhlVariation; // For PMFHL instructions
         uint8_t vuFunction;     // For VU instructions
 
+        // Fetched for a delayed transfer outside its callable map body.
+        bool isBoundaryDelaySlot = false;
+        bool isValidEncoding = true; // Authored instruction fixtures default to valid.
         bool isMmio = false;
         uint32_t mmioAddress = 0;
         std::string disassembly;

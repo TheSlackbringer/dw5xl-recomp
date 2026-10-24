@@ -192,7 +192,7 @@ namespace ps2recomp
             bool needsIndirectFallback = false;
             for (const Instruction *jrInst : indirectJumps)
             {
-                if (jrInst->function == SPECIAL_JALR)
+                if (jrInst->function == SPECIAL_JALR && jrInst->rd != 0u)
                 {
                     queueResumeEntryTarget(jrInst->address + 8u);
                 }

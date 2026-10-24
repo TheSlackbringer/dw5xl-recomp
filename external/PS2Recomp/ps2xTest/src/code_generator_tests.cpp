@@ -1565,33 +1565,18 @@ void register_code_generator_tests()
                      "resolved HLE calls must not retain the unchanged-PC compatibility guard");
         });
 
-        tc.Run("trailing JAL without decoded delay slot still emits call flow", [](TestCase &t) {
+        tc.Run("trailing JAL rejects an unavailable architectural slot", [](TestCase &t) {
             Function func;
-            func.name = "jal_truncated";
-            func.start = 0xA100;
-            func.end = 0xA108;
-            func.isRecompiled = true;
-            func.isStub = false;
-
-            Symbol targetSym;
-            targetSym.name = "some_func";
-            targetSym.address = 0xB000;
-            targetSym.isFunction = true;
-
-            Instruction jal = makeJal(0xA100, 0xB000);
-
-            CodeGenerator gen({targetSym}, {});
-            std::string generated = gen.generateFunction(func, {jal}, false);
-            printGeneratedCode("trailing JAL without decoded delay slot still emits call flow", generated);
-
-            t.IsTrue(generated.find("SET_GPR_U32(ctx, 31, 0xA108u);") != std::string::npos,
-                     "truncated trailing JAL should still set RA");
-            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, 0xB000u") != std::string::npos,
-                     "truncated trailing JAL should still emit the call dispatch");
-            t.IsTrue(generated.find("0xA100u, 0xA108u") != std::string::npos,
-                     "truncated trailing JAL should still pass the fallthrough to runtime dispatch");
-            t.IsTrue(generated.find("// JAL 0xB000 - Handled by branch logic") == std::string::npos,
-                     "truncated trailing JAL must not degrade to comment-only output");
+            func.name = "truncated";
+            func.start = 41216;
+            func.end = 41220;
+            CodeGenerator gen({}, {});
+            bool rejected = false;
+            try { (void)gen.generateFunction(func, {makeJal(0xA100, 0xB000)}, false); }
+            catch (const std::runtime_error &e) {
+                rejected = std::string(e.what()).find("delay slot") != std::string::npos;
+            }
+            t.IsTrue(rejected, "missing slot must fail rather than invent a NOP and publish control flow");
         });
 
         tc.Run("JAL to internal target becomes goto", [](TestCase &t) {
@@ -1790,34 +1775,18 @@ void register_code_generator_tests()
                      "JR $31 should pass a return-specific debug name");
         });
 
-        tc.Run("trailing JR $31 without decoded delay slot still emits return flow", [](TestCase &t) {
+        tc.Run("trailing JR rejects an unavailable architectural slot", [](TestCase &t) {
             Function func;
-            func.name = "jr_ra_truncated";
-            func.start = 0x1500;
-            func.end = 0x1540;
-            func.isRecompiled = true;
-            func.isStub = false;
-
-            Instruction jal = makeJal(0x1500, 0x1510);
-            Instruction jalDelay = makeNop(0x1504);
-            Instruction atReturn = makeNop(0x1508);
-            Instruction atTarget = makeNop(0x1510);
-            Instruction jr = makeJr(0x1514, 31);
-
+            func.name = "truncated";
+            func.start = 5376;
+            func.end = 5380;
             CodeGenerator gen({}, {});
-            std::string generated = gen.generateFunction(func, {jal, jalDelay, atReturn, atTarget, jr}, false);
-            printGeneratedCode("trailing JR $31 without decoded delay slot still emits return flow", generated);
-
-            t.IsTrue(generated.find("const uint32_t jumpTarget = GPR_U32(ctx, 31);") != std::string::npos,
-                     "truncated trailing JR should still read the return target");
-            t.IsFalse(generated.find("switch (jumpTarget)") != std::string::npos,
-                      "truncated trailing JR should not emit a broad local return-target switch");
-            t.IsTrue(generated.find("label_1508:") != std::string::npos,
-                     "truncated trailing JR should still include the internal return label");
-            t.IsTrue(generated.find("// JR $31 - Handled by branch logic") == std::string::npos,
-                     "truncated trailing JR must not degrade to comment-only output");
-            t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::Return") != std::string::npos,
-                     "truncated JR $31 should still use return diagnostics");
+            bool rejected = false;
+            try { (void)gen.generateFunction(func, {makeJr(0x1500, 31)}, false); }
+            catch (const std::runtime_error &e) {
+                rejected = std::string(e.what()).find("delay slot") != std::string::npos;
+            }
+            t.IsTrue(rejected, "missing slot must fail rather than invent a NOP and publish control flow");
         });
 
         tc.Run("unresolved JR non-RA uses dispatcher resume entries without broad local switch", [](TestCase &t) {

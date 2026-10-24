@@ -17,7 +17,7 @@ import struct
 import sys
 import tomllib
 
-VERSION = '031-v3-1'
+VERSION = '031-v3-2'
 DEFAULT_LIMITS = dict(binary_bytes=64<<20, csv_bytes=16<<20, config_bytes=1<<20,
     rows=100_000, root_visits=65_536, module_visits=2_000_000, tail_bytes=4096,
     findings=10_000, report_bytes=32<<20, generated_bytes=512<<20, generated_files=100_000)
@@ -606,7 +606,7 @@ class Analysis:
                 path=Path(root)/name
                 if path.is_symlink():raise Invalid('GENERATED_READ','Generated file symlinks are unsupported')
                 if path.suffix in ('.cpp','.h','.hpp'):paths.append(path)
-        table={};functions={};exits=[];calls=collections.Counter();total=0;table_files=[]
+        table={};functions={};exits=[];implicit_candidates=[];calls=collections.Counter();total=0;table_files=[]
         wanted={row.start for row,_,_,_ in self.slots}|self.entries
         # Only relevant function bodies are retained; all generated inputs are consumed once and hashed.
         for path in sorted(paths,key=lambda p:p.relative_to(folder).as_posix()):
@@ -641,6 +641,10 @@ class Analysis:
                 for call in re.finditer(r'runtime\s*->\s*dispatchGuestBranch\s*\(\s*rdram\s*,\s*ctx\s*,\s*(0x[\da-fA-F]+)[uU]?\s*,\s*0x[\da-fA-F]+[uU]?\s*,\s*0x[\da-fA-F]+[uU]?\s*,\s*PS2Runtime::GuestBranchKind::DirectCall\s*,',body):
                     calls[int(call[1],16)]+=1
                 labels=resume_labels(body)
+                tail=re.search(r'ctx\s*->\s*pc\s*=\s*(0x[\da-fA-F]+)[uU]?\s*;\s*$',body)
+                if tail:
+                    implicit_candidates.append(dict(entry=entry,end=int(tail[1],16),symbol=symbol,
+                        labels=set(labels),file=label,line=line+body.count('\n',0,tail.start())))
                 if entry in wanted or labels.keys()&self.entries:
                     if symbol in functions:raise Invalid('GENERATED_FORMAT','Duplicate supported wrapper')
                     functions[symbol]=dict(entry=entry,file=label,line=line,code=body,labels=labels)
@@ -681,6 +685,93 @@ class Analysis:
             self.finding('GENERATED_TARGET_UNREGISTERED',row,entry,'Literal generated exit lacks current-module registration',
                 target=target,generated_file=file,generated_line=line,address_kind='wrapper_entry')
             audit['unregistered_exits']+=1
+        # An emitted final PC assignment is not necessarily reachable: JR/J can
+        # leave a dead epilogue behind. Follow independent binary control flow from
+        # the actual registered wrapper/resume entries before reporting that exit.
+        audit['implicit_exits']=[]
+        audit['unregistered_implicit_exits']=0
+        audit['implicit_exit_scope']='Literal trailing PC; bounded possible binary paths from declared/configured entries and corroborated resume entries. Uncorroborated registrations are recorded separately. No general C++ equivalence or indirect-destination proof.'
+        registered_by_symbol=collections.defaultdict(set)
+        for address,record in table.items():registered_by_symbol[record['symbol']].add(address)
+        # Registration alone can be a speculative indirect-fallback label. Build
+        # independent possible paths from declared/configured entries, never seed
+        # this search with every emitted resume label. Calls supply both their
+        # direct target and possible return continuation, without ownership claims.
+        corroborated=set();pending=list(self.row_starts|self.entries)
+        while pending:
+            pc=pending.pop()
+            if pc in corroborated or not self.image.is_code(pc):continue
+            corroborated.add(pc)
+            if len(corroborated)>self.limits['module_visits']:
+                raise Invalid('LIMIT_IMPLICIT_ROOTS','Implicit-entry evidence visit limit exceeded')
+            c=self.get_control(pc)
+            if c.kind in ('unsupported','unmapped','return','indirect','exception'):continue
+            slot_exception=False
+            if c.delayed:
+                slotpc=(pc+4)&0xffffffff;slot=self.get_control(slotpc)
+                if not self.image.is_code(slotpc) or slot.kind in ('unsupported','unmapped'):continue
+                slot_exception=slot.kind=='exception'
+            if slot_exception:
+                if c.likely:pending.append((pc+8)&0xffffffff)
+            elif c.kind=='ordinary':pending.append((pc+4)&0xffffffff)
+            else:
+                if c.target is not None:pending.append(c.target)
+                if c.kind=='call' or (c.kind=='branch' and not c.unconditional):
+                    pending.append((pc+8)&0xffffffff)
+        audit['implicit_entry_evidence_visits']=len(corroborated)
+        audit['uncorroborated_resume_entries']=[]
+        implicit_visits=0
+        for candidate in implicit_candidates:
+            entry,end=candidate['entry'],candidate['end']
+            if end<=entry or end>0xffffffff or end%4:continue
+            registered_roots=registered_by_symbol[candidate['symbol']]&({entry}|candidate['labels'])
+            roots=registered_roots&corroborated
+            unknown=registered_roots-corroborated
+            if unknown:
+                audit['uncorroborated_resume_entries'].append(dict(entry=entry,entries=sorted(unknown),
+                    generated_file=candidate['file'],limitation='Registration alone does not prove an indirect entry is reached'))
+            pending=[(root,root,'root') for root in sorted(roots)]
+            visited=set();witness=None
+            while pending:
+                pc,root,edge=pending.pop()
+                if pc==end:
+                    if edge=='fallthrough':witness=root;break
+                    continue
+                if pc<entry or pc>=end or pc in visited:continue
+                visited.add(pc);implicit_visits+=1
+                if len(visited)>self.limits['root_visits'] or implicit_visits>self.limits['module_visits']:
+                    raise Invalid('LIMIT_IMPLICIT_VISITS','Implicit-exit path visit limit exceeded')
+                c=self.get_control(pc)
+                if c.kind in ('unsupported','unmapped') or not self.image.is_code(pc):
+                    self.error('IMPLICIT_EXIT_UNSUPPORTED','Unsupported reached instruction in implicit-exit audit',address=pc)
+                    continue
+                slot_exception=False
+                if c.delayed:
+                    slot=self.get_control((pc+4)&0xffffffff)
+                    if not self.image.is_code((pc+4)&0xffffffff) or slot.kind in ('unsupported','unmapped'):
+                        self.error('IMPLICIT_EXIT_UNSUPPORTED','Unavailable/unsupported reached slot in implicit-exit audit',address=pc)
+                        continue
+                    slot_exception=slot.kind=='exception'
+                if slot_exception:
+                    if c.likely:pending.append(((pc+8)&0xffffffff,root,'fallthrough'))
+                elif c.kind=='ordinary':pending.append(((pc+4)&0xffffffff,root,'fallthrough'))
+                elif c.kind=='jump':
+                    if c.target is not None:pending.append((c.target,root,'explicit'))
+                elif c.kind=='call':pending.append(((pc+8)&0xffffffff,root,'fallthrough'))
+                elif c.kind=='branch':
+                    if c.target is not None:pending.append((c.target,root,'explicit'))
+                    if not c.unconditional:pending.append(((pc+8)&0xffffffff,root,'fallthrough'))
+            if witness is None:continue
+            record=dict(entry=entry,root=witness,target=end,registered=end in table,
+                generated_file=candidate['file'],generated_line=candidate['line'])
+            audit['implicit_exits'].append(record)
+            if end not in table and self.image.is_code(end):
+                row=rows_by_start.get(entry,Row('<generated>',entry,end,end-entry,0))
+                self.finding('GENERATED_FALLTHROUGH_UNREGISTERED',row,witness,
+                    'Reachable trailing generated PC lacks current-module registration',
+                    root=witness,target=end,generated_file=candidate['file'],generated_line=candidate['line'])
+                audit['unregistered_implicit_exits']+=1
+        audit['implicit_exit_visits']=implicit_visits
         audit['unique_exit_sites']=len(unique)
         audit['external_targets']=[dict(target=target,occurrences=n,
             evidence='supplied_main_registration' if target in main else 'unknown_external_module',

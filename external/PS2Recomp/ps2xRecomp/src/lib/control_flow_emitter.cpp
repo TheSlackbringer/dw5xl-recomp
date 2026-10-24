@@ -50,7 +50,7 @@ namespace ps2recomp
     bool ControlFlowEmitter::isCallLikeEdge() const
     {
         return (m_branchInst.opcode == OPCODE_JAL) ||
-               (m_branchInst.opcode == OPCODE_SPECIAL && m_branchInst.function == SPECIAL_JALR);
+               (m_branchInst.opcode == OPCODE_SPECIAL && m_branchInst.function == SPECIAL_JALR && m_branchInst.rd != 0u);
     }
 
     bool ControlFlowEmitter::isInternalTarget(uint32_t target) const
@@ -65,6 +65,8 @@ namespace ps2recomp
                 (m_branchInst.opcode == OPCODE_REGIMM &&
                  (m_branchInst.rt == REGIMM_BLTZL || m_branchInst.rt == REGIMM_BGEZL ||
                   m_branchInst.rt == REGIMM_BLTZALL || m_branchInst.rt == REGIMM_BGEZALL)) ||
+                (m_branchInst.opcode == OPCODE_COP0 && m_branchInst.rs == COP0_BC &&
+                 (m_branchInst.rt == COP0_BC_BCFL || m_branchInst.rt == COP0_BC_BCTL)) ||
                 (m_branchInst.opcode == OPCODE_COP1 && m_branchInst.rs == COP1_BC &&
                  (m_branchInst.rt == COP1_BC_BCFL || m_branchInst.rt == COP1_BC_BCTL)) ||
                 (m_branchInst.opcode == OPCODE_COP2 && m_branchInst.rs == COP2_BC &&
@@ -147,6 +149,12 @@ namespace ps2recomp
         }
 
         m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
+        // A trap/exception or runtime transfer in the slot owns the new PC.
+        // A native syscall's ordinary +4 continuation is not itself a transfer.
+        const bool syscall = m_delaySlot.opcode == OPCODE_SPECIAL && m_delaySlot.function == SPECIAL_SYSCALL;
+        m_ss << fmt::format("{}if (ctx->pc != 0x{:X}u", indent, delayPc());
+        if (syscall) m_ss << fmt::format(" && ctx->pc != 0x{:X}u", delayPc() + 4u);
+        m_ss << ") { return; }\n";
     }
 
     void ControlFlowEmitter::emitResumeFromDelaySlotEntry()
@@ -406,10 +414,10 @@ namespace ps2recomp
             return fmt::format("GPR_U64(ctx, {}) != GPR_U64(ctx, {})", rsReg, rtReg);
         case OPCODE_BLEZ:
         case OPCODE_BLEZL:
-            return fmt::format("GPR_S32(ctx, {}) <= 0", rsReg);
+            return fmt::format("GPR_S64(ctx, {}) <= 0", rsReg);
         case OPCODE_BGTZ:
         case OPCODE_BGTZL:
-            return fmt::format("GPR_S32(ctx, {}) > 0", rsReg);
+            return fmt::format("GPR_S64(ctx, {}) > 0", rsReg);
         case OPCODE_REGIMM:
             switch (m_branchInst.rt)
             {
@@ -417,15 +425,26 @@ namespace ps2recomp
             case REGIMM_BLTZL:
             case REGIMM_BLTZAL:
             case REGIMM_BLTZALL:
-                return fmt::format("GPR_S32(ctx, {}) < 0", rsReg);
+                return fmt::format("GPR_S64(ctx, {}) < 0", rsReg);
             case REGIMM_BGEZ:
             case REGIMM_BGEZL:
             case REGIMM_BGEZAL:
             case REGIMM_BGEZALL:
-                return fmt::format("GPR_S32(ctx, {}) >= 0", rsReg);
+                return fmt::format("GPR_S64(ctx, {}) >= 0", rsReg);
             default:
                 return "false";
             }
+        case OPCODE_COP0:
+            if (m_branchInst.rs == COP0_BC)
+            {
+                // CPCOND0: every selected DMAC channel has a completion status.
+                // Read the existing device registers once, before any slot effects.
+                const std::string ready = "([&]() { const uint32_t pcr = runtime->memory().readIORegister(0x1000E020u); "
+                    "const uint32_t stat = runtime->memory().readIORegister(0x1000E010u); "
+                    "return ((stat | ~pcr) & 0x3FFu) == 0x3FFu; }())";
+                return (m_branchInst.rt == COP0_BC_BCF || m_branchInst.rt == COP0_BC_BCFL) ? "!" + ready : ready;
+            }
+            break;
         case OPCODE_COP1:
             if (m_branchInst.rs == COP1_BC)
             {
@@ -467,17 +486,13 @@ namespace ps2recomp
         const bool likely = isLikelyBranch();
         const std::string branchTakenVar = fmt::format("branch_taken_0x{:x}", m_branchInst.address);
         std::string unconditionalLinkCode;
-        std::string conditionalLinkCode;
 
         if (m_branchInst.opcode == OPCODE_REGIMM)
         {
-            if (m_branchInst.rt == REGIMM_BLTZAL || m_branchInst.rt == REGIMM_BGEZAL)
+            if (m_branchInst.rt == REGIMM_BLTZAL || m_branchInst.rt == REGIMM_BGEZAL ||
+                m_branchInst.rt == REGIMM_BLTZALL || m_branchInst.rt == REGIMM_BGEZALL)
             {
                 unconditionalLinkCode = fmt::format("SET_GPR_U32(ctx, 31, 0x{:X}u);", fallthroughPc());
-            }
-            else if (m_branchInst.rt == REGIMM_BLTZALL || m_branchInst.rt == REGIMM_BGEZALL)
-            {
-                conditionalLinkCode = fmt::format("SET_GPR_U32(ctx, 31, 0x{:X}u);", fallthroughPc());
             }
         }
 
@@ -492,10 +507,6 @@ namespace ps2recomp
         if (likely)
         {
             m_ss << "        if (" << branchTakenVar << ") {\n";
-            if (!conditionalLinkCode.empty())
-            {
-                m_ss << "            " << conditionalLinkCode << "\n";
-            }
             emitDelaySlot("            ");
 
             if (isInternalTarget(target))
@@ -511,10 +522,6 @@ namespace ps2recomp
         }
         else
         {
-            if (!conditionalLinkCode.empty())
-            {
-                m_ss << "        if (" << branchTakenVar << ") { " << conditionalLinkCode << " }\n";
-            }
 
             emitDelaySlot("        ");
 
@@ -566,7 +573,7 @@ namespace ps2recomp
         else if (m_branchInst.opcode == OPCODE_SPECIAL &&
                  (m_branchInst.function == SPECIAL_JR || m_branchInst.function == SPECIAL_JALR))
         {
-            emitRegisterJump(m_branchInst.function == SPECIAL_JALR ? RegisterBranchKind::Call : RegisterBranchKind::Jump);
+            emitRegisterJump(m_branchInst.function == SPECIAL_JALR && m_branchInst.rd != 0u ? RegisterBranchKind::Call : RegisterBranchKind::Jump);
         }
         else if (m_branchInst.isBranch)
         {

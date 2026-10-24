@@ -118,6 +118,13 @@ and generated wrapper signature. Hashes every consumed `.cpp`/`.h`/`.hpp` file. 
 This check deliberately covers that emitted invariant; dynamic exits and general C++
 equivalence are outside its claim. External module availability remains unknown.
 Configured-entry records distinguish wrapper entries from emitted resume case/goto labels.
+Literal trailing PC assignments also receive a bounded binary-path check, including
+configured interior entries and possible call returns. Only resume entries corroborated
+by paths from declared/configured roots can prove a missing fall-through registration.
+Speculative indirect-fallback labels are listed under `uncorroborated_resume_entries`;
+their presence alone cannot prove execution into adjacent padding/data. Neither this
+check nor a clean result proves all indirect targets or general C++ equivalence.
+
 Initial emitted PC assignments determine wrapper entries; function-name suffixes are not
 assumed to be entry addresses. Current `getRegU32(ctx,31)` / `ps2_stubs::<name>` or `ps2_syscalls::<name>` adapters
 are counted as native stub wrappers, with the stub name shown for configured registrations.

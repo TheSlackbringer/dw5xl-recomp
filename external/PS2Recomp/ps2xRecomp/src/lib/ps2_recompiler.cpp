@@ -1181,6 +1181,7 @@ namespace ps2recomp
             }
 
             discoverAdditionalEntryPoints();
+            discoverNativeContinuations();
 
             if (failedCount > 0)
             {
@@ -1201,6 +1202,8 @@ namespace ps2recomp
 
     void PS2Recompiler::generateOutput()
     {
+        if (m_invalidDelaySlot)
+            throw std::runtime_error("Cannot generate output after a required delay-slot failure");
         try
         {
             m_functionRenames.clear();
@@ -2133,100 +2136,281 @@ namespace ps2recomp
         }
     }
 
-    bool PS2Recompiler::decodeFunction(Function &function)
+    void PS2Recompiler::discoverNativeContinuations()
+    {
+        size_t blocks = 0u;
+        size_t labels = 0u;
+        std::unordered_set<uint32_t> evidencedEntries = m_entryPointHintStarts;
+        for (;;)
+        {
+            std::unordered_set<uint32_t> registered;
+            std::unordered_set<uint32_t> starts;
+            std::unordered_set<uint32_t> entryOwners;
+            for (const auto &function : m_functions)
+            {
+                if (shouldGenerateCodeForFunction(function))
+                {
+                    starts.insert(function.start);
+                    if (isEntryFunctionName(function.name)) entryOwners.insert(function.start);
+                    registered.insert(function.start);
+                }
+            }
+            std::unordered_map<uint32_t, uint32_t> registeredOwner;
+            for (uint32_t start : starts) registeredOwner.emplace(start, start);
+            std::vector<uint32_t> resumeOwners;
+            for (const auto &[owner, targets] : m_resumeEntryTargetsByOwner) resumeOwners.push_back(owner);
+            std::sort(resumeOwners.begin(), resumeOwners.end(), [&](uint32_t left, uint32_t right) {
+                const bool l = entryOwners.contains(left), r = entryOwners.contains(right);
+                return l != r ? !l : left > right;
+            });
+            for (uint32_t owner : resumeOwners)
+                for (uint32_t target : m_resumeEntryTargetsByOwner.at(owner)) {
+                    registered.insert(target);
+                    registeredOwner.emplace(target, owner);
+                }
+            bool newEvidence = false;
+
+            const auto executable = [&](uint32_t address)
+            {
+                return (address & 3u) == 0u && std::any_of(m_sections.begin(), m_sections.end(),
+                    [address](const Section &section)
+                    {
+                        return section.isCode && section.data && address >= section.address &&
+                            static_cast<uint64_t>(address) + 4u <= static_cast<uint64_t>(section.address) + section.size;
+                    });
+            };
+            std::unordered_set<uint32_t> needed;
+            for (const auto &function : m_functions)
+            {
+                if (!function.isRecompiled || function.isStub || function.isSkipped)
+                    continue;
+                const auto decoded = m_decodedFunctions.find(function.start);
+                if (decoded == m_decodedFunctions.end())
+                    continue;
+                std::unordered_map<uint32_t, const Instruction *> body;
+                for (const auto &instruction : decoded->second)
+                    if (instruction.address < function.end && !instruction.isBoundaryDelaySlot)
+                        body.emplace(instruction.address, &instruction);
+                std::vector<uint32_t> pending{function.start};
+                // Indirect-fallback labels alone are not evidence of executable
+                // fall-through: some name slots/padding after a real return.
+                for (uint32_t target : evidencedEntries)
+                    if (registeredOwner.contains(target) && registeredOwner.at(target) == function.start)
+                        pending.push_back(target);
+                std::unordered_set<uint32_t> visited;
+                const auto edge = [&](uint32_t target, uint32_t source)
+                {
+                    if (body.contains(target)) pending.push_back(target);
+                    else if (registered.contains(target)) {
+                        if (!starts.contains(target) && evidencedEntries.insert(target).second) newEvidence = true;
+                    } else if (executable(target) && needed.insert(target).second) {
+                        std::ostringstream message;
+                        message << "owner=0x" << std::hex << function.start << " source=0x" << source << " target=0x" << target;
+                        m_reporter.info("continuation-edge", message.str());
+                    }
+                };
+                while (!pending.empty())
+                {
+                    const uint32_t pc = pending.back(); pending.pop_back();
+                    if (!visited.insert(pc).second) continue;
+                    const auto it = body.find(pc);
+                    if (it == body.end()) continue;
+                    const Instruction &inst = *it->second;
+                    if (!inst.hasDelaySlot)
+                    {
+                        if (!inst.isReturn) edge(pc + 4u, pc);
+                    }
+                    else if (inst.opcode == OPCODE_J || inst.opcode == OPCODE_JAL)
+                    {
+                        edge(decodeAbsoluteJumpTarget(pc, inst.target), pc);
+                        if (inst.opcode == OPCODE_JAL) edge(pc + 8u, pc);
+                    }
+                    else if (inst.opcode == OPCODE_SPECIAL &&
+                        (inst.function == SPECIAL_JR || inst.function == SPECIAL_JALR))
+                    {
+                        // An indirect destination is not recovered from pointer-shaped data.
+                        // Linking JALR has an architectural return continuation; rd=0 does not.
+                        if (inst.function == SPECIAL_JALR && inst.rd != 0u) edge(pc + 8u, pc);
+                    }
+                    else if (inst.isBranch)
+                    {
+                        const uint32_t target = pc + 4u + static_cast<int32_t>(static_cast<int16_t>(inst.immediate)) * 4u;
+                        // Prune the architecturally constant register-equality cases. This
+                        // avoids treating padding after an unconditional BEQ as reachable.
+                        const bool equal = inst.rs == inst.rt;
+                        const bool always = equal && (inst.opcode == OPCODE_BEQ || inst.opcode == OPCODE_BEQL);
+                        const bool never = equal && (inst.opcode == OPCODE_BNE || inst.opcode == OPCODE_BNEL);
+                        if (!never) edge(target, pc);
+                        if (!always) edge(pc + 8u, pc);
+                    }
+                }
+            }
+            if (needed.empty()) { if (newEvidence) continue; break; }
+
+            // Reuse existing native bodies where the destination is decoded. Only
+            // genuinely uncovered executable continuations need a new basic block.
+            evidencedEntries.insert(needed.begin(), needed.end());
+            const size_t newLabels = collectInternalEntryTargetsImpl(
+                m_functions, m_decodedFunctions, needed, m_resumeEntryTargetsByOwner);
+            labels += newLabels;
+            for (const auto &[owner, targets] : m_resumeEntryTargetsByOwner)
+                for (uint32_t target : targets) needed.erase(target);
+            if (!needed.empty())
+            {
+                const EntryDiscoveryStats stats = discoverAdditionalEntryPointsImpl(
+                    m_functions, m_decodedFunctions, m_sections, nullptr,
+                    [this](Function &function) { return decodeFunction(function, true); }, needed);
+                if (stats.discoveredCount == 0u)
+                    throw std::runtime_error("Unable to translate an evidenced native continuation");
+                blocks += stats.discoveredCount;
+            }
+            for (const auto &function : m_functions)
+            {
+                if (!function.isRecompiled || function.isStub || function.isSkipped) continue;
+                const auto decoded = m_decodedFunctions.find(function.start);
+                if (decoded == m_decodedFunctions.end()) continue;
+                const auto analysis = m_codeGenerator->collectInternalBranchTargets(function, decoded->second, &m_functions);
+                auto &targets = m_resumeEntryTargetsByOwner[function.start];
+                targets.insert(targets.end(), analysis.resumeEntryPoints.begin(), analysis.resumeEntryPoints.end());
+                targets.insert(targets.end(), analysis.indirectFallbackEntryPoints.begin(), analysis.indirectFallbackEntryPoints.end());
+                std::sort(targets.begin(), targets.end());
+                targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+            }
+        }
+        m_codeGenerator->setResumeEntryTargets(m_resumeEntryTargetsByOwner);
+        if (blocks || labels)
+        {
+            m_reporter.recordAdditionalEntryPoints(blocks + labels);
+            m_reporter.info("continuation", "translated " + std::to_string(blocks) +
+                " evidenced native continuation block(s), reused " + std::to_string(labels) + " native label(s)");
+        }
+    }
+
+    bool PS2Recompiler::decodeFunction(Function &function, bool continuationBlock)
     {
         std::vector<Instruction> instructions;
         bool truncated = false;
-
-        uint32_t start = function.start;
-        uint32_t end = function.end;
-
-        for (uint32_t address = start; address < end; address += 4)
+        const auto decodeAt = [&](uint32_t address)
         {
+            uint32_t rawInstruction = m_elfParser->readWord(address);
+            const uint32_t originalInstruction = rawInstruction;
+
+            auto patchIt = m_config.patches.find(address);
+            if (patchIt != m_config.patches.end())
+            {
+                const PatchClass patchClass = classifyPatchedInstruction(originalInstruction);
+                if (shouldApplyConfiguredPatch(patchClass, m_config))
+                {
+                    try
+                    {
+                        rawInstruction = std::stoul(patchIt->second, nullptr, 0);
+                        {
+                            std::ostringstream msg;
+                            msg << "Applied patch at 0x" << std::hex << address;
+                            m_reporter.info("patch", msg.str());
+                        }
+                    }
+                    catch (const std::exception &e)
+                    {
+                        {
+                            std::ostringstream msg;
+                            msg << "Invalid patch value at 0x" << std::hex << address
+                                << " (" << patchIt->second << "): " << e.what()
+                                << ". Using original instruction.";
+                            m_reporter.warningAt("patch", function.name, address, msg.str());
+                        }
+                    }
+                }
+            }
+
+            Instruction inst = m_decoder->decodeInstruction(address, rawInstruction, !m_config.lowMemoryMode);
+
+            auto mmioIt = m_config.mmioByInstructionAddress.find(address);
+            if (mmioIt != m_config.mmioByInstructionAddress.end())
+            {
+                inst.isMmio = true;
+                inst.mmioAddress = mmioIt->second;
+            }
+            return inst;
+        };
+
+        for (uint64_t next = function.start; next < function.end; next += 4u)
+        {
+            const uint32_t address = static_cast<uint32_t>(next);
             try
             {
-                if (!m_elfParser->isValidAddress(address))
+                instructions.push_back(decodeAt(address));
+                // A newly evidenced continuation is a basic block, not guessed
+                // ownership of all bytes up to the next callable entry.
+                if (continuationBlock && (instructions.back().hasDelaySlot || instructions.back().isReturn))
                 {
-                    {
-                        std::ostringstream msg;
-                        msg << "Invalid address 0x" << std::hex << address << " (truncating decode)";
-                        m_reporter.warningAt("decode", function.name, address, msg.str());
-                    }
-                    truncated = true;
+                    function.end = address + 4u;
                     break;
                 }
-
-                uint32_t rawInstruction = m_elfParser->readWord(address);
-                const uint32_t originalInstruction = rawInstruction;
-
-                auto patchIt = m_config.patches.find(address);
-                if (patchIt != m_config.patches.end())
-                {
-                    const PatchClass patchClass = classifyPatchedInstruction(originalInstruction);
-                    if (shouldApplyConfiguredPatch(patchClass, m_config))
-                    {
-                        try
-                        {
-                            rawInstruction = std::stoul(patchIt->second, nullptr, 0);
-                            {
-                                std::ostringstream msg;
-                                msg << "Applied patch at 0x" << std::hex << address;
-                                m_reporter.info("patch", msg.str());
-                            }
-                        }
-                        catch (const std::exception &e)
-                        {
-                            {
-                                std::ostringstream msg;
-                                msg << "Invalid patch value at 0x" << std::hex << address
-                                    << " (" << patchIt->second << "): " << e.what()
-                                    << ". Using original instruction.";
-                                m_reporter.warningAt("patch", function.name, address, msg.str());
-                            }
-                        }
-                    }
-                }
-
-                Instruction inst = m_decoder->decodeInstruction(address, rawInstruction, !m_config.lowMemoryMode);
-
-                auto mmioIt = m_config.mmioByInstructionAddress.find(address);
-                if (mmioIt != m_config.mmioByInstructionAddress.end())
-                {
-                    inst.isMmio = true;
-                    inst.mmioAddress = mmioIt->second;
-                }
-
-                instructions.push_back(inst);
             }
             catch (const std::exception &e)
             {
-                {
-                    std::ostringstream msg;
-                    msg << "Error decoding instruction: " << e.what() << " (truncating decode)";
-                    m_reporter.warningAt("decode", function.name, address, msg.str());
-                }
+                m_reporter.warningAt("decode", function.name, address,
+                    std::string("Error decoding instruction: ") + e.what() + " (truncating decode)");
                 truncated = true;
                 break;
             }
         }
-
         if (instructions.empty())
         {
-            {
-                std::ostringstream msg;
-                msg << "No decodable instructions found at 0x" << std::hex << function.start;
-                m_reporter.warningAt("decode", function.name, function.start, msg.str());
-            }
+            m_reporter.warningAt("decode", function.name, function.start, "No decodable instructions found");
             return false;
         }
-
         if (truncated)
+            function.end = instructions.back().address + 4u;
+
+        // CSV End describes callable ownership; a required slot can be a separate
+        // callable entry. Read that single architectural instruction from this
+        // module without expanding End or replacing unknown bytes with a NOP.
+        for (size_t i = 0; i < instructions.size(); ++i)
         {
-            function.end = instructions.back().address + 4;
+            const Instruction branch = instructions[i];
+            if (!branch.hasDelaySlot)
+                continue;
+            try
+            {
+                const uint64_t slotAddress = static_cast<uint64_t>(branch.address) + 4u;
+                if (slotAddress > UINT32_MAX || (branch.address & 3u) != 0u)
+                    throw std::runtime_error("delay-slot address is unaligned or overflows");
+                const uint32_t address = static_cast<uint32_t>(slotAddress);
+                const bool mapped = std::any_of(m_sections.begin(), m_sections.end(),
+                    [slotAddress](const Section &section)
+                    {
+                        return section.isCode && section.data && slotAddress >= section.address &&
+                            slotAddress + 4u <= static_cast<uint64_t>(section.address) + section.size;
+                    });
+                if (!mapped)
+                    throw std::runtime_error("required delay slot is not file-backed EE code in this module");
+                if (i + 1u == instructions.size())
+                {
+                    Instruction slot = decodeAt(address);
+                    slot.isBoundaryDelaySlot = true;
+                    instructions.push_back(std::move(slot));
+                }
+                const Instruction &slot = instructions[i + 1u];
+                if (!slot.isValidEncoding)
+                    throw std::runtime_error("required delay slot has a reserved or invalid encoding");
+                if (slot.address != address || slot.hasDelaySlot)
+                    throw std::runtime_error("required delay slot is missing or contains an unsupported delayed transfer");
+                const auto unhandledBefore = m_reporter.counters().unhandledInstructions;
+                (void)m_codeGenerator->translateInstruction(slot);
+                if (m_reporter.counters().unhandledInstructions != unhandledBefore)
+                    throw std::runtime_error("required delay slot has no supported native translation");
+            }
+            catch (const std::exception &e)
+            {
+                m_invalidDelaySlot = true;
+                m_reporter.errorAt("delay-slot", function.name, branch.address, e.what());
+                throw;
+            }
+            ++i;
         }
-
         m_decodedFunctions.insert_or_assign(function.start, std::move(instructions));
-
         return true;
     }
 

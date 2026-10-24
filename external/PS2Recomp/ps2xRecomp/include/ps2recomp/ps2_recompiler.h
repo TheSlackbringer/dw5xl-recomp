@@ -77,8 +77,10 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
         CodeGenerator::BootstrapInfo m_bootstrapInfo;
 
-        bool decodeFunction(Function &function);
+        bool m_invalidDelaySlot = false;
+        bool decodeFunction(Function &function, bool continuationBlock = false);
         void discoverAdditionalEntryPoints();
+        void discoverNativeContinuations();
         bool shouldSkipFunction(const Function &function) const;
         bool isStubFunction(const Function &function) const;
         bool isCorrectnessCriticalFunction(const Function &function) const;
