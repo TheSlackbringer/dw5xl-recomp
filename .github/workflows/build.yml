@@ -40,8 +40,6 @@ jobs:
       - uses: actions/checkout@v7
       - name: Test release draft lifecycle
         run: python3 -m unittest discover -s tools/release -p 'test_*.py' -v
-      - name: Test function-map diagnostics (synthetic inputs only)
-        run: python3 -m unittest discover -s tools/tests -p 'test_validate_function_map.py' -v
       - name: No game data in the repository
         run: |
           bad=$(git ls-files | grep -iE '^(game|discs|ghidra|ghidra_iop|notes)/|/output/|^recomp/[^/]+/(vu[01]|iop)/|vu[01]_lifted|\.(iso|elf|irx)$' || true)
@@ -61,12 +59,19 @@ jobs:
           -DPS2X_PARALLEL_GS_SOURCE_DIR="$PWD/app/deps/parallel-gs"
       - name: Build
         run: cmake --build app/build-ci
-      - name: Build the recompiler (separately, the app build turns it off)
+      - name: Build the recompiler and synthetic native tests
         run: >
           CC=clang CXX=clang++ cmake -S external/PS2Recomp -B build-recomp -G Ninja -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_LINKER_TYPE=LLD -DPS2X_BUILD_RUNTIME=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF
-          -DPS2X_BUILD_STUDIO=OFF -DPS2X_ENABLE_SCCACHE=OFF
-          && cmake --build build-recomp --target ps2_recomp
+          -DCMAKE_LINKER_TYPE=LLD -DPS2X_BUILD_RUNTIME=ON -DPS2X_BUILD_ANALYZER=ON -DPS2X_BUILD_TEST=ON
+          -DPS2X_BUILD_STUDIO=OFF -DPS2X_ENABLE_SCCACHE=OFF -DPS2X_ENABLE_DEBUG_UI=OFF
+          -DPS2X_ENABLE_VULKAN_GS=OFF -DFETCHCONTENT_SOURCE_DIR_RAYLIB="$PWD/app/build-ci/_deps/raylib-src"
+          && cmake --build build-recomp --target ps2_recomp ps2x_tests ps2x_boundary_native_tests
+      - name: Test recompiler diagnostics and native boundaries (synthetic inputs only)
+        run: |
+          PS2X_TEST_RECOMPILER="$PWD/build-recomp/ps2xRecomp/ps2_recomp" \
+            python3 -m unittest discover -s tools/tests -p 'test_*.py' -v
+          ./build-recomp/ps2xTest/ps2x_boundary_native_tests
+          cd external/PS2Recomp && ../../build-recomp/ps2xTest/ps2x_tests
       - name: Test (no GPU, no game data)
         run: ctest --test-dir app/build-ci --output-on-failure
       - name: Collect dependency sources for the Linux package

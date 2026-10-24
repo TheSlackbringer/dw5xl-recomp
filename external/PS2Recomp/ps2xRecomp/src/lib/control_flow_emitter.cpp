@@ -60,17 +60,7 @@ namespace ps2recomp
 
     bool ControlFlowEmitter::isLikelyBranch() const
     {
-        return (m_branchInst.opcode == OPCODE_BEQL || m_branchInst.opcode == OPCODE_BNEL ||
-                m_branchInst.opcode == OPCODE_BLEZL || m_branchInst.opcode == OPCODE_BGTZL ||
-                (m_branchInst.opcode == OPCODE_REGIMM &&
-                 (m_branchInst.rt == REGIMM_BLTZL || m_branchInst.rt == REGIMM_BGEZL ||
-                  m_branchInst.rt == REGIMM_BLTZALL || m_branchInst.rt == REGIMM_BGEZALL)) ||
-                (m_branchInst.opcode == OPCODE_COP0 && m_branchInst.rs == COP0_BC &&
-                 (m_branchInst.rt == COP0_BC_BCFL || m_branchInst.rt == COP0_BC_BCTL)) ||
-                (m_branchInst.opcode == OPCODE_COP1 && m_branchInst.rs == COP1_BC &&
-                 (m_branchInst.rt == COP1_BC_BCFL || m_branchInst.rt == COP1_BC_BCTL)) ||
-                (m_branchInst.opcode == OPCODE_COP2 && m_branchInst.rs == COP2_BC &&
-                 (m_branchInst.rt == COP2_BC_BCFL || m_branchInst.rt == COP2_BC_BCTL)));
+        return isGuestLikelyBranch(m_branchInst);
     }
 
     std::vector<uint32_t> ControlFlowEmitter::resolvedLocalIndirectTargets() const
@@ -126,7 +116,7 @@ namespace ps2recomp
         return code;
     }
 
-    void ControlFlowEmitter::emitDelaySlot(std::string_view indent)
+    void ControlFlowEmitter::emitDelaySlot(std::string_view indent, bool executingAsDelaySlot)
     {
         if (!hasRealDelaySlot())
         {
@@ -134,8 +124,9 @@ namespace ps2recomp
         }
 
         m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
-        m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
-        m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
+        m_ss << fmt::format("{}ctx->in_delay_slot = {};\n", indent, executingAsDelaySlot ? "true" : "false");
+        if (executingAsDelaySlot)
+            m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
 
         const std::string code = delaySlotCode();
         std::istringstream lines(code);
@@ -165,7 +156,8 @@ namespace ps2recomp
         }
 
         m_ss << fmt::format("    if (ctx->pc == 0x{:X}u) {{\n", delayPc());
-        emitDelaySlot("        ");
+        // A callable slot is an ordinary instruction when entered directly.
+        emitDelaySlot("        ", false);
         m_ss << fmt::format("        ctx->pc = 0x{:X}u;\n", fallthroughPc());
 
         if (isInternalTarget(fallthroughPc()))
@@ -222,6 +214,11 @@ namespace ps2recomp
             return false;
         }
 
+        // Copied code is callable only while its loaded instruction image matches.
+        // Even a known direct tail-call must pass through the guarded resolver.
+        for (const auto &copy : m_gen.m_codeCopies)
+            if (target >= copy.destination && uint64_t(target) < uint64_t(copy.destination) + copy.size)
+                return false;
         const std::string functionName = m_gen.getFunctionName(target);
         if (functionName.empty())
         {

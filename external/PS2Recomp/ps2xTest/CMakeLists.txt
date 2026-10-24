@@ -148,17 +148,23 @@ set(boundary_fixture_table "${boundary_fixture_dir}/register_functions.cpp")
 add_custom_command(OUTPUT "${boundary_fixture_cpp}" "${boundary_fixture_table}"
     COMMAND $<TARGET_FILE:ps2x_boundary_fixture_generator> "${boundary_fixture_dir}"
     DEPENDS ps2x_boundary_fixture_generator VERBATIM)
-add_executable(ps2x_boundary_native_tests src/boundary_native_tests.cpp
+add_executable(ps2x_boundary_native_tests src/boundary_native_tests.cpp src/tlb_native_tests.cpp
     "${boundary_fixture_cpp}" "${boundary_fixture_table}" $<TARGET_OBJECTS:ps2_test_function_table>)
 target_include_directories(ps2x_boundary_native_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib/Kernel
-    ${CMAKE_SOURCE_DIR}/ps2xIOP/include "${boundary_fixture_dir}" "${boundary_fixture_dir}/units")
+    ${CMAKE_SOURCE_DIR}/ps2xIOP/include "${boundary_fixture_dir}/units" "${boundary_fixture_dir}")
 target_link_libraries(ps2x_boundary_native_tests PRIVATE ps2_runtime ps2_iop)
 if(NOT MSVC)
     target_compile_options(ps2x_boundary_native_tests PRIVATE -msse4.1)
 endif()
 if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
     ps2x_stage_ffmpeg_runtime_dlls(ps2x_boundary_native_tests)
+endif()
+# Match the other production-runtime test executables on Windows.
+if(MSVC)
+    target_link_options(ps2x_boundary_native_tests PRIVATE "/STACK:8388608")
+elseif(MINGW)
+    target_link_options(ps2x_boundary_native_tests PRIVATE "-Wl,--stack,8388608")
 endif()
 if(BUILD_TESTING)
     add_test(NAME native_function_boundaries COMMAND ps2x_boundary_native_tests)

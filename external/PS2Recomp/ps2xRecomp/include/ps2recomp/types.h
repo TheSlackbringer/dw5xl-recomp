@@ -175,6 +175,16 @@ namespace ps2recomp
         std::string calleeName;
     };
 
+    // Explicit file-backed code copied by the guest to a different execution address.
+    // Function ranges are (byte offset, byte length), not inferred from arbitrary data.
+    struct CodeCopy
+    {
+        std::string name;
+        uint32_t source = 0, destination = 0, size = 0;
+        std::vector<std::pair<uint32_t, uint32_t>> functions;
+        std::map<uint32_t, uint32_t> expectedWords; // original words at execution PCs
+    };
+
     // Recompiler configuration
     struct RecompilerConfig
     {
@@ -197,6 +207,7 @@ namespace ps2recomp
         std::vector<std::string> entryPointHints;
         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;
         std::vector<JumpTable> jumpTables;
+        std::vector<CodeCopy> codeCopies;
     };
 
 } // namespace ps2recomp

@@ -9,6 +9,7 @@
 #include <limits>
 #include <thread>
 #include <cctype>
+#include <unordered_set>
 
 namespace ps2recomp
 {
@@ -64,6 +65,44 @@ namespace ps2recomp
             }
             else if (!config.moduleId.empty())
                 throw std::runtime_error("module_id requires raw input_format");
+            if (data.contains("code_copies"))
+            {
+                std::unordered_set<std::string> names;
+                for (const auto &item : toml::find<toml::array>(data, "code_copies"))
+                {
+                    CodeCopy copy;
+                    copy.name = toml::find<std::string>(item, "name");
+                    if (copy.name.empty() || !std::isalpha(static_cast<unsigned char>(copy.name.front())) ||
+                        !std::all_of(copy.name.begin(), copy.name.end(), [](unsigned char c) { return std::isalnum(c) || c == '_'; }) ||
+                        !names.insert(copy.name).second)
+                        throw std::runtime_error("Code copy names must be unique C++ identifiers");
+                    const auto address = [&](const char *key) {
+                        const int64_t v = toml::find<int64_t>(item, key);
+                        if (v < 0 || v > 0xffffffffll || (v & 3))
+                            throw std::runtime_error(std::string("Invalid code copy ") + key);
+                        return static_cast<uint32_t>(v);
+                    };
+                    copy.source = address("source"); copy.destination = address("destination"); copy.size = address("size");
+                    if (!copy.size || uint64_t(copy.source) + copy.size > 0x100000000ull ||
+                        uint64_t(copy.destination) + copy.size > 0x100000000ull)
+                        throw std::runtime_error("Code copy range overflows or is empty");
+                    std::vector<std::pair<uint32_t,uint32_t>> ranges;
+                    for (const auto &range : toml::find<std::vector<std::vector<int64_t>>>(item, "functions"))
+                    {
+                        if (range.size() != 2 || range[0] < 0 || range[1] <= 0 ||
+                            ((range[0] | range[1]) & 3) || uint64_t(range[0]) + range[1] > copy.size)
+                            throw std::runtime_error("Code copy function range must be aligned and inside its image");
+                        ranges.emplace_back(static_cast<uint32_t>(range[0]),static_cast<uint32_t>(range[1]));
+                    }
+                    std::sort(ranges.begin(), ranges.end());
+                    for (size_t i = 1; i < ranges.size(); ++i)
+                        if (uint64_t(ranges[i-1].first) + ranges[i-1].second > ranges[i].first)
+                            throw std::runtime_error("Code copy function ranges overlap");
+                    if (ranges.empty()) throw std::runtime_error("Code copy requires explicit function ranges");
+                    copy.functions = std::move(ranges);
+                    config.codeCopies.push_back(std::move(copy));
+                }
+            }
             config.ghidraMapPath = toml::find_or<std::string>(general, "ghidra_output", "");
             config.outputPath = toml::find<std::string>(general, "output");
             config.singleFileOutput = toml::find_or<bool>(general, "single_file_output", false);
@@ -332,6 +371,22 @@ namespace ps2recomp
         general["stubs"] = config.stubImplementations;
         general["entry_points"] = config.entryPointHints;
         data["general"] = general;
+        if (!config.codeCopies.empty())
+        {
+            toml::array copies;
+            for (const auto &copy : config.codeCopies)
+            {
+                toml::table item;
+                item["name"] = copy.name;
+                item["source"] = int64_t(copy.source); item["destination"] = int64_t(copy.destination); item["size"] = int64_t(copy.size);
+                toml::array ranges;
+                for (const auto &[offset,length] : copy.functions)
+                    ranges.push_back(toml::array{int64_t(offset),int64_t(length)});
+                item["functions"] = ranges;
+                copies.push_back(item);
+            }
+            data["code_copies"] = copies;
+        }
 
         if (!config.mmioByInstructionAddress.empty())
         {

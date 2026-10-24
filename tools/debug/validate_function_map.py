@@ -17,7 +17,7 @@ import struct
 import sys
 import tomllib
 
-VERSION = '031-v3-2'
+VERSION = '031-v3-4'
 DEFAULT_LIMITS = dict(binary_bytes=64<<20, csv_bytes=16<<20, config_bytes=1<<20,
     rows=100_000, root_visits=65_536, module_visits=2_000_000, tail_bytes=4096,
     findings=10_000, report_bytes=32<<20, generated_bytes=512<<20, generated_files=100_000)
@@ -115,6 +115,44 @@ class Image:
         for a,b in zip(self.mappings,self.mappings[1:]):
             if a[1]>b[0]:raise Invalid('ELF_MAPPING','Overlapping load mappings')
         if not self.code:raise Invalid('ELF_MAPPING','No supported file-backed EE executable mapping')
+
+    def add_code_copies(self,copies):
+        if not isinstance(copies,list):raise Invalid('CODE_COPY','code_copies must be an array')
+        names=set();rows=[]
+        for copy in copies:
+            if not isinstance(copy,dict):raise Invalid('CODE_COPY','Each code copy must be a table')
+            name=copy.get('name');source=copy.get('source');dest=copy.get('destination');size=copy.get('size')
+            if not isinstance(name,str) or not re.fullmatch('[A-Za-z][A-Za-z0-9_]*',name) or name in names:
+                raise Invalid('CODE_COPY','Unique code copy identifier required')
+            names.add(name)
+            if any(type(v)is not int or v<0 or v>0xffffffff or v%4 for v in (source,dest,size)) or not size or source+size>1<<32 or dest+size>1<<32:
+                raise Invalid('CODE_COPY','Invalid aligned code copy range')
+            physical=dest&0x1fffffff
+            if physical+size>0x2000000 or not (dest<0x2000000 or 0x80000000<=dest<0xc0000000):
+                raise Invalid('CODE_COPY','Code copy destination is outside direct-mapped EE RAM')
+            if any(physical<(hi&0x1fffffff) and physical+size>(lo&0x1fffffff) for lo,hi,_ in self.mappings):
+                raise Invalid('CODE_COPY','Code copy destination overlaps a mapped image')
+            off=self.offset(source)
+            if off is None or self.offset(source+size-4)!=off+size-4:
+                raise Invalid('CODE_COPY','Code copy source must be contiguous file-backed bytes')
+            ranges=copy.get('functions')
+            if not isinstance(ranges,list) or not ranges:raise Invalid('CODE_COPY','Explicit function ranges required')
+            checked=[]
+            for pair in ranges:
+                if not isinstance(pair,list) or len(pair)!=2 or any(type(v)is not int for v in pair):
+                    raise Invalid('CODE_COPY','Function ranges require offset/length integer pairs')
+                start,length=pair
+                if start<0 or length<=0 or (start|length)%4 or start+length>size:
+                    raise Invalid('CODE_COPY','Function range outside copied image')
+                checked.append((start,length))
+            checked.sort()
+            if any(a+n>b for (a,n),(b,_) in zip(checked,checked[1:])):raise Invalid('CODE_COPY','Overlapping copied functions')
+            self.mappings.append((dest,dest+size,off))
+            for start,length in checked:
+                self.code.append((dest+start,dest+start+length))
+                rows.append(Row('copy_'+name+'_'+str(start),dest+start,dest+start+length,length,0))
+        self.mappings.sort();self.code.sort()
+        return rows
 
     def bounds(self,offset,size):
         if offset<0 or size<0 or offset+size>len(self.blob):
@@ -348,6 +386,9 @@ class Analysis:
         if not isinstance(general,dict):raise Invalid('PROFILE_FORMAT','general table required')
         self.rows=parse_rows(blobs['csv'],self.limits['rows'])
         self.image=Image(blobs['binary'],general)
+        copied_rows=self.image.add_code_copies(self.profile.get('code_copies',[]))
+        self.rows.extend(copied_rows)
+        self.entries.update(row.start for row in copied_rows)
         module_id=general.get('module_id','main')
         if record:
             if general.get('module_id') and module_id!=record['id']:raise Invalid('MODULE_ID','Profile/manifest module mismatch')
@@ -697,12 +738,12 @@ class Analysis:
         # independent possible paths from declared/configured entries, never seed
         # this search with every emitted resume label. Calls supply both their
         # direct target and possible return continuation, without ownership claims.
-        corroborated=set();pending=list(self.row_starts|self.entries)
+        corroborated=set(self.row_starts|self.entries);pending=list(corroborated);reached=set()
         while pending:
             pc=pending.pop()
-            if pc in corroborated or not self.image.is_code(pc):continue
-            corroborated.add(pc)
-            if len(corroborated)>self.limits['module_visits']:
+            if pc in reached or not self.image.is_code(pc):continue
+            reached.add(pc)
+            if len(reached)>self.limits['module_visits']:
                 raise Invalid('LIMIT_IMPLICIT_ROOTS','Implicit-entry evidence visit limit exceeded')
             c=self.get_control(pc)
             if c.kind in ('unsupported','unmapped','return','indirect','exception'):continue
@@ -715,10 +756,17 @@ class Analysis:
                 if c.likely:pending.append((pc+8)&0xffffffff)
             elif c.kind=='ordinary':pending.append((pc+4)&0xffffffff)
             else:
-                if c.target is not None:pending.append(c.target)
+                if c.target is not None:
+                    corroborated.add(c.target);pending.append(c.target)
                 if c.kind=='call' or (c.kind=='branch' and not c.unconditional):
-                    pending.append((pc+8)&0xffffffff)
-        audit['implicit_entry_evidence_visits']=len(corroborated)
+                    continuation=(pc+8)&0xffffffff
+                    if c.kind=='call':corroborated.add(continuation)
+                    pending.append(continuation)
+        # Merely passing through a PC inside one wrapper does not make it an
+        # external entry into a different overlapping wrapper. Conditional
+        # untaken paths and ordinary fall-through remain local paths.
+        audit['implicit_entry_evidence_visits']=len(reached)
+        audit['corroborated_implicit_entries']=len(corroborated)
         audit['uncorroborated_resume_entries']=[]
         implicit_visits=0
         for candidate in implicit_candidates:

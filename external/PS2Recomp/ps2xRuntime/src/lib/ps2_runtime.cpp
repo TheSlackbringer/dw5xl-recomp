@@ -317,6 +317,28 @@ namespace
         ctx->in_delay_slot = false;
     }
 
+    [[noreturn]] void raiseTlbAccessFault(R5900Context *ctx, const TlbFault &fault)
+    {
+        const bool nested = (ctx->cop0_status & COP0_STATUS_EXL) != 0u;
+        const uint32_t code = fault.kind == TlbFault::Kind::Modified ? 1u : fault.store ? 3u : 2u;
+        ctx->cop0_badvaddr = fault.address;
+        ctx->cop0_context = (ctx->cop0_context & 0xFF800000u) | ((fault.address >> 9u) & 0x007FFFF0u);
+        ctx->cop0_entryhi = (fault.address & 0xFFFFE000u) | (ctx->cop0_entryhi & 0xFFu);
+        if (!nested)
+        {
+            ctx->cop0_epc = ctx->in_delay_slot ? ctx->branch_pc : ctx->pc;
+            ctx->cop0_cause = (ctx->cop0_cause & ~COP0_CAUSE_BD) | (ctx->in_delay_slot ? COP0_CAUSE_BD : 0u);
+        }
+        ctx->cop0_cause = (ctx->cop0_cause & ~COP0_CAUSE_EXCCODE_MASK) | (code << 2u);
+        const bool refill = fault.kind == TlbFault::Kind::Refill && !nested;
+        // EE Core v6 table4-1: refill at +0; invalid/modified/nested at +0x180.
+        ctx->pc = ((ctx->cop0_status & COP0_STATUS_BEV) ? 0xBFC00200u : 0x80000000u) + (refill ? 0u : 0x180u);
+        ctx->cop0_status |= COP0_STATUS_EXL;
+        ctx->in_delay_slot = false;
+        // Reuse the EE dispatcher's existing control transfer; no interpreter.
+        throw EeDispatcherTransfer{};
+    }
+
     std::filesystem::path normalizeAbsolutePath(const std::filesystem::path &path)
     {
         if (path.empty())
@@ -1210,8 +1232,25 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     }
 }
 
+namespace
+{
+    std::vector<const RecompiledCodeImage *> &staticCodeImages()
+    {
+        static std::vector<const RecompiledCodeImage *> images;
+        return images;
+    }
+}
+
+RecompiledCodeImageRegistration::RecompiledCodeImageRegistration(const RecompiledCodeImage &image)
+{
+    staticCodeImages().push_back(&image);
+}
+
 PS2Runtime::PS2Runtime()
 {
+    for (const auto *image : staticCodeImages())
+        if (!registerCompiledCodeImage(*image))
+            throw std::runtime_error("Invalid generated copied-code metadata");
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
 
@@ -1924,6 +1963,51 @@ namespace
     }
 }
 
+bool PS2Runtime::registerCompiledCodeImage(const RecompiledCodeImage &image)
+{
+    const auto &module = image.module;
+    const uint64_t end = uint64_t(module.guestBase) + module.fileSize;
+    const uint32_t physical = module.guestBase & 0x1fffffffu;
+    if (!module.identity || !*module.identity || (module.guestBase & 3u) || !module.fileSize ||
+        end > 0x100000000ull || uint64_t(physical) + module.fileSize > PS2_RAM_SIZE ||
+        !(module.guestBase < PS2_RAM_SIZE || (module.guestBase >= 0x80000000u && module.guestBase < 0xc0000000u)) ||
+        !module.entries || !module.entryCount || module.entryCount > module.fileSize/4u ||
+        !image.words || !image.wordCount || image.wordCount > module.fileSize/4u ||
+        (module.guestBase < g_ps2RecompiledFunctionTableEnd && end > g_ps2RecompiledFunctionTableBase))
+        return false;
+    bool nonzero = false;
+    for (size_t i = 0; i < image.wordCount; ++i)
+    {
+        const auto &word = image.words[i];
+        if ((word.address & 3u) || word.address < module.guestBase || uint64_t(word.address)+4u > end ||
+            (i && word.address <= image.words[i-1].address)) return false;
+        nonzero |= word.word != 0;
+    }
+    if (!nonzero) return false; // empty RAM cannot stand in for a copied all-zero image
+    for (size_t i = 0; i < module.entryCount; ++i)
+    {
+        const auto &entry = module.entries[i];
+        if (!entry.function || (entry.address & 3u) || entry.address < module.guestBase || uint64_t(entry.address)+4u > end ||
+            (i && entry.address <= module.entries[i-1].address)) return false;
+        const auto *finish = image.words + image.wordCount;
+        const auto *word = std::lower_bound(image.words, finish, entry.address,
+            [](const RecompiledCodeWord &candidate,uint32_t pc) { return candidate.address < pc; });
+        if (word == finish || word->address != entry.address) return false;
+    }
+    for (const auto *other : m_compiledCodeImages)
+    {
+        if (std::string_view(other->module.identity) == module.identity) return other == &image;
+        const uint32_t otherPhysical = other->module.guestBase & 0x1fffffffu;
+        if (physical < uint64_t(otherPhysical)+other->module.fileSize && uint64_t(physical)+module.fileSize > otherPhysical)
+            return false;
+    }
+    for (const auto *other : m_compiledModules)
+        if (physical < uint64_t(other->guestBase)+other->fileSize && uint64_t(physical)+module.fileSize > other->guestBase)
+            return false;
+    m_compiledCodeImages.push_back(&image);
+    return true;
+}
+
 bool PS2Runtime::registerCompiledModule(const RecompiledModule &module)
 {
     const uint64_t end = static_cast<uint64_t>(module.guestBase) + module.fileSize;
@@ -1946,6 +2030,11 @@ bool PS2Runtime::registerCompiledModule(const RecompiledModule &module)
         end > g_ps2RecompiledFunctionTableBase)
     {
         return reject();
+    }
+    for (const auto *copy : m_compiledCodeImages)
+    {
+        const uint32_t physical = copy->module.guestBase & 0x1fffffffu;
+        if (module.guestBase < uint64_t(physical)+copy->module.fileSize && end > physical) return reject();
     }
     uint32_t previous = 0u;
     for (size_t i = 0; i < module.entryCount; ++i)
@@ -1999,6 +2088,28 @@ PS2Runtime::RecompiledFunction PS2Runtime::resolveFunctionExact(uint32_t address
     if ((address & 3u) != 0u)
     {
         return nullptr;
+    }
+    // Both module kinds are forbidden to shadow the dense main envelope.
+    // Preserve its hot path without copied-image scans or byte checks.
+    uint32_t mainSlot = 0u;
+    if (generatedFunctionTableSlot(address,mainSlot)) return g_ps2RecompiledFunctionTable[mainSlot];
+    for (const auto *image : m_compiledCodeImages)
+    {
+        const auto &module = image->module;
+        if (address < module.guestBase || uint64_t(address) >= uint64_t(module.guestBase)+module.fileSize) continue;
+        const auto *finish = module.entries + module.entryCount;
+        const auto *entry = std::lower_bound(module.entries, finish, address,
+            [](const RecompiledModuleEntry &candidate,uint32_t pc) { return candidate.address < pc; });
+        if (entry == finish || entry->address != address) return nullptr;
+        const auto *ram = m_memory.getRDRAM();
+        if (!ram) return nullptr;
+        for (size_t i = 0; i < image->wordCount; ++i)
+        {
+            uint32_t word;
+            std::memcpy(&word,ram+(image->words[i].address & 0x1fffffffu),sizeof(word));
+            if (word != image->words[i].word) return nullptr;
+        }
+        return entry->function;
     }
     // All registered module envelopes are reserved, including currently inactive
     // modules and tails that are longer than the active module's file.
@@ -2451,35 +2562,19 @@ void PS2Runtime::handleTrap(uint8_t *rdram, R5900Context *ctx)
 
 void PS2Runtime::handleTLBR(uint8_t *rdram, R5900Context *ctx)
 {
-    uint32_t vpn = 0;
-    uint32_t pfn = 0;
-    uint32_t mask = 0;
-    bool valid = false;
-
     const uint32_t index = ctx->cop0_index & 0x3Fu;
-    if (!m_memory.tlbRead(index, vpn, pfn, mask, valid))
+    if (!m_memory.tlbReadRegisters(index, ctx->cop0_pagemask, ctx->cop0_entryhi,
+                                  ctx->cop0_entrylo0, ctx->cop0_entrylo1))
     {
         raiseCop0Exception(ctx, EXCEPTION_RESERVED_INSTRUCTION);
-        return;
     }
-
-    // Preserve low ASID bits in EntryHi.
-    ctx->cop0_entryhi = (ctx->cop0_entryhi & 0x00000FFFu) | (vpn & 0xFFFFF000u);
-    ctx->cop0_entrylo0 = (ctx->cop0_entrylo0 & ~0x03FFFFC2u) |
-                         ((pfn & 0x000FFFFFu) << 6) |
-                         (valid ? 0x2u : 0u);
-    ctx->cop0_pagemask = mask & 0x01FFE000u;
 }
 
 void PS2Runtime::handleTLBWI(uint8_t *rdram, R5900Context *ctx)
 {
     const uint32_t index = ctx->cop0_index & 0x3Fu;
-    const uint32_t vpn = ctx->cop0_entryhi & 0xFFFFF000u;
-    const uint32_t pfn = (ctx->cop0_entrylo0 >> 6) & 0x000FFFFFu;
-    const uint32_t mask = ctx->cop0_pagemask & 0x01FFE000u;
-    const bool valid = (ctx->cop0_entrylo0 & 0x2u) != 0u;
-
-    if (!m_memory.tlbWrite(index, vpn, pfn, mask, valid))
+    if (!m_memory.tlbWriteRegisters(index, ctx->cop0_pagemask, ctx->cop0_entryhi,
+                                   ctx->cop0_entrylo0, ctx->cop0_entrylo1))
     {
         raiseCop0Exception(ctx, EXCEPTION_RESERVED_INSTRUCTION);
     }
@@ -2501,12 +2596,8 @@ void PS2Runtime::handleTLBWR(uint8_t *rdram, R5900Context *ctx)
         random = wired;
     }
 
-    const uint32_t vpn = ctx->cop0_entryhi & 0xFFFFF000u;
-    const uint32_t pfn = (ctx->cop0_entrylo0 >> 6) & 0x000FFFFFu;
-    const uint32_t mask = ctx->cop0_pagemask & 0x01FFE000u;
-    const bool valid = (ctx->cop0_entrylo0 & 0x2u) != 0u;
-
-    if (!m_memory.tlbWrite(random, vpn, pfn, mask, valid))
+    if (!m_memory.tlbWriteRegisters(random, ctx->cop0_pagemask, ctx->cop0_entryhi,
+                                   ctx->cop0_entrylo0, ctx->cop0_entrylo1))
     {
         raiseCop0Exception(ctx, EXCEPTION_RESERVED_INSTRUCTION);
         return;
@@ -2519,7 +2610,7 @@ void PS2Runtime::handleTLBWR(uint8_t *rdram, R5900Context *ctx)
 
 void PS2Runtime::handleTLBP(uint8_t *rdram, R5900Context *ctx)
 {
-    const int32_t index = m_memory.tlbProbe(ctx->cop0_entryhi & 0xFFFFF000u);
+    const int32_t index = m_memory.tlbProbe(ctx->cop0_entryhi);
     if (index >= 0)
     {
         ctx->cop0_index = (ctx->cop0_index & ~0x8000003Fu) |
@@ -2993,7 +3084,11 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
     {
-        return m_memory.read8(vaddr);
+        return m_memory.read8(vaddr, static_cast<uint8_t>(ctx->cop0_entryhi));
+    }
+    catch (const TlbFault &fault)
+    {
+        raiseTlbAccessFault(ctx, fault);
     }
     catch (const std::exception &)
     {
@@ -3006,7 +3101,11 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
     {
-        return m_memory.read16(vaddr);
+        return m_memory.read16(vaddr, static_cast<uint8_t>(ctx->cop0_entryhi));
+    }
+    catch (const TlbFault &fault)
+    {
+        raiseTlbAccessFault(ctx, fault);
     }
     catch (const std::exception &)
     {
@@ -3019,7 +3118,11 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
     {
-        return m_memory.read32(vaddr);
+        return m_memory.read32(vaddr, static_cast<uint8_t>(ctx->cop0_entryhi));
+    }
+    catch (const TlbFault &fault)
+    {
+        raiseTlbAccessFault(ctx, fault);
     }
     catch (const std::exception &)
     {
@@ -3032,7 +3135,11 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
     {
-        return m_memory.read64(vaddr);
+        return m_memory.read64(vaddr, static_cast<uint8_t>(ctx->cop0_entryhi));
+    }
+    catch (const TlbFault &fault)
+    {
+        raiseTlbAccessFault(ctx, fault);
     }
     catch (const std::exception &)
     {
@@ -3045,7 +3152,11 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
     {
-        return m_memory.read128(vaddr);
+        return m_memory.read128(vaddr, static_cast<uint8_t>(ctx->cop0_entryhi));
+    }
+    catch (const TlbFault &fault)
+    {
+        raiseTlbAccessFault(ctx, fault);
     }
     catch (const std::exception &)
     {
@@ -3059,7 +3170,11 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
     ps2TraceGuestWrite(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
     try
     {
-        m_memory.write8(vaddr, value);
+        m_memory.write8(vaddr, value, static_cast<uint8_t>(ctx->cop0_entryhi));
+    }
+    catch (const TlbFault &fault)
+    {
+        raiseTlbAccessFault(ctx, fault);
     }
     catch (const std::exception &)
     {
@@ -3072,7 +3187,11 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     ps2TraceGuestWrite(rdram, vaddr, 2u, value, 0u, "WRITE16", ctx);
     try
     {
-        m_memory.write16(vaddr, value);
+        m_memory.write16(vaddr, value, static_cast<uint8_t>(ctx->cop0_entryhi));
+    }
+    catch (const TlbFault &fault)
+    {
+        raiseTlbAccessFault(ctx, fault);
     }
     catch (const std::exception &)
     {
@@ -3085,8 +3204,12 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
     try
     {
-        m_memory.write32(vaddr, value);
+        m_memory.write32(vaddr, value, static_cast<uint8_t>(ctx->cop0_entryhi));
         drainCompletedDmacHandlers(rdram);
+    }
+    catch (const TlbFault &fault)
+    {
+        raiseTlbAccessFault(ctx, fault);
     }
     catch (const std::exception &)
     {
@@ -3099,7 +3222,11 @@ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     ps2TraceGuestWrite(rdram, vaddr, 8u, value, 0u, "WRITE64", ctx);
     try
     {
-        m_memory.write64(vaddr, value);
+        m_memory.write64(vaddr, value, static_cast<uint8_t>(ctx->cop0_entryhi));
+    }
+    catch (const TlbFault &fault)
+    {
+        raiseTlbAccessFault(ctx, fault);
     }
     catch (const std::exception &)
     {
@@ -3114,7 +3241,11 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
     ps2TraceGuestWrite(rdram, vaddr, 16u, _parts[0], _parts[1], "WRITE128", ctx);
     try
     {
-        m_memory.write128(vaddr, value);
+        m_memory.write128(vaddr, value, static_cast<uint8_t>(ctx->cop0_entryhi));
+    }
+    catch (const TlbFault &fault)
+    {
+        raiseTlbAccessFault(ctx, fault);
     }
     catch (const std::exception &)
     {

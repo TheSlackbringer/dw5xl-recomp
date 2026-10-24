@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -1344,6 +1345,62 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(probeLo,
                      kGuestSyscallTableGuestBase & 0xFFFFu,
                      "Guest kernel initialization should seed the syscall table probe low word");
+        });
+
+        // Exec services cannot inherit the generic unknown-syscall success value.
+        // A returning ExecPS2 may report failure; LoadExecPS2/ExecOSD do not have
+        // a normal return continuation (ps2sdk kernel.h / exit.c contracts).
+        tc.Run("ExecPS2 without a native launch service fails without launching", [](TestCase &t)
+        {
+            TestEnv env;
+            env.ctx.pc = 0x12340u;
+            setRegU32(env.ctx, 4, 0x200000u);
+            setRegU32(env.ctx, 5, 0x123400u);
+            setRegU32(env.ctx, 6, 2u);
+            setRegU32(env.ctx, 7, 0x1600u);
+            setRegU32(env.ctx, 2, 99u);
+            env.runtime.handleSyscall(env.rdram.data(), &env.ctx, 7u);
+            t.Equals(getRegS32(env.ctx, 2), KE_ERROR, "unsupported ExecPS2 must not report success");
+            t.Equals(env.ctx.pc, 0x12340u, "failed ExecPS2 must not claim a transfer");
+            t.Equals(::getRegU32(&env.ctx, 4), 0x200000u, "failed ExecPS2 preserves its entry argument");
+            t.Equals(::getRegU32(&env.ctx, 7), 0x1600u, "failed ExecPS2 preserves the argument block");
+        });
+
+        tc.Run("unavailable nonreturning launch services diagnose instead of falling through", [](TestCase &t)
+        {
+            for (const uint32_t id : {6u, 0x7bu})
+            {
+                TestEnv env;
+                env.ctx.pc = 0x12340u;
+                bool diagnosed = false;
+                try { env.runtime.handleSyscall(env.rdram.data(), &env.ctx, id); }
+                catch (const std::runtime_error &e)
+                {
+                    const std::string text(e.what());
+                    diagnosed = text.find(id == 6u ? "LoadExecPS2" : "ExecOSD") != std::string::npos;
+                }
+                t.IsTrue(diagnosed, "a missing nonreturning launch service must stop with its service name");
+                t.Equals(env.ctx.pc, 0x12340u, "unsupported launch must not fabricate an entry PC");
+            }
+        });
+
+        tc.Run("installed native launch overrides keep precedence", [](TestCase &t)
+        {
+            for (const uint32_t id : {6u, 7u, 0x7bu})
+            {
+                TestEnv env;
+                constexpr uint32_t handler = 0x200000u;
+                env.runtime.registerFunction(handler, overrideReturnHandler);
+                env.runtime.registerFunction(K_OVERRIDE_ENTRY, schedulerOverrideEntry);
+                env.runtime.registerFunction(K_OVERRIDE_RESUME, schedulerOverrideResume);
+                env.runtime.setEeSyscallOverride(env.rdram.data(), id, handler);
+                gOverrideSyscall = id;
+                R5900Context main{}; main.pc = K_OVERRIDE_ENTRY;
+                setRegU32(main, 4, 7u); setRegU32(main, 5, 5u);
+                env.runtime.eeScheduler().reset(env.rdram.data(), main);
+                env.runtime.eeScheduler().run();
+                t.Equals(getRegS32(gOverrideResult, 2), 12, "an installed native service must run before the unavailable-service guard");
+            }
         });
 
         tc.Run("SetSyscall override runs as a scheduler invocation", [](TestCase &t)

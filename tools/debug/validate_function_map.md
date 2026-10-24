@@ -78,6 +78,12 @@ are insufficient to classify EE code. Raw input requires aligned `raw_base`,
 code/data addressability, not proof that every byte is an instruction. Declared entries
 are analysis roots, not evidence that the game executes them.
 
+Profiles may also declare explicit `[[code_copies]]` with a file-backed source, execution destination,
+size and function offset/length pairs. These add separately mapped code roots; surrounding copy data
+stays non-code. The diagnostic checks source bounds, alignment and destination/alias conflicts
+independently of the generator. See [compiled_code_copies.md](compiled_code_copies.md). A generated
+registration does not prove that its copied instruction image is currently loaded in a runtime.
+
 Inputs are bounded snapshots; reports hash the bytes actually consumed. Expected hashes
 check identity, not historical correctness of a mapping. No input is rewritten.
 
@@ -121,6 +127,9 @@ Configured-entry records distinguish wrapper entries from emitted resume case/go
 Literal trailing PC assignments also receive a bounded binary-path check, including
 configured interior entries and possible call returns. Only resume entries corroborated
 by paths from declared/configured roots can prove a missing fall-through registration.
+Ordinary fall-through inside a neighbouring overlapping wrapper does not establish a
+callable entry into another wrapper. Declared/configured roots, reached explicit targets
+and call-return continuations provide separate entry evidence.
 Speculative indirect-fallback labels are listed under `uncorroborated_resume_entries`;
 their presence alone cannot prove execution into adjacent padding/data. Neither this
 check nor a clean result proves all indirect targets or general C++ equivalence.

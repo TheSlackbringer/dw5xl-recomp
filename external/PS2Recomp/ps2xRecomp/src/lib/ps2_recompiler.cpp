@@ -1,5 +1,6 @@
 #include "ps2recomp/ps2_recompiler.h"
 #include "ps2recomp/instructions.h"
+#include "ps2recomp/control_flow_utils.h"
 #include "ps2recomp/types.h"
 #include "ps2recomp/elf_parser.h"
 #include "ps2recomp/r5900_decoder.h"
@@ -921,6 +922,23 @@ namespace ps2recomp
             }
 
             m_functions = m_elfParser->extractFunctions();
+            for (const auto &copy : m_config.codeCopies)
+            {
+                m_elfParser->addCodeCopy(copy);
+                bool nonzeroCode = false;
+                for (const auto &[offset,length] : copy.functions)
+                    for (uint32_t i = 0; i < length; i += 4u)
+                        nonzeroCode |= m_elfParser->readWord(copy.destination + offset + i) != 0u;
+                if (!nonzeroCode) throw std::runtime_error("Code copy requires nonzero instruction words: " + copy.name);
+                for (const auto &[offset,length] : copy.functions)
+                {
+                    Function function{};
+                    function.name = "copy_" + copy.name + "_" + std::to_string(offset);
+                    function.start = copy.destination + offset;
+                    function.end = function.start + length;
+                    m_functions.push_back(std::move(function));
+                }
+            }
             m_symbols = m_elfParser->extractSymbols();
             m_sections = m_elfParser->getSections();
             m_relocations = m_elfParser->getRelocations();
@@ -1006,6 +1024,7 @@ namespace ps2recomp
             m_decoder = std::make_unique<R5900Decoder>();
             m_codeGenerator = std::make_unique<CodeGenerator>(m_symbols, m_sections);
             m_codeGenerator->setReporter(&m_reporter);
+            m_codeGenerator->m_codeCopies = m_config.codeCopies;
             if (rawModule)
             {
                 m_codeGenerator->m_moduleId = m_config.moduleId;
@@ -1321,6 +1340,15 @@ namespace ps2recomp
                     m_generatedStubs[function.start] = stub.str();
                 }
             }
+
+            // Capture original code words before low-memory output releases decoded blocks.
+            // Data words are deliberately excluded: guest-owned data can change after copying.
+            for (auto &copy : m_codeGenerator->m_codeCopies)
+                for (const auto &[start,instructions] : m_decodedFunctions)
+                    for (const auto &instruction : instructions)
+                        if (instruction.address >= copy.destination &&
+                            uint64_t(instruction.address) + 4u <= uint64_t(copy.destination) + copy.size)
+                            copy.expectedWords[instruction.address] = m_elfParser->readWord(instruction.address);
 
             if (!generateFunctionHeader())
             {
@@ -2188,9 +2216,13 @@ namespace ps2recomp
                 if (decoded == m_decodedFunctions.end())
                     continue;
                 std::unordered_map<uint32_t, const Instruction *> body;
-                for (const auto &instruction : decoded->second)
+                std::unordered_set<uint32_t> unconditionalTrapAddresses;
+                for (const auto &instruction : decoded->second) {
+                    if (instruction.opcode == OPCODE_SPECIAL && instruction.function == SPECIAL_BREAK)
+                        unconditionalTrapAddresses.insert(instruction.address);
                     if (instruction.address < function.end && !instruction.isBoundaryDelaySlot)
                         body.emplace(instruction.address, &instruction);
+                }
                 std::vector<uint32_t> pending{function.start};
                 // Indirect-fallback labels alone are not evidence of executable
                 // fall-through: some name slots/padding after a real return.
@@ -2216,6 +2248,13 @@ namespace ps2recomp
                     const auto it = body.find(pc);
                     if (it == body.end()) continue;
                     const Instruction &inst = *it->second;
+                    if (unconditionalTrapAddresses.contains(pc)) continue;
+                    if (inst.hasDelaySlot && unconditionalTrapAddresses.contains(pc + 4u)) {
+                        // BREAK always traps. A likely branch can annul its slot
+                        // on the untaken path; ordinary branches have no successor.
+                        if (isGuestLikelyBranch(inst)) edge(pc + 8u, pc);
+                        continue;
+                    }
                     if (!inst.hasDelaySlot)
                     {
                         if (!inst.isReturn) edge(pc + 4u, pc);
@@ -2459,6 +2498,9 @@ namespace ps2recomp
 
     bool PS2Recompiler::isCorrectnessCriticalFunction(const Function &function) const
     {
+        for (const auto &copy : m_config.codeCopies)
+            if (function.start >= copy.destination && uint64_t(function.start) < uint64_t(copy.destination) + copy.size)
+                return true;
         return IsCorrectnessCriticalFunctionName(function.name) ||
                m_correctnessCriticalFunctionStarts.contains(function.start);
     }

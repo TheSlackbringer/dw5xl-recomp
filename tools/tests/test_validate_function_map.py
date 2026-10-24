@@ -296,6 +296,27 @@ class FunctionMap(unittest.TestCase):
         scope=r['audit'].get('uncorroborated_resume_entries',[])
         self.assertTrue(any(BASE+8 in x['entries'] for x in scope))
 
+    def test_overlapping_entry_fallthrough_does_not_prove_external_resume(self):
+        self.configure([0x00a00008,NOP,0x24210001,0x24840004,0x24840004,RETURN,NOP],
+            [('owner',BASE,BASE+16),('entry_1008',BASE+8,BASE+28)])
+        folder=self.root/'overlap';folder.mkdir()
+        (folder/'owner.cpp').write_text('void owner_0x1000(uint8_t* rdram,R5900Context* ctx,PS2Runtime* runtime) {'
+            'switch(ctx->pc){case 0x100cu:goto label_100c;}ctx->pc=0x1000u;'
+            'ctx->pc=GPR_U32(ctx,5);return;label_100c:ctx->pc=0x100cu;'
+            'SET_GPR_S32(ctx,4,104);ctx->pc=0x1010u;}')
+        (folder/'entry.cpp').write_text('void entry_0x1008(uint8_t* rdram,R5900Context* ctx,PS2Runtime* runtime) {'
+            'ctx->pc=0x1008u;SET_GPR_S32(ctx,1,1);SET_GPR_S32(ctx,4,108);'
+            'ctx->pc=GPR_U32(ctx,31);return;}')
+        (folder/'register_functions.cpp').write_text('RecompiledModuleEntry entries[]={'
+            '{0x1000u,owner_0x1000},{0x1008u,entry_0x1008},{0x100cu,owner_0x1000}};')
+        prov=self.root/'overlap.json';prov.write_text(json.dumps(dict(schema_version=1,
+            inputs={k:digest(v) for k,v in [('binary',self.binary),('csv',self.csv),('profile',self.profile)]},
+            outputs={p.name:digest(p) for p in folder.iterdir()},
+            generation=dict(exit_code=0,command=['independent fixture'],recompiler_sha256='a'*64,source_revision='synthetic'))))
+        _,r,_=self.invoke('--generation-provenance',str(prov),generated=folder)
+        self.assertNotIn('GENERATED_FALLTHROUGH_UNREGISTERED',self.codes(r))
+        self.assertTrue(any(BASE+12 in x['entries'] for x in r['audit']['uncorroborated_resume_entries']))
+
     def test_generated_registration_does_not_mask_missing_operation(self):
         folder,prov=self.generated()
         _, report, _ = self.invoke('--generation-provenance',str(prov),generated=folder,code=1)

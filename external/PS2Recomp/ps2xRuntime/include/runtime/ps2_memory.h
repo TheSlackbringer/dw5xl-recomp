@@ -10,6 +10,7 @@
 #include <atomic>
 #include <iostream>
 #include <mutex>
+#include <exception>
 
 #include "gs/ps2_gif_arbiter.h"
 #if defined(_MSC_VER)
@@ -22,6 +23,18 @@
 #endif
 
 class GS;
+
+// Architectural mapped-access failure. Runtime converts this to COP0 state and
+// unwinds the native invocation before a faulting load can commit its result.
+struct TlbFault final : std::exception
+{
+    enum class Kind { Refill, Invalid, Modified };
+    Kind kind;
+    uint32_t address;
+    bool store;
+    TlbFault(Kind k, uint32_t a, bool s) : kind(k), address(a), store(s) {}
+    const char* what() const noexcept override { return "EE TLB access fault"; }
+};
 
 constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
 constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
@@ -278,6 +291,7 @@ public:
 
     // Memory access methods
     uint8_t *getRDRAM() { return m_rdram; }
+    const uint8_t *getRDRAM() const { return m_rdram; }
     uint8_t *getScratchpad() { return m_scratchpad; }
     uint8_t *getIOPRAM() { return iop_ram; }
     uint64_t dmaStartCount() const { return m_dmaStartCount.load(std::memory_order_relaxed); }
@@ -288,23 +302,26 @@ public:
     uint64_t getVU1CodeGeneration() const { return m_vu1CodeGeneration.load(std::memory_order_relaxed); }
 
     // Read/write memory
-    uint8_t read8(uint32_t address);
-    uint16_t read16(uint32_t address);
-    uint32_t read32(uint32_t address);
-    uint64_t read64(uint32_t address);
-    __m128i read128(uint32_t address);
+    uint8_t read8(uint32_t address, uint8_t asid = 0);
+    uint16_t read16(uint32_t address, uint8_t asid = 0);
+    uint32_t read32(uint32_t address, uint8_t asid = 0);
+    uint64_t read64(uint32_t address, uint8_t asid = 0);
+    __m128i read128(uint32_t address, uint8_t asid = 0);
 
-    void write8(uint32_t address, uint8_t value);
-    void write16(uint32_t address, uint16_t value);
-    void write32(uint32_t address, uint32_t value);
-    void write64(uint32_t address, uint64_t value);
-    void write128(uint32_t address, __m128i value);
+    void write8(uint32_t address, uint8_t value, uint8_t asid = 0);
+    void write16(uint32_t address, uint16_t value, uint8_t asid = 0);
+    void write32(uint32_t address, uint32_t value, uint8_t asid = 0);
+    void write64(uint32_t address, uint64_t value, uint8_t asid = 0);
+    void write128(uint32_t address, __m128i value, uint8_t asid = 0);
 
     // TLB handling
     uint32_t translateAddress(uint32_t virtualAddress);
     bool tlbRead(uint32_t index, uint32_t &vpn, uint32_t &pfn, uint32_t &mask, bool &valid) const;
     bool tlbWrite(uint32_t index, uint32_t vpn, uint32_t pfn, uint32_t mask, bool valid);
-    int32_t tlbProbe(uint32_t vpn) const;
+    // Both page halves and the single stored global bit are retained.
+    bool tlbReadRegisters(uint32_t index, uint32_t &mask, uint32_t &hi, uint32_t &lo0, uint32_t &lo1) const;
+    bool tlbWriteRegisters(uint32_t index, uint32_t mask, uint32_t hi, uint32_t lo0, uint32_t lo1);
+    int32_t tlbProbe(uint32_t entryHi) const;
     size_t tlbEntryCount() const { return m_tlbEntries.size(); }
 
     // Hardware register interface
@@ -400,6 +417,16 @@ public:
     VIFRegisters vif1_regs;
     DMARegisters dma_regs[10]; // 10 DMA channels
 
+    // Resolve the existing mapped native-access window to a physical-style
+    // address (including the canonical scratchpad address). Flat RAM stays flat.
+    struct ResolvedMemoryAddress
+    {
+        uint32_t address;
+        bool scratch;
+        bool mapped;
+    };
+    ResolvedMemoryAddress resolveMappedAccess(uint32_t address, uint8_t asid, bool store) const;
+
     // TLB entries
     struct TLBEntry
     {
@@ -407,6 +434,9 @@ public:
         uint32_t pfn;
         uint32_t mask;
         bool valid;
+        uint32_t entryHi;
+        uint32_t entryLo0;
+        uint32_t entryLo1;
     };
 
     std::vector<TLBEntry> m_tlbEntries;

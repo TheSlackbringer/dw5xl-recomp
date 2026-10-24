@@ -1,11 +1,31 @@
 #include "Common.h"
 #include "Dispatcher.h"
 #include "System.h"
+#include <stdexcept>
 
 namespace ps2_syscalls
 {
     bool dispatchNumericSyscall(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // The SDK callback trampoline uses -8 to enter the installed kernel
+        // return service (table entry 8). Its native body restores the saved
+        // context and continues there; an ordinary nested invocation would
+        // overwrite that stack/link and discard the control transfer.
+        if (syscallNumber == static_cast<uint32_t>(-8) && runtime && ctx)
+        {
+            uint32_t handler = 0u;
+            const bool installed = runtime->findEeSyscallOverride(syscallNumber, handler) ||
+                                   runtime->findEeSyscallOverride(8u, handler);
+            if (installed && handler != 0u)
+            {
+                if (runtime->hasFunction(handler))
+                    ctx->pc = handler;
+                else
+                    setReturnS32(ctx, KE_ERROR);
+                return true;
+            }
+        }
+
         if (dispatchSyscallOverride(syscallNumber, rdram, ctx, runtime))
         {
             return true;
@@ -22,6 +42,18 @@ namespace ps2_syscalls
         case 0x04:
             ExitThread(rdram, ctx, runtime);
             return true;
+        case 0x06:
+            // This service has no returning continuation. Without a native
+            // implementation, generic TODO success would run unrelated code.
+            throw std::runtime_error("LoadExecPS2 is unavailable: native executable loading/launch service is not installed");
+        case 0x07:
+            // ExecPS2 may return failure. Availability of its entry in the
+            // compiled function table alone does not supply kernel exec state.
+            std::cerr << "[ExecPS2] unavailable: native launch service is not installed" << std::endl;
+            setReturnS32(ctx, KE_ERROR);
+            return true;
+        case 0x7B:
+            throw std::runtime_error("ExecOSD is unavailable: native OSD executable/launch service is not installed");
         case 0x10:
             AddIntcHandler(rdram, ctx, runtime);
             return true;
