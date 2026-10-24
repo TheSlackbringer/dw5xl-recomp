@@ -6,6 +6,7 @@
 #include "runtime/host_input.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_present_stats.h"
 #include "gs/gs_trace.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_device_queue.h"
@@ -937,9 +938,6 @@ static void applySavedOutputSettings(GS &gs)
 } // namespace
 
 
-// DW5XL-DEBUG issue 023: field reads copied for the window and copies of more than one field, counted by the Vulkan
-// scanout and printed with PS2X_PRESENT_STATS. Defined here so runtimes built without the Vulkan GS still link.
-std::atomic<uint64_t> g_dw5xlReadsCopied{0}, g_dw5xlMultiReadCopies{0};
 
 // Host window rate: field pacing by default, the window paced on every guest VBlankEnd (one host frame per field;
 // issue 015; the default since issue 023, owner 2026-10-24, after its jump was fixed by reading each field at its end

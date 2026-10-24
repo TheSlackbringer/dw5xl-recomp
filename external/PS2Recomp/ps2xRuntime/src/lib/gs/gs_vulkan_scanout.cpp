@@ -2,6 +2,7 @@
 #include "gs_vulkan_scanout.h"
 
 #include "runtime/gs/field_history.h"
+#include "runtime/gs/gs_present_stats.h"
 #include "gs_interface.hpp"
 #include "device.hpp"
 #include "buffer.hpp"
@@ -397,9 +398,6 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     }
 }
 
-// DW5XL-DEBUG issue 023: field reads copied for the window, and copies that took more than one field (PS2X_PRESENT_STATS).
-// Defined in ps2_runtime.cpp, which reads them and is also built without the Vulkan GS.
-extern std::atomic<uint64_t> g_dw5xlReadsCopied, g_dw5xlMultiReadCopies;
 
 bool finishVulkanGsPresentInto(Vulkan::Device &device, VulkanGsScanoutState &state,
                                std::vector<VulkanGsScanoutState::StagedRead> &reads,
