@@ -17,8 +17,9 @@ namespace ps2_host_input
         float alpha = 0.0f;
     };
 
-    // Device APIs are sampled by the window thread. Guest pad reads consume a
-    // synchronized snapshot and game hooks consume each mouse delta once.
+    // Device APIs are sampled by the window thread. Guest pad reads take one
+    // snapshot per guest field (a host-input script is evaluated by those reads
+    // for their field, not by poll) and game hooks consume each mouse delta once.
     void enableVerditeControls();
     void poll(uint64_t vsyncTick = 0);
     void setGameplayActive(bool active);

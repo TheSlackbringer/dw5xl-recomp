@@ -617,6 +617,12 @@ namespace ps2_stubs
             return enabled;
         }
 
+        // Guest field for the trace (issue 023 5c: movie events per field, compared between window modes).
+        uint64_t mpegTraceField(PS2Runtime *runtime)
+        {
+            return runtime ? runtime->eeScheduler().currentVSyncTick() : 0u;
+        }
+
         bool mpegTraceSample(uint64_t index)
         {
             const uint64_t count = index + 1u;
@@ -2313,7 +2319,8 @@ namespace ps2_stubs
         }
         if (mpegTraceEnabled())
             std::cerr << "[MPEG:CdStreamStart] generation=" << g_mpeg_stub_state.cdStreamGeneration
-                      << " handles=" << g_mpeg_stub_state.playbackByMpeg.size() << std::endl;
+                      << " handles=" << g_mpeg_stub_state.playbackByMpeg.size()
+                      << " field=" << mpegTraceField(runtime) << std::endl;
         PS2_IF_AGRESSIVE_LOGS({
             std::cerr << "[MPEG:CdStreamStart] generation=" << g_mpeg_stub_state.cdStreamGeneration
                       << " reopened=" << g_mpeg_stub_state.playbackByMpeg.size() << std::endl;
@@ -2377,7 +2384,8 @@ namespace ps2_stubs
             if (mpegTraceEnabled())
                 std::cerr << "[MPEG:CdStreamEof] produced=" << g_mpeg_stub_state.cdStreamBytesProduced
                           << " demuxed=" << g_mpeg_stub_state.cdStreamBytesDemuxed
-                          << " handles=" << completedMpegIds.size() << std::endl;
+                          << " handles=" << completedMpegIds.size()
+                          << " field=" << mpegTraceField(runtime) << std::endl;
         }
 
         if (changed)
@@ -2647,7 +2655,7 @@ namespace ps2_stubs
         if (mpegTraceEnabled())
             std::cerr << "[MPEG:Create] mpeg=0x" << std::hex << param_1
                       << " work=0x" << uVar3 << std::dec << " workBytes=" << iVar2_signed
-                      << " status=0" << std::endl;
+                      << " status=0 field=" << mpegTraceField(runtime) << std::endl;
     }
 
     void sceMpegDelete(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -3111,6 +3119,9 @@ namespace ps2_stubs
             }
             playback = std::move(resetState);
         }
+        if (mpegTraceEnabled())
+            std::cerr << "[MPEG:Reset] mpeg=0x" << std::hex << param_1 << std::dec
+                      << " field=" << mpegTraceField(runtime) << std::endl;
         if (runtime)
         {
             runtime->memory().resetIpuInputConsumption();

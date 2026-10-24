@@ -16,6 +16,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "runtime/ps2_pad.h"
+#include "runtime/ee_scheduler.h"
 
 #include <array>
 #include <cstdlib>
@@ -121,14 +122,14 @@ namespace
         }
     }
 
-    void fillReport(uint8_t *half, bool connected)
+    void fillReport(uint8_t *half, bool connected, uint64_t field)
     {
         std::memset(half, 0, 0x7Cu);
         if (!connected)
             return;
         std::array<uint8_t, 32> pad{};
         static PSPadBackend backend;
-        backend.readState(0, 0, pad.data(), pad.size());
+        backend.readState(0, 0, pad.data(), pad.size(), field);
         const uint16_t pressed = static_cast<uint16_t>(~(pad[2] | (pad[3] << 8)));
         uint8_t *data = half + 0x1Cu;
         data[0] = pad[2];
@@ -149,7 +150,7 @@ namespace
         std::memcpy(half + 4, &one, 4);
     }
 
-    void pad2GetSide(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    void pad2GetSide(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t socket = getRegU32(ctx, 4);
         const uint32_t buf = *reinterpret_cast<uint32_t *>(getMemPtr(rdram, kSocketTable + socket * kSocketStride + 0x10u));
@@ -158,7 +159,7 @@ namespace
         for (uint32_t half = 0; half < 2u; ++half)
         {
             uint8_t *p = getMemPtr(rdram, buf + half * 0x80u);
-            fillReport(p, connected);
+            fillReport(p, connected, runtime->eeScheduler().currentVSyncTick());
             std::memcpy(p + 0x7Cu, &counter, 4);
         }
         finish(ctx, static_cast<int32_t>(buf));

@@ -225,6 +225,10 @@ if(DW5XL_BUILD_TESTS)
     target_link_libraries(dw5xl_hotkeys_test PRIVATE ps2_runtime)
     target_compile_definitions(dw5xl_hotkeys_test PRIVATE DW5XL_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
     add_test(NAME hotkeys COMMAND dw5xl_hotkeys_test)
+    # One controller sample per guest field (issue 023 5c): scripts by field, no mid-field changes.
+    add_executable(dw5xl_host_input_field_sample_test tests/host_input_field_sample_test.cpp)
+    target_link_libraries(dw5xl_host_input_field_sample_test PRIVATE ps2_runtime)
+    add_test(NAME host_input_field_sample COMMAND dw5xl_host_input_field_sample_test)
     # Save-state archive (issue 027): save -> load -> save identity, refusal of damaged files.
     add_executable(dw5xl_state_archive_test tests/state_archive_test.cpp)
     target_link_libraries(dw5xl_state_archive_test PRIVATE ps2_runtime)

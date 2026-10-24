@@ -10,7 +10,8 @@ public:
     PSPadBackend() = default;
     ~PSPadBackend() = default;
 
-    bool readState(int port, int slot, uint8_t *data, size_t size);
+    // field: the guest field (VBlank count) of the game's pad read.
+    bool readState(int port, int slot, uint8_t *data, size_t size, uint64_t field);
 };
 
 #endif

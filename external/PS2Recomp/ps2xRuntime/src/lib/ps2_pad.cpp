@@ -52,7 +52,16 @@ namespace
     State gState;
     std::mutex gMutex;
 
-    // Only the window thread touches the following device and edge state.
+    // One controller sample per guest field (issue 023 5c): the PS2's controller driver reads the pad once per field
+    // and the game reads that result, so every pad read within a field returns the sample taken at its first read.
+    std::mutex gSampleMutex;
+    bool gSampleValid = false;
+    uint64_t gSampleField = 0;
+    uint16_t gSamplePressed = 0;
+    std::array<uint8_t, 4> gSampleSticks{128, 128, 128, 128};
+
+    // Only the thread that reads the inputs touches the following device and edge state: the window thread, or with
+    // a host-input script the game's pad reads (under gSampleMutex).
     bool gPreviousFocus = false, gPreviousGameplay = false;
     bool gResumeCapture = false, gCursorDisabled = false;
     std::array<bool, 3> gPreviousMouse{}, gSwallowedMouse{};
@@ -213,7 +222,8 @@ namespace ps2_host_input
         blit(0, white);
     }
 
-    void poll(uint64_t vsyncTick)
+    // One reading of the devices, or of the script for field `vsyncTick`, into gState.
+    static void readInputs(uint64_t vsyncTick)
     {
         initScript();
         if (!IsWindowReady() && !gScripted) return;
@@ -351,8 +361,7 @@ namespace ps2_host_input
             if (captured) DisableCursor(); else EnableCursor();
             gCursorDisabled = captured;
         }
-        Vector2 delta = GetMouseDelta();
-        if (gScripted) delta = {0.0f, 0.0f};
+        Vector2 delta = gScripted ? Vector2{0.0f, 0.0f} : GetMouseDelta();
         for (Event &event : gEvents)
         {
             if (event.name == "MOUSE" && !event.consumed && vsyncTick >= event.tick)
@@ -365,8 +374,9 @@ namespace ps2_host_input
 
         // Brief taps must survive until a slow guest frame samples its pad.
         // Movement keys are never extended, so releasing W/A/S/D stops promptly.
+        // A script's presses last exactly the fields it names (issue 023 5c).
         const uint16_t rawPressed = pressed;
-        for (unsigned bit = 0; bit < 16; ++bit)
+        for (unsigned bit = 0; bit < 16 && !gScripted; ++bit)
         {
             const uint16_t mask = static_cast<uint16_t>(1u << bit);
             if ((kTapButtons & mask) && (rawPressed & mask) && !(gPreviousPressed & mask))
@@ -407,9 +417,17 @@ namespace ps2_host_input
         gPreviousMouse = mouse;
         gPreviousPressed = rawPressed;
     }
+
+    void poll(uint64_t vsyncTick)
+    {
+        initScript();
+        // A script is evaluated by the game's pad reads, for the field they happen in (PSPadBackend::readState).
+        if (gScripted) return;
+        readInputs(vsyncTick);
+    }
 }
 
-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size, uint64_t field)
 {
     if (!data || size < 32) return false;
     std::memset(data, 0, 32);
@@ -417,11 +435,29 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[1] = 0x73;
     uint16_t pressed;
     {
-        std::lock_guard<std::mutex> lock(gMutex);
-        pressed = gState.pressed;
-        std::memcpy(data + 4, gState.sticks.data(), gState.sticks.size());
+        std::lock_guard<std::mutex> sampleLock(gSampleMutex);
+        if (!gSampleValid || field != gSampleField)
+        {
+            initScript();
+            if (gScripted)
+                ps2_host_input::readInputs(field);
+            const uint16_t previous = gSamplePressed;
+            {
+                std::lock_guard<std::mutex> lock(gMutex);
+                gSamplePressed = gState.pressed;
+                gSampleSticks = gState.sticks;
+            }
+            gSamplePressed |= static_cast<uint16_t>(ps2x_dev::g_padPressedMask.load(std::memory_order_relaxed));
+            // DW5XL-DEBUG issue 023 5c: the field in which the game's sample changes.
+            if (traceEnabled() && (!gSampleValid || gSamplePressed != previous))
+                std::fprintf(stderr, "[pad-sample] field=%llu pressed=%04x\n", static_cast<unsigned long long>(field),
+                             gSamplePressed);
+            gSampleField = field;
+            gSampleValid = true;
+        }
+        pressed = gSamplePressed;
+        std::memcpy(data + 4, gSampleSticks.data(), gSampleSticks.size());
     }
-    pressed |= static_cast<uint16_t>(ps2x_dev::g_padPressedMask.load(std::memory_order_relaxed));
     const uint16_t buttons = static_cast<uint16_t>(~pressed);
     data[2] = static_cast<uint8_t>(buttons);
     data[3] = static_cast<uint8_t>(buttons >> 8);
