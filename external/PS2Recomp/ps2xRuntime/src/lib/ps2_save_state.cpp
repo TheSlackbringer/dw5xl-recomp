@@ -22,7 +22,7 @@
 namespace
 {
     constexpr char kMagic[8] = {'D', 'W', '5', 'X', 'L', 'S', 'T', 'A'};
-    constexpr uint32_t kFormatVersion = 1u;
+    constexpr uint32_t kFormatVersion = 2u; // 2: an abandoned movie's leftover decoded frames (issue 023/027)
 
     uint64_t fnv1a(const uint8_t *data, size_t size)
     {
@@ -92,6 +92,7 @@ bool ps2x::registerStubState(const char *name, StubStateFn fn)
 namespace
 {
     uint8_t *g_stateGuestRdram = nullptr;
+    uint64_t g_stateVsyncTick = 0u;
 }
 
 uint8_t *ps2x::stateGuestRdram()
@@ -99,9 +100,15 @@ uint8_t *ps2x::stateGuestRdram()
     return g_stateGuestRdram;
 }
 
-void ps2x::serializeStubStates(StateArchive &a, uint8_t *rdram)
+uint64_t ps2x::stateVsyncTick()
+{
+    return g_stateVsyncTick;
+}
+
+void ps2x::serializeStubStates(StateArchive &a, uint8_t *rdram, uint64_t vsyncTick)
 {
     g_stateGuestRdram = rdram;
+    g_stateVsyncTick = vsyncTick;
     a.tag("STUB");
     for (auto &[name, fn] : stubStates())
     {
@@ -112,6 +119,7 @@ void ps2x::serializeStubStates(StateArchive &a, uint8_t *rdram)
         fn(a);
     }
     g_stateGuestRdram = nullptr;
+    g_stateVsyncTick = 0u;
 }
 
 void PS2Runtime::registerStateHook(std::string name, StateHook hook)
@@ -179,7 +187,7 @@ void PS2Runtime::serializeState(ps2x::StateArchive &a)
             throw ps2x::StateError("state needs compiled module " + module + ", which this build does not have");
     }
 
-    ps2x::serializeStubStates(a, m_memory.getRDRAM());
+    ps2x::serializeStubStates(a, m_memory.getRDRAM(), m_eeScheduler->currentVSyncTick());
     m_iopSubsystem->serializeState(a);
 
     for (auto &[name, hook] : m_stateHooks)

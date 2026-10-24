@@ -937,10 +937,14 @@ static void applySavedOutputSettings(GS &gs)
 } // namespace
 
 
-// Host window rate: a fixed 60 FPS by default. PS2X_HOST_FPS=<n> sets another fixed rate; PS2X_HOST_FPS=field
-// paces the window on every guest VBlankEnd instead (one host frame per field; issue 015). Opt-in until issue 023
-// decides the default (its jump, owner 2026-10-19, was the field read racing the game's copy; fixed by reading each
-// field at its end on the GS side).
+// DW5XL-DEBUG issue 023: field reads copied for the window and copies of more than one field, counted by the Vulkan
+// scanout and printed with PS2X_PRESENT_STATS. Defined here so runtimes built without the Vulkan GS still link.
+std::atomic<uint64_t> g_dw5xlReadsCopied{0}, g_dw5xlMultiReadCopies{0};
+
+// Host window rate: field pacing by default, the window paced on every guest VBlankEnd (one host frame per field;
+// issue 015; the default since issue 023, owner 2026-10-24, after its jump was fixed by reading each field at its end
+// on the GS side). PS2X_HOST_FPS=<n> sets a fixed rate instead (60 = the earlier default); PS2X_HOST_FPS=field is
+// the default spelled out. Returns 0 for field pacing.
 static int configuredHostTargetFps()
 {
     if (const char *env = std::getenv("PS2X_HOST_FPS"))
@@ -951,7 +955,7 @@ static int configuredHostTargetFps()
         if (fps > 0)
             return fps;
     }
-    return 60;
+    return 0;
 }
 
 // The texture grows to the largest presented image (4x output); smaller frames
@@ -975,7 +979,6 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     // DW5XL-DEBUG issue 023: PS2X_PRESENT_STATS=1 prints once a second the window frames, new pictures,
     // field reads copied, copies of more than one field (skipped fields), frames over 25 ms and the longest gap.
     {
-        extern std::atomic<uint64_t> g_dw5xlReadsCopied, g_dw5xlMultiReadCopies;
         static const bool s_stats = [] { const char *v = std::getenv("PS2X_PRESENT_STATS"); return v && *v && *v != '0'; }();
         static uint64_t s_frames = 0, s_slow = 0, s_windowStartNs = 0, s_lastNs = 0, s_lastGen = 0, s_newPictures = 0;
         static double s_maxMs = 0.0;
@@ -1542,7 +1545,7 @@ bool PS2Runtime::initialize(const char *title)
         {
             const char *hidden = std::getenv("PS2X_HIDDEN");
             // DW5XL-DEBUG issue 023 (step 3 experiment): PS2X_VSYNC=1 swaps on the display's refresh (swap interval 1)
-            // instead of immediately; with PS2X_HOST_FPS=field that is one picture per PS2 field, shown on a refresh.
+            // instead of immediately; with field pacing (the default) that is one picture per PS2 field, shown on a refresh.
             const char *vsync = std::getenv("PS2X_VSYNC");
             const bool vsyncOn = vsync && *vsync == '1';
             SetConfigFlags(FLAG_WINDOW_RESIZABLE |

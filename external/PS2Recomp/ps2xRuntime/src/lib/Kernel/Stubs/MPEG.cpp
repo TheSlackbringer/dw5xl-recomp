@@ -3180,6 +3180,29 @@ namespace ps2_stubs
 {
 namespace
 {
+    // Fields without a picture served before a movie whose data has ended counts as abandoned (one second, PAL).
+    constexpr uint64_t kAbandonedPlaybackFields = 50u;
+
+    bool playbackBusy(const MpegPlaybackState &p)
+    {
+        return !p.decodedFrames.empty() || p.demuxTransaction || p.retryPacket ||
+               (p.decoder && !p.streamEnded && !p.sequenceEndDecoded);
+    }
+
+    // A movie the game has stopped playing: its data stream has ended, nothing is in flight, and it has not been asked
+    // for a picture for a second. The game leaves one like that when a skip lands mid-movie and it never resets the
+    // handle (issue 023/027: the third boot movie, skipped with Start, with field pacing).
+    bool playbackAbandoned(const MpegStubState &m, const MpegPlaybackState &p, uint64_t tick)
+    {
+        // The CD producer has delivered its last data (EOF pending: the game stopped demultiplexing before reaching
+        // it), or the demuxer reached it (seen), or the stream was replaced: no more data can arrive for this movie.
+        const bool producerEnded = p.cdStreamGeneration != m.cdStreamGeneration || p.acceptedProgramEnd ||
+                                   m.currentCdStreamEofSeen || m.cdStreamEofPending;
+        const bool idle = p.lastOutputServiceTick != std::numeric_limits<uint64_t>::max() &&
+                          tick >= p.lastOutputServiceTick + kAbandonedPlaybackFields;
+        return producerEnded && idle && !p.demuxTransaction && !p.retryPacket;
+    }
+
     void serializeMpegStubState(ps2x::StateArchive &a)
     {
         std::lock_guard lock(g_mpeg_stub_mutex);
@@ -3187,11 +3210,13 @@ namespace
         MpegStubState &m = g_mpeg_stub_state;
         // A handle the game keeps between movies is saved; a movie in progress (frames queued, a demux transaction,
         // a decoder that has not reached its end) holds a live FFmpeg decoder and is refused. The decoder is created
-        // again from the next movie data, as after sceMpegCreate.
+        // again from the next movie data, as after sceMpegCreate. An abandoned movie (playbackAbandoned) is saved with
+        // its leftover decoded frames as data and as ended: only the live decoder is not carried over, which the game
+        // could notice only by asking that movie for more than its leftover frames.
+        const uint64_t tick = ps2x::stateVsyncTick();
         if (a.saving())
             for (const auto &[addr, p] : m.playbackByMpeg)
-                if (!p.decodedFrames.empty() || p.demuxTransaction || p.retryPacket ||
-                    (p.decoder && !p.streamEnded && !p.sequenceEndDecoded))
+                if (playbackBusy(p) && !playbackAbandoned(m, p, tick))
                     throw ps2x::StateError("a movie is playing");
         a.value(m.initialized);
         a.value(m.nextCallbackHandle);
@@ -3204,6 +3229,8 @@ namespace
         a.value(g_nextPlaybackGeneration);
         a.map(m.playbackByMpeg, [](ps2x::StateArchive &x, MpegPlaybackState &p)
         {
+            // Saving, a busy playback here is abandoned (checked above): it is written as it will be after loading.
+            const bool dropDecoder = x.saving() && playbackBusy(p);
             x.value(p.sdkWorkAddr);
             x.value(p.callbackGeneration);
             x.value(p.picturesServed);
@@ -3215,7 +3242,8 @@ namespace
             x.value(p.sawSequenceEnd);
             x.value(p.sequenceEndDecoded);
             x.value(p.acceptedProgramEnd);
-            x.value(p.streamEnded);
+            bool streamEnded = p.streamEnded || dropDecoder;
+            x.value(streamEnded);
             x.value(p.decoderFailed);
             x.value(p.cdStreamGeneration);
             x.value(p.waitingForVideoSequenceHeader);
@@ -3240,14 +3268,24 @@ namespace
             x.value(p.lastOutputServiceTick);
             x.value(p.lastInputServiceTick);
             x.value(p.acceptedVideoPayloadBytes);
+            std::vector<MpegDecodedFrame> frames(p.decodedFrames.begin(), p.decodedFrames.end());
+            x.sequence(frames, [](ps2x::StateArchive &y, MpegDecodedFrame &f)
+            {
+                y.value(f.width);
+                y.value(f.height);
+                y.value(f.repeatPict);
+                y.value(f.pts90k);
+                y.vector(f.rgba);
+            });
             if (x.loading())
             {
                 p.retryPacketBytes = size_t(retryBytes);
                 p.retryEvent = size_t(retryEvent);
                 p.retryCallback = size_t(retryCallback);
                 p.guestRdram = ps2x::stateGuestRdram();
+                p.streamEnded = streamEnded;
                 p.decoder.reset();
-                p.decodedFrames.clear();
+                p.decodedFrames.assign(std::make_move_iterator(frames.begin()), std::make_move_iterator(frames.end()));
                 p.demuxTransaction.reset();
             }
         });

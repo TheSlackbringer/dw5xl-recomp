@@ -9,8 +9,10 @@ namespace ps2x
     using StubStateFn = void (*)(StateArchive &);
     bool registerStubState(const char *name, StubStateFn fn);
     // rdram: this run's guest memory, for stub state that keeps host pointers into it (stateGuestRdram()).
-    void serializeStubStates(StateArchive &archive, uint8_t *rdram);
+    // vsyncTick: the guest field of the state (stateVsyncTick(); the scheduler is restored before the stubs).
+    void serializeStubStates(StateArchive &archive, uint8_t *rdram, uint64_t vsyncTick);
     uint8_t *stateGuestRdram();
+    uint64_t stateVsyncTick();
 }
 
 // The translation unit's own file (a unity batch counts as one), for names that are unique per copy of a header.
