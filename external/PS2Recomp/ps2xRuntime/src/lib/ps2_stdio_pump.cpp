@@ -17,6 +17,7 @@
 #define PUMP_WRITE _write
 #else
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #define PUMP_DUP dup
 #define PUMP_DUP2 dup2
@@ -35,6 +36,10 @@ namespace ps2x::stdio_pump
             int destination = -1; // duplicate of its original destination
             int pipeRead = -1;
             int mode = 0;         // Windows: the descriptor's text/binary mode, kept across the swap
+            // Issue 025 Step 7: a second descriptor with the same destination writes into the same pipe.
+            int sharedFd = -1;
+            int sharedDestination = -1;
+            int sharedMode = 0;
             std::thread thread;
         };
 
@@ -64,6 +69,43 @@ namespace ps2x::stdio_pump
             return handle != -1 && handle != -2;
 #else
             return fcntl(fd, F_GETFD) != -1;
+#endif
+        }
+
+        // Issue 025 Step 7: do two descriptors lead to the same destination (stdout and stderr into one log file,
+        // one terminal, one pipe)? Then they share one pipe so their writes stay in program order across the two.
+        bool sameDestination(int a, int b)
+        {
+#if defined(_WIN32)
+            const HANDLE ha = reinterpret_cast<HANDLE>(_get_osfhandle(a));
+            const HANDLE hb = reinterpret_cast<HANDLE>(_get_osfhandle(b));
+            if (ha == INVALID_HANDLE_VALUE || hb == INVALID_HANDLE_VALUE || !ha || !hb)
+                return false;
+            if (ha == hb)
+                return true;
+            const DWORD type = GetFileType(ha);
+            if (type != GetFileType(hb))
+                return false;
+            if (type == FILE_TYPE_DISK)
+            {
+                BY_HANDLE_FILE_INFORMATION ia{}, ib{};
+                return GetFileInformationByHandle(ha, &ia) && GetFileInformationByHandle(hb, &ib) &&
+                       ia.dwVolumeSerialNumber == ib.dwVolumeSerialNumber && ia.nFileIndexHigh == ib.nFileIndexHigh &&
+                       ia.nFileIndexLow == ib.nFileIndexLow;
+            }
+            // Pipes and consoles: the same kernel object (Windows 10 and later; otherwise one pump each, as before).
+            using CompareFn = BOOL(WINAPI *)(HANDLE, HANDLE);
+            static const CompareFn compare = [] {
+                HMODULE module = GetModuleHandleW(L"kernelbase.dll");
+                if (!module)
+                    module = GetModuleHandleW(L"kernel32.dll");
+                return module ? reinterpret_cast<CompareFn>(GetProcAddress(module, "CompareObjectHandles")) : nullptr;
+            }();
+            return compare && compare(ha, hb);
+#else
+            struct stat sa{}, sb{};
+            return fstat(a, &sa) == 0 && fstat(b, &sb) == 0 && sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino &&
+                   (sa.st_mode & S_IFMT) == (sb.st_mode & S_IFMT);
 #endif
         }
 
@@ -103,7 +145,7 @@ namespace ps2x::stdio_pump
             if (!validDestination(fd))
                 return false;
             for (const Pump *p : g_pumps)
-                if (p->fd == fd)
+                if (p->fd == fd || p->sharedFd == fd)
                     return false;
             int fds[2];
             if (!makePipe(fds, pipeBytes))
@@ -131,10 +173,58 @@ namespace ps2x::stdio_pump
             if (const DWORD id = stdHandleId(fd))
                 SetStdHandle(id, reinterpret_cast<HANDLE>(_get_osfhandle(fd))); // Win32-level writers too
 #endif
-            auto *pump = new Pump{fd, destination, fds[0], mode, {}};
+            auto *pump = new Pump; // fields set by name: Pump has more members than these
+            pump->fd = fd;
+            pump->destination = destination;
+            pump->pipeRead = fds[0];
+            pump->mode = mode;
             pump->thread = std::thread(copyLoop, fds[0], destination);
             g_pumps.push_back(pump);
             return true;
+        }
+    }
+
+    namespace
+    {
+        // Issue 025 Step 7: `second` becomes another write end of `first`'s pipe; drain() restores it.
+        bool share(int first, int second)
+        {
+            Pump *pump = nullptr;
+            for (Pump *p : g_pumps)
+                if (p->fd == first)
+                    pump = p;
+            if (!pump || pump->sharedFd >= 0)
+                return false;
+            int mode = 0;
+#if defined(_WIN32)
+            mode = _setmode(second, _O_BINARY);
+            _setmode(second, mode);
+#endif
+            const int destination = PUMP_DUP(second);
+            if (destination < 0)
+                return false;
+            if (PUMP_DUP2(first, second) < 0) // POSIX returns the descriptor, Windows 0: only negative fails
+            {
+                PUMP_CLOSE(destination);
+                return false;
+            }
+#if defined(_WIN32)
+            _setmode(second, mode);
+            if (const DWORD id = stdHandleId(second))
+                SetStdHandle(id, reinterpret_cast<HANDLE>(_get_osfhandle(second)));
+#endif
+            pump->sharedFd = second;
+            pump->sharedDestination = destination;
+            pump->sharedMode = mode;
+            return true;
+        }
+
+        bool installPairLocked(int first, int second, size_t pipeBytes)
+        {
+            if (validDestination(first) && validDestination(second) && sameDestination(first, second) &&
+                install(first, pipeBytes))
+                return share(first, second) || install(second, pipeBytes);
+            return install(first, pipeBytes) | install(second, pipeBytes);
         }
     }
 
@@ -142,6 +232,12 @@ namespace ps2x::stdio_pump
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         return install(fd, pipeBytes);
+    }
+
+    bool installPair(int first, int second, size_t pipeBytes)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        return installPairLocked(first, second, pipeBytes);
     }
 
     bool installStdio()
@@ -153,7 +249,7 @@ namespace ps2x::stdio_pump
         bool any = false;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            any = install(1, 1u << 20) | install(2, 1u << 20);
+            any = installPairLocked(1, 2, 1u << 20);
         }
         if (any)
             std::atexit(drain);
@@ -174,15 +270,25 @@ namespace ps2x::stdio_pump
             // Point the descriptor back at its destination: this closes the pipe's last write end, so the thread
             // copies what is queued, reads end-of-file and stops. Later writes go straight to the destination.
             PUMP_DUP2(pump->destination, pump->fd);
+            if (pump->sharedFd >= 0)
+                PUMP_DUP2(pump->sharedDestination, pump->sharedFd); // the pipe's other write end
 #if defined(_WIN32)
             _setmode(pump->fd, pump->mode);
             if (const DWORD id = stdHandleId(pump->fd))
                 SetStdHandle(id, reinterpret_cast<HANDLE>(_get_osfhandle(pump->fd)));
+            if (pump->sharedFd >= 0)
+            {
+                _setmode(pump->sharedFd, pump->sharedMode);
+                if (const DWORD id = stdHandleId(pump->sharedFd))
+                    SetStdHandle(id, reinterpret_cast<HANDLE>(_get_osfhandle(pump->sharedFd)));
+            }
 #endif
             if (pump->thread.joinable())
                 pump->thread.join();
             PUMP_CLOSE(pump->pipeRead);
             PUMP_CLOSE(pump->destination);
+            if (pump->sharedDestination >= 0)
+                PUMP_CLOSE(pump->sharedDestination);
             delete pump;
         }
     }

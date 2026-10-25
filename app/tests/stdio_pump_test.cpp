@@ -94,6 +94,75 @@ int main()
 
     T_CLOSE(program);
     T_CLOSE(dest[0]);
+
+    // Issue 025 Step 7: two descriptors with the same destination (stdout and stderr into one log) share one pipe, so
+    // writes alternating between them arrive in exactly the order they were written.
+    {
+        int log[2];
+        if (T_PIPE(log) != 0)
+        {
+            std::printf("FAIL cannot create the shared destination pipe\n");
+            return 1;
+        }
+        const int out = T_DUP(log[1]), err = T_DUP(log[1]);
+        T_CLOSE(log[1]);
+        check(ps2x::stdio_pump::installPair(out, err, 1u << 20), "pair installed (same destination)");
+        std::string written;
+        for (int i = 0; i < 1000; ++i)
+        {
+            char line[48];
+            const int fd = (i % 2) ? err : out;
+            const int n = std::snprintf(line, sizeof(line), "%s %04d ordered line\n", (i % 2) ? "err" : "out", i);
+            T_WRITE(fd, line, n);
+            written.append(line, static_cast<size_t>(n));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // the log is read only afterwards
+        std::string got;
+        std::thread reader([&] { got = readExactly(log[0], written.size()); });
+        ps2x::stdio_pump::drain();
+        reader.join();
+        check(got == written, "same destination: writes to both descriptors keep their program order");
+        T_CLOSE(out);
+        T_CLOSE(err);
+        T_CLOSE(log[0]);
+    }
+
+    // Different destinations stay separate: each descriptor's bytes reach its own destination, in order.
+    {
+        int a[2], b[2];
+        if (T_PIPE(a) != 0 || T_PIPE(b) != 0)
+        {
+            std::printf("FAIL cannot create the two destination pipes\n");
+            return 1;
+        }
+        const int out = T_DUP(a[1]), err = T_DUP(b[1]);
+        T_CLOSE(a[1]);
+        T_CLOSE(b[1]);
+        check(ps2x::stdio_pump::installPair(out, err, 1u << 20), "pair installed (different destinations)");
+        std::string toA, toB;
+        for (int i = 0; i < 200; ++i)
+        {
+            char line[48];
+            int n = std::snprintf(line, sizeof(line), "a %04d\n", i);
+            T_WRITE(out, line, n);
+            toA.append(line, static_cast<size_t>(n));
+            n = std::snprintf(line, sizeof(line), "b %04d\n", i);
+            T_WRITE(err, line, n);
+            toB.append(line, static_cast<size_t>(n));
+        }
+        std::string gotA, gotB;
+        std::thread readerA([&] { gotA = readExactly(a[0], toA.size()); });
+        std::thread readerB([&] { gotB = readExactly(b[0], toB.size()); });
+        ps2x::stdio_pump::drain();
+        readerA.join();
+        readerB.join();
+        check(gotA == toA && gotB == toB, "different destinations: each stream reaches its own destination");
+        T_CLOSE(out);
+        T_CLOSE(err);
+        T_CLOSE(a[0]);
+        T_CLOSE(b[0]);
+    }
+
     std::printf("%s\n", g_failures ? "stdio_pump: FAIL" : "stdio_pump: PASS");
     return g_failures ? 1 : 0;
 }
