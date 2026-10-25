@@ -1,6 +1,6 @@
-// Port of tools/vu1_translator.py (disc mode), tools/native_call_analysis.py and tools/disc_vu_inputs.py.
-// Function and variable names follow the Python so the two can be read side by side; the output must stay
-// byte-identical (vu1lift test).
+// The VU1/VU0 translator (issues 011, 025). Originally a port of the Python tools/vu1_translator.py,
+// native_call_analysis.py and disc_vu_inputs.py; since issue 025 Step 6 the only translator. Some section names
+// still follow the old Python function names.
 #include "vu1_translator.h"
 #include "../sha256.h"
 #include "vu1_inputs.h"
@@ -513,7 +513,7 @@ std::vector<uint32_t> legacyFindReachable(const std::vector<uint8_t> &code, uint
     return {visited.begin(), visited.end()};
 }
 
-// ---- native_call_analysis.analyze ----
+// ---- BAL/JR call analysis (proves every dynamic return before native emission) ----
 constexpr size_t kMaxValues = 64;
 using Value = std::optional<std::set<int>>; // None = unknown
 using Regs = std::array<Value, 16>;
@@ -918,7 +918,7 @@ std::map<uint32_t, std::set<uint32_t>> pairSuccessors(const std::vector<uint8_t>
     return succ;
 }
 
-// FMAC flag results nothing can observe (same rule as tools/vu1_translator.py find_dead_pushes): on every path from
+// FMAC flag results nothing can observe (issue 025 V2): on every path from
 // the pair after it, the next flag-producing FMAC comes before any flag reader, and no reader, end of program, D/T
 // bit or unproven jump comes in the three pairs after that FMAC.
 std::set<uint32_t> findDeadPushes(const std::vector<uint8_t> &code, const std::vector<uint32_t> &reachable,
@@ -1181,7 +1181,9 @@ struct Segment
     // ---- find_dead_timing (issue 025 v10 V3) ----
     // A ready-table write of a slot is left out when on every path from the next pair the slot is written again (or
     // the program ends) before a stall check or region guard reads it; a horizon update when on every path a later
-    // update is at least as far before the end (see tools/vu1_translator.py find_dead_timing).
+    // update is at least as far before the end. Inside a run only the stall checks and guards read the table; after
+    // a normal end the pipelines run to the horizon (flushPipelines) and a cancelled run is followed by the VU reset
+    // (resetScheduler), so no later reader can see a left-out write.
     void findDeadTiming(const std::vector<uint32_t> &reachable,
                         const std::map<uint32_t, std::vector<uint32_t>> &regionStart, const NativeCallInfo *calls)
     {
@@ -1738,7 +1740,7 @@ std::string translateSegment(const std::vector<uint8_t> &code, uint32_t entryPc,
     const size_t index = size_t(at - out.begin());
     out.erase(at);
     out.insert(out.begin() + std::ptrdiff_t(index), table.begin(), table.end());
-    // Every program uses the inlined FMAC fast path (issue 025 v10 V4b; see tools/vu1_translator.py).
+    // Every program uses the inlined FMAC fast path (issue 025 v10 V4b: -19.5 % on the large programs, exact).
     return join(out, "\n");
 }
 
@@ -1765,8 +1767,8 @@ struct DiscBins
     std::map<std::string, std::vector<uint8_t>> bins, covered;
 };
 
-// disc_vu_inputs._load_bins: load_disc_bins (VU1, 16 KB images) and load_vu0_bins (VU0, 4 KB, each range's SHA256
-// over its own chunks)
+// Disc inputs: rebuilds the VU1 (16 KB) and VU0 (4 KB) code images from the executable and checks each range's
+// SHA256 over its own chunks.
 DiscBins loadBins(const std::filesystem::path &elfPath, const Range *ranges, size_t rangeCount, size_t imageSize,
                   bool ownDigest)
 {
@@ -1937,7 +1939,7 @@ bool generateLiftedVu1(const std::filesystem::path &elf, std::string &text, std:
     }
 }
 
-// Port of tools/vu0_translator.py (issue 025).
+// The VU0 microprograms (issue 025).
 bool generateLiftedVu0(const std::filesystem::path &elf, std::string &text, std::string &error,
                        const std::function<void(const std::string &)> &log,
                        const std::function<bool(const std::string &)> &staticTiming)

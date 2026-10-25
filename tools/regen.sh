@@ -56,10 +56,12 @@ if [[ "$selection" == ovl00 || "$selection" == all ]]; then regen ovl00; fi
 if [[ "$selection" == ovl01 || "$selection" == all ]]; then regen ovl01; fi
 if [[ "$selection" == ovl02 || "$selection" == all ]]; then regen ovl02; fi
 if [[ "$selection" == main || "$selection" == all ]]; then
-    # Translate verified VU1 payloads from your own PAL executable into ignored local C++.
-    # DW5XL_VU1_INPUT=capture retains explicit research inputs; never commit generated code.
+    # Translate verified VU1 payloads from your own PAL executable into ignored local C++ (never commit it), with
+    # the C++ translator (issue 025 Step 6; build it first: cmake --build app/build --target dw5xl_vu1lift).
     # Stop on input/translation errors rather than silently compiling stale lifted output.
-    python3 "$root/tools/vu1_translator.py"
+    lifter="${DW5XL_VU1LIFT:-$root/app/build/dw5xl_vu1lift}"
+    mkdir -p "$root/recomp/dw5xl/vu1" "$root/recomp/dw5xl/vu0"
+    "$lifter" "$root/game/dw5xl/SLES_538.60" "$root/recomp/dw5xl/vu1/dw5xl_vu1_lifted.cpp"
     # Issue 025: the VU0 microprograms (VCALLMS) from the same executable, into recomp/dw5xl/vu0/.
-    python3 "$root/tools/vu0_translator.py"
+    "$lifter" --vu0 "$root/game/dw5xl/SLES_538.60" "$root/recomp/dw5xl/vu0/dw5xl_vu0_lifted.cpp"
 fi
