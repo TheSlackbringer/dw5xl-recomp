@@ -1,6 +1,6 @@
-// Port of tools/vu1_translator.py (disc mode), tools/native_call_analysis.py and tools/disc_vu_inputs.py.
-// Function and variable names follow the Python so the two can be read side by side; the output must stay
-// byte-identical (vu1lift test).
+// The VU1/VU0 translator (issues 011, 025). Originally a port of the Python tools/vu1_translator.py,
+// native_call_analysis.py and disc_vu_inputs.py; since issue 025 Step 6 the only translator. Some section names
+// still follow the old Python function names.
 #include "vu1_translator.h"
 #include "../sha256.h"
 #include "vu1_inputs.h"
@@ -233,6 +233,22 @@ std::string blendWrap(const std::string &reg, const std::string &val, uint32_t d
     return reg + F(" = blend<0x%x>(", lm) + reg + ", " + val + ");";
 }
 
+// Issue 025 v10 V1 (port of NORM_KNOWN / nv): lanes known to hold zero or a normal float per VF register (bits as
+// in dest: x=8 y=4 z=2 w=1) for the pair being translated; nullptr = nothing known. norm() is the identity on such
+// lanes, so it is left out where every lane an operand is read in is known (see normKnownStates).
+const std::map<uint32_t, uint32_t> *g_normKnown = nullptr;
+
+std::string nv(uint32_t r, uint32_t lanes)
+{
+    if (g_normKnown && r != 0)
+    {
+        const auto it = g_normKnown->find(r);
+        if (((it == g_normKnown->end() ? 0u : it->second) & lanes) == lanes)
+            return F("vf[%u]", r);
+    }
+    return F("norm(vf[%u])", r);
+}
+
 // ---- translate_upper ----
 std::string translateUpper(const Upper &u)
 {
@@ -249,8 +265,8 @@ std::string translateUpper(const Upper &u)
     for (const char *base : bases)
         for (int i = 0; i < 4; ++i)
         {
-            const std::string val = F("fmac<%s, %u>(norm(vf[%u]), bc<%d>(norm(vf[%u])), acc, fl)", fmacMap.at(base),
-                                      d, fs, i, ft);
+            const std::string val = F("fmac<%s, %u>(", fmacMap.at(base), d) + nv(fs, d) + F(", bc<%d>(", i) +
+                                    nv(ft, 8u >> i) + "), acc, fl)";
             if (name == std::string(base) + kBC[i])
                 return blendWrap(vfd, val, d);
             if (name == std::string(base) + "A" + kBC[i])
@@ -258,7 +274,7 @@ std::string translateUpper(const Upper &u)
         }
     for (const char *base : bases)
     {
-        const std::string val = F("fmac<%s, %u>(norm(vf[%u]), norm(vf[%u]), acc, fl)", fmacMap.at(base), d, fs, ft);
+        const std::string val = F("fmac<%s, %u>(", fmacMap.at(base), d) + nv(fs, d) + ", " + nv(ft, d) + ", acc, fl)";
         if (name == base)
             return blendWrap(vfd, val, d);
         if (name == std::string(base) + "A")
@@ -266,7 +282,7 @@ std::string translateUpper(const Upper &u)
     }
     for (const char *base : bases)
     {
-        const std::string val = F("fmac<%s, %u>(norm(vf[%u]), splat(c.st.q), acc, fl)", fmacMap.at(base), d, fs);
+        const std::string val = F("fmac<%s, %u>(", fmacMap.at(base), d) + nv(fs, d) + ", splat(c.st.q), acc, fl)";
         if (name == std::string(base) + "q")
             return blendWrap(vfd, val, d);
         if (name == std::string(base) + "Aq")
@@ -274,7 +290,7 @@ std::string translateUpper(const Upper &u)
     }
     for (const char *base : bases)
     {
-        const std::string val = F("fmac<%s, %u>(norm(vf[%u]), splat(i_reg), acc, fl)", fmacMap.at(base), d, fs);
+        const std::string val = F("fmac<%s, %u>(", fmacMap.at(base), d) + nv(fs, d) + ", splat(i_reg), acc, fl)";
         if (name == std::string(base) + "i")
             return blendWrap(vfd, val, d);
         if (name == std::string(base) + "Ai")
@@ -282,8 +298,8 @@ std::string translateUpper(const Upper &u)
     }
     if (name == "OPMULA" || name == "OPMSUB")
     {
-        const std::string a = F("_mm_shuffle_ps(norm(vf[%u]), norm(vf[%u]), _MM_SHUFFLE(3, 0, 2, 1))", fs, fs);
-        const std::string b = F("_mm_shuffle_ps(norm(vf[%u]), norm(vf[%u]), _MM_SHUFFLE(3, 1, 0, 2))", ft, ft);
+        const std::string a = "_mm_shuffle_ps(" + nv(fs, 15) + ", " + nv(fs, 15) + ", _MM_SHUFFLE(3, 0, 2, 1))";
+        const std::string b = "_mm_shuffle_ps(" + nv(ft, 15) + ", " + nv(ft, 15) + ", _MM_SHUFFLE(3, 1, 0, 2))";
         if (name == "OPMULA")
             return blendWrap("acc", F("fmac<Mul, %u>(", d) + a + ", " + b + ", acc, fl)", d);
         return blendWrap(vfd, F("fmac<MSub, %u>(", d) + a + ", " + b + ", acc, fl)", d);
@@ -306,9 +322,9 @@ std::string translateUpper(const Upper &u)
         return F("vl::LiftAccess::clipAt(c, cyc, vl::clipFlags(vf[%u], bc<3>(vf[%u])) & 0x3F);", fs, ft);
     const std::string vft = "vf[" + S(ft) + "]";
     if (name == "FTOI0")
-        return blendWrap(vft, F("vuFtoiV(norm(vf[%u]), 1.0f)", fs), d);
+        return blendWrap(vft, "vuFtoiV(" + nv(fs, d) + ", 1.0f)", d);
     if (name == "FTOI4")
-        return blendWrap(vft, F("vuFtoiV(norm(vf[%u]), 16.0f)", fs), d);
+        return blendWrap(vft, "vuFtoiV(" + nv(fs, d) + ", 16.0f)", d);
     if (name == "ITOF0")
         return blendWrap(vft, F("vuItofV(vf[%u], 1.0f)", fs), d);
     if (name == "ITOF4")
@@ -497,7 +513,7 @@ std::vector<uint32_t> legacyFindReachable(const std::vector<uint8_t> &code, uint
     return {visited.begin(), visited.end()};
 }
 
-// ---- native_call_analysis.analyze ----
+// ---- BAL/JR call analysis (proves every dynamic return before native emission) ----
 constexpr size_t kMaxValues = 64;
 using Value = std::optional<std::set<int>>; // None = unknown
 using Regs = std::array<Value, 16>;
@@ -827,12 +843,88 @@ int fmacDest(const std::string &upCode)
     return -1;
 }
 
-// FMAC flag results nothing can observe (same rule as tools/vu1_translator.py find_dead_pushes).
-std::set<uint32_t> findDeadPushes(const std::vector<uint8_t> &code, const std::vector<uint32_t> &reachable)
+const std::set<uint32_t> kBranchOps = {0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2c, 0x2d, 0x2e, 0x2f};
+constexpr uint32_t kPathEnd = 0xFFFFFFFFu;     // program end (Python _END)
+constexpr uint32_t kPathUnknown = 0xFFFFFFFEu; // no proven successor (Python None)
+
+// Issue 025 v10 V2 (port of pair_successors): the pairs that can run after each pair. A branch's delay slot runs
+// next, then its target and (conditional) the fall-through; JR goes to its proven targets; an E bit ends the
+// program after its delay slot; a jump straight into a delay slot continues after it.
+std::map<uint32_t, std::set<uint32_t>> pairSuccessors(const std::vector<uint8_t> &code,
+                                                      const std::vector<uint32_t> &reachable,
+                                                      const NativeCallInfo *calls)
 {
-    static const std::set<uint32_t> kBranchOps = {0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2c, 0x2d, 0x2e, 0x2f};
     const std::set<uint32_t> reach(reachable.begin(), reachable.end());
-    struct Info { bool push, reader, barrier; };
+    auto jrOf = [&](uint32_t pc) -> const std::set<uint32_t> * {
+        if (!calls)
+            return nullptr;
+        const auto it = calls->jrTargets.find(pc);
+        return it == calls->jrTargets.end() ? nullptr : &it->second;
+    };
+    std::set<uint32_t> jumpedTo;
+    for (uint32_t pc : reachable)
+    {
+        const auto [lo, up] = unpackPair(code, pc);
+        const Lower l = decodeLower(lo, pc);
+        if (!((up >> 31) & 1) && l.type == LType::NORM && kBranchOps.count(l.op))
+        {
+            if (l.op == 0x24)
+            {
+                if (const auto *jr = jrOf(pc))
+                    jumpedTo.insert(jr->begin(), jr->end());
+            }
+            else if (l.op != 0x25)
+                jumpedTo.insert(l.tgt);
+        }
+    }
+    std::map<uint32_t, std::set<uint32_t>> succ;
+    for (uint32_t pc : reachable)
+    {
+        const auto [lo, up] = unpackPair(code, pc);
+        if (!succ.count(pc))
+            succ[pc] = {pc + 8};
+        const Lower l = decodeLower(lo, pc);
+        const uint32_t dPc = pc + 8;
+        if ((up >> 30) & 1)
+        {
+            succ[pc] = {dPc};
+            succ[dPc] = {kPathEnd};
+        }
+        else if (!((up >> 31) & 1) && l.type == LType::NORM && kBranchOps.count(l.op))
+        {
+            succ[pc] = {dPc};
+            if (l.op == 0x24)
+            {
+                const auto *jr = jrOf(pc);
+                succ[dPc] = (jr && !jr->empty()) ? *jr : std::set<uint32_t>{kPathUnknown};
+            }
+            else if (l.op == 0x25)
+                succ[dPc] = {kPathUnknown};
+            else if (l.op == 0x20 || l.op == 0x21)
+                succ[dPc] = {l.tgt};
+            else
+                succ[dPc] = {l.tgt, pc + 16};
+            if (jumpedTo.count(dPc))
+                succ[dPc].insert(pc + 16);
+        }
+    }
+    for (auto &[pc, next] : succ)
+    {
+        std::set<uint32_t> mapped;
+        for (uint32_t q : next)
+            mapped.insert(q == kPathEnd || q == kPathUnknown || reach.count(q) ? q : kPathUnknown);
+        next = mapped;
+    }
+    return succ;
+}
+
+// FMAC flag results nothing can observe (issue 025 V2): on every path from
+// the pair after it, the next flag-producing FMAC comes before any flag reader, and no reader, end of program, D/T
+// bit or unproven jump comes in the three pairs after that FMAC.
+std::set<uint32_t> findDeadPushes(const std::vector<uint8_t> &code, const std::vector<uint32_t> &reachable,
+                                  const NativeCallInfo *calls)
+{
+    struct Info { bool push, reader, stop; };
     std::map<uint32_t, Info> info;
     for (uint32_t pc : reachable)
     {
@@ -841,28 +933,128 @@ std::set<uint32_t> findDeadPushes(const std::vector<uint8_t> &code, const std::v
         const Lower l = decodeLower(lo, pc);
         const int dest = fmacDest(translateUpper(decodeUpper(up & 0x07ffffff)));
         const bool lowerNorm = !iBit && l.type == LType::NORM;
-        info[pc] = {dest > 0, lowerNorm && kMacStatusReaders.count(l.op) != 0,
-                    ((up >> 27) & 0xB) != 0 || (lowerNorm && kBranchOps.count(l.op) != 0)};
+        info[pc] = {dest > 0, lowerNorm && kMacStatusReaders.count(l.op) != 0, ((up >> 27) & 0x3) != 0};
     }
-    auto at = [&](uint32_t pc) -> const Info * { return reach.count(pc) ? &info.at(pc) : nullptr; };
+    const auto succ = pairSuccessors(code, reachable, calls);
     std::set<uint32_t> dead;
     for (uint32_t pc : reachable)
     {
         const Info &p = info.at(pc);
-        if (!p.push || p.barrier)
+        if (!p.push || p.stop)
             continue;
-        uint32_t q = pc + 8;
-        while (at(q) && !at(q)->reader && !at(q)->barrier && !at(q)->push)
-            q += 8;
-        if (!at(q) || !at(q)->push || at(q)->reader || at(q)->barrier)
-            continue;
-        bool clear = true;
-        for (uint32_t k = 1; k <= 3 && clear; ++k)
-            clear = at(q + 8 * k) && !at(q + 8 * k)->reader && !at(q + 8 * k)->barrier;
-        if (clear)
+        // States: (pair, n) with n = 0 before the next push, n = 1..3 the pairs still checked after it.
+        std::vector<std::pair<uint32_t, int>> todo;
+        for (uint32_t q : succ.at(pc))
+            todo.push_back({q, 0});
+        std::set<std::pair<uint32_t, int>> seen;
+        bool ok = true;
+        while (!todo.empty() && ok)
+        {
+            const auto [q, n] = todo.back();
+            todo.pop_back();
+            if (!seen.insert({q, n}).second)
+                continue;
+            if (q == kPathUnknown || q == kPathEnd || info.at(q).reader || info.at(q).stop)
+            {
+                ok = false;
+                break;
+            }
+            int nxt;
+            if (n == 0)
+                nxt = info.at(q).push ? 1 : 0;
+            else
+                nxt = n < 3 ? n + 1 : -1;
+            if (nxt >= 0)
+                for (uint32_t r : succ.at(q))
+                    todo.push_back({r, nxt});
+        }
+        if (ok)
             dead.insert(pc);
     }
     return dead;
+}
+
+// Issue 025 v10 V1 (port of norm_known_states): which VF lanes hold zero or a normal float before each pair. The
+// destination lanes of ADD, SUB and MUL (not MADD/MSUB) are zero or normal on every path of vl::fmac; every other VF
+// write makes its lanes unknown. Straight-line code only: empty at each block, each label and after a program end.
+bool normFmacName(const std::string &name)
+{
+    for (const char *base : {"ADD", "SUB", "MUL"})
+        if (name == base || (name.size() == 4 && name.compare(0, 3, base) == 0 &&
+                             std::string("xyzwqi").find(name[3]) != std::string::npos))
+            return true;
+    return false;
+}
+
+std::map<uint32_t, std::map<uint32_t, uint32_t>> normKnownStates(const std::vector<uint8_t> &code,
+                                                                 const std::vector<std::vector<uint32_t>> &blocks,
+                                                                 const std::set<uint32_t> &targets)
+{
+    std::map<uint32_t, std::map<uint32_t, uint32_t>> states;
+    for (const auto &block : blocks)
+    {
+        std::map<uint32_t, uint32_t> state;
+        std::optional<uint32_t> stopAfter;
+        for (uint32_t pc : block)
+        {
+            if (targets.count(pc))
+                state.clear();
+            states[pc] = state;
+            const auto [lo, up] = unpackPair(code, pc);
+            const Upper u = decodeUpper(up & 0x07ffffff);
+            if (!((up >> 31) & 1))
+            {
+                const Lower l = decodeLower(lo, pc);
+                if (const uint32_t w = lowerWritesVf(l))
+                    state[w] &= ~l.dd;
+            }
+            if (const uint32_t w = upperWritesVf(u))
+            {
+                if (!u.special && normFmacName(u.name))
+                    state[w] |= u.d;
+                else
+                    state[w] &= ~u.d;
+            }
+            if ((up >> 30) & 1)
+                stopAfter = pc + 8;
+            else if (stopAfter && pc == *stopAfter)
+                state.clear();
+        }
+    }
+    return states;
+}
+
+// Issue 025 v10 V3 (port of ready_known_states): ready-table slots that cannot delay a pair (their last writer lies
+// at least its latency in pairs earlier in the same straight-line code). Empty at each block, label and program end.
+std::map<uint32_t, std::set<int>> readyKnownStates(const std::vector<uint8_t> &code,
+                                                   const std::vector<std::vector<uint32_t>> &blocks,
+                                                   const std::set<uint32_t> &targets)
+{
+    std::map<uint32_t, std::set<int>> states;
+    for (const auto &block : blocks)
+    {
+        std::map<int, std::pair<int, uint32_t>> last; // slot -> (index of its writer, latency)
+        int index = 0;
+        std::optional<uint32_t> stopAfter;
+        for (uint32_t pc : block)
+        {
+            if (targets.count(pc))
+                last.clear();
+            const auto [lo, up] = unpackPair(code, pc);
+            std::set<int> &ready = states[pc];
+            for (const auto &[slot, at] : last)
+                if (index - at.first >= int(at.second))
+                    ready.insert(slot);
+            for (const auto &[slot, lat] : pairTiming(lo, up).writes)
+                last[slot] = {index, lat};
+            ++index;
+            if ((up >> 30) & 1)
+                stopAfter = pc + 8;
+            else if (stopAfter && pc == *stopAfter)
+                last.clear();
+        }
+    }
+    return states;
 }
 
 struct Segment
@@ -871,6 +1063,21 @@ struct Segment
     bool queueFmacFlags = true;
     std::set<uint32_t> deadPushes;
     std::vector<std::pair<uint32_t, PairTiming>> timings;
+    std::map<uint32_t, std::map<uint32_t, uint32_t>> normStates; // V1
+    std::map<uint32_t, std::set<int>> readyStates;               // V3
+    std::set<std::pair<uint32_t, int>> deadWrites;               // V3: (pc, slot)
+    std::set<uint32_t> deadHorizon;                              // V3
+
+    // Sets g_normKnown for pc while it lives (the emitted pair's operands).
+    struct NormScope
+    {
+        explicit NormScope(const Segment &s, uint32_t pc)
+        {
+            const auto it = s.normStates.find(pc);
+            g_normKnown = it == s.normStates.end() ? nullptr : &it->second;
+        }
+        ~NormScope() { g_normKnown = nullptr; }
+    };
 
     std::string fmacFlagCode(uint32_t pc) const
     {
@@ -900,7 +1107,11 @@ struct Segment
                 out.push_back(F("    shadow_vf = vf[%u];", shadow));
             }
         }
-        const std::string upCode = translateUpper(u);
+        std::string upCode;
+        {
+            const NormScope scope(*this, pc);
+            upCode = translateUpper(u);
+        }
         std::string loCode = translateLower(l, lo, iBit, pc);
         if (shadow)
             replaceAll(loCode, F("vf[%u]", shadow), "shadow_vf");
@@ -927,14 +1138,14 @@ struct Segment
         PairTiming t = pairTiming(lo, up);
         timings.push_back({pc, t});
         std::vector<std::string> lines;
-        if (!t.reads.empty())
-        {
-            std::vector<std::string> checks;
-            for (int slot : t.reads)
+        const auto ready = readyStates.find(pc);
+        std::vector<std::string> checks;
+        for (int slot : t.reads)
+            if (ready == readyStates.end() || !ready->second.count(slot))
                 checks.push_back(F("r_ = rdy[%d] > r_ ? rdy[%d] : r_;", slot, slot));
+        if (!checks.empty())
             lines.push_back("    { uint64_t r_ = cyc; " + join(checks, " ") +
                             " if (r_ > cyc) vl::LiftAccess::stall(c, cyc, r_); }");
-        }
         if (t.flags & (FLAG_FDIV | FLAG_WAITQ))
             lines.push_back("    vl::LiftAccess::fdivWait(c, cyc);");
         if (t.flags & (FLAG_EFU | FLAG_WAITP))
@@ -951,20 +1162,99 @@ struct Segment
         const auto [lo, up] = unpackPair(code, pc);
         const PairTiming t = pairTiming(lo, up);
         std::vector<std::string> lines;
-        if (!t.writes.empty())
-        {
-            std::vector<std::string> w;
-            for (const auto &[slot, lat] : t.writes)
+        std::vector<std::string> w;
+        for (const auto &[slot, lat] : t.writes)
+            if (!deadWrites.count({pc, slot}))
                 w.push_back(F("rdy[%d] = cyc + %u;", slot, lat));
+        if (!w.empty())
             lines.push_back("    " + join(w, " "));
+        if (!t.writes.empty() && !deadHorizon.count(pc))
             lines.push_back(F("    if (cyc + %u > hz) hz = cyc + %u;", t.maxLat, t.maxLat));
-        }
         if (t.firstVi && (t.flags & FLAG_BRANCH_DELAY))
             lines.push_back(F("    bbValid = true; bbReg = %u; bbVal = ov;", t.firstVi));
         else
             lines.push_back("    bbValid = false;");
         lines.push_back("    vl::LiftAccess::tick(c, cyc);");
         return lines;
+    }
+
+    // ---- find_dead_timing (issue 025 v10 V3) ----
+    // A ready-table write of a slot is left out when on every path from the next pair the slot is written again (or
+    // the program ends) before a stall check or region guard reads it; a horizon update when on every path a later
+    // update is at least as far before the end. Inside a run only the stall checks and guards read the table; after
+    // a normal end the pipelines run to the horizon (flushPipelines) and a cancelled run is followed by the VU reset
+    // (resetScheduler), so no later reader can see a left-out write.
+    void findDeadTiming(const std::vector<uint32_t> &reachable,
+                        const std::map<uint32_t, std::vector<uint32_t>> &regionStart, const NativeCallInfo *calls)
+    {
+        const auto succ = pairSuccessors(code, reachable, calls);
+        std::map<uint32_t, std::set<int>> reads, writes;
+        std::map<uint32_t, std::optional<uint32_t>> hzl;
+        for (uint32_t pc : reachable)
+        {
+            const auto [lo, up] = unpackPair(code, pc);
+            const PairTiming t = pairTiming(lo, up);
+            const auto ready = readyStates.find(pc);
+            auto isReady = [&](int slot) { return ready != readyStates.end() && ready->second.count(slot); };
+            std::set<int> &r = reads[pc];
+            for (int slot : t.reads)
+                if (!isReady(slot))
+                    r.insert(slot);
+            const auto region = regionStart.find(pc);
+            if (region != regionStart.end())
+                for (const auto &[slot, k] : simulateRegion(region->second).guards)
+                    if (!isReady(slot))
+                        r.insert(slot);
+            std::set<int> &wr = writes[pc];
+            for (const auto &[slot, lat] : t.writes)
+                wr.insert(slot);
+            hzl[pc] = t.writes.empty() ? std::nullopt : std::optional<uint32_t>(t.maxLat);
+        }
+        for (uint32_t pc : reachable)
+        {
+            for (int slot : writes.at(pc))
+            {
+                std::vector<uint32_t> todo(succ.at(pc).begin(), succ.at(pc).end());
+                std::set<uint32_t> seen;
+                bool live = false;
+                while (!todo.empty() && !live)
+                {
+                    const uint32_t q = todo.back();
+                    todo.pop_back();
+                    if (seen.count(q) || q == kPathEnd)
+                        continue;
+                    seen.insert(q);
+                    if (q == kPathUnknown || reads.at(q).count(slot))
+                        live = true;
+                    else if (!writes.at(q).count(slot))
+                        todo.insert(todo.end(), succ.at(q).begin(), succ.at(q).end());
+                }
+                if (!live)
+                    deadWrites.insert({pc, slot});
+            }
+            const std::optional<uint32_t> lat = hzl.at(pc);
+            if (!lat)
+                continue;
+            std::vector<std::pair<uint32_t, uint32_t>> todo;
+            for (uint32_t q : succ.at(pc))
+                todo.push_back({q, 1u});
+            std::set<std::pair<uint32_t, uint32_t>> seen;
+            bool live = false;
+            while (!todo.empty() && !live)
+            {
+                const auto [q, dist] = todo.back();
+                todo.pop_back();
+                if (!seen.insert({q, dist}).second)
+                    continue;
+                if (q == kPathUnknown || q == kPathEnd)
+                    live = true;
+                else if (!hzl.at(q) || dist + *hzl.at(q) < *lat)
+                    for (uint32_t r : succ.at(q))
+                        todo.push_back({r, std::min(dist + 1u, *lat)});
+            }
+            if (!live)
+                deadHorizon.insert(pc);
+        }
     }
 
     // ---- static_regions ----
@@ -1097,8 +1387,10 @@ struct Segment
             window = std::max(window, n);
         }
         std::vector<std::pair<int, int>> guards; // (k, slot) sorted
+        const auto ready = readyStates.find(start);
         for (const auto &[slot, k] : sim.guards)
-            guards.push_back({k, slot});
+            if (ready == readyStates.end() || !ready->second.count(slot))
+                guards.push_back({k, slot});
         std::sort(guards.begin(), guards.end());
         std::vector<std::string> conds;
         for (const auto &[k, slot] : guards)
@@ -1163,29 +1455,6 @@ struct Segment
         out.push_back("    } }");
     }
 };
-
-// re.sub(r'\bfmac<', 'fmacOutOfLine<', text)
-std::string outOfLineFmac(const std::string &text)
-{
-    std::string out;
-    out.reserve(text.size() + text.size() / 8);
-    for (size_t i = 0; i < text.size(); ++i)
-    {
-        if (text.compare(i, 5, "fmac<") == 0)
-        {
-            const bool boundary =
-                i == 0 || !(std::isalnum(static_cast<unsigned char>(text[i - 1])) || text[i - 1] == '_');
-            if (boundary)
-            {
-                out += "fmacOutOfLine<";
-                i += 4;
-                continue;
-            }
-        }
-        out += text[i];
-    }
-    return out;
-}
 
 } // namespace
 
@@ -1272,6 +1541,8 @@ std::string translateSegment(const std::vector<uint8_t> &code, uint32_t entryPc,
     }
     if (!currBlock.empty())
         blocks.push_back(currBlock);
+    seg.readyStates = readyKnownStates(code, blocks, targets);
+    seg.normStates = normKnownStates(code, blocks, targets);
 
     const bool queue = seg.queueFmacFlags;
     std::vector<std::string> out;
@@ -1294,7 +1565,7 @@ std::string translateSegment(const std::vector<uint8_t> &code, uint32_t entryPc,
     out.push_back("    uint64_t *rdy = vl::LiftAccess::readyTable(c);");
     out.push_back("    uint64_t cyc = vl::LiftAccess::cycle(c), hz = 0;");
     if (queue)
-        seg.deadPushes = findDeadPushes(code, reachable);
+        seg.deadPushes = findDeadPushes(code, reachable, reach.calls ? &*reach.calls : nullptr);
     if (queue)
         out.push_back("    vl::LiftAccess::FlagQueue fq; vl::LiftAccess::flagsEnter(c, fq);");
     if (!seg.deadPushes.empty())
@@ -1334,6 +1605,7 @@ std::string translateSegment(const std::vector<uint8_t> &code, uint32_t entryPc,
             regionStart[r.front()] = r;
             regionEnd[r.back()] = r.front();
         }
+    seg.findDeadTiming(reachable, regionStart, reach.calls ? &*reach.calls : nullptr);
 
     auto label = [&](uint32_t pc) {
         if (targets.count(pc))
@@ -1363,7 +1635,11 @@ std::string translateSegment(const std::vector<uint8_t> &code, uint32_t entryPc,
                 const auto &[tgt, cond] = branchInfo[pc];
                 out.push_back(F("    // %04x: branch to %04x", pc, tgt));
                 append(seg.timingBegin(pc));
-                const std::string upCode = translateUpper(u);
+                std::string upCode;
+                {
+                    const Segment::NormScope scope(seg, pc);
+                    upCode = translateUpper(u);
+                }
                 if (!upCode.empty())
                 {
                     out.push_back("    " + upCode);
@@ -1464,8 +1740,8 @@ std::string translateSegment(const std::vector<uint8_t> &code, uint32_t entryPc,
     const size_t index = size_t(at - out.begin());
     out.erase(at);
     out.insert(out.begin() + std::ptrdiff_t(index), table.begin(), table.end());
-    const std::string text = join(out, "\n");
-    return queue ? text : outOfLineFmac(text);
+    // Every program uses the inlined FMAC fast path (issue 025 v10 V4b: -19.5 % on the large programs, exact).
+    return join(out, "\n");
 }
 
 // ---- __main__ (disc mode) ----
@@ -1491,8 +1767,8 @@ struct DiscBins
     std::map<std::string, std::vector<uint8_t>> bins, covered;
 };
 
-// disc_vu_inputs._load_bins: load_disc_bins (VU1, 16 KB images) and load_vu0_bins (VU0, 4 KB, each range's SHA256
-// over its own chunks)
+// Disc inputs: rebuilds the VU1 (16 KB) and VU0 (4 KB) code images from the executable and checks each range's
+// SHA256 over its own chunks.
 DiscBins loadBins(const std::filesystem::path &elfPath, const Range *ranges, size_t rangeCount, size_t imageSize,
                   bool ownDigest)
 {
@@ -1663,7 +1939,7 @@ bool generateLiftedVu1(const std::filesystem::path &elf, std::string &text, std:
     }
 }
 
-// Port of tools/vu0_translator.py (issue 025).
+// The VU0 microprograms (issue 025).
 bool generateLiftedVu0(const std::filesystem::path &elf, std::string &text, std::string &error,
                        const std::function<void(const std::string &)> &log,
                        const std::function<bool(const std::string &)> &staticTiming)

@@ -141,13 +141,14 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
   - `ps2xRecomp/` — the recompiler `ps2_recomp` (VU0 macro ops: `src/lib/vu_translator.cpp`).
 - `recomp/dw5xl/dw5xl.toml` — recompiler config (stubs, entry points, `[mmio]` map, jump tables, `[patches]`).
   `recomp/dw5xl/output/` and `recomp/dw5xl/overlays/ovl0N/output/` — generated C++ (gitignored; `tools/regen.sh`).
-  `recomp/dw5xl/vu1/` — lifted VU1 C++ (gitignored, game-derived; `tools/vu1_translator.py`).
-  `recomp/dw5xl/vu0/` — lifted VU0 microprograms (gitignored, game-derived; `tools/vu0_translator.py`, issue 025;
-  the launcher's C++ port `app/setup/vu1lift/` writes both, CTests `vu1lift/vu0lift_matches_python`).
+  `recomp/dw5xl/vu1/` — lifted VU1 C++ and `recomp/dw5xl/vu0/` — lifted VU0 microprograms (issue 025; both
+  gitignored, game-derived), written by the VU translator `app/setup/vu1lift/` (`dw5xl_vu1lift [--vu0]`, run by the
+  launcher and `tools/regen.sh`; the only translator since issue 025 Step 6). Its disc inputs (offsets, sizes,
+  hashes only) are `app/setup/vu1lift/vu1_inputs.h`.
 - `app/` — our executable: `src/dw5xl_pad2.cpp` (pad bridge), `dw5xl_images.cpp` + `ipu_idec.*` (native IPU stills),
   `dw5xl_overlays.cpp` (overlay lifecycle/dispatch); tests in `app/tests/` (CTest).
-- `tools/` — `regen.sh`, `vu1_translator.py`/`vu1_timing.py`/`disc_vu_inputs.py` (VU1 lifting from the player's own
-  disc: offsets + hashes only), `heavy_battle_test.py`, `pcsx2_reference.py`, `gsreplay/`, `ghidra_scripts/`, `debug/`.
+- `tools/` — `regen.sh` (recompiler + VU translator), `heavy_battle_test.py`, `pcsx2_reference.py`, `gsreplay/`,
+  `ghidra_scripts/`, `debug/`.
 - Local, gitignored: `game/dw5xl/` (extracted XL disc; run from here; `mc0/`,`mc1/` memory cards), `game/dw5/`,
   `discs/`, `ghidra/` (project dw5xl), `ghidra_iop/` (project koeisnd), `notes/` (issues, evidence, history).
 
@@ -182,11 +183,14 @@ VU0 microprograms (`VCALLMS`, issue 025): `PS2X_VU0_LIFT=0` (interpret them) · 
 native VU0 run repeated by the interpreter and compared; `[vu0verify]`) · `PS2X_VU0_CENSUS=<file>` (per-program
 runs/cycles/host ns + the 4 KB image, game data) · `[vu0lift:hit|miss]` counters give the native share.
 Test runs without a silent sink (Windows): `PS2X_MUTE=1` (master volume 0, audio timing unchanged).
+Logging: `PS2X_STDIO_DIRECT=1` (stdout/stderr written directly instead of through the background log pump, which keeps
+a slow log destination from stalling game threads; for crash hunting, where the pump could lose the last lines; issue 025).
 VU1 exactness/speed: `PS2X_VU1_LIFT_VERIFY=1` (every native VU1 run repeated by the interpreter and compared; slow) ·
 `PS2X_DEVICE_PROFILE=1` with the async trace (device time: transfer/VU1/GIF submit/VIF unpack) ·
 `PS2X_VU1_RUN_CAPTURE=<prefix>` + `_PC/_FROM/_COUNT` (real run starts for `dw5xl_vu1_lift_test benchcap`; game data,
 local only). Translator: `DW5XL_VU1_STATIC=all|none|<segments>` (static timing, default all);
-`tools/vu1_find_disc_range.py` adds a VU1 program to the lift from a local census image.
+`dw5xl_vu1lift --find-range <census image> <entry pc> <name> [disc files]` prints the `vu1_inputs.h` entries that add
+a VU1 program to the lift from a local census image.
 Graphics: `PS2X_GS_SCALE` / `PS2X_GS_SSAA` · `PS2X_NO_WEAVE` · `PS2X_GS_SYNCREADBACK` · `PS2X_GS_TRACE=<file>` +
 `_FROM/_TO` · `PS2X_GS_RECORD=<file>` + `_FROM/_TO` · `PS2X_VRAM_DUMP=<file>` (decode: `tools/debug/gs_vram_ct32.py`) ·
 `PS2X_XGKICK_CAPTURE=<prefix>` + `_FROM/_TO` · `PS2X_DEBUG_ZALWAYS`, `PS2X_ZWATCH` (experiments only).

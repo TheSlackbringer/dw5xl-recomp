@@ -79,7 +79,7 @@ target_precompile_headers(dw5xl PRIVATE
 # 42k small generated files: batch them so the compiler isn't started 42k times.
 set_target_properties(dw5xl PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
 set_source_files_properties(src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp src/dw5xl_install.cpp setup/wizard_console.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
-# Lifted VU1 microprograms are translated from the game's own microcode (tools/vu1_translator.py, run by
+# Lifted VU1 microprograms are translated from the game's own microcode (dw5xl_vu1lift, run by the launcher or
 # tools/regen.sh) into the ignored recomp/dw5xl/vu1/ folder. Game-derived: never committed. Without it,
 # VU1 microcode runs in the interpreter.
 set(DW5XL_VU1_LIFTED_SRC "${DW5XL_RECOMP_ROOT}/dw5xl/vu1/dw5xl_vu1_lifted.cpp")
@@ -91,8 +91,8 @@ else()
     message(STATUS "No lifted VU1 code (run tools/regen.sh); VU1 microcode will be interpreted")
 endif()
 # Lifted VU0 microprograms (issue 025): the programs the game starts with VCALLMS, translated the same way
-# (tools/vu0_translator.py) into the ignored recomp/dw5xl/vu0/ folder. Game-derived: never committed. Without it,
-# VU0 microprograms run in the interpreter.
+# (dw5xl_vu1lift --vu0, also run by tools/regen.sh) into the ignored recomp/dw5xl/vu0/ folder. Game-derived: never
+# committed. Without it, VU0 microprograms run in the interpreter.
 set(DW5XL_VU0_LIFTED_SRC "${DW5XL_RECOMP_ROOT}/dw5xl/vu0/dw5xl_vu0_lifted.cpp" CACHE FILEPATH
     "Generated VU0 microprogram translations (game-derived)")
 if(EXISTS "${DW5XL_VU0_LIFTED_SRC}")
@@ -100,7 +100,7 @@ if(EXISTS "${DW5XL_VU0_LIFTED_SRC}")
     set_source_files_properties("${DW5XL_VU0_LIFTED_SRC}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
     set_property(SOURCE "${DW5XL_VU0_LIFTED_SRC}" APPEND PROPERTY COMPILE_OPTIONS ${DW5XL_STRICT_FP_FLAGS})
 else()
-    message(STATUS "No lifted VU0 code (run tools/vu0_translator.py); VU0 microprograms will be interpreted")
+    message(STATUS "No lifted VU0 code (run tools/regen.sh); VU0 microprograms will be interpreted")
 endif()
 # Generated code uses SSE4.1/AVX intrinsics (PS2Recomp only enables them in its own directory).
 target_compile_options(dw5xl PRIVATE ${DW5XL_ARCH_FLAGS} ${DW5XL_STRICT_FP_FLAGS})
@@ -174,7 +174,8 @@ add_library(dw5xl_setup_core STATIC setup/iso9660.cpp setup/disc_setup.cpp setup
     setup/build_game.cpp setup/install_state.cpp setup/setup_layout.cpp setup/setup_pipeline.cpp setup/vu1lift/vu1_timing.cpp setup/vu1lift/vu1_translator.cpp)
 target_include_directories(dw5xl_setup_core PUBLIC setup)
 target_link_libraries(dw5xl_setup_core PUBLIC ffmpeg Threads::Threads)
-# VU1 lifter (port of tools/vu1_translator.py, disc mode): dw5xl_vu1lift <SLES_538.60> <output.cpp>
+# VU1/VU0 translator, the only one (issue 025 Step 6): dw5xl_vu1lift [--vu0] <SLES_538.60> <output.cpp>;
+# dw5xl_vu1lift --find-range <image> <pc> <name> [disc files] prints the vu1_inputs.h entries for a new program.
 add_executable(dw5xl_vu1lift setup/vu1lift/vu1lift_main.cpp)
 target_link_libraries(dw5xl_vu1lift PRIVATE dw5xl_setup_core)
 # The wizard's window (raylib + imgui) and no-window run, shared by dw5xl_setup and the game (installed mode).
@@ -195,19 +196,6 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_setup_disc_test tests/setup_disc_test.cpp)
     target_link_libraries(dw5xl_setup_disc_test PRIVATE dw5xl_setup_core)
     add_test(NAME setup_disc COMMAND dw5xl_setup_disc_test)
-    find_package(Python3 COMPONENTS Interpreter QUIET)
-    if(Python3_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../game/dw5xl/SLES_538.60" AND NOT CMAKE_CROSSCOMPILING)
-        # Needs the player's own executable (local only, never CI): C++ lifter == tools/vu1_translator.py.
-        add_test(NAME vu1lift_matches_python COMMAND "${CMAKE_COMMAND}" -DLIFTER=$<TARGET_FILE:dw5xl_vu1lift>
-                 -DPYTHON=${Python3_EXECUTABLE} "-DREPO=${CMAKE_CURRENT_SOURCE_DIR}/.."
-                 "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/vu1lift-compare" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompareVu1Lift.cmake")
-        set_tests_properties(vu1lift_matches_python PROPERTIES TIMEOUT 300)
-        # Issue 025: the same for the VU0 microprograms (C++ --vu0 == tools/vu0_translator.py).
-        add_test(NAME vu0lift_matches_python COMMAND "${CMAKE_COMMAND}" -DLIFTER=$<TARGET_FILE:dw5xl_vu1lift>
-                 -DPYTHON=${Python3_EXECUTABLE} "-DREPO=${CMAKE_CURRENT_SOURCE_DIR}/.." -DUNIT=vu0
-                 "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/vu0lift-compare" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompareVu1Lift.cmake")
-        set_tests_properties(vu0lift_matches_python PROPERTIES TIMEOUT 120)
-    endif()
     add_executable(dw5xl_setup_build_test tests/setup_build_test.cpp)
     target_link_libraries(dw5xl_setup_build_test PRIVATE dw5xl_setup_core)
     add_test(NAME setup_build COMMAND dw5xl_setup_build_test)
@@ -345,6 +333,12 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_iop_ascii_compare_test tests/iop_ascii_compare_test.cpp)
     target_link_libraries(dw5xl_iop_ascii_compare_test PRIVATE ps2_iop)
     add_test(NAME iop_ascii_compare COMMAND dw5xl_iop_ascii_compare_test)
+    # Issue 025 v10 Step 5: a slow log destination must not stall the writing thread.
+    add_executable(dw5xl_stdio_pump_test tests/stdio_pump_test.cpp
+                   "${PS2RECOMP_DIR}/ps2xRuntime/src/lib/ps2_stdio_pump.cpp")
+    target_include_directories(dw5xl_stdio_pump_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME stdio_pump COMMAND dw5xl_stdio_pump_test)
+    set_tests_properties(stdio_pump PROPERTIES TIMEOUT 20)
     # ThreadSanitizer variant: the queue, PS2Memory, VIF1 parser and GIF arbiter
     # are recompiled instrumented; their archive copies are then never pulled in.
     option(DW5XL_TSAN_TESTS "Build the ThreadSanitizer variant of the VU1 async queue test" ON)

@@ -244,8 +244,10 @@ namespace vl
     //    The product's sticky class is then known too: zero where a or b is
     //    zero, sign = sign(a) ^ sign(b), never underflow/overflow (q normal).
     // app/tests/vu1_fmac_fast_test.cpp checks both paths agree bit for bit.
+    // Always inlined into the translated VU code: the compiler otherwise calls it out of line, passing the vectors
+    // through memory (issue 025 v9, C1: -17.9 % in the VU1 benchmark, all checked inputs identical).
     template <FmacOp Op, int Dest>
-    inline V fmac(V a, V b, V acc, Flags &fl)
+    [[gnu::always_inline]] inline V fmac(V a, V b, V acc, Flags &fl)
     {
         constexpr int laneMask = ((Dest & 8) ? 1 : 0) | ((Dest & 4) ? 2 : 0) | ((Dest & 2) ? 4 : 0) | ((Dest & 1) ? 8 : 0);
         if constexpr (laneMask == 0)

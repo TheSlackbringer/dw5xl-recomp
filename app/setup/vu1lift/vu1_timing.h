@@ -1,6 +1,6 @@
 #pragma once
-// Per-pair VU1 timing for the lifter (issue 011): a line-by-line port of tools/vu1_timing.py, itself a
-// transcription of VU1Interpreter::decodeUpperUsage / decodeLowerUsage / makeLiftTiming. The lifted code embeds the
+// Per-pair VU1 timing for the lifter (issue 011): a transcription of VU1Interpreter::decodeUpperUsage /
+// decodeLowerUsage / makeLiftTiming. The lifted code embeds the
 // result and checks it against the interpreter at run time, so a divergence costs speed, never correctness.
 #include <array>
 #include <cstdint>

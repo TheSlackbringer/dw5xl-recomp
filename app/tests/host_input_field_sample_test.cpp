@@ -1,6 +1,7 @@
 // One controller sample per guest field (issue 023 5c): a host-input script is evaluated for the field of the game's
 // pad read, presses last exactly the fields the script names (no real-time tap hold), and every read within one field
 // returns the sample taken at the first read of that field.
+#include "ps2_runtime.h"
 #include "runtime/ps2_pad.h"
 
 #include <atomic>
@@ -8,6 +9,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+
+// The runtime references the recompiled-function table; this test has no generated code (as the other app tests).
+extern const uint32_t g_ps2RecompiledFunctionTableBase = 0x1000;
+extern const uint32_t g_ps2RecompiledFunctionTableEnd = 0x1004;
+extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = 1;
+PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[] = {nullptr};
 
 namespace ps2x_dev
 {

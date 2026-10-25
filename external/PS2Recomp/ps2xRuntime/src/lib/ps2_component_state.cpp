@@ -83,6 +83,7 @@ void GSRasterBackend::SerializeState(ps2x::StateArchive &)
 
 void GS::serializeState(ps2x::StateArchive &a)
 {
+    m_forceFieldRead.store(true, std::memory_order_release); // issue 023 2R: read the next field after a load
     a.tag("GSFE");
     a.value(m_gifPathStates);
     a.value(m_localMemorySize);

@@ -140,6 +140,12 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 void GS::reset()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    // Issue 023 step 2R: start over (the next field is read whatever it holds).
+    m_displayPagesValid = false;
+    m_drawOverlap = {};
+    m_displayWritesSinceRead = 0;
+    m_hasLastFieldRead = false;
+    m_forceFieldRead.store(true, std::memory_order_release);
     std::memset(m_ctx, 0, sizeof(m_ctx));
     m_prim = {};
     m_primRegister = {};
@@ -545,8 +551,123 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
 
 // DW5XL-DEBUG issue 023: draw counts for PS2X_VBL_DRAW_TRACE (printed and reset by the EE scheduler).
 std::atomic<uint64_t> g_dw5xlVblDisplayDraws{0}, g_dw5xlVblOtherDraws{0};
+// DW5XL-DEBUG issue 023: display-buffer draws counted in GS order, never reset (field reads print the difference).
+std::atomic<uint64_t> g_dw5xlDisplayDrawsTotal{0};
 extern const uint64_t *g_dw5xlEeCyclePtr;
 extern std::atomic<uint64_t> g_dw5xlDisplayFirstCycle, g_dw5xlDisplayLastCycle;
+
+namespace
+{
+    // Issue 023 step 2R. GS local memory is 512 pages of 8 KB; a page's size in pixels depends on the format.
+    // Unknown formats use the smallest page (64x32), which can only count more pages (a field read stays "new").
+    void gsPageSize(uint8_t psm, uint32_t &width, uint32_t &height)
+    {
+        switch (psm)
+        {
+        case 0x02: case 0x0A: case 0x32: case 0x3A: // 16-bit colour and depth
+            width = 64u; height = 64u; return;
+        case 0x13: // 8-bit
+            width = 128u; height = 64u; return;
+        case 0x14: // 4-bit
+            width = 128u; height = 128u; return;
+        default: // 32/24-bit colour and depth, and the formats stored in their layout
+            width = 64u; height = 32u; return;
+        }
+    }
+
+    // Calls fn(page) for every page the rectangle x0..x1, y0..y1 (inclusive) of a buffer touches. basePage and fbw
+    // (in 64-pixel units) as in FRAME/DISPFB.
+    template <typename Fn>
+    void forEachGsPage(uint32_t basePage, uint32_t fbw, uint8_t psm, uint32_t x0, uint32_t y0, uint32_t x1,
+                       uint32_t y1, Fn &&fn)
+    {
+        if (x1 < x0 || y1 < y0)
+            return;
+        uint32_t pageWidth = 64u, pageHeight = 32u;
+        gsPageSize(psm, pageWidth, pageHeight);
+        const uint32_t perRow = std::max<uint32_t>(1u, (fbw * 64u + pageWidth - 1u) / pageWidth);
+        const uint32_t lastRow = std::min<uint32_t>(y1, 2047u) / pageHeight;
+        const uint32_t lastCol = std::min<uint32_t>(x1, 2047u) / pageWidth;
+        for (uint32_t row = y0 / pageHeight; row <= lastRow; ++row)
+            for (uint32_t col = x0 / pageWidth; col <= lastCol; ++col)
+                fn((basePage + row * perRow + col) & 511u);
+    }
+}
+
+const std::bitset<512> &GS::displayPagesUnlocked()
+{
+    // The pages the enabled read circuits show (PMODE EN1/EN2; DISPFB base, width, format, offset; DISPLAY size and
+    // magnification), recomputed only when those registers change.
+    DisplayRegs regs{};
+    if (m_privRegs)
+    {
+        regs.pmode = m_privRegs->pmode;
+        regs.smode2 = m_privRegs->smode2;
+        regs.dispfb1 = m_privRegs->dispfb1;
+        regs.display1 = m_privRegs->display1;
+        regs.dispfb2 = m_privRegs->dispfb2;
+        regs.display2 = m_privRegs->display2;
+    }
+    if (m_displayPagesValid && regs == m_displayPagesRegs)
+        return m_displayPages;
+    m_displayPages.reset();
+    const uint64_t dispfb[2] = {regs.dispfb1, regs.dispfb2};
+    const uint64_t display[2] = {regs.display1, regs.display2};
+    for (int circuit = 0; circuit < 2; ++circuit)
+    {
+        if ((regs.pmode & (1u << circuit)) == 0u)
+            continue;
+        const uint64_t fb = dispfb[circuit], disp = display[circuit];
+        const uint32_t magh = static_cast<uint32_t>((disp >> 23) & 0xFu) + 1u;
+        const uint32_t magv = static_cast<uint32_t>((disp >> 27) & 0x3u) + 1u;
+        const uint32_t width = (static_cast<uint32_t>((disp >> 32) & 0xFFFu) + 1u + magh - 1u) / magh;
+        const uint32_t height = (static_cast<uint32_t>((disp >> 44) & 0x7FFu) + 1u + magv - 1u) / magv;
+        const uint32_t dbx = static_cast<uint32_t>((fb >> 32) & 0x7FFu);
+        const uint32_t dby = static_cast<uint32_t>((fb >> 43) & 0x7FFu);
+        forEachGsPage(static_cast<uint32_t>(fb & 0x1FFu), static_cast<uint32_t>((fb >> 9) & 0x3Fu),
+                      static_cast<uint8_t>((fb >> 15) & 0x1Fu), dbx, dby, dbx + width - 1u, dby + height - 1u,
+                      [this](uint32_t page) { m_displayPages.set(page); });
+    }
+    m_displayPagesRegs = regs;
+    m_displayPagesValid = true;
+    ++m_displayPagesGeneration;
+    return m_displayPages;
+}
+
+void GS::noteDisplayWriteUnlocked(uint32_t basePage, uint32_t fbw, uint8_t psm, uint32_t x0, uint32_t y0,
+                                  uint32_t x1, uint32_t y1)
+{
+    const std::bitset<512> &shown = displayPagesUnlocked();
+    bool touches = false;
+    forEachGsPage(basePage, fbw, psm, x0, y0, x1, y1, [&](uint32_t page) { touches = touches || shown.test(page); });
+    if (touches)
+        ++m_displayWritesSinceRead;
+}
+
+void GS::noteDrawWriteUnlocked(const GSContext &context)
+{
+    // Draws come in long runs with the same frame and scissor: the overlap is computed once per run.
+    displayPagesUnlocked();
+    const GSFrameReg &f = context.frame;
+    const GSScissorReg &s = context.scissor;
+    const uint64_t frameKey = uint64_t(f.fbp) | (uint64_t(f.fbw) << 9) | (uint64_t(f.psm) << 15) |
+                              (uint64_t(context.zbuf.zbp) << 21) | (uint64_t(context.zbuf.psm) << 30) |
+                              (uint64_t(context.zbuf.zmask ? 1u : 0u) << 36);
+    const uint64_t scissorKey = uint64_t(s.x0) | (uint64_t(s.x1) << 16) | (uint64_t(s.y0) << 32) | (uint64_t(s.y1) << 48);
+    if (m_drawOverlap.frameKey != frameKey || m_drawOverlap.scissorKey != scissorKey ||
+        m_drawOverlap.displayGeneration != m_displayPagesGeneration)
+    {
+        const std::bitset<512> &shown = m_displayPages;
+        bool overlaps = false;
+        const auto test = [&](uint32_t page) { overlaps = overlaps || shown.test(page); };
+        forEachGsPage(f.fbp, f.fbw, f.psm, s.x0, s.y0, s.x1, s.y1, test);
+        if (!context.zbuf.zmask) // depth writes land in memory too
+            forEachGsPage(context.zbuf.zbp, f.fbw, context.zbuf.psm, s.x0, s.y0, s.x1, s.y1, test);
+        m_drawOverlap = {frameKey, scissorKey, m_displayPagesGeneration, overlaps};
+    }
+    if (m_drawOverlap.overlaps)
+        ++m_displayWritesSinceRead;
+}
 
 GSPresentationRequest GS::captureFieldScanoutRequest(uint64_t fieldTick) const
 {
@@ -584,13 +705,55 @@ void GS::submitFieldScanout(const GSPresentationRequest &captured)
     request.bgcolor = captured.bgcolor;
     request.vsyncTick = captured.vsyncTick;
 
+    // Issue 023 step 2R: when the game made no new picture during this field (no GS write touched the displayed
+    // buffer and the display registers are unchanged since the previous read), the buffer still holds the previous
+    // field's picture, made for the other field parity. Reading and weaving it as this field put the picture one line
+    // off; it is a repeat instead: not read, and the window keeps showing the previous picture (what a dropped frame
+    // looks like on a progressive display). A fact of the GS stream, no timing.
+    DisplayRegs regs{};
+    regs.pmode = captured.pmode;
+    regs.smode2 = captured.smode2;
+    regs.dispfb1 = captured.dispfb1;
+    regs.display1 = captured.display1;
+    regs.dispfb2 = captured.dispfb2;
+    regs.display2 = captured.display2;
+    regs.bgcolor = captured.bgcolor;
+    const bool regsChanged = !m_hasLastFieldRead || !(regs == m_lastFieldReadRegs);
+    const bool forced = m_forceFieldRead.exchange(false, std::memory_order_acq_rel);
+    const uint64_t writes = m_displayWritesSinceRead;
+    const bool repeat = !forced && !regsChanged && writes == 0u && m_fieldScanouts.load(std::memory_order_acquire);
+    m_displayWritesSinceRead = 0;
+    m_lastFieldReadRegs = regs;
+    m_hasLastFieldRead = true;
+
     // DW5XL-DEBUG issue 023: draws into the displayed buffer since the last VBlank event when the field is read
     // (needs PS2X_VBL_DRAW_TRACE).
     static const bool s_copyTrace = [] { const char *v = std::getenv("PS2X_VBL_DRAW_TRACE"); return v && *v && *v != '0'; }();
     if (s_copyTrace)
-        std::fprintf(stderr, "[field:read] field=%llu displayDraws=%llu\n",
+    {
+        // sinceLastRead: display-buffer draws in GS order since the previous field read (0 = the game made no copy
+        // during this field: the buffer still holds the previous field's picture). writes/regs/repeat: step 2R's
+        // decision (writes touching the displayed pages, display registers changed, field kept as a repeat).
+        static uint64_t s_lastTotal = 0;
+        const uint64_t total = g_dw5xlDisplayDrawsTotal.load(std::memory_order_relaxed);
+        std::fprintf(stderr, "[field:read] field=%llu displayDraws=%llu sinceLastRead=%llu writes=%llu regs=%d repeat=%d\n",
                      static_cast<unsigned long long>(request.vsyncTick),
-                     static_cast<unsigned long long>(g_dw5xlVblDisplayDraws.load(std::memory_order_relaxed)));
+                     static_cast<unsigned long long>(g_dw5xlVblDisplayDraws.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(total - s_lastTotal), static_cast<unsigned long long>(writes),
+                     (regsChanged || forced) ? 1 : 0, repeat ? 1 : 0);
+        s_lastTotal = total;
+    }
+    if (repeat)
+    {
+        // The field is done for the window (field pacing waits for it), but there is nothing new to read.
+        {
+            std::lock_guard<std::mutex> lock(m_fieldScanoutMutex);
+            m_lastSubmittedField = request.vsyncTick;
+            m_hasSubmittedField = true;
+        }
+        m_fieldScanoutCv.notify_all();
+        return;
+    }
     const bool submitted = m_backend->SubmitFieldScanout(request);
     m_fieldScanouts.store(submitted, std::memory_order_release);
     if (submitted)
@@ -1580,6 +1743,18 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+        if (m_trxdir == 0u || m_trxdir == 2u)
+        {
+            // Issue 023 step 2R: host->local and local->local transfers write their destination rectangle. DBP is
+            // in 64-word blocks (32 per page); a destination not on a page boundary can reach one page further.
+            const uint32_t page = m_bitbltbuf.dbp / 32u;
+            const uint32_t x0 = m_trxpos.dsax, y0 = m_trxpos.dsay;
+            const uint32_t x1 = x0 + std::max<uint32_t>(m_trxreg.rrw, 1u) - 1u;
+            const uint32_t y1 = y0 + std::max<uint32_t>(m_trxreg.rrh, 1u) - 1u;
+            noteDisplayWriteUnlocked(page, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, x0, y0, x1, y1);
+            if (m_bitbltbuf.dbp % 32u != 0u)
+                noteDisplayWriteUnlocked(page + 1u, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, x0, y0, x1, y1);
+        }
 
         if (m_backend)
         {
@@ -1773,6 +1948,7 @@ void GS::vertexKick(bool drawing)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
+        noteDrawWriteUnlocked(batch.state.context); // issue 023 step 2R
         // DW5XL-DEBUG issue 023: PS2X_VBL_DRAW_TRACE=1 counts draws into the displayed frame buffer and elsewhere;
         // the EE scheduler prints and resets the counts at every VBlankStart/VBlankEnd (guest order with
         // PS2X_GS_ASYNC=0 PS2X_VU1_ASYNC=0).
@@ -1782,6 +1958,8 @@ void GS::vertexKick(bool drawing)
             {
                 const bool toDisplay = batch.state.context.frame.fbp == static_cast<uint32_t>(m_privRegs->dispfb1 & 0x1FFu);
                 (toDisplay ? g_dw5xlVblDisplayDraws : g_dw5xlVblOtherDraws).fetch_add(1u, std::memory_order_relaxed);
+                if (toDisplay)
+                    g_dw5xlDisplayDrawsTotal.fetch_add(1u, std::memory_order_relaxed);
                 if (toDisplay && g_dw5xlEeCyclePtr)
                 {
                     const uint64_t cycle = *g_dw5xlEeCyclePtr;
@@ -1838,12 +2016,15 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
+    const GSContext &context = m_ctx[(contextIndex != 0u) ? 1 : 0];
+    noteDrawWriteUnlocked(context); // issue 023 step 2R: a clear is a draw over the scissor
+    return m_backend && m_backend->ClearFramebuffer(context, rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    noteDrawWriteUnlocked(activeContext()); // issue 023 step 2R
     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
 }
 
@@ -1962,6 +2143,7 @@ void GS::setResolutionScale(uint32_t scale)
     {
         m_backend->SetResolutionScale(scale);
     }
+    m_forceFieldRead.store(true, std::memory_order_release); // issue 023 2R: the new output needs a fresh read
 }
 
 uint32_t GS::getResolutionScale() const
@@ -1978,6 +2160,7 @@ void GS::setAASamples(uint32_t samples)
 {
     std::lock_guard<std::mutex> lock(m_backendLifetimeMutex);
     if (m_backend) m_backend->SetAASamples(samples);
+    m_forceFieldRead.store(true, std::memory_order_release); // issue 023 2R: the new output needs a fresh read
 }
 
 uint32_t GS::getAASamples() const

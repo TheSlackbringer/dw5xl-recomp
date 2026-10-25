@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -279,6 +280,36 @@ private:
     std::condition_variable m_fieldScanoutCv;
     uint64_t m_lastSubmittedField = 0;
     bool m_hasSubmittedField = false;
+    // Issue 023 step 2R: a field read is new only if, since the previous read, a GS write touched the displayed
+    // buffer or the display registers changed; otherwise it is a repeat and the window keeps the previous picture.
+    // GS side, in stream order (under m_stateMutex).
+    struct DisplayRegs
+    {
+        uint64_t pmode = 0, smode2 = 0, dispfb1 = 0, display1 = 0, dispfb2 = 0, display2 = 0, bgcolor = 0;
+        bool operator==(const DisplayRegs &o) const
+        {
+            return pmode == o.pmode && smode2 == o.smode2 && dispfb1 == o.dispfb1 && display1 == o.display1 &&
+                   dispfb2 == o.dispfb2 && display2 == o.display2 && bgcolor == o.bgcolor;
+        }
+    };
+    void noteDisplayWriteUnlocked(uint32_t basePage, uint32_t fbw, uint8_t psm, uint32_t x0, uint32_t y0,
+                                  uint32_t x1, uint32_t y1);
+    void noteDrawWriteUnlocked(const GSContext &context);
+    const std::bitset<512> &displayPagesUnlocked();
+    std::bitset<512> m_displayPages;
+    DisplayRegs m_displayPagesRegs{};
+    bool m_displayPagesValid = false;
+    uint64_t m_displayPagesGeneration = 0;
+    struct DrawOverlap
+    {
+        uint64_t frameKey = ~0ull, scissorKey = ~0ull, displayGeneration = ~0ull;
+        bool overlaps = false;
+    } m_drawOverlap;
+    uint64_t m_displayWritesSinceRead = 0;
+    DisplayRegs m_lastFieldReadRegs{};
+    bool m_hasLastFieldRead = false;
+    // Output scale/AA change, reset or a loaded save state: the next field is read even without a GS write.
+    std::atomic<bool> m_forceFieldRead{true};
     uint64_t m_nativeImageUploadCount = 0;
     uint64_t m_nativePackedGIFPacketCount = 0;
 
