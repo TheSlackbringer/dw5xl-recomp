@@ -428,8 +428,53 @@ QUEUE_FMAC_FLAGS = True
 DEAD_PUSHES = set()
 _BRANCH_OPS = (0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2c, 0x2d, 0x2e, 0x2f)
 
-def find_dead_pushes(code, reachable):
+# Issue 025 v10 V2: the same rule along every control-flow path. A branch's delay slot runs next, then its target
+# and (conditional) the fall-through; JR goes to its proven targets; an E bit ends the program after its delay
+# slot. A result is dead when on every path from the pair after it the next flag-producing FMAC comes before any
+# flag reader, and no reader comes in the three pairs after that FMAC either; an end of program, a D/T bit or a
+# jump without proven targets on the way keeps the push.
+_END = -1
+
+def pair_successors(code, reachable):
     reach = set(reachable)
+    succ = {}
+    # A jump straight into a delay slot has no branch pending: the pair after the slot runs next.
+    jumped_to = set()
+    for pc in reachable:
+        lo, up = struct.unpack_from('<II', code, pc)
+        l = decode_lower(lo, pc)
+        if not (up >> 31) & 1 and l['type'] == 'NORM' and l['op'] in _BRANCH_OPS:
+            if l['op'] == 0x24:
+                jumped_to.update((_NATIVE_CALL_INFO['jr_targets'].get(pc) or ()) if _NATIVE_CALL_INFO else ())
+            elif l['op'] != 0x25:
+                jumped_to.add(l['tgt'])
+    for pc in reachable:
+        lo, up = struct.unpack_from('<II', code, pc)
+        if pc not in succ:
+            succ[pc] = {pc + 8}
+        l = decode_lower(lo, pc)
+        d_pc = pc + 8
+        if (up >> 30) & 1:
+            succ[pc] = {d_pc}
+            succ[d_pc] = {_END}
+        elif not (up >> 31) & 1 and l['type'] == 'NORM' and l['op'] in _BRANCH_OPS:
+            succ[pc] = {d_pc}
+            if l['op'] == 0x24:
+                jr = _NATIVE_CALL_INFO['jr_targets'].get(pc) if _NATIVE_CALL_INFO else None
+                succ[d_pc] = set(jr) if jr else {None}
+            elif l['op'] == 0x25:
+                succ[d_pc] = {None}
+            elif l['op'] in (0x20, 0x21):
+                succ[d_pc] = {l['tgt']}
+            else:
+                succ[d_pc] = {l['tgt'], pc + 16}
+            if d_pc in jumped_to:
+                succ[d_pc].add(pc + 16)
+    for pc, nxt in succ.items():
+        succ[pc] = {q if q in (_END, None) or q in reach else None for q in nxt}
+    return succ
+
+def find_dead_pushes(code, reachable):
     info = {}
     for pc in reachable:
         lo, up = struct.unpack_from('<II', code, pc)
@@ -439,18 +484,32 @@ def find_dead_pushes(code, reachable):
         lower_norm = not i_bit and l['type'] == 'NORM'
         info[pc] = (m is not None and int(m.group(1)) != 0,
                     lower_norm and l['op'] in MAC_STATUS_READERS,
-                    bool((up >> 27) & 0xB) or (lower_norm and l['op'] in _BRANCH_OPS))
+                    bool((up >> 27) & 0x3))
+    succ = pair_successors(code, reachable)
     dead = set()
     for pc in reachable:
-        push, _, barrier = info[pc]
-        if not push or barrier:
+        push, _, stop = info[pc]
+        if not push or stop:
             continue
-        q = pc + 8
-        while q in reach and not info[q][1] and not info[q][2] and not info[q][0]:
-            q += 8
-        if q not in reach or not info[q][0] or info[q][1] or info[q][2]:
-            continue
-        if all(q + 8 * k in reach and not info[q + 8 * k][1] and not info[q + 8 * k][2] for k in (1, 2, 3)):
+        # States: (pair, n) with n = 0 before the next push, n = 1..3 the pairs still checked after it.
+        todo = [(q, 0) for q in succ[pc]]
+        seen = set()
+        ok = True
+        while todo and ok:
+            q, n = todo.pop()
+            if (q, n) in seen:
+                continue
+            seen.add((q, n))
+            if q is None or q == _END or info[q][1] or info[q][2]:
+                ok = False
+                break
+            if n == 0:
+                nxt = 1 if info[q][0] else 0
+            else:
+                nxt = n + 1 if n < 3 else None
+            if nxt is not None:
+                todo.extend((r, nxt) for r in succ[q])
+        if ok:
             dead.add(pc)
     return dead
 

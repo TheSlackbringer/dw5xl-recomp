@@ -827,12 +827,88 @@ int fmacDest(const std::string &upCode)
     return -1;
 }
 
-// FMAC flag results nothing can observe (same rule as tools/vu1_translator.py find_dead_pushes).
-std::set<uint32_t> findDeadPushes(const std::vector<uint8_t> &code, const std::vector<uint32_t> &reachable)
+const std::set<uint32_t> kBranchOps = {0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2c, 0x2d, 0x2e, 0x2f};
+constexpr uint32_t kPathEnd = 0xFFFFFFFFu;     // program end (Python _END)
+constexpr uint32_t kPathUnknown = 0xFFFFFFFEu; // no proven successor (Python None)
+
+// Issue 025 v10 V2 (port of pair_successors): the pairs that can run after each pair. A branch's delay slot runs
+// next, then its target and (conditional) the fall-through; JR goes to its proven targets; an E bit ends the
+// program after its delay slot; a jump straight into a delay slot continues after it.
+std::map<uint32_t, std::set<uint32_t>> pairSuccessors(const std::vector<uint8_t> &code,
+                                                      const std::vector<uint32_t> &reachable,
+                                                      const NativeCallInfo *calls)
 {
-    static const std::set<uint32_t> kBranchOps = {0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2c, 0x2d, 0x2e, 0x2f};
     const std::set<uint32_t> reach(reachable.begin(), reachable.end());
-    struct Info { bool push, reader, barrier; };
+    auto jrOf = [&](uint32_t pc) -> const std::set<uint32_t> * {
+        if (!calls)
+            return nullptr;
+        const auto it = calls->jrTargets.find(pc);
+        return it == calls->jrTargets.end() ? nullptr : &it->second;
+    };
+    std::set<uint32_t> jumpedTo;
+    for (uint32_t pc : reachable)
+    {
+        const auto [lo, up] = unpackPair(code, pc);
+        const Lower l = decodeLower(lo, pc);
+        if (!((up >> 31) & 1) && l.type == LType::NORM && kBranchOps.count(l.op))
+        {
+            if (l.op == 0x24)
+            {
+                if (const auto *jr = jrOf(pc))
+                    jumpedTo.insert(jr->begin(), jr->end());
+            }
+            else if (l.op != 0x25)
+                jumpedTo.insert(l.tgt);
+        }
+    }
+    std::map<uint32_t, std::set<uint32_t>> succ;
+    for (uint32_t pc : reachable)
+    {
+        const auto [lo, up] = unpackPair(code, pc);
+        if (!succ.count(pc))
+            succ[pc] = {pc + 8};
+        const Lower l = decodeLower(lo, pc);
+        const uint32_t dPc = pc + 8;
+        if ((up >> 30) & 1)
+        {
+            succ[pc] = {dPc};
+            succ[dPc] = {kPathEnd};
+        }
+        else if (!((up >> 31) & 1) && l.type == LType::NORM && kBranchOps.count(l.op))
+        {
+            succ[pc] = {dPc};
+            if (l.op == 0x24)
+            {
+                const auto *jr = jrOf(pc);
+                succ[dPc] = (jr && !jr->empty()) ? *jr : std::set<uint32_t>{kPathUnknown};
+            }
+            else if (l.op == 0x25)
+                succ[dPc] = {kPathUnknown};
+            else if (l.op == 0x20 || l.op == 0x21)
+                succ[dPc] = {l.tgt};
+            else
+                succ[dPc] = {l.tgt, pc + 16};
+            if (jumpedTo.count(dPc))
+                succ[dPc].insert(pc + 16);
+        }
+    }
+    for (auto &[pc, next] : succ)
+    {
+        std::set<uint32_t> mapped;
+        for (uint32_t q : next)
+            mapped.insert(q == kPathEnd || q == kPathUnknown || reach.count(q) ? q : kPathUnknown);
+        next = mapped;
+    }
+    return succ;
+}
+
+// FMAC flag results nothing can observe (same rule as tools/vu1_translator.py find_dead_pushes): on every path from
+// the pair after it, the next flag-producing FMAC comes before any flag reader, and no reader, end of program, D/T
+// bit or unproven jump comes in the three pairs after that FMAC.
+std::set<uint32_t> findDeadPushes(const std::vector<uint8_t> &code, const std::vector<uint32_t> &reachable,
+                                  const NativeCallInfo *calls)
+{
+    struct Info { bool push, reader, stop; };
     std::map<uint32_t, Info> info;
     for (uint32_t pc : reachable)
     {
@@ -841,25 +917,42 @@ std::set<uint32_t> findDeadPushes(const std::vector<uint8_t> &code, const std::v
         const Lower l = decodeLower(lo, pc);
         const int dest = fmacDest(translateUpper(decodeUpper(up & 0x07ffffff)));
         const bool lowerNorm = !iBit && l.type == LType::NORM;
-        info[pc] = {dest > 0, lowerNorm && kMacStatusReaders.count(l.op) != 0,
-                    ((up >> 27) & 0xB) != 0 || (lowerNorm && kBranchOps.count(l.op) != 0)};
+        info[pc] = {dest > 0, lowerNorm && kMacStatusReaders.count(l.op) != 0, ((up >> 27) & 0x3) != 0};
     }
-    auto at = [&](uint32_t pc) -> const Info * { return reach.count(pc) ? &info.at(pc) : nullptr; };
+    const auto succ = pairSuccessors(code, reachable, calls);
     std::set<uint32_t> dead;
     for (uint32_t pc : reachable)
     {
         const Info &p = info.at(pc);
-        if (!p.push || p.barrier)
+        if (!p.push || p.stop)
             continue;
-        uint32_t q = pc + 8;
-        while (at(q) && !at(q)->reader && !at(q)->barrier && !at(q)->push)
-            q += 8;
-        if (!at(q) || !at(q)->push || at(q)->reader || at(q)->barrier)
-            continue;
-        bool clear = true;
-        for (uint32_t k = 1; k <= 3 && clear; ++k)
-            clear = at(q + 8 * k) && !at(q + 8 * k)->reader && !at(q + 8 * k)->barrier;
-        if (clear)
+        // States: (pair, n) with n = 0 before the next push, n = 1..3 the pairs still checked after it.
+        std::vector<std::pair<uint32_t, int>> todo;
+        for (uint32_t q : succ.at(pc))
+            todo.push_back({q, 0});
+        std::set<std::pair<uint32_t, int>> seen;
+        bool ok = true;
+        while (!todo.empty() && ok)
+        {
+            const auto [q, n] = todo.back();
+            todo.pop_back();
+            if (!seen.insert({q, n}).second)
+                continue;
+            if (q == kPathUnknown || q == kPathEnd || info.at(q).reader || info.at(q).stop)
+            {
+                ok = false;
+                break;
+            }
+            int nxt;
+            if (n == 0)
+                nxt = info.at(q).push ? 1 : 0;
+            else
+                nxt = n < 3 ? n + 1 : -1;
+            if (nxt >= 0)
+                for (uint32_t r : succ.at(q))
+                    todo.push_back({r, nxt});
+        }
+        if (ok)
             dead.insert(pc);
     }
     return dead;
@@ -1294,7 +1387,7 @@ std::string translateSegment(const std::vector<uint8_t> &code, uint32_t entryPc,
     out.push_back("    uint64_t *rdy = vl::LiftAccess::readyTable(c);");
     out.push_back("    uint64_t cyc = vl::LiftAccess::cycle(c), hz = 0;");
     if (queue)
-        seg.deadPushes = findDeadPushes(code, reachable);
+        seg.deadPushes = findDeadPushes(code, reachable, reach.calls ? &*reach.calls : nullptr);
     if (queue)
         out.push_back("    vl::LiftAccess::FlagQueue fq; vl::LiftAccess::flagsEnter(c, fq);");
     if (!seg.deadPushes.empty())
