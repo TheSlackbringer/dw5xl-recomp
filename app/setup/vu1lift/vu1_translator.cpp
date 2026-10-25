@@ -1257,29 +1257,6 @@ struct Segment
     }
 };
 
-// re.sub(r'\bfmac<', 'fmacOutOfLine<', text)
-std::string outOfLineFmac(const std::string &text)
-{
-    std::string out;
-    out.reserve(text.size() + text.size() / 8);
-    for (size_t i = 0; i < text.size(); ++i)
-    {
-        if (text.compare(i, 5, "fmac<") == 0)
-        {
-            const bool boundary =
-                i == 0 || !(std::isalnum(static_cast<unsigned char>(text[i - 1])) || text[i - 1] == '_');
-            if (boundary)
-            {
-                out += "fmacOutOfLine<";
-                i += 4;
-                continue;
-            }
-        }
-        out += text[i];
-    }
-    return out;
-}
-
 } // namespace
 
 std::vector<uint32_t> findReachable(const std::vector<uint8_t> &code, uint32_t entryPc)
@@ -1557,8 +1534,8 @@ std::string translateSegment(const std::vector<uint8_t> &code, uint32_t entryPc,
     const size_t index = size_t(at - out.begin());
     out.erase(at);
     out.insert(out.begin() + std::ptrdiff_t(index), table.begin(), table.end());
-    const std::string text = join(out, "\n");
-    return queue ? text : outOfLineFmac(text);
+    // Every program uses the inlined FMAC fast path (issue 025 v10 V4b; see tools/vu1_translator.py).
+    return join(out, "\n");
 }
 
 // ---- __main__ (disc mode) ----

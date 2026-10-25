@@ -919,15 +919,10 @@ def translate_segment(code, entry_pc, fn_name, static_timing=False):
              f"    if (!vl::LiftAccess::validate(c, kTiming, kPcs, {len(timings)}u, s_timingState, \"{fn_name}\")) {{ c.declined = true; return; }}"]
     i = out.index("@@TIMING_TABLE@@")
     out[i:i + 1] = table
-    text = "\n".join(out)
-    # Both FMAC paths are exact (identical results and flags). Programs that queue
-    # their MAC/status flags use the inlined per-lane fast path (vl::fmac). The
-    # very large programs that keep only their last flags call it out of line
-    # (vl::fmacOutOfLine): inlined there it was ~37 % slower (register pressure),
-    # called ~18 % faster than the exact path (issue 001 work.md, M12).
-    if not QUEUE_FMAC_FLAGS:
-        text = re.sub(r'\bfmac<', 'fmacOutOfLine<', text)
-    return text
+    # Every program uses the inlined per-lane fast path (vl::fmac, always inline). Issue 001 M12 had the very large
+    # programs call it out of line (inlined ~37 % slower then); issue 025 v10 V4b measured the opposite on today's
+    # code: -19.5 % on the real runs of the 0x0800 programs, exact.
+    return "\n".join(out)
 
 def static_enabled(name):
     # DW5XL_VU1_STATIC: 'all' (default), 'none', or a comma list of segments.
