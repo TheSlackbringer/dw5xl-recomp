@@ -117,57 +117,67 @@ def blend_wrap(reg, val, d):
     else:
         return f"{reg} = blend<0x{lm:x}>({reg}, {val});"
 
+# Issue 025 v10 V1: lanes known to hold zero or a normal float, per VF register (bits as in dest: x=8 y=4 z=2 w=1),
+# for the pair being translated; None = nothing known. norm() is the identity on such lanes, so it is left out where
+# every lane an operand is read in is known (see norm_known_states).
+NORM_KNOWN = None
+
+def nv(r, lanes):
+    if NORM_KNOWN is not None and r != 0 and (NORM_KNOWN.get(r, 0) & lanes) == lanes:
+        return f"vf[{r}]"
+    return f"norm(vf[{r}])"
+
 def translate_upper(u):
     name = u['name']
     d = u['d']
     fd = u['fd']
     fs = u['fs']
     ft = u['ft']
-    
+
     if name == 'NOP':
         return ""
-        
+
     fmac_map = {'ADD':'Add', 'SUB':'Sub', 'MUL':'Mul', 'MADD':'MAdd', 'MSUB':'MSub',
                 'ADDA':'Add', 'SUBA':'Sub', 'MULA':'Mul', 'MADDA':'MAdd', 'MSUBA':'MSub'}
-                
+
     for base in ('ADD', 'SUB', 'MUL', 'MADD', 'MSUB'):
         for i, c in enumerate(BC):
             if name == base + c:
-                val = f"fmac<{fmac_map[base]}, {d}>(norm(vf[{fs}]), bc<{i}>(norm(vf[{ft}])), acc, fl)"
+                val = f"fmac<{fmac_map[base]}, {d}>({nv(fs, d)}, bc<{i}>({nv(ft, 8 >> i)}), acc, fl)"
                 return blend_wrap(f"vf[{fd}]", val, d)
             if name == base + 'A' + c:
-                val = f"fmac<{fmac_map[base]}, {d}>(norm(vf[{fs}]), bc<{i}>(norm(vf[{ft}])), acc, fl)"
+                val = f"fmac<{fmac_map[base]}, {d}>({nv(fs, d)}, bc<{i}>({nv(ft, 8 >> i)}), acc, fl)"
                 return blend_wrap("acc", val, d)
-                
+
     for base in ('ADD', 'SUB', 'MUL', 'MADD', 'MSUB'):
         if name == base:
-            val = f"fmac<{fmac_map[base]}, {d}>(norm(vf[{fs}]), norm(vf[{ft}]), acc, fl)"
+            val = f"fmac<{fmac_map[base]}, {d}>({nv(fs, d)}, {nv(ft, d)}, acc, fl)"
             return blend_wrap(f"vf[{fd}]", val, d)
         if name == base + 'A':
-            val = f"fmac<{fmac_map[base]}, {d}>(norm(vf[{fs}]), norm(vf[{ft}]), acc, fl)"
+            val = f"fmac<{fmac_map[base]}, {d}>({nv(fs, d)}, {nv(ft, d)}, acc, fl)"
             return blend_wrap("acc", val, d)
-            
+
     for base in ('ADD', 'SUB', 'MUL', 'MADD', 'MSUB'):
         if name == base + 'q':
-            val = f"fmac<{fmac_map[base]}, {d}>(norm(vf[{fs}]), splat(c.st.q), acc, fl)"
+            val = f"fmac<{fmac_map[base]}, {d}>({nv(fs, d)}, splat(c.st.q), acc, fl)"
             return blend_wrap(f"vf[{fd}]", val, d)
         if name == base + 'Aq':
-            val = f"fmac<{fmac_map[base]}, {d}>(norm(vf[{fs}]), splat(c.st.q), acc, fl)"
+            val = f"fmac<{fmac_map[base]}, {d}>({nv(fs, d)}, splat(c.st.q), acc, fl)"
             return blend_wrap("acc", val, d)
-            
+
     for base in ('ADD', 'SUB', 'MUL', 'MADD', 'MSUB'):
         if name == base + 'i':
-            val = f"fmac<{fmac_map[base]}, {d}>(norm(vf[{fs}]), splat(i_reg), acc, fl)"
+            val = f"fmac<{fmac_map[base]}, {d}>({nv(fs, d)}, splat(i_reg), acc, fl)"
             return blend_wrap(f"vf[{fd}]", val, d)
         if name == base + 'Ai':
-            val = f"fmac<{fmac_map[base]}, {d}>(norm(vf[{fs}]), splat(i_reg), acc, fl)"
+            val = f"fmac<{fmac_map[base]}, {d}>({nv(fs, d)}, splat(i_reg), acc, fl)"
             return blend_wrap("acc", val, d)
-            
+
     # Outer product (interpreter OuterMul/OuterMSub): x = fs.y*ft.z, y = fs.z*ft.x,
     # z = fs.x*ft.y; the exact FMAC of crossed operands (w is outside dest xyz).
     if name in ('OPMULA', 'OPMSUB'):
-        a = f"_mm_shuffle_ps(norm(vf[{fs}]), norm(vf[{fs}]), _MM_SHUFFLE(3, 0, 2, 1))"
-        b = f"_mm_shuffle_ps(norm(vf[{ft}]), norm(vf[{ft}]), _MM_SHUFFLE(3, 1, 0, 2))"
+        a = f"_mm_shuffle_ps({nv(fs, 15)}, {nv(fs, 15)}, _MM_SHUFFLE(3, 0, 2, 1))"
+        b = f"_mm_shuffle_ps({nv(ft, 15)}, {nv(ft, 15)}, _MM_SHUFFLE(3, 1, 0, 2))"
         if name == 'OPMULA':
             return blend_wrap("acc", f"fmac<Mul, {d}>({a}, {b}, acc, fl)", d)
         return blend_wrap(f"vf[{fd}]", f"fmac<MSub, {d}>({a}, {b}, acc, fl)", d)
@@ -192,9 +202,9 @@ def translate_upper(u):
         return f"vl::LiftAccess::clipAt(c, cyc, vl::clipFlags(vf[{fs}], bc<3>(vf[{ft}])) & 0x3F);"
         
     if name == 'FTOI0':
-        return blend_wrap(f"vf[{ft}]", f"vuFtoiV(norm(vf[{fs}]), 1.0f)", d)
+        return blend_wrap(f"vf[{ft}]", f"vuFtoiV({nv(fs, d)}, 1.0f)", d)
     if name == 'FTOI4':
-        return blend_wrap(f"vf[{ft}]", f"vuFtoiV(norm(vf[{fs}]), 16.0f)", d)
+        return blend_wrap(f"vf[{ft}]", f"vuFtoiV({nv(fs, d)}, 16.0f)", d)
     if name == 'ITOF0':
         return blend_wrap(f"vf[{ft}]", f"vuItofV(vf[{fs}], 1.0f)", d)
     if name == 'ITOF4':
@@ -522,7 +532,50 @@ def fmac_flag_code(pc=None):
         return "    if (fl.pending) { fl.pending = false; vl::LiftAccess::flagsPush(c, fq, cyc, fl.mac, fl.cur, fl.extra); }"
     return "    if (fl.pending) { fl.pending = false; lastMac = fl.mac; lastCur = fl.cur; sticky6 |= fl.cur | fl.extra; anyFmac = true; }"
 
+# Issue 025 v10 V1: which VF lanes hold zero or a normal float before each pair. The destination lanes of ADD, SUB and
+# MUL (not MADD/MSUB: two roundings can keep a denormal near FLT_MIN) are zero or normal on every path of vl::fmac:
+# one rounding toward zero stays normal when the exact result is, and zero/underflow/overflow are clamped. Every other
+# VF write makes its lanes unknown. Straight-line code only: the state starts empty at each block, each label and
+# after a program end, so every way into a pair runs through the pairs this walk saw.
+NORM_STATES = {}
+_NORM_FMAC = re.compile(r'(ADD|SUB|MUL)[xyzwqi]?')
+
+def norm_known_states(code, blocks, targets):
+    states = {}
+    for block in blocks:
+        state = {}
+        stop_after = None
+        for pc in block:
+            if pc in targets:
+                state = {}
+            states[pc] = dict(state)
+            lo, up = struct.unpack_from('<II', code, pc)
+            u = decode_upper(up & 0x07ffffff)
+            if not (up >> 31) & 1:
+                w = lower_writes_vf(decode_lower(lo, pc))
+                if w is not None:
+                    state[w] = state.get(w, 0) & ~decode_lower(lo, pc)['dd']
+            w = upper_writes_vf(u)
+            if w is not None:
+                if u['type'] == 'UP' and _NORM_FMAC.fullmatch(u['name']):
+                    state[w] = state.get(w, 0) | u['d']
+                else:
+                    state[w] = state.get(w, 0) & ~u['d']
+            if (up >> 30) & 1:
+                stop_after = pc + 8
+            elif pc == stop_after:
+                state = {}
+    return states
+
 def emit_pair(u, l, lo, i_bit, pc, out):
+    global NORM_KNOWN
+    NORM_KNOWN = NORM_STATES.get(pc)
+    try:
+        emit_pair_known(u, l, lo, i_bit, pc, out)
+    finally:
+        NORM_KNOWN = None
+
+def emit_pair_known(u, l, lo, i_bit, pc, out):
     shadow = None
     w = upper_writes_vf(u)
     # Like the interpreter's upperVfShadowReg: when the lower instruction reads
@@ -541,14 +594,97 @@ def emit_pair(u, l, lo, i_bit, pc, out):
             out.append(fmac_flag_code(pc))
     if lo_code: out.append(f"    {lo_code}")
 
+# Issue 025 v10 V3: ready-table slots that cannot delay a pair. Inside a translated run only the translated code writes
+# the ready table: rdy[slot] = (issue cycle of its last writer) + latency. Every pair takes at least one cycle (stalls
+# only add), so a slot whose last writer lies at least `latency` pairs earlier in the same straight-line code is ready.
+# Straight-line code only, as in norm_known_states: the state starts empty at each block, each label and after a
+# program end. Such slots are left out of the pair's stall check and of a static region's entry guard.
+READY_STATES = {}
+
+def ready_known_states(code, blocks, targets):
+    states = {}
+    for block in blocks:
+        last = {}
+        index = 0
+        stop_after = None
+        for pc in block:
+            if pc in targets:
+                last = {}
+            lo, up = struct.unpack_from('<II', code, pc)
+            states[pc] = {slot for slot, (at, lat) in last.items() if index - at >= lat}
+            for slot, lat in vu1_timing.pair_timing(lo, up)['writes']:
+                last[slot] = (index, lat)
+            index += 1
+            if (up >> 30) & 1:
+                stop_after = pc + 8
+            elif pc == stop_after:
+                last = {}
+    return states
+
+# Issue 025 v10 V3: ready-table writes and horizon updates nothing needs. Inside a run the ready table is read only by
+# the stall checks and static-region guards this file emits. A normal end runs the pipelines until the cycle reaches
+# the horizon (flushPipelines), and every entry is at most the horizon, so after the end no entry can delay anything;
+# a cancelled run is followed by the ordered VU reset, which clears both (resetScheduler). So a write of a slot is
+# left out when on every path from the next pair the slot is written again (or the program ends) before a check or
+# guard reads it; a horizon update is left out when on every path a later update is at least as far (cycles grow by
+# at least one per pair; a static region's single update covers its pairs) before the program ends.
+DEAD_WRITES = set()   # (pc, slot)
+DEAD_HORIZON = set()  # pc
+
+def find_dead_timing(code, reachable, region_start):
+    succ = pair_successors(code, reachable)
+    reads, writes, hzl = {}, {}, {}
+    for pc in reachable:
+        lo, up = struct.unpack_from('<II', code, pc)
+        t = vu1_timing.pair_timing(lo, up)
+        ready = READY_STATES.get(pc, ())
+        r = {slot for slot in t['reads'] if slot not in ready}
+        if pc in region_start:
+            r |= {slot for slot in simulate_region(code, region_start[pc])[1] if slot not in ready}
+        reads[pc] = r
+        writes[pc] = {slot for slot, _ in t['writes']}
+        hzl[pc] = t['maxLat'] if t['writes'] else None
+    dead_writes, dead_hz = set(), set()
+    for pc in reachable:
+        for slot in writes[pc]:
+            todo, seen, live = list(succ[pc]), set(), False
+            while todo and not live:
+                q = todo.pop()
+                if q in seen or q == _END:
+                    continue
+                seen.add(q)
+                if q is None or slot in reads[q]:
+                    live = True
+                elif slot not in writes[q]:
+                    todo.extend(succ[q])
+            if not live:
+                dead_writes.add((pc, slot))
+        lat = hzl[pc]
+        if lat is None:
+            continue
+        todo, seen, live = [(q, 1) for q in succ[pc]], set(), False
+        while todo and not live:
+            q, dist = todo.pop()
+            if (q, dist) in seen:
+                continue
+            seen.add((q, dist))
+            if q is None or q == _END:
+                live = True
+            elif hzl[q] is None or dist + hzl[q] < lat:
+                todo.extend((r, min(dist + 1, lat)) for r in succ[q])
+        if not live:
+            dead_hz.add(pc)
+    return dead_writes, dead_hz
+
 def timing_begin(code, pc, timings):
     """Stall checks before a pair, with the pair's read slots as constants."""
     lo, up = struct.unpack_from('<II', code, pc)
     t = vu1_timing.pair_timing(lo, up)
     timings.append((pc, t))
     lines = []
-    if t['reads']:
-        checks = ' '.join(f"r_ = rdy[{slot}] > r_ ? rdy[{slot}] : r_;" for slot in t['reads'])
+    reads = [slot for slot in t['reads'] if slot not in READY_STATES.get(pc, ())]
+    if reads:
+        checks = ' '.join(f"r_ = rdy[{slot}] > r_ ? rdy[{slot}] : r_;" for slot in reads)
         lines.append(f"    {{ uint64_t r_ = cyc; {checks} if (r_ > cyc) vl::LiftAccess::stall(c, cyc, r_); }}")
     if t['flags'] & (vu1_timing.FLAG_FDIV | vu1_timing.FLAG_WAITQ):
         lines.append("    vl::LiftAccess::fdivWait(c, cyc);")
@@ -565,8 +701,10 @@ def timing_end(code, pc):
     lo, up = struct.unpack_from('<II', code, pc)
     t = vu1_timing.pair_timing(lo, up)
     lines = []
-    if t['writes']:
-        lines.append("    " + " ".join(f"rdy[{slot}] = cyc + {lat};" for slot, lat in t['writes']))
+    live = [(slot, lat) for slot, lat in t['writes'] if (pc, slot) not in DEAD_WRITES]
+    if live:
+        lines.append("    " + " ".join(f"rdy[{slot}] = cyc + {lat};" for slot, lat in live))
+    if t['writes'] and pc not in DEAD_HORIZON:
         lines.append(f"    if (cyc + {t['maxLat']} > hz) hz = cyc + {t['maxLat']};")
     if t['firstVi'] and t['flags'] & vu1_timing.FLAG_BRANCH_DELAY:
         lines.append(f"    bbValid = true; bbReg = {t['firstVi']}; bbVal = ov;")
@@ -657,7 +795,9 @@ def emit_static_region(code, region, emit_one, out):
     # any window of kFmacLatency cycles (older ones are drained first).
     push_at = [k for k, body in zip(issue, bodies) if any('flagsPush(' in line for line in body)]
     window = max((sum(1 for q in push_at if k - 4 < q <= k) for k in push_at), default=0)
-    conds = [f"rdy[{slot}] <= t0 + {k}" for slot, k in sorted(guards.items(), key=lambda x: (x[1], x[0]))]
+    ready = READY_STATES.get(start, ())
+    conds = [f"rdy[{slot}] <= t0 + {k}" for slot, k in sorted(guards.items(), key=lambda x: (x[1], x[0]))
+             if slot not in ready]
     if quiet:
         conds.append(f"vl::LiftAccess::quietUntil(c, t0 + {length})")
         if window:
@@ -692,7 +832,7 @@ def emit_static_region(code, region, emit_one, out):
     out.append("    } }")
 
 def translate_segment(code, entry_pc, fn_name, static_timing=False):
-    global QUEUE_FMAC_FLAGS, DEAD_PUSHES
+    global QUEUE_FMAC_FLAGS, DEAD_PUSHES, READY_STATES, DEAD_WRITES, DEAD_HORIZON, NORM_STATES, NORM_KNOWN
     reachable = find_reachable(code, entry_pc)
     QUEUE_FMAC_FLAGS = False
     for rpc in reachable:
@@ -746,7 +886,9 @@ def translate_segment(code, entry_pc, fn_name, static_timing=False):
             curr_block = [pc]
     if curr_block:
         blocks.append(curr_block)
-        
+    READY_STATES = ready_known_states(code, blocks, targets)
+    NORM_STATES = norm_known_states(code, blocks, targets)
+
     out = []
     timings = []
     out.append(f"void {fn_name}(vl::Run &c)")
@@ -800,6 +942,7 @@ def translate_segment(code, entry_pc, fn_name, static_timing=False):
         for r in static_regions(code, blocks, targets, branch_info, branch_delay_slots):
             region_start[r[0]] = r
             region_end[r[-1]] = r[0]
+    DEAD_WRITES, DEAD_HORIZON = find_dead_timing(code, reachable, region_start)
 
     def emit_one(rpc, body):
         rlo, rup = struct.unpack_from('<II', code, rpc)
@@ -826,7 +969,9 @@ def translate_segment(code, entry_pc, fn_name, static_timing=False):
                 tgt, cond = branch_info[pc]
                 out.append(f"    // {pc:04x}: branch to {tgt:04x}")
                 out.extend(timing_begin(code, pc, timings))
+                NORM_KNOWN = NORM_STATES.get(pc)
                 up_code = translate_upper(u)
+                NORM_KNOWN = None
                 if up_code:
                     out.append(f"    {up_code}")
                     if 'fmac<' in up_code:
