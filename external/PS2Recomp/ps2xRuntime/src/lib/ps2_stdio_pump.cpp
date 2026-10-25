@@ -114,7 +114,8 @@ namespace ps2x::stdio_pump
             _setmode(fd, mode);             // ... and leave it as it was
 #endif
             const int destination = PUMP_DUP(fd);
-            if (destination < 0 || PUMP_DUP2(fds[1], fd) != 0)
+            // dup2 returns the new descriptor on POSIX and 0 on Windows: only a negative value is a failure.
+            if (destination < 0 || PUMP_DUP2(fds[1], fd) < 0)
             {
                 if (destination >= 0)
                     PUMP_CLOSE(destination);
