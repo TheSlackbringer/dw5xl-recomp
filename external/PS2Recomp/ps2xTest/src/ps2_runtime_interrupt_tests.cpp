@@ -73,6 +73,17 @@ namespace
     constexpr uint32_t kInvocationQueueResumePc = 0x00160540u;
     constexpr uint32_t kInvocationQueueHandlerPc = 0x00160550u;
 
+
+    constexpr uint32_t kKernelVectorStartPc = 0x00160600u;
+    constexpr uint32_t kKernelVectorResumePc = 0x00160610u;
+    constexpr uint32_t kKernelVectorHandlerPc = 0x00160620u;
+    constexpr uint32_t kKernelVectorOrdinaryPc = 0x00160630u;
+    constexpr uint32_t kKernelVectorFinalPc = 0x00160640u;
+    std::atomic<bool> g_kernelVectorResumed{false};
+    bool g_kernelVectorTimer = false;
+    uint32_t g_kernelVectorCause = 0u;
+    uint32_t g_kernelVectorParentSp = 0u;
+
     constexpr uint32_t kTimer2Count = 0x10001000u;
     constexpr uint32_t kTimer2Mode = 0x10001010u;
     constexpr uint32_t kTimer2Compare = 0x10001020u;
@@ -333,6 +344,81 @@ namespace
         g_dispatchTrace.push_back(3);
         g_resumedResult = getRegS32(*ctx, 2);
         g_timer2Resumed.store(true, std::memory_order_release);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+
+    void schedulerKernelVectorHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(2);
+        g_kernelVectorCause = getRegU32(ctx, 4);
+        if (g_kernelVectorTimer)
+        {
+            auto &memory = runtime->memory();
+            memory.writeIORegister(0x10001810u, memory.readIORegister(0x10001810u) | kTimerModeEquf);
+        }
+        runtime->eeScheduler().signalSemaphore(g_testSemaphoreId, true);
+        ctx->pc = 0u;
+    }
+
+    void schedulerKernelVectorOrdinary(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(4);
+        runtime->eeScheduler().signalSemaphore(g_testSemaphoreId, true);
+        ctx->pc = 0u;
+    }
+
+    void schedulerKernelVectorStart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(1);
+        auto &scheduler = runtime->eeScheduler();
+        g_testSemaphoreId = scheduler.createSemaphore(0, 1, 0u, 0u);
+        runtime->setEeSyscallOverride(rdram, 0x12Cu, kKernelVectorHandlerPc);
+        if (g_kernelVectorTimer)
+        {
+            auto &memory = runtime->memory();
+            memory.writeIORegister(0x10001800u, 0u);
+            memory.writeIORegister(0x10001820u, 8u);
+            memory.writeIORegister(0x10001810u,
+                kTimerModeBusClockDiv256 | kTimerModeCue | kTimerModeCmpe | kTimerModeEquf);
+        }
+        else
+        {
+            scheduler.addIrqHandler(false, 12u, kKernelVectorOrdinaryPc, true, 0u, 0u, 0u);
+            scheduler.setIrqCauseEnabled(false, 12u, false);
+            scheduler.dispatchIrq(false, 12u);
+            scheduler.setIrqCauseEnabled(false, 12u, true);
+            scheduler.dispatchIrq(false, 12u);
+        }
+        ctx->pc = kKernelVectorResumePc;
+        scheduler.waitSemaphore(g_testSemaphoreId);
+    }
+
+    void schedulerKernelVectorResume(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(3);
+        g_kernelVectorParentSp = getRegU32(ctx, 29);
+        if (g_kernelVectorTimer)
+        {
+            g_kernelVectorResumed.store(true, std::memory_order_release);
+            ctx->pc = 0u;
+            runtime->requestStop();
+            return;
+        }
+        // Removing the installed kernel vector restores ordinary handler dispatch.
+        runtime->setEeSyscallOverride(rdram, 0x12Cu, 0u);
+        auto &scheduler = runtime->eeScheduler();
+        g_testSemaphoreId = scheduler.createSemaphore(0, 1, 0u, 0u);
+        scheduler.dispatchIrq(false, 12u);
+        ctx->pc = kKernelVectorFinalPc;
+        scheduler.waitSemaphore(g_testSemaphoreId);
+    }
+
+    void schedulerKernelVectorFinal(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(5);
+        g_kernelVectorResumed.store(true, std::memory_order_release);
         ctx->pc = 0u;
         runtime->requestStop();
     }
@@ -705,6 +791,58 @@ void register_ps2_runtime_interrupt_tests()
             t.Equals(g_resumedResult, g_testSemaphoreId,
                      "the Timer2 handler should hand the semaphore directly to the waiter");
         });
+
+
+        for (bool timer : {true, false})
+        {
+            tc.Run(timer ? "installed INTC kernel vector receives a live Timer3 compare"
+                         : "INTC kernel vector respects masking, replaces the chain, and can be removed",
+                [timer](TestCase &t)
+            {
+                TestEnv env;
+                t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+                env.runtime.registerFunction(kKernelVectorStartPc, schedulerKernelVectorStart);
+                env.runtime.registerFunction(kKernelVectorResumePc, schedulerKernelVectorResume);
+                env.runtime.registerFunction(kKernelVectorHandlerPc, schedulerKernelVectorHandler);
+                env.runtime.registerFunction(kKernelVectorOrdinaryPc, schedulerKernelVectorOrdinary);
+                env.runtime.registerFunction(kKernelVectorFinalPc, schedulerKernelVectorFinal);
+                g_dispatchTrace.clear();
+                g_kernelVectorTimer = timer;
+                g_kernelVectorCause = 0u;
+                g_kernelVectorParentSp = 0u;
+                g_kernelVectorResumed.store(false, std::memory_order_release);
+                R5900Context mainContext{};
+                mainContext.pc = kKernelVectorStartPc;
+                setRegU32(mainContext, 29, 0x001D0000u);
+                std::atomic<bool> schedulerThrew{false};
+                std::thread gameThread([&]()
+                {
+                    try
+                    {
+                        env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+                        env.runtime.eeScheduler().run();
+                    }
+                    catch (...)
+                    {
+                        schedulerThrew.store(true, std::memory_order_release);
+                    }
+                });
+                const bool resumed = waitUntil([]()
+                {
+                    return g_kernelVectorResumed.load(std::memory_order_acquire);
+                }, std::chrono::milliseconds(150));
+                if (!resumed) env.runtime.requestStop();
+                gameThread.join();
+                t.IsTrue(resumed, "installed kernel vector should execute and wake the waiter");
+                t.IsFalse(schedulerThrew.load(std::memory_order_acquire), "kernel-vector dispatch should not throw");
+                const std::vector<int> expected = timer ? std::vector<int>{1, 2, 3}
+                                                       : std::vector<int>{1, 2, 3, 4, 5};
+                t.IsTrue(g_dispatchTrace == expected,
+                    "the kernel vector runs once; ordinary dispatch resumes only after its removal");
+                t.Equals(g_kernelVectorCause, 12u, "kernel vector receives the actual INTC cause");
+                t.Equals(g_kernelVectorParentSp, 0x001D0000u, "interrupt returns with the waiting thread's stack intact");
+            });
+        }
 
         tc.Run("scheduler stop wakes an idle VSync wait without a timeout", [](TestCase &t)
         {
