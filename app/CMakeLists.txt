@@ -345,6 +345,12 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_iop_ascii_compare_test tests/iop_ascii_compare_test.cpp)
     target_link_libraries(dw5xl_iop_ascii_compare_test PRIVATE ps2_iop)
     add_test(NAME iop_ascii_compare COMMAND dw5xl_iop_ascii_compare_test)
+    # Issue 025 v10 Step 5: a slow log destination must not stall the writing thread.
+    add_executable(dw5xl_stdio_pump_test tests/stdio_pump_test.cpp
+                   "${PS2RECOMP_DIR}/ps2xRuntime/src/lib/ps2_stdio_pump.cpp")
+    target_include_directories(dw5xl_stdio_pump_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME stdio_pump COMMAND dw5xl_stdio_pump_test)
+    set_tests_properties(stdio_pump PROPERTIES TIMEOUT 20)
     # ThreadSanitizer variant: the queue, PS2Memory, VIF1 parser and GIF arbiter
     # are recompiled instrumented; their archive copies are then never pulled in.
     option(DW5XL_TSAN_TESTS "Build the ThreadSanitizer variant of the VU1 async queue test" ON)

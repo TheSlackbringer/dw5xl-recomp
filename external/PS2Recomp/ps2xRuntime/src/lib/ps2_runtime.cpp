@@ -10,6 +10,7 @@
 #include "gs/gs_trace.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_device_queue.h"
+#include "runtime/ps2_stdio_pump.h"
 #include "runtime/ps2_profile_markers.h"
 #include "vif1_capture.h"
 #include "ThreadNaming.h"
@@ -626,6 +627,7 @@ namespace ps2x_dev
                     if (runtime) runtime->audioBackend().stopPcmStream();
                     std::cout.flush();
                     std::cerr.flush();
+                    ps2x::stdio_pump::drain(); // issue 025: _Exit skips atexit; write out the queued log
                     std::_Exit(0);
                 }
             }
@@ -780,6 +782,7 @@ namespace ps2x_dev
                 if (runtime) runtime->audioBackend().stopPcmStream();
                 std::cout.flush();
                 std::cerr.flush();
+                ps2x::stdio_pump::drain(); // issue 025: _Exit skips atexit; write out the queued log
                 std::_Exit(0);
             }
         }
