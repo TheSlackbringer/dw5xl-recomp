@@ -182,6 +182,8 @@ VU0 microprograms (`VCALLMS`, issue 025): `PS2X_VU0_LIFT=0` (interpret them) · 
 native VU0 run repeated by the interpreter and compared; `[vu0verify]`) · `PS2X_VU0_CENSUS=<file>` (per-program
 runs/cycles/host ns + the 4 KB image, game data) · `[vu0lift:hit|miss]` counters give the native share.
 Test runs without a silent sink (Windows): `PS2X_MUTE=1` (master volume 0, audio timing unchanged).
+Logging: `PS2X_STDIO_DIRECT=1` (stdout/stderr written directly instead of through the background log pump, which keeps
+a slow log destination from stalling game threads; for crash hunting, where the pump could lose the last lines; issue 025).
 VU1 exactness/speed: `PS2X_VU1_LIFT_VERIFY=1` (every native VU1 run repeated by the interpreter and compared; slow) ·
 `PS2X_DEVICE_PROFILE=1` with the async trace (device time: transfer/VU1/GIF submit/VIF unpack) ·
 `PS2X_VU1_RUN_CAPTURE=<prefix>` + `_PC/_FROM/_COUNT` (real run starts for `dw5xl_vu1_lift_test benchcap`; game data,
