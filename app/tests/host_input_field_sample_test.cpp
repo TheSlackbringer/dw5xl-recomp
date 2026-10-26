@@ -1,7 +1,9 @@
 // One controller sample per guest field (issue 023 5c): a host-input script is evaluated for the field of the game's
 // pad read, presses last exactly the fields the script names (no real-time tap hold), and every read within one field
-// returns the sample taken at the first read of that field.
+// returns the sample taken at the first read of that field. Issue 023 3S: while a host screen blocks the game's input
+// the game sees nothing, and a button still held when the block ends stays hidden until it is released.
 #include "ps2_runtime.h"
+#include "runtime/host_input.h"
 #include "runtime/ps2_pad.h"
 
 #include <atomic>
@@ -43,9 +45,9 @@ uint16_t pressedAt(PSPadBackend &pad, uint64_t field)
 int main()
 {
 #ifdef _WIN32
-    _putenv_s("PS2X_HOST_INPUT", "10:X:3,20:ENTER:1,30:Z:1");
+    _putenv_s("PS2X_HOST_INPUT", "10:X:3,20:ENTER:1,30:Z:1,50:Z:10,62:Z:1");
 #else
-    setenv("PS2X_HOST_INPUT", "10:X:3,20:ENTER:1,30:Z:1", 1);
+    setenv("PS2X_HOST_INPUT", "10:X:3,20:ENTER:1,30:Z:1,50:Z:10,62:Z:1", 1);
 #endif
     PSPadBackend pad;
     check(!(pressedAt(pad, 9) & kCross), "X not pressed in field 9");
@@ -64,6 +66,17 @@ int main()
     ps2x_dev::g_padPressedMask.store(0u, std::memory_order_relaxed);
     check((pressedAt(pad, 41) & kCircle) != 0, "a release arriving mid-field is not seen by a later read of field 41");
     check(!(pressedAt(pad, 42) & kCircle), "the release is seen in field 42");
+
+    // Issue 023 3S: Square held over fields 50..59; a host screen blocks the input in field 51 only.
+    check((pressedAt(pad, 50) & kSquare) != 0, "Square pressed in field 50 (50:Z:10)");
+    ps2_host_input::setGameInputBlocked(true);
+    check(pressedAt(pad, 51) == 0u, "blocked: the game sees no buttons in field 51");
+    ps2_host_input::setGameInputBlocked(false);
+    bool hidden = true;
+    for (uint64_t field = 52; field < 60; ++field) hidden = hidden && !(pressedAt(pad, field) & kSquare);
+    check(hidden, "Square still held after the block (fields 52..59) stays hidden until released");
+    check(!(pressedAt(pad, 60) & kSquare), "released in field 60");
+    check((pressedAt(pad, 62) & kSquare) != 0, "a new press after the release reaches the game (field 62)");
 
     std::printf("%s\n", failures ? "host_input_field_sample: FAIL" : "host_input_field_sample: PASS");
     return failures ? 1 : 0;

@@ -282,6 +282,10 @@ public:
     void reset(uint8_t *rdram, const R5900Context &mainContext);
     void run();
     void requestStop();
+    // Issue 023 3S: a host screen pauses the game: the executor holds at its next dispatcher-level event check
+    // until resumed (use PS2Runtime::setHostPaused, which also stops the IOP clock and the audio output).
+    void setHostPaused(bool paused);
+    bool hostPaused() const { return m_hostPaused.load(std::memory_order_acquire); }
     // CRT mode 2=NTSC, 3=PAL. Unsupported modes retain the previous cadence.
     void setCrtMode(uint32_t mode) noexcept;
     [[nodiscard]] bool palVideoMode() const noexcept;
@@ -461,6 +465,7 @@ private:
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_guestExecuting{false};
     std::atomic<bool> m_stopRequested{false};
+    std::atomic<bool> m_hostPaused{false};
     std::atomic<bool> m_checkpointPending{false};
     uint32_t m_debugPublishCountdown = 0u;
 

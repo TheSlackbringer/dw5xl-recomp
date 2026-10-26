@@ -2005,6 +2005,15 @@ void EeScheduler::applyPendingPreemption()
 void EeScheduler::processPendingEvents()
 {
     assertExecutor();
+    if (m_hostPaused.load(std::memory_order_acquire))
+    {
+        // Issue 023 3S: held here, at the dispatcher level (no guest frames on the host stack), until the host
+        // screen closes. Nothing advances meanwhile: no EE cycles, timers or IOP time; overdue fields re-anchor.
+        std::unique_lock lock(m_eventMutex);
+        m_eventCv.wait(lock, [this]()
+                       { return !m_hostPaused.load(std::memory_order_acquire) ||
+                                m_stopRequested.load(std::memory_order_acquire); });
+    }
     processDueDeadlines();
     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
     m_pendingEeTimerInterrupts = 0u;
@@ -2039,6 +2048,16 @@ void EeScheduler::processPendingEvents()
 // tools/heavy_battle_test.py), with the time since the previous deadline service.
 static std::chrono::steady_clock::time_point g_lastDeadlineService{};
 static std::chrono::steady_clock::time_point g_prevDeadlineService{};
+void EeScheduler::setHostPaused(bool paused)
+{
+    {
+        std::lock_guard lock(m_eventMutex);
+        m_hostPaused.store(paused, std::memory_order_release);
+        m_checkpointPending.store(true, std::memory_order_release);   // running guest code returns to the dispatcher
+    }
+    m_eventCv.notify_all();
+}
+
 void EeScheduler::processDueDeadlines()
 {
     g_prevDeadlineService = g_lastDeadlineService;

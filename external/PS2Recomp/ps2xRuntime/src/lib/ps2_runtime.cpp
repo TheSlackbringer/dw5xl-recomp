@@ -1465,6 +1465,34 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
     m_iopSubsystem->runEeCycles(eeCycles);
 }
 
+void PS2Runtime::setHostPaused(bool paused)
+{
+    const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    {
+        std::lock_guard<std::mutex> lock(m_hostPauseMutex);
+        if (paused == (m_hostPauseStartNs != 0u))
+            return;
+        if (paused)
+            m_hostPauseStartNs = now;
+        else
+        {
+            m_hostPausedTotalNs += now - m_hostPauseStartNs;
+            m_hostPauseStartNs = 0u;
+        }
+    }
+    if (m_eeScheduler)
+        m_eeScheduler->setHostPaused(paused);
+    m_audioBackend.setPcmPaused(paused);
+}
+
+uint64_t PS2Runtime::hostPausedNanoseconds(uint64_t steadyNowNs) const
+{
+    std::lock_guard<std::mutex> lock(m_hostPauseMutex);
+    const uint64_t current = m_hostPauseStartNs != 0u && steadyNowNs > m_hostPauseStartNs ? steadyNowNs - m_hostPauseStartNs : 0u;
+    return m_hostPausedTotalNs + current;
+}
+
 void PS2Runtime::resetIop()
 {
     m_iopSubsystem->reset();
@@ -3803,6 +3831,7 @@ void PS2Runtime::run()
                     s_shotTick = std::strtoull(v, nullptr, 10); s_shotPath = std::strchr(v, ':') + 1;
                 }
             }
+            if (!m_windowShotRequest.empty() && s_shotPath.empty()) { s_shotPath = m_windowShotRequest; s_shotTick = 0; m_windowShotRequest.clear(); }
             if (!s_shotPath.empty() && currentVsync >= s_shotTick) {
                 ::Image shot = LoadImageFromScreen();
                 ExportImage(shot, s_shotPath.c_str());

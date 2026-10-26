@@ -5,6 +5,9 @@
 // - the game's own SCREEN ADJUST routine (0x2C86F0) still runs the screen (title, button bar, one frame per loop,
 //   Back), but while PC SETTINGS is open its picture-position calls become menu navigation and its own drawing is
 //   skipped; the rows are drawn over the game by the overlay.
+// During play, Esc or the pad's Back held 0.75 s opens the same screen on its own: the game is paused (EE held, IOP
+// clock and audio stopped) and darkened, its input blocked, and the window thread runs the screen, with the title and
+// button bar drawn from the game's pictures (all pictures are read from the disc, LINKDATA entries 0 and 41).
 // Only functions that never wait are replaced (a waiting EE thread unwinds the host stack to the dispatcher).
 #include "game_overrides.h"
 #include "ps2_runtime.h"
@@ -12,6 +15,8 @@
 #include "dw5xl_pc_settings.h"
 #include "imgui.h"
 #include "raylib.h"
+#include "runtime/ee_scheduler.h"
+#include "runtime/host_input.h"
 #include "runtime/ps2_settings.h"
 
 #include <array>
@@ -40,6 +45,7 @@ constexpr uint32_t kButtonBar = 0x00264020u;          // button bar text (id, ..
 constexpr uint32_t kAdjustSlot = 3u;                  // SCREEN ADJUST's title slot argument
 constexpr uint32_t kAdjustBar = 0x27u, kSettingsBar = 5u;   // "Default / Adjust / Back" -> "Select / Change / Back"
 constexpr int kWordRow = 3;                           // SCREEN ADJUST's row in the word strip (sub-file 12)
+constexpr double kBackHoldSeconds = 0.75;             // the pad's Back held this long opens the screen during play
 
 PS2Runtime::RecompiledFunction g_original[9] = {};
 enum Slot { ListOpen, Title, OffsetX, OffsetY, OffsetSet, OffsetApply, AdjustDraw, ButtonBar, AdjustGuides };
@@ -227,6 +233,7 @@ void buttonBar(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
 }
 
 PS2Runtime *g_runtime = nullptr;
+void backHeld();   // the doors (below)
 
 void install(PS2Runtime &runtime)
 {
@@ -255,6 +262,7 @@ void install(PS2Runtime &runtime)
         if (!g_original[i]) return;
     }
     for (const Hook &h : hooks) runtime.replaceFunction(h.address, h.fn);
+    ps2_host_input::setBackHoldAction(kBackHoldSeconds, &backHeld);
     std::fprintf(stderr, "[dw5xl:pc-settings] installed (Options: SCREEN ADJUST -> PC SETTINGS)\n");
 }
 }
@@ -263,18 +271,29 @@ namespace dw5xl::pcsettings {
 namespace {
 std::mutex g_mutex;
 Snapshot g_state;                                  // guarded by g_mutex
-std::atomic<bool> g_open{false};
+std::atomic<bool> g_open{false};                   // the Options menu's screen is open
 constexpr int kValueCount[kRows] = {2, 3, 5, 2, 0};
 }
 // DW5XL-DEBUG issue 023 3S: PS2X_PCSETTINGS_TRACE=1 logs opening, closing and every navigation input.
 bool trace() { static const bool on = [] { const char *v = std::getenv("PS2X_PCSETTINGS_TRACE"); return v && *v == '1'; }(); return on; }
-void setOpen(bool open)
+namespace {
+// Opens (Closed -> mode) or closes (mode -> Closed); false when the screen is in another mode.
+bool switchMode(Mode from, Mode to)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (trace()) std::fprintf(stderr, "[pc-settings] %s\n", open ? "open" : "close");
-    if (open && !g_state.open) { g_state.row = 0; g_state.needsInit = true; }
-    g_state.open = open; g_open.store(open, std::memory_order_release);
+    if (g_state.mode != from) return false;
+    if (trace()) std::fprintf(stderr, "[pc-settings] %s %s\n", to == Mode::Closed ? "close" : "open",
+                              (to == Mode::InPlay || from == Mode::InPlay) ? "in-play" : "options");
+    if (to != Mode::Closed) { g_state.row = 0; g_state.needsInit = true; }
+    g_state.mode = to;
     ++g_state.version;
+    return true;
+}
+}
+void setOpen(bool open)
+{
+    if (open ? switchMode(Mode::Closed, Mode::Options) : switchMode(Mode::Options, Mode::Closed))
+        g_open.store(open, std::memory_order_release);
 }
 bool isOpen() { return g_open.load(std::memory_order_acquire); }
 void input(Input in)
@@ -299,6 +318,125 @@ void setValues(const Values &v) { std::lock_guard<std::mutex> lock(g_mutex); g_s
 void clearChanged() { std::lock_guard<std::mutex> lock(g_mutex); g_state.changed = false; }
 }
 
+// --- the doors during play (window thread) -------------------------------------------------------------------------
+namespace {
+using dw5xl::pcsettings::Input;
+using dw5xl::pcsettings::Mode;
+constexpr uint16_t kPadTriangle = 0x1000u;            // the game's Back in its menus
+std::atomic<bool> g_backHeld{false};
+void backHeld() { g_backHeld.store(true, std::memory_order_release); }
+
+void openInPlay()
+{
+    if (!dw5xl::pcsettings::switchMode(Mode::Closed, Mode::InPlay)) return;
+    ps2_host_input::setGameInputBlocked(true);
+    g_runtime->setHostPaused(true);
+    std::fprintf(stderr, "[dw5xl:pc-settings] opened during play at field %llu: game paused\n",
+                 static_cast<unsigned long long>(g_runtime->eeScheduler().currentVSyncTick()));
+}
+void closeInPlay()
+{
+    if (!dw5xl::pcsettings::switchMode(Mode::InPlay, Mode::Closed)) return;
+    g_runtime->setHostPaused(false);
+    ps2_host_input::setGameInputBlocked(false);   // buttons still held stay hidden from the game until released
+    std::fprintf(stderr, "[dw5xl:pc-settings] closed at field %llu: game resumed\n",
+                 static_cast<unsigned long long>(g_runtime->eeScheduler().currentVSyncTick()));
+}
+
+// DW5XL-DEBUG issue 023 3S: PS2X_PCSETTINGS_SCRIPT="<field>:esc,<frames>:<step>,..." drives the doors and the screen
+// in hidden runs (the guest field stops while paused, so later steps count window frames after the previous one).
+// Steps: esc, hold (Back held), up, down, left, right, cross, back (Triangle), shot=<file.png>.
+struct ScriptStep { uint64_t wait = 0; std::string action; };
+std::vector<ScriptStep> g_script;
+size_t g_scriptNext = 0;
+uint64_t g_scriptFrames = 0;
+void loadScript()
+{
+    const char *v = std::getenv("PS2X_PCSETTINGS_SCRIPT");
+    if (!v || !*v) return;
+    std::string all = v;
+    for (size_t at = 0; at <= all.size();) {
+        const size_t comma = std::min(all.find(',', at), all.size());
+        const std::string step = all.substr(at, comma - at);
+        if (const size_t colon = step.find(':'); colon != std::string::npos)
+            g_script.push_back({std::strtoull(step.c_str(), nullptr, 10), step.substr(colon + 1)});
+        at = comma + 1;
+    }
+}
+// The script's action for this frame, or empty.
+std::string scriptAction()
+{
+    static std::once_flag once; std::call_once(once, loadScript);
+    if (g_scriptNext >= g_script.size()) return {};
+    const ScriptStep &step = g_script[g_scriptNext];
+    const bool due = g_scriptNext == 0 ? g_runtime->eeScheduler().currentVSyncTick() >= step.wait : ++g_scriptFrames >= step.wait;
+    if (!due) return {};
+    ++g_scriptNext; g_scriptFrames = 0;
+    std::fprintf(stderr, "[pc-settings] script step %zu: %s\n", g_scriptNext, step.action.c_str());
+    return step.action;
+}
+
+// One press per frame from the keyboard or the first pad (stick pushed past half counts once until it returns).
+struct Presses { bool up = false, down = false, left = false, right = false, cross = false, back = false; };
+Presses readPresses()
+{
+    Presses p;
+    auto key = [](int k) { return IsKeyPressed(k) || IsKeyPressedRepeat(k); };
+    p.up = key(KEY_UP) || key(KEY_W); p.down = key(KEY_DOWN) || key(KEY_S);
+    p.left = key(KEY_LEFT) || key(KEY_A); p.right = key(KEY_RIGHT) || key(KEY_D);
+    p.cross = IsKeyPressed(KEY_X) || IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_ENTER);
+    p.back = IsKeyPressed(KEY_V) || IsKeyPressed(KEY_KP_1);
+    for (int pad = 0; pad < 4; ++pad) {
+        if (!IsGamepadAvailable(pad)) continue;
+        p.up |= IsGamepadButtonPressed(pad, GAMEPAD_BUTTON_LEFT_FACE_UP);
+        p.down |= IsGamepadButtonPressed(pad, GAMEPAD_BUTTON_LEFT_FACE_DOWN);
+        p.left |= IsGamepadButtonPressed(pad, GAMEPAD_BUTTON_LEFT_FACE_LEFT);
+        p.right |= IsGamepadButtonPressed(pad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT);
+        p.cross |= IsGamepadButtonPressed(pad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
+        p.back |= IsGamepadButtonPressed(pad, GAMEPAD_BUTTON_RIGHT_FACE_UP);
+        static int s_stick = 0;                       // 0 centred, else the direction already counted
+        const float x = GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_X), y = GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_Y);
+        const int dir = y < -0.5f ? 1 : y > 0.5f ? 2 : x < -0.5f ? 3 : x > 0.5f ? 4 : 0;
+        if (dir != s_stick && dir) { p.up |= dir == 1; p.down |= dir == 2; p.left |= dir == 3; p.right |= dir == 4; }
+        s_stick = dir;
+        break;
+    }
+    return p;
+}
+}
+
+namespace dw5xl::pcsettings {
+bool frame(bool allowOpen)
+{
+    if (!g_runtime) return false;
+    const std::string script = scriptAction();
+    std::string shot;
+    if (script.rfind("shot=", 0) == 0) shot = script.substr(5);
+    const bool esc = IsKeyPressed(KEY_ESCAPE) || script == "esc";
+    const bool held = g_backHeld.exchange(false, std::memory_order_acq_rel) || script == "hold";
+    const Mode mode = snapshot().mode;
+    Presses p;
+    if (mode == Mode::InPlay) {
+        p = readPresses();
+        p.up |= script == "up"; p.down |= script == "down"; p.left |= script == "left"; p.right |= script == "right";
+        p.cross |= script == "cross"; p.back |= script == "back";
+    } else if (mode == Mode::Options)                 // the game's routine does not use Cross
+        p.cross = IsKeyPressed(KEY_X) || IsKeyPressed(KEY_SPACE) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
+    if (mode == Mode::Closed && (esc || held) && allowOpen) openInPlay();
+    else if (mode == Mode::Options && esc) ps2_host_input::tapGameButtons(kPadTriangle);   // the game's Back
+    else if (mode == Mode::InPlay) {
+        if (esc || held || p.back) closeInPlay();
+        else if (p.up) input(Input::Up);
+        else if (p.down) input(Input::Down);
+        else if (p.left) input(Input::Left);
+        else if (p.right) input(Input::Right);
+    }
+    const Snapshot s = snapshot();
+    if (s.mode != Mode::Closed && s.row == kDefaultRow && p.cross) input(Input::Default);
+    if (!shot.empty()) g_runtime->requestWindowShot(shot);
+    return snapshot().mode != Mode::Closed;
+}
+}
 
 // --- the rows, drawn over the game by the overlay (window thread) -----------------------------------------------
 namespace {
@@ -327,6 +465,7 @@ struct Assets {
     Tex number[2][5][2];                              // [resolution / anti-aliasing][value][white / yellow]
     Tex glow, help[kRows];
     uint8_t line[4] = {};                             // separator colour (already tinted as the game draws it)
+    Tex title, icon[3], barText[3];                   // in play: the screen title and the bar (Select, Change, Back)
 } g_assets;
 
 Tex upload(const MImage &img)
@@ -346,10 +485,31 @@ std::vector<uint8_t> readFile(const std::filesystem::path &p, uint64_t offset = 
     return f ? out : std::vector<uint8_t>{};
 }
 
-void buildAssets(uint8_t *ram)
+// A container read from the disc: every sub-file inside the buffer.
+bool containerFits(const std::vector<uint8_t> &c)
+{
+    if (c.size() < 16) return false;
+    const uint32_t count = le32(c.data());
+    if (count == 0u || count > 4096u) return false;
+    uint64_t end = uint64_t((count + 4u) >> 2) * 16u;
+    if (4u + 4u * uint64_t(count) > c.size()) return false;
+    for (uint32_t i = 0; i < count; ++i) end += uint64_t(le32(c.data() + 4 + 4 * i)) * 16u;
+    return end <= c.size();
+}
+
+void buildAssets()
 {
     Assets &A = g_assets; A.tried = true;
-    const uint32_t container = rd32(ram, kMenuContainerPtr);
+    // the Options menu file (LINKDATA entry 41, LZP2) and the boot pictures (entry 0, not packed), from the disc
+    const auto dir = PS2Runtime::getIoPaths().elfDirectory;
+    const auto idxFile = readFile(dir / "LINKDATA.IDX");
+    const auto idx = parseLinkIndex(idxFile.data(), idxFile.size());
+    if (idx.size() <= 41) return;
+    const auto packed = readFile(dir / "LINKDATA.BIN", idx[41].offset(), idx[41].size);
+    std::vector<uint8_t> menuFile;
+    if (!unpackLzp2(packed.data(), packed.size(), menuFile) || !containerFits(menuFile)) return;
+    uint8_t *ram = menuFile.data();                   // the helpers address the file like the game's RAM copy
+    const uint32_t container = 0u;
     uint32_t a12, n12, a13, n13; std::vector<Tim2Picture> s12, s13;
     if (!subFile(ram, container, 12, a12, n12) || !subFile(ram, container, 13, a13, n13)) return;
     const Tim2Picture *t12 = tim(ram, a12, n12, s12), *t13 = tim(ram, a13, n13, s13);
@@ -397,11 +557,7 @@ void buildAssets(uint8_t *ram)
     float k[3]; for (int c = 0; c < 3; ++c) k[c] = float((ys[c] / std::max(yn, 1)) / std::max(1.0, ws[c] / std::max(wn, 1)));
     const char *words[2] = {"WINDOW", "FULLSCREEN"};
     for (int i = 0; i < 2; ++i) { const MImage w = word(words[i]); if (!w.w) return; A.word[i][0] = upload(w); A.word[i][1] = upload(tinted(w, k)); }
-    // the number font, the separator line and the glow: the boot pictures (LINKDATA entry 0, not packed)
-    const auto dir = PS2Runtime::getIoPaths().elfDirectory;
-    const auto idxFile = readFile(dir / "LINKDATA.IDX");
-    const auto idx = parseLinkIndex(idxFile.data(), idxFile.size());
-    if (idx.empty()) return;
+    // the number font, the separator line, the glow and the bar icons: the boot pictures
     const auto boot = readFile(dir / "LINKDATA.BIN", idx[0].offset(), idx[0].size);
     const auto bootPics = findTim2(boot.data(), boot.size());
     if (bootPics.empty() || bootPics[0].w != 512 || bootPics[0].h != 512) return;
@@ -422,12 +578,21 @@ void buildAssets(uint8_t *ram)
     A.line[0] = uint8_t(A.line[0] * 112 / 128); A.line[1] = uint8_t(A.line[1] * 112 / 128); A.line[2] = uint8_t(A.line[2] * 112 / 128);
     A.line[3] = uint8_t(A.line[3] * 104 / 128);
     A.glow = upload(crop(decodeTim2(boot.data(), boot.size(), bootPics[0], 34), 480, 448, 32, 32));
+    const int iconPalette[3] = {44, 43, 40}, iconX[3] = {332, 312, 252};          // Select, Change, Back (20x20)
+    for (int i = 0; i < 3; ++i)
+        A.icon[i] = upload(crop(decodeTim2(boot.data(), boot.size(), bootPics[0], iconPalette[i]), iconX[i], 336, 20, 20));
+    // the title: "PC SETTINGS" built as in the Options menu (patchTitle), from this copy of the menu file
+    uint32_t a7, n7; std::vector<Tim2Picture> s7;
+    if (!patchTitle(ram, container) || !subFile(ram, container, 7, a7, n7)) return;
+    const Tim2Picture *t7 = tim(ram, a7, n7, s7);
+    if (!t7) return;
+    A.title = upload(decodeTim2(ram + a7, n7, *t7));
     // the help lines in the small font of the executable (glyphs from '!' at 0x216230, palette 0x215F90)
     const auto exe = readFile(PS2Runtime::getIoPaths().elfPath);
     if (exe.size() < 0x216230 + 95 * 160) return;
-    for (int r = 0; r < kRows; ++r) {
+    auto smallText = [&](const char *text) {
         std::vector<MImage> glyphs; std::vector<int> pens; int pen = 0;
-        for (const char *p = kHelp[r]; *p; ++p) {
+        for (const char *p = text; *p; ++p) {
             if (*p == ' ' || *p < 33 || *p > 126) { pen += 7; continue; }        // 5 game pixels at 0.75 per texel
             const MImage g = decodeGlyph(exe.data() + 0x216230 + size_t(*p - 33) * 160, exe.data() + 0x215F90);
             int x0 = 16, x1 = -1;
@@ -441,8 +606,11 @@ void buildAssets(uint8_t *ram)
                 const uint8_t *src = glyphs[i].at(x, y); uint8_t *dst = line.at(pens[i] + x, y);
                 if (src[3] > dst[3]) std::memcpy(dst, src, 4);
             }
-        A.help[r] = upload(line);
-    }
+        return line;
+    };
+    for (int r = 0; r < kRows; ++r) A.help[r] = upload(smallText(kHelp[r]));
+    const char *bar[3] = {"Select", "Change", "Back"};
+    for (int i = 0; i < 3; ++i) A.barText[i] = upload(smallText(bar[i]));
     A.ok = true;
 }
 
@@ -478,12 +646,10 @@ void applyChanges(const dw5xl::pcsettings::Snapshot &s)
 }
 
 namespace dw5xl::pcsettings {
-bool overlayWanted() { return isOpen() && g_runtime; }
 void drawOverlay()
 {
     Snapshot s = snapshot();
-    if (!s.open || !g_runtime) return;
-    uint8_t *ram = g_runtime->memory().getRDRAM();
+    if (s.mode == Mode::Closed || !g_runtime) return;
     if (s.needsInit) {
         Values v;
         const uint32_t scale = g_runtime->gs().getResolutionScale(), samples = g_runtime->gs().getAASamples();
@@ -495,16 +661,33 @@ void drawOverlay()
         s = snapshot();
     }
     if (s.changed) applyChanges(s);
-    // Cross on DEFAULT (the game's routine does not use Cross)
-    if (s.row == kDefaultRow && (IsKeyPressed(KEY_X) || IsKeyPressed(KEY_SPACE) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN)))
-        input(Input::Default);
-    if (!g_assets.tried) buildAssets(ram);
+    if (!g_assets.tried) buildAssets();
     if (!g_assets.ok) return;
     float rx, ry, rw, rh; g_runtime->pictureRect(rx, ry, rw, rh);
     if (rw <= 0 || rh <= 0) return;
     const Map m{rx, ry, rw / 512.0f, rh / 448.0f};
     ImDrawList *dl = ImGui::GetBackgroundDrawList();
     const Assets &A = g_assets;
+    if (s.mode == Mode::InPlay) {
+        // the paused game darkened; the title and the button bar as the Options screens show them
+        dl->AddRectFilled(m.at(0, 0), m.at(512, 448), IM_COL32(0, 0, 0, 205));
+        image(dl, m, A.title, 16, 20, 280, 46);
+        separator(dl, m, 57, 512, 512);
+        // the bar: a dark band between two light lines, fading in from the left (measured on the SETTINGS screen)
+        auto band = [&](float y0, float y1, ImU32 on) {
+            const ImU32 off = on & ~IM_COL32_A_MASK;
+            dl->AddRectFilledMultiColor(m.at(140, y0), m.at(280, y1), off, on, on, off);
+            dl->AddRectFilled(m.at(280, y0), m.at(512, y1), on);
+        };
+        band(407, 409, IM_COL32(124, 115, 99, 255));
+        band(409, 432, IM_COL32(35, 33, 32, 255));
+        band(432, 434, IM_COL32(124, 115, 99, 255));
+        const float iconX[3] = {299, 367, 442};
+        for (int i = 0; i < 3; ++i) {
+            image(dl, m, A.icon[i], iconX[i], 410, 12, 20);
+            image(dl, m, A.barText[i], iconX[i] + 13, 410, float(A.barText[i].w) * 0.75f, 20);
+        }
+    }
     const int screenRow[kRows] = {0, 1, 2, 3, 5};
     const float rowY = 100.0f + 34.0f * screenRow[s.row];
     image(dl, m, A.glow, 0, rowY - 2, 144, 32, IM_COL32(255, 208, 96, 128));

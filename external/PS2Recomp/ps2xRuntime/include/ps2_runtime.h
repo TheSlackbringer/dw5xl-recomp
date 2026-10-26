@@ -496,6 +496,11 @@ public:
     inline const PS2Memory &memory() const { return m_memory; }
 
     // Issue 023 3S: where the game picture was last drawn in the window (x, y, width, height in window pixels).
+    // Issue 023 3S: pauses the whole guest for a host screen (window thread): EE held, IOP clock and audio stopped.
+    void setHostPaused(bool paused);
+    uint64_t hostPausedNanoseconds(uint64_t steadyNowNs) const;   // total paused time up to now (IOP clock)
+    // DW5XL-DEBUG issue 023 3S (window thread): save the whole window, overlays included, at the end of this frame.
+    void requestWindowShot(const std::string &path) { m_windowShotRequest = path; }
     void pictureRect(float &x, float &y, float &w, float &h) const { x = m_pictureRect[0]; y = m_pictureRect[1]; w = m_pictureRect[2]; h = m_pictureRect[3]; }
     inline GS &gs() { return m_gs; }
     inline const GS &gs() const { return m_gs; }
@@ -591,6 +596,9 @@ private:
     std::atomic<bool> m_missingFunctionReported{false};
     std::atomic<bool> m_stopRequested{false};
     float m_pictureRect[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::string m_windowShotRequest;
+    mutable std::mutex m_hostPauseMutex;
+    uint64_t m_hostPauseStartNs = 0, m_hostPausedTotalNs = 0;   // guarded by m_hostPauseMutex
     DebugUiCallback m_debugUiInitCallback = nullptr;
     DebugUiCallback m_debugUiDrawCallback = nullptr;
     DebugUiCallback m_debugUiShutdownCallback = nullptr;

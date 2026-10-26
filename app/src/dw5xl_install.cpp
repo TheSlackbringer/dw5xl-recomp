@@ -299,8 +299,10 @@ void dw5xlConfigureDebugPanel(PS2DebugPanel &panel)
     }
     else if (const char *debug = std::getenv("PS2X_DEBUG_UI"); debug && *debug == '0')
         panel.setVisible(false);   // DW5XL-DEBUG: developer run without the F1 debugger open (window screenshots)
-    // the disc prompt and (issue 023 3S) the PC SETTINGS rows share the imgui overlay
+    // the disc prompt and (issue 023 3S) the PC SETTINGS screen share the imgui overlay; its check runs every frame
+    // and also serves the screen's doors (Esc, Back held)
     static bool s_discs = false;
-    panel.setOverlay([] { s_discs = overlayWanted(); return s_discs || dw5xl::pcsettings::overlayWanted(); },
-                     [] { if (dw5xl::pcsettings::overlayWanted()) dw5xl::pcsettings::drawOverlay(); if (s_discs) drawOverlay(); });
+    static bool s_settings = false;
+    panel.setOverlay([] { s_discs = overlayWanted(); s_settings = dw5xl::pcsettings::frame(!s_discs); return s_discs || s_settings; },
+                     [] { if (s_settings) dw5xl::pcsettings::drawOverlay(); if (s_discs) drawOverlay(); });
 }

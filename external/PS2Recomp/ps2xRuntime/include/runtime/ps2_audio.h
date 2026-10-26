@@ -40,6 +40,7 @@ public:
     bool startPcmStream();
     void stopPcmStream();
     void updatePcmStream();
+    void setPcmPaused(bool paused);   // issue 023 3S: a host pause keeps the queued samples for the resume
     // Actual SPU2 output: interleaved signed 16-bit stereo at 48000 Hz.
     // No device calls are made by the guest-side producer.
     void submitPcm(std::span<const int16_t> stereo48k);

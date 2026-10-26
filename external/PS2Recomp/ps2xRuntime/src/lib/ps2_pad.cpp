@@ -89,6 +89,12 @@ namespace
     std::vector<Event> gEvents;
     std::once_flag gScriptInit;
     bool gScripted = false;
+    // Issue 023 3S: a host screen blocks the game's input; Back held runs the host action.
+    std::atomic<bool> gInputBlocked{false};
+    uint16_t gHiddenUntilRelease = 0;
+    void (*gBackHoldAction)() = nullptr;
+    double gBackHoldSeconds = 0.75, gBackDownSince = -1.0;
+    bool gBackHoldFired = false;
 
     void initScript()
     {
@@ -146,6 +152,16 @@ namespace ps2_host_input
     {
         std::lock_guard<std::mutex> lock(gMutex);
         gState.verdite = true;
+    }
+
+    void setGameInputBlocked(bool blocked) { gInputBlocked.store(blocked); }
+    void setBackHoldAction(double seconds, void (*action)()) { gBackHoldSeconds = seconds; gBackHoldAction = action; }
+    void tapGameButtons(uint16_t mask)
+    {
+        const double now = IsWindowReady() ? GetTime() : 0.0;
+        std::lock_guard<std::mutex> sampleLock(gSampleMutex);   // a script reads the inputs on the game's thread
+        for (unsigned bit = 0; bit < 16; ++bit)
+            if (mask & (1u << bit)) gTapUntil[bit] = now + 0.1;
     }
 
     void setGameplayActive(bool active)
@@ -254,7 +270,7 @@ namespace ps2_host_input
             bind(key(KEY_SPACE, "SPACE"), PAD_SQUARE);
             bind(key(KEY_F, "F"), PAD_CROSS);
             bind(key(KEY_Q, "Q"), PAD_TRIANGLE);
-            bind(key(KEY_TAB, "TAB") || key(KEY_ESCAPE, "ESCAPE"), PAD_CIRCLE);
+            bind(key(KEY_TAB, "TAB"), PAD_CIRCLE);   // Esc opens PC SETTINGS (issue 023 3S)
             bind(key(KEY_RIGHT_SHIFT, "RIGHTSHIFT"), PAD_SELECT);
         }
         else
@@ -262,7 +278,7 @@ namespace ps2_host_input
             bind(key(KEY_A, "A"), PAD_LEFT);
             bind(key(KEY_D, "D"), PAD_RIGHT);
             bind(key(KEY_X, "X") || key(KEY_SPACE, "SPACE"), PAD_CROSS);
-            bind(key(KEY_C, "C") || key(KEY_ESCAPE, "ESCAPE"), PAD_CIRCLE);
+            bind(key(KEY_C, "C"), PAD_CIRCLE);       // Esc opens PC SETTINGS (issue 023 3S)
             bind(key(KEY_Z, "Z") || key(KEY_KP_0, "KP0"), PAD_SQUARE);
             bind(key(KEY_V, "V") || key(KEY_KP_1, "KP1"), PAD_TRIANGLE);
             bind(key(KEY_Q, "Q"), PAD_L1);
@@ -287,10 +303,20 @@ namespace ps2_host_input
                 {GAMEPAD_BUTTON_RIGHT_FACE_LEFT, PAD_SQUARE}, {GAMEPAD_BUTTON_RIGHT_FACE_UP, PAD_TRIANGLE},
                 {GAMEPAD_BUTTON_LEFT_TRIGGER_1, PAD_L1}, {GAMEPAD_BUTTON_RIGHT_TRIGGER_1, PAD_R1},
                 {GAMEPAD_BUTTON_LEFT_TRIGGER_2, PAD_L2}, {GAMEPAD_BUTTON_RIGHT_TRIGGER_2, PAD_R2},
-                {GAMEPAD_BUTTON_MIDDLE_RIGHT, PAD_START}, {GAMEPAD_BUTTON_MIDDLE_LEFT, PAD_SELECT},
+                {GAMEPAD_BUTTON_MIDDLE_RIGHT, PAD_START},
                 {GAMEPAD_BUTTON_LEFT_THUMB, PAD_L3}, {GAMEPAD_BUTTON_RIGHT_THUMB, PAD_R3}
             };
             for (const auto &button : buttons) bind(IsGamepadButtonDown(gamepad, button.first), button.second);
+            // Back: Select, or (issue 023 3S) held for a while the host action, a short press Select on release
+            const bool back = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_LEFT);
+            if (!gBackHoldAction) bind(back, PAD_SELECT);
+            else if (back) {
+                if (gBackDownSince < 0.0) gBackDownSince = now;
+                if (!gBackHoldFired && now - gBackDownSince >= gBackHoldSeconds) { gBackHoldFired = true; gBackHoldAction(); }
+            } else if (gBackDownSince >= 0.0) {
+                if (!gBackHoldFired) gTapUntil[0] = now + 0.1;            // PAD_SELECT is bit 0, a tap button
+                gBackDownSince = -1.0; gBackHoldFired = false;
+            }
             sticks[0] = stickByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X));
             sticks[1] = stickByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y));
             sticks[2] = stickByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X));
@@ -374,15 +400,18 @@ namespace ps2_host_input
 
         // Brief taps must survive until a slow guest frame samples its pad.
         // Movement keys are never extended, so releasing W/A/S/D stops promptly.
-        // A script's presses last exactly the fields it names (issue 023 5c).
+        // A script's presses last exactly the fields it names (issue 023 5c); host taps (tapGameButtons, a short
+        // Back press) apply in scripted runs too.
         const uint16_t rawPressed = pressed;
-        for (unsigned bit = 0; bit < 16 && !gScripted; ++bit)
+        for (unsigned bit = 0; bit < 16; ++bit)
         {
             const uint16_t mask = static_cast<uint16_t>(1u << bit);
-            if ((kTapButtons & mask) && (rawPressed & mask) && !(gPreviousPressed & mask))
+            if (!gScripted && (kTapButtons & mask) && (rawPressed & mask) && !(gPreviousPressed & mask))
                 gTapUntil[bit] = now + 0.1;
             if (focused && now < gTapUntil[bit]) pressed |= mask;
         }
+        if (gInputBlocked) { gHiddenUntilRelease = pressed; pressed = 0; sticks = {128, 128, 128, 128}; gTapUntil.fill(0.0); }   // issue 023 3S
+        else { gHiddenUntilRelease &= pressed; pressed &= static_cast<uint16_t>(~gHiddenUntilRelease); }
         {
             std::lock_guard<std::mutex> lock(gMutex);
             if (traceEnabled() && (gState.pressed != pressed || gState.captured != captured))

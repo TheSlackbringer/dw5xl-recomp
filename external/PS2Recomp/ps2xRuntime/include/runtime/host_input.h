@@ -29,4 +29,12 @@ namespace ps2_host_input
     MouseCaptureIndicator mouseCaptureIndicator();
     // Window-thread overlay, called after the game picture has been drawn.
     void drawMouseCaptureIndicator(float x, float y, float width, float height);
+    // Issue 023 3S: while a host screen is open the game gets no buttons and centred sticks; buttons still held when
+    // it closes stay hidden from the game until released.
+    void setGameInputBlocked(bool blocked);
+    // Issue 023 3S: holding the pad's Back for `seconds` runs `action` (window thread) instead of pressing Select; a
+    // shorter press still reaches the game as Select, sent on release. nullptr: Back is Select again.
+    void setBackHoldAction(double seconds, void (*action)());
+    // Window thread: a short press of these PS2 pad buttons (pad bit mask) reaches the game, as a key tap would.
+    void tapGameButtons(uint16_t mask);
 }

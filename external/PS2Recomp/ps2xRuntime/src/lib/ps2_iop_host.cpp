@@ -276,8 +276,10 @@ void PS2IopHostAdapter::audioSamples(std::span<const int16_t> stereo48k)
 
 std::optional<uint64_t> PS2IopHostAdapter::monotonicNanoseconds() const noexcept
 {
+    // Issue 023 3S: the IOP's time stops while a host screen pauses the game (no catch-up burst on resume).
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+    const uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+    return ns - m_runtime.hostPausedNanoseconds(ns);
 }
 
 std::optional<bool> PS2IopHostAdapter::readMappedCdSectors(uint32_t lsn, uint32_t sectors,

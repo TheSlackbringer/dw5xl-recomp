@@ -317,6 +317,21 @@ PS2AudioBackend::PcmStats PS2AudioBackend::pcmStats() const
             state.running.load(std::memory_order_acquire)};
 }
 
+void PS2AudioBackend::setPcmPaused(bool paused)
+{
+#if !defined(PLATFORM_VITA)
+    auto &state = *m_impl;
+    if (!state.playbackStarted || !IsAudioStreamValid(state.pcmStream))
+        return;
+    if (paused)
+        PauseAudioStream(state.pcmStream);
+    else
+        ResumeAudioStream(state.pcmStream);
+#else
+    (void)paused;
+#endif
+}
+
 void PS2AudioBackend::updatePcmStream()
 {
     auto &state = *m_impl;
