@@ -106,6 +106,38 @@ inline Image decodeTim2(const uint8_t* data,size_t n,const Tim2Picture& t,uint32
     }
     return img;
 }
+// The raw palette indices of an indexed TIM2 (one per pixel).
+inline std::vector<uint8_t> tim2Indices(const uint8_t* data,size_t n,const Tim2Picture& t) {
+    std::vector<uint8_t> out;
+    const size_t needed=t.imageType==4?(size_t(t.w)*t.h+1)/2:size_t(t.w)*t.h;
+    if(t.pixels+needed>n) return out;
+    out.resize(size_t(t.w)*t.h);
+    for(size_t k=0;k<out.size();++k) out[k]=t.imageType==4?((data[t.pixels+k/2]>>((k&1)*4))&15):data[t.pixels+k];
+    return out;
+}
+// An RGBA picture fitted to an 8-bit TIM2's palette (nearest colour, alpha weighted like a colour channel); returns
+// the indices as stored in the TIM2 (PS2 palette order). Fully transparent pixels take the most transparent entry.
+inline std::vector<uint8_t> quantize(const Image& img,const uint8_t* data,const Tim2Picture& t) {
+    std::vector<uint8_t> out(size_t(img.w)*img.h,0);
+    if(t.imageType!=5 || t.clutSize<256*4) return {};
+    auto stored=[&](int e){ return uint8_t((e&0xE7)|((e&0x08)<<1)|((e&0x10)>>1)); };   // order swap is its own inverse
+    const bool linear=(t.clutType&0x80)!=0;
+    int clearest=0;
+    for(int e=0;e<256;++e) if(data[t.clut+e*4+3]<data[t.clut+clearest*4+3]) clearest=e;
+    for(int y=0;y<img.h;++y) for(int x=0;x<img.w;++x) {
+        const uint8_t* p=img.at(x,y); int best=clearest;
+        if(p[3]>0) {
+            long bestD=-1;
+            for(int e=0;e<256;++e) {
+                const uint8_t* c=data+t.clut+e*4; const int a=std::min(255,c[3]*2);
+                const long d=long(c[0]-p[0])*(c[0]-p[0])+long(c[1]-p[1])*(c[1]-p[1])+long(c[2]-p[2])*(c[2]-p[2])+2L*(a-p[3])*(a-p[3]);
+                if(bestD<0 || d<bestD) { bestD=d; best=e; }
+            }
+        }
+        out[size_t(y)*img.w+x]=linear?uint8_t(best):stored(best);
+    }
+    return out;
+}
 // The small font in the executable: 160-byte glyphs (16x20, 4-bit indices), 16-colour 32-bit palette.
 inline Image decodeGlyph(const uint8_t* glyph,const uint8_t* palette) {
     Image img(16,20);
@@ -125,9 +157,10 @@ inline Image crop(const Image& src,int x0,int y0,int w,int h) {
 
 // Letters split by shape: a letter's fill (bright, mostly opaque pixels) is one connected region; every other inked
 // pixel belongs to the nearest fill, so outlines that touch a neighbour stay with their own letter.
-struct Letter { Image img; int fill0=0,fill1=0; };      // fill0..fill1: the fill's columns inside img
+struct Letter { Image img; std::vector<uint8_t> idx; int fill0=0,fill1=0; };   // fill0..fill1: the fill's columns
+                                                        // inside img; idx: palette indices (255 = empty) if known
 inline bool isFill(const uint8_t* p) { return p[3]>128 && (p[0]+p[1]+p[2])>450; }
-inline std::vector<Letter> splitLetters(const Image& word,size_t count) {
+inline std::vector<Letter> splitLetters(const Image& word,size_t count,const std::vector<uint8_t>* indices=nullptr) {
     const int W=word.w,H=word.h;
     std::vector<int> label(size_t(W)*H,0); std::vector<size_t> sizes;
     for(int y=0;y<H;++y) for(int x=0;x<W;++x) {
@@ -170,13 +203,19 @@ inline std::vector<Letter> splitLetters(const Image& word,size_t count) {
         for(int y=0;y<H;++y) for(int x=0;x<W;++x) if(owner[size_t(y)*W+x]==int(k)) { x0=std::min(x0,x); x1=std::max(x1,x); }
         if(x1<x0) return {};
         Letter& l=out[k]; l.img=Image(x1-x0+1,H);
-        for(int y=0;y<H;++y) for(int x=x0;x<=x1;++x) if(owner[size_t(y)*W+x]==int(k)) std::memcpy(l.img.at(x-x0,y),word.at(x,y),4);
+        if(indices) l.idx.assign(size_t(l.img.w)*H,255);
+        for(int y=0;y<H;++y) for(int x=x0;x<=x1;++x) if(owner[size_t(y)*W+x]==int(k)) {
+            std::memcpy(l.img.at(x-x0,y),word.at(x,y),4);
+            if(indices) l.idx[size_t(y)*l.img.w+x-x0]=(*indices)[size_t(y)*W+x];
+        }
         l.fill0=left[ids[k]]-x0; l.fill1=right[ids[k]]-x0;
     }
     return out;
 }
 // A word from letters (nullptr = space of `space` columns): fills `fillGap` columns apart, as in the game's words.
-inline Image buildWord(const std::vector<const Letter*>& letters,int space,int fillGap,int margin=4) {
+// With `outIdx`, also the palette indices (letters split with indices): where outlines overlap, the more opaque wins.
+inline Image buildWord(const std::vector<const Letter*>& letters,int space,int fillGap,int margin=4,
+                       std::vector<uint8_t>* outIdx=nullptr) {
     int H=0; for(auto* l:letters) if(l) H=std::max(H,l->img.h);
     struct Place { const Letter* l; int left; };
     std::vector<Place> placed; int pen=margin,right=0;
@@ -187,8 +226,10 @@ inline Image buildWord(const std::vector<const Letter*>& letters,int space,int f
     }
     const int shift=placed.empty()?0:std::max(0,-placed.front().left);
     Image out(right+shift+margin,H);
+    if(outIdx) outIdx->assign(size_t(out.w)*H,255);
     for(const auto& p:placed) for(int y=0;y<p.l->img.h;++y) for(int x=0;x<p.l->img.w;++x) {
         const uint8_t* s=p.l->img.at(x,y); uint8_t* d=out.at(p.left+shift+x,y);
+        if(outIdx && !p.l->idx.empty() && s[3]>d[3]) (*outIdx)[size_t(y)*out.w+p.left+shift+x]=p.l->idx[size_t(y)*p.l->img.w+x];
         const float a=s[3]/255.0f;
         for(int c=0;c<3;++c) d[c]=uint8_t(std::lround(d[c]*(1-a)+s[c]*a));
         d[3]=std::max(d[3],s[3]);

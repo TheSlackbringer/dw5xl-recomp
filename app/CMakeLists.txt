@@ -54,6 +54,7 @@ add_executable(dw5xl
     src/ipu_idec.cpp
     src/dw5xl_overlays.cpp
     src/dw5xl_install.cpp
+    src/dw5xl_pc_settings.cpp
     setup/wizard_console.cpp
 )
 target_include_directories(dw5xl PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
@@ -78,7 +79,7 @@ target_precompile_headers(dw5xl PRIVATE
 )
 # 42k small generated files: batch them so the compiler isn't started 42k times.
 set_target_properties(dw5xl PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
-set_source_files_properties(src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp src/dw5xl_install.cpp setup/wizard_console.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
+set_source_files_properties(src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp src/dw5xl_install.cpp src/dw5xl_pc_settings.cpp setup/wizard_console.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
 # Lifted VU1 microprograms are translated from the game's own microcode (dw5xl_vu1lift, run by the launcher or
 # tools/regen.sh) into the ignored recomp/dw5xl/vu1/ folder. Game-derived: never committed. Without it,
 # VU1 microcode runs in the interpreter.
