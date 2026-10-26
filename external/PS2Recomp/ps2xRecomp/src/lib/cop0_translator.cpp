@@ -82,11 +82,11 @@ namespace ps2recomp
             case COP0_REG_RANDOM:
                 return "// MTC0 to RANDOM register ignored (read-only)";
             case COP0_REG_ENTRYLO0:
-                return fmt::format("ctx->cop0_entrylo0 = GPR_U32(ctx, {}) & 0x3FFFFFFF;", rt);
+                return fmt::format("ctx->cop0_entrylo0 = GPR_U32(ctx, {}) & 0x83FFFFFF;", rt);
             case COP0_REG_ENTRYLO1:
-                return fmt::format("ctx->cop0_entrylo1 = GPR_U32(ctx, {}) & 0x3FFFFFFF;", rt);
+                return fmt::format("ctx->cop0_entrylo1 = GPR_U32(ctx, {}) & 0x03FFFFFF;", rt);
             case COP0_REG_CONTEXT:
-                return fmt::format("ctx->cop0_context = (ctx->cop0_context & 0xFF800000) | (GPR_U32(ctx, {}) & 0x7FFFFF);", rt);
+                return fmt::format("ctx->cop0_context = (ctx->cop0_context & 0x007FFFF0) | (GPR_U32(ctx, {}) & 0xFF800000);", rt);
             case COP0_REG_PAGEMASK:
                 return fmt::format("ctx->cop0_pagemask = GPR_U32(ctx, {}) & 0x01FFE000;", rt);
             case COP0_REG_WIRED:
@@ -96,7 +96,7 @@ namespace ps2recomp
             case COP0_REG_COUNT:
                 return fmt::format("ctx->cop0_count = GPR_U32(ctx, {});", rt);
             case COP0_REG_ENTRYHI:
-                return fmt::format("ctx->cop0_entryhi = GPR_U32(ctx, {}) & 0xC00000FF;", rt);
+                return fmt::format("ctx->cop0_entryhi = GPR_U32(ctx, {}) & 0xFFFFE0FF;", rt);
             case COP0_REG_COMPARE:
                 return fmt::format("ctx->cop0_compare = GPR_U32(ctx, {}); ctx->cop0_cause &= ~0x8000;", rt);
             case COP0_REG_STATUS:

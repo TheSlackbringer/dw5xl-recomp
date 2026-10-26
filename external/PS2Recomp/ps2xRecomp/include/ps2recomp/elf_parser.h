@@ -14,6 +14,7 @@ namespace ps2recomp
         struct Section;
         struct Function;
         struct Symbol;
+        struct CodeCopy;
         class RecompilerReporter;
 
         class ElfParser
@@ -27,6 +28,7 @@ namespace ps2recomp
                 bool parseRaw(uint32_t guestBase, uint32_t codeOffset);
                 uint32_t getRawFileSize() const { return static_cast<uint32_t>(m_rawImage.size()); }
 
+                void addCodeCopy(const CodeCopy &copy);
                 bool loadGhidraFunctionMap(const std::string &mapPath);
                 std::vector<Function> extractFunctions() const;
                 std::vector<Function> extractExtraFunctions() const;
@@ -48,6 +50,7 @@ namespace ps2recomp
                 std::string m_filePath;
                 std::vector<uint8_t> m_rawImage;
                 bool m_rawMode = false;
+                std::vector<std::vector<uint8_t>> m_codeCopyBytes;
                 std::unique_ptr<ELFIO::elfio> m_elf;
 
                 std::vector<Section> m_sections;

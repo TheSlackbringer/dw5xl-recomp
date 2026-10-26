@@ -13,6 +13,7 @@ namespace ps2recomp
 {
 	struct JumpTableEntry;
     struct JumpTable;
+    struct CodeCopy;
 	struct Instruction;
     struct MemoryAccessHint;
 	struct Function;
@@ -69,6 +70,7 @@ namespace ps2recomp
         const std::vector<Section>& m_sections;
         BootstrapInfo m_bootstrapInfo;
         std::string m_moduleId;
+        std::vector<CodeCopy> m_codeCopies;
         uint32_t m_moduleBase = 0;
         uint32_t m_moduleCodeOffset = 0;
         uint32_t m_moduleFileSize = 0;

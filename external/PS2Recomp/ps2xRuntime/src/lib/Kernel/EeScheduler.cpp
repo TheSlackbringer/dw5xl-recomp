@@ -1467,6 +1467,27 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     {
         return;
     }
+    // SetSyscall's INTC entries replace the kernel's per-cause dispatcher.
+    // The SDK Alarm installer uses slot 0x12c for TIM3; this is distinct from
+    // registering a user handler through AddIntcHandler. Preserve the native
+    // replacement's control over that cause instead of also running the old chain.
+    uint32_t kernelHandler = 0u;
+    if (!dmac && cause < 16u &&
+        m_runtime.findEeSyscallOverride(0x120u + cause, kernelHandler))
+    {
+        if (!m_runtime.hasFunction(kernelHandler))
+            throw std::runtime_error("Installed INTC kernel vector has no native function");
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::Interrupt;
+        invocation.tag = cause;
+        invocation.context.pc = kernelHandler;
+        SET_GPR_U32(&invocation.context, 4, cause);
+        SET_GPR_U32(&invocation.context, 29, 0u);
+        SET_GPR_U32(&invocation.context, 31, 0u);
+        queueInvocation(std::move(invocation));
+        return;
+    }
+
     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
     std::vector<EeIrqHandler> matching;
     for (const auto &[id, handler] : handlers)

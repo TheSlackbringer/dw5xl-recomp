@@ -1797,3 +1797,37 @@ critical = [
   "sub_00332510", # Uses SIMD instructions
   "sub_003393A0", # Uses SIMD instructions
 ]
+
+# SDK blocks copied into kernel RAM: compile at their actual execution addresses.
+# Ranges follow the original query tables and reachable direct-call helpers.
+# Generated code is enabled only when all its loaded instruction words match.
+
+[[code_copies]]
+name = "sdk_tlb"
+source = 0x30f848
+destination = 0x80075000
+size = 0x330
+functions = [[0x0, 0x38], [0x38, 0x90], [0xc8, 0x3c], [0x108, 0x4c], [0x158, 0x4c], [0x1a8, 0x130]]
+
+[[code_copies]]
+name = "sdk_exec"
+source = 0x30feb8
+destination = 0x80074000
+size = 0x7a8
+functions = [[0x0, 0x84], [0x88, 0xac], [0x138, 0xac], [0x1e8, 0xc0], [0x2a8, 0xa4], [0x350, 0x74], [0x3c8, 0xd0], [0x498, 0x1e4]]
+
+[[code_copies]]
+name = "sdk_alarm"
+source = 0x310680
+destination = 0x80076000
+size = 0x740
+functions = [[0x0, 0x38], [0x38, 0x1c], [0x58, 0x104], [0x160, 0x13c], [0x2a0, 0x1a0], [0x440, 0x20], [0x460, 0x24], [0x488, 0x1e0], [0x680, 0x3c], [0x6c0, 0x28]]
+
+# Alarm's ERET callback bridge is copied separately from its kernel helpers.
+# Only the five instructions through its terminal syscall are executable.
+[[code_copies]]
+name = "sdk_alarm_callback"
+source = 0x310dc0
+destination = 0x82000
+size = 0x28
+functions = [[0x0, 0x14]]

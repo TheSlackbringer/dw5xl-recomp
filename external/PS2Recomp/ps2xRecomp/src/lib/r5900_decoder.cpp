@@ -104,6 +104,7 @@ namespace ps2recomp
 
         const RabbitizerInstrDescriptor *desc = rabbitizerInst.descriptor;
 
+        inst.isValidEncoding = RabbitizerInstruction_isValid(&rabbitizerInst);
         inst.isBranch = RabbitizerInstrDescriptor_isBranch(desc);
         inst.isJump = RabbitizerInstrDescriptor_isJump(desc);
         inst.isCall = RabbitizerInstruction_isFunctionCall(&rabbitizerInst);

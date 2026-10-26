@@ -353,7 +353,7 @@ bool PS2Memory::initialize(size_t ramSize)
         ps2SetScratchpadHostPtr(m_scratchpad);
 
         // Initialize EE TLB entries (R5900 has 48 entries).
-        m_tlbEntries.assign(48, TLBEntry{0, 0, 0, false});
+        m_tlbEntries.assign(48, TLBEntry{});
 
         // Allocate IOP RAM
         iop_ram = new uint8_t[2 * 1024 * 1024]; // 2MB
@@ -659,29 +659,32 @@ uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
         return virtualAddress;
     }
 
-    // KSEG2/KSEG3 are TLB mapped.
-    if (Ps2IsKseg23Address(virtualAddress))
-    {
-        for (const auto &entry : m_tlbEntries)
-        {
-            if (entry.valid)
-            {
-                // PageMask uses bits [24:13]. Build an address-level mask (plus 4KB base page bits).
-                const uint32_t mask = entry.mask & 0x01FFE000u;
-                const uint32_t compareMask = ~(mask | 0xFFFu);
-                if ((virtualAddress & compareMask) == (entry.vpn & compareMask))
-                {
-                    // TLB hit
-                    const uint32_t pageOffsetMask = mask | 0xFFFu;
-                    const uint32_t physBase = entry.pfn << 12;
-                    return physBase | (virtualAddress & pageOffsetMask);
-                }
-            }
-        }
-        throw std::runtime_error("TLB miss for address: 0x" + std::to_string(virtualAddress));
-    }
+    const auto resolved = resolveMappedAccess(virtualAddress, 0, false);
+    return resolved.scratch ? ps2ScratchpadOffset(resolved.address) : resolved.address;
+}
 
-    return virtualAddress;
+PS2Memory::ResolvedMemoryAddress PS2Memory::resolveMappedAccess(uint32_t address, uint8_t asid, bool store) const
+{
+    // Generated ordinary RAM accesses bypass this model already. Preserve the
+    // established flat low segments, uncached mirrors and direct scratch alias.
+    if (!Ps2IsKseg23Address(address) || isScratchpad(address))
+        return {address, isScratchpad(address), false};
+    const int32_t index = tlbProbe((address & 0xFFFFE000u) | asid);
+    if (index < 0)
+        throw TlbFault(TlbFault::Kind::Refill, address, store);
+    const TLBEntry &entry = m_tlbEntries[index];
+    const bool scratch = (entry.entryLo0 & 0x80000000u) != 0u;
+    const uint32_t pageSize = ((entry.mask | 0x1FFFu) + 1u) >> 1u;
+    const uint32_t lo = scratch || !(address & pageSize) ? entry.entryLo0 : entry.entryLo1;
+    if (!(lo & 2u))
+        throw TlbFault(TlbFault::Kind::Invalid, address, store);
+    if (store && !(lo & 4u))
+        throw TlbFault(TlbFault::Kind::Modified, address, store);
+    if (scratch)
+        return {PS2_SCRATCHPAD_BASE | (address & (PS2_SCRATCHPAD_SIZE - 1u)), true, true};
+    const uint32_t offsetMask = pageSize - 1u;
+    const uint32_t physicalBase = ((lo >> 6u) & 0xFFFFFu) << 12u;
+    return {(physicalBase & ~offsetMask) | (address & offsetMask), false, true};
 }
 
 bool PS2Memory::tlbRead(uint32_t index, uint32_t &vpn, uint32_t &pfn, uint32_t &mask, bool &valid) const
@@ -711,35 +714,68 @@ bool PS2Memory::tlbWrite(uint32_t index, uint32_t vpn, uint32_t pfn, uint32_t ma
     entry.pfn = pfn & 0x000FFFFFu;
     entry.mask = mask & 0x01FFE000u;
     entry.valid = valid;
+    entry.entryHi = entry.vpn;
+    entry.entryLo0 = (entry.pfn << 6) | (valid ? 0x2u : 0u);
+    entry.entryLo1 = 0u;
     return true;
 }
 
-int32_t PS2Memory::tlbProbe(uint32_t vpn) const
+bool PS2Memory::tlbReadRegisters(uint32_t index, uint32_t &mask, uint32_t &hi,
+                               uint32_t &lo0, uint32_t &lo1) const
 {
-    const uint32_t normalizedVpn = vpn & 0xFFFFF000u;
+    if (index >= m_tlbEntries.size())
+        return false;
+    const TLBEntry &entry = m_tlbEntries[index];
+    mask = entry.mask;
+    hi = entry.entryHi;
+    lo0 = entry.entryLo0;
+    lo1 = entry.entryLo1;
+    if (lo0 & 0x80000000u)
+    {
+        // EE Core v6 p125: scratchpad PFN/C are ignored; C reads as 2.
+        lo0 = (lo0 & ~0x38u) | 0x10u;
+        lo1 = (lo1 & ~0x38u) | 0x10u;
+    }
+    return true;
+}
+
+bool PS2Memory::tlbWriteRegisters(uint32_t index, uint32_t mask, uint32_t hi,
+                                uint32_t lo0, uint32_t lo1)
+{
+    if (!tlbWrite(index, hi, (lo0 >> 6) & 0x000FFFFFu, mask, (lo0 & 0x2u) != 0u))
+        return false;
+    TLBEntry &entry = m_tlbEntries[index];
+    entry.entryHi = hi & 0xFFFFE0FFu;
+    const uint32_t global = lo0 & lo1 & 1u;
+    entry.entryLo0 = (lo0 & 0x83FFFFFEu) | global;
+    entry.entryLo1 = (lo1 & 0x03FFFFFEu) | global;
+    return true;
+}
+
+int32_t PS2Memory::tlbProbe(uint32_t hi) const
+{
     for (uint32_t i = 0; i < static_cast<uint32_t>(m_tlbEntries.size()); ++i)
     {
         const TLBEntry &entry = m_tlbEntries[i];
-        if (!entry.valid)
-        {
-            continue;
-        }
-
-        const uint32_t mask = entry.mask & 0x01FFE000u;
-        const uint32_t compareMask = ~(mask | 0xFFFu);
-        if ((normalizedVpn & compareMask) == (entry.vpn & compareMask))
-        {
+        // Each entry covers a pair. A legal scratch entry spans 16KiB with
+        // PageMask=0. V is a permission bit, not part of tag matching.
+        const uint32_t pairMask = (entry.entryLo0 & 0x80000000u) ? 0x3FFFu : (entry.mask | 0x1FFFu);
+        const bool tag = (hi & ~pairMask & 0xFFFFE000u) == (entry.entryHi & ~pairMask & 0xFFFFE000u);
+        const bool asid = (entry.entryLo0 & entry.entryLo1 & 1u) || ((hi & 0xFFu) == (entry.entryHi & 0xFFu));
+        if (tag && asid)
             return static_cast<int32_t>(i);
-        }
     }
-
     return -1;
 }
 
-uint8_t PS2Memory::read8(uint32_t address)
+uint8_t PS2Memory::read8(uint32_t address, uint8_t asid)
 {
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    const auto resolved = resolveMappedAccess(address, asid, false);
+    address = resolved.address;
+
+    const bool scratch = resolved.scratch;
+    const uint32_t physAddr = scratch ? ps2ScratchpadOffset(address) :
+        resolved.mapped ? address : translateAddress(address);
 
     if (scratch)
     {
@@ -767,15 +803,19 @@ uint8_t PS2Memory::read8(uint32_t address)
     return 0;
 }
 
-uint16_t PS2Memory::read16(uint32_t address)
+uint16_t PS2Memory::read16(uint32_t address, uint8_t asid)
 {
     if (address & 1)
     {
         throw std::runtime_error("Unaligned 16-bit read at address: 0x" + std::to_string(address));
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    const auto resolved = resolveMappedAccess(address, asid, false);
+    address = resolved.address;
+
+    const bool scratch = resolved.scratch;
+    const uint32_t physAddr = scratch ? ps2ScratchpadOffset(address) :
+        resolved.mapped ? address : translateAddress(address);
 
     if (scratch)
     {
@@ -802,12 +842,15 @@ uint16_t PS2Memory::read16(uint32_t address)
     return 0;
 }
 
-uint32_t PS2Memory::read32(uint32_t address)
+uint32_t PS2Memory::read32(uint32_t address, uint8_t asid)
 {
     if (address & 3)
     {
         throw std::runtime_error("Unaligned 32-bit read at address: 0x" + std::to_string(address));
     }
+
+    const auto resolved = resolveMappedAccess(address, asid, false);
+    address = resolved.address;
 
     if (isGsPrivReg(address))
     {
@@ -826,8 +869,9 @@ uint32_t PS2Memory::read32(uint32_t address)
         return (uint32_t)(val >> (off * 8));
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    const bool scratch = resolved.scratch;
+    const uint32_t physAddr = scratch ? ps2ScratchpadOffset(address) :
+        resolved.mapped ? address : translateAddress(address);
 
     if (scratch)
     {
@@ -851,12 +895,15 @@ uint32_t PS2Memory::read32(uint32_t address)
     return 0;
 }
 
-uint64_t PS2Memory::read64(uint32_t address)
+uint64_t PS2Memory::read64(uint32_t address, uint8_t asid)
 {
     if (address & 7)
     {
         throw std::runtime_error("Unaligned 64-bit read at address: 0x" + std::to_string(address));
     }
+
+    const auto resolved = resolveMappedAccess(address, asid, false);
+    address = resolved.address;
 
     if (isGsPrivReg(address))
     {
@@ -870,8 +917,9 @@ uint64_t PS2Memory::read64(uint32_t address)
         return reg ? *reg : 0;
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    const bool scratch = resolved.scratch;
+    const uint32_t physAddr = scratch ? ps2ScratchpadOffset(address) :
+        resolved.mapped ? address : translateAddress(address);
 
     if (scratch)
     {
@@ -898,18 +946,25 @@ uint64_t PS2Memory::read64(uint32_t address)
         uint32_t hi = m_ioRegisters.count(address + 4) ? m_ioRegisters[address + 4] : 0u;
         return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
     }
+    // Unknown physical bus regions must not re-enter virtual translation.
+    if (resolved.mapped)
+        return 0;
     return (uint64_t)read32(address) | ((uint64_t)read32(address + 4) << 32);
 }
 
-__m128i PS2Memory::read128(uint32_t address)
+__m128i PS2Memory::read128(uint32_t address, uint8_t asid)
 {
     if (address & 15)
     {
         throw std::runtime_error("Unaligned 128-bit read at address: 0x" + std::to_string(address));
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    const auto resolved = resolveMappedAccess(address, asid, false);
+    address = resolved.address;
+
+    const bool scratch = resolved.scratch;
+    const uint32_t physAddr = scratch ? ps2ScratchpadOffset(address) :
+        resolved.mapped ? address : translateAddress(address);
 
     if (scratch)
     {
@@ -938,10 +993,14 @@ __m128i PS2Memory::read128(uint32_t address)
     return _mm_setzero_si128();
 }
 
-void PS2Memory::write8(uint32_t address, uint8_t value)
+void PS2Memory::write8(uint32_t address, uint8_t value, uint8_t asid)
 {
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    const auto resolved = resolveMappedAccess(address, asid, true);
+    address = resolved.address;
+
+    const bool scratch = resolved.scratch;
+    const uint32_t physAddr = scratch ? ps2ScratchpadOffset(address) :
+        resolved.mapped ? address : translateAddress(address);
 
     if (scratch)
     {
@@ -978,15 +1037,19 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
     }
 }
 
-void PS2Memory::write16(uint32_t address, uint16_t value)
+void PS2Memory::write16(uint32_t address, uint16_t value, uint8_t asid)
 {
     if (address & 1)
     {
         throw std::runtime_error("Unaligned 16-bit write at address: 0x" + std::to_string(address));
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    const auto resolved = resolveMappedAccess(address, asid, true);
+    address = resolved.address;
+
+    const bool scratch = resolved.scratch;
+    const uint32_t physAddr = scratch ? ps2ScratchpadOffset(address) :
+        resolved.mapped ? address : translateAddress(address);
 
     if (scratch)
     {
@@ -1021,12 +1084,15 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
     }
 }
 
-void PS2Memory::write32(uint32_t address, uint32_t value)
+void PS2Memory::write32(uint32_t address, uint32_t value, uint8_t asid)
 {
     if (address & 3)
     {
         throw std::runtime_error("Unaligned 32-bit write at address: 0x" + std::to_string(address));
     }
+
+    const auto resolved = resolveMappedAccess(address, asid, true);
+    address = resolved.address;
 
     if (isGsPrivReg(address))
     {
@@ -1048,8 +1114,9 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         return;
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    const bool scratch = resolved.scratch;
+    const uint32_t physAddr = scratch ? ps2ScratchpadOffset(address) :
+        resolved.mapped ? address : translateAddress(address);
 
     if (scratch)
     {
@@ -1082,12 +1149,15 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
     }
 }
 
-void PS2Memory::write64(uint32_t address, uint64_t value)
+void PS2Memory::write64(uint32_t address, uint64_t value, uint8_t asid)
 {
     if (address & 7)
     {
         throw std::runtime_error("Unaligned 64-bit write at address: 0x" + std::to_string(address));
     }
+
+    const auto resolved = resolveMappedAccess(address, asid, true);
+    address = resolved.address;
 
     if (isGsPrivReg(address))
     {
@@ -1106,8 +1176,9 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         return;
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    const bool scratch = resolved.scratch;
+    const uint32_t physAddr = scratch ? ps2ScratchpadOffset(address) :
+        resolved.mapped ? address : translateAddress(address);
 
     if (scratch)
     {
@@ -1139,15 +1210,19 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
     }
 }
 
-void PS2Memory::write128(uint32_t address, __m128i value)
+void PS2Memory::write128(uint32_t address, __m128i value, uint8_t asid)
 {
     if (address & 15)
     {
         throw std::runtime_error("Unaligned 128-bit write at address: 0x" + std::to_string(address));
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    const auto resolved = resolveMappedAccess(address, asid, true);
+    address = resolved.address;
+
+    const bool scratch = resolved.scratch;
+    const uint32_t physAddr = scratch ? ps2ScratchpadOffset(address) :
+        resolved.mapped ? address : translateAddress(address);
 
     if (!scratch && physAddr == 0x10004000u) // VIF0_FIFO
     {

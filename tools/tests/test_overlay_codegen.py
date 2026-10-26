@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Game-independent CLI regression checks for separately generated raw modules."""
+import os
 import pathlib
 import struct
 import subprocess
@@ -7,7 +8,7 @@ import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-RECOMP = ROOT / 'external/PS2Recomp/build/ps2xRecomp/ps2_recomp'
+RECOMP = pathlib.Path(os.environ.get('PS2X_TEST_RECOMPILER', str(ROOT / ('external/PS2Recomp/build/ps2xRecomp/ps2_recomp' + ('.exe' if os.name == 'nt' else '')))))
 
 class RawModules(unittest.TestCase):
     def setUp(self):

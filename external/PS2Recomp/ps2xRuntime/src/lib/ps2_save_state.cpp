@@ -22,7 +22,7 @@
 namespace
 {
     constexpr char kMagic[8] = {'D', 'W', '5', 'X', 'L', 'S', 'T', 'A'};
-    constexpr uint32_t kFormatVersion = 2u; // 2: an abandoned movie's leftover decoded frames (issue 023/027)
+    constexpr uint32_t kFormatVersion = 3u; // 3: complete COP0 TLB register images (issue 038)
 
     uint64_t fnv1a(const uint8_t *data, size_t size)
     {

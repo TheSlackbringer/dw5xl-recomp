@@ -12,6 +12,21 @@ namespace ps2recomp
         return ((address + 4u) & 0xF0000000u) | (target << 2);
     }
 
+    inline bool isGuestLikelyBranch(const Instruction &inst) noexcept
+    {
+        return (inst.opcode == OPCODE_BEQL || inst.opcode == OPCODE_BNEL ||
+                inst.opcode == OPCODE_BLEZL || inst.opcode == OPCODE_BGTZL ||
+                (inst.opcode == OPCODE_REGIMM &&
+                 (inst.rt == REGIMM_BLTZL || inst.rt == REGIMM_BGEZL ||
+                  inst.rt == REGIMM_BLTZALL || inst.rt == REGIMM_BGEZALL)) ||
+                (inst.opcode == OPCODE_COP0 && inst.rs == COP0_BC &&
+                 (inst.rt == COP0_BC_BCFL || inst.rt == COP0_BC_BCTL)) ||
+                (inst.opcode == OPCODE_COP1 && inst.rs == COP1_BC &&
+                 (inst.rt == COP1_BC_BCFL || inst.rt == COP1_BC_BCTL)) ||
+                (inst.opcode == OPCODE_COP2 && inst.rs == COP2_BC &&
+                 (inst.rt == COP2_BC_BCFL || inst.rt == COP2_BC_BCTL)));
+    }
+
     inline bool isGuestNop(const Instruction &inst) noexcept
     {
         const bool sllZero =

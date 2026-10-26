@@ -1981,6 +1981,71 @@ namespace ps2recomp
         return m_extraFunctions;
     }
 
+    void ElfParser::addCodeCopy(const CodeCopy &copy)
+    {
+        const auto &name = copy.name;
+        const auto source = copy.source, destination = copy.destination, size = copy.size;
+        const uint64_t end = uint64_t(destination) + size;
+        const uint32_t physical = destination & 0x1fffffffu;
+        if (!size || ((source | destination | size) & 3u) ||
+            uint64_t(source) + size > 0x100000000ull || end > 0x100000000ull ||
+            uint64_t(physical) + size > 0x02000000u ||
+            !(destination < 0x02000000u || (destination >= 0x80000000u && destination < 0xc0000000u)))
+            throw std::runtime_error("Invalid code copy address/size: " + name);
+        std::vector<Section> mappings;
+        if (m_rawMode)
+        {
+            for (const auto &section : m_sections)
+                if (section.name == ".raw_prefix" || section.name == ".raw_payload") mappings.push_back(section);
+        }
+        else
+        {
+            // Debug/symbol sections carry file bytes but are not loaded guest memory.
+            // Use PT_LOAD views for both source provenance and destination ownership.
+            AppendLoadSegmentsAsSections(*m_elf,mappings);
+        }
+        for (const auto &section : m_sections)
+            if (section.name.starts_with(".copied.") && section.isData) mappings.push_back(section);
+        for (const auto &section : mappings)
+        {
+            const uint32_t other = section.address & 0x1fffffffu;
+            if (physical < uint64_t(other) + section.size && uint64_t(physical) + size > other)
+                throw std::runtime_error("Code copy destination overlaps a mapped image: " + name);
+        }
+        std::vector<uint8_t> bytes(size);
+        for (uint32_t offset = 0; offset < size; offset += 4u)
+        {
+            const Section *backing = nullptr;
+            for (const auto &section : mappings)
+                if (section.data && source + offset >= section.address &&
+                    uint64_t(source) + offset + 4u <= uint64_t(section.address) + section.size)
+                {
+                    if (backing) throw std::runtime_error("Code copy source has ambiguous load mappings: " + name);
+                    backing = &section;
+                }
+            if (!backing) throw std::runtime_error("Code copy source is not file-backed loaded memory: " + name);
+            std::memcpy(bytes.data() + offset,backing->data + (source + offset - backing->address),sizeof(uint32_t));
+        }
+        m_codeCopyBytes.push_back(std::move(bytes));
+        Section section{};
+        section.name = ".copied." + name;
+        section.address = destination;
+        section.size = size;
+        section.isData = true;
+        section.isReadOnly = true;
+        section.data = m_codeCopyBytes.back().data();
+        // The execution view outranks non-loaded metadata with the same virtual address.
+        m_sections.insert(m_sections.begin(),section);
+        for (const auto &[offset,length] : copy.functions)
+        {
+            Section code = section;
+            code.name += ".code." + std::to_string(offset);
+            code.address += offset; code.data += offset; code.size = length;
+            code.isCode = true; code.isData = false;
+            m_sections.insert(m_sections.begin(),code);
+        }
+    }
+
     bool ElfParser::isValidAddress(uint32_t address) const
     {
         for (const auto &section : m_sections)

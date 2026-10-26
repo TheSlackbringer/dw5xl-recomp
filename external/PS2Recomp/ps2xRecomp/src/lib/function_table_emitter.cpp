@@ -166,6 +166,29 @@ namespace ps2recomp
         std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b)
                   { return a.first < b.first; });
 
+        std::stringstream copied;
+        for (const auto &copy : cg.m_codeCopies)
+        {
+            std::vector<std::pair<uint32_t,std::string>> imageEntries;
+            std::erase_if(entries, [&](const auto &entry) {
+                if (entry.first < copy.destination || uint64_t(entry.first) >= uint64_t(copy.destination) + copy.size) return false;
+                imageEntries.push_back(entry); return true;
+            });
+            if (imageEntries.empty() || copy.expectedWords.empty() ||
+                std::none_of(copy.expectedWords.begin(),copy.expectedWords.end(),[](const auto &entry) { return entry.second != 0; }))
+                throw std::runtime_error("Code copy has no nonzero compiled code: " + copy.name);
+            copied << "\nnamespace {\nconst RecompiledModuleEntry copy_entries_" << copy.name << "[] = {\n";
+            for (const auto &[address,name] : imageEntries)
+                copied << "    {0x" << std::hex << address << "u, " << name << "},\n";
+            copied << "};\nconst RecompiledCodeWord copy_words_" << copy.name << "[] = {\n";
+            for (const auto &[address,word] : copy.expectedWords)
+                copied << "    {0x" << std::hex << address << "u, 0x" << word << "u},\n";
+            copied << "};\nconst RecompiledCodeImage copy_image_" << copy.name << " = {\n    {\"" << copy.name << "\", 0x"
+                   << std::hex << copy.destination << "u, 0x" << copy.size << "u, copy_entries_" << copy.name << ", "
+                   << std::dec << imageEntries.size() << "u}, copy_words_" << copy.name << ", " << copy.expectedWords.size() << "u\n};\n"
+                   << "const RecompiledCodeImageRegistration copy_registration_" << copy.name << "(copy_image_" << copy.name << ");\n}\n";
+        }
+
         if (!cg.m_moduleId.empty())
         {
             if (entries.empty()) throw std::runtime_error("Raw module has no generated entries");
@@ -185,7 +208,7 @@ namespace ps2recomp
             ss << "extern const RecompiledModule g_ps2Module_" << cg.m_moduleId << " = {\n";
             ss << "    \"" << cg.m_moduleId << "\", 0x" << std::hex << cg.m_moduleBase
                << "u, 0x" << cg.m_moduleFileSize << "u, entries, " << std::dec << entries.size() << "u\n};\n";
-            return ss.str();
+            return ss.str() + copied.str();
         }
 
         uint32_t tableBase = 0u;
@@ -224,6 +247,6 @@ namespace ps2recomp
         ss << "static const GeneratedFunctionTableInitializer g_generatedFunctionTableInitializer;\n";
         ss << "}\n";
 
-        return ss.str();
+        return ss.str() + copied.str();
     }
 }
