@@ -26,13 +26,13 @@ class RawModules(unittest.TestCase):
         output = self.work / identity
         config = self.work / 'input.toml'
         config.write_text(f'''[general]
-input = "{self.work}/input.bin"
+input = "{self.work.as_posix()}/input.bin"
 input_format = "raw"
 module_id = "{identity}"
 raw_base = 0x1000
 raw_code_offset = {offset}
-ghidra_output = "{self.work}/functions.csv"
-output = "{output}"
+ghidra_output = "{self.work.as_posix()}/functions.csv"
+output = "{output.as_posix()}"
 ''')
         result = subprocess.run([str(RECOMP), str(config)], capture_output=True, text=True)
         return result, output
