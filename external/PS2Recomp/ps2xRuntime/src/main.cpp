@@ -186,6 +186,8 @@ int main(int argc, char *argv[])
 #else
     // Issue 025 v10: game threads must not wait on a slow log destination (console, pipe, redirect).
     ps2x::stdio_pump::installStdio();
+    // Issue 023 step 7T: C++ log lines (std::cerr << ... chains) are written whole, never split by another thread.
+    ps2x::stdio_pump::installLineStreams();
 #endif
     setupTerminateLogger();
 

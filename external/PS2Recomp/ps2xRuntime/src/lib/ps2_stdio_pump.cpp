@@ -1,8 +1,12 @@
 #include "runtime/ps2_stdio_pump.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
 #include <mutex>
+#include <streambuf>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -240,6 +244,181 @@ namespace ps2x::stdio_pump
         return installPairLocked(first, second, pipeBytes);
     }
 
+    // Issue 023 step 7T: whole log lines from the C++ streams. std::cerr is unbuffered (unitbuf), so a chain like
+    // `std::cerr << a << b << std::endl` used to be one write per <<, and another thread's line could land in between.
+    // Each thread now collects its own text per stream and writes every finished line (up to and including the
+    // newline) with one fwrite to the C stream, so C and C++ output share one order and no line is split by another
+    // thread. Unfinished text goes out when its newline comes, above 64 KB, at thread exit and in drain().
+    namespace
+    {
+        constexpr size_t kStreams = 3;            // 0 std::cout -> stdout, 1 std::cerr -> stderr, 2 std::clog -> stderr
+        constexpr size_t kUnfinishedLimit = 65536; // text without a newline is written once it grows past this
+
+        std::FILE *streamFile(size_t which)
+        {
+            return which == 0 ? stdout : stderr;
+        }
+
+        void writeText(size_t which, const char *data, size_t size)
+        {
+            if (size != 0)
+                std::fwrite(data, 1, size, streamFile(which)); // one call: the C stream's lock keeps it whole
+        }
+
+        // One thread's unfinished text; registered so drain() can write out other threads' text too.
+        struct ThreadText
+        {
+            std::mutex mutex;
+            std::string text[kStreams];
+
+            void writeAll()
+            {
+                for (size_t which = 0; which < kStreams; ++which)
+                {
+                    writeText(which, text[which].data(), text[which].size());
+                    text[which].clear();
+                }
+            }
+        };
+
+        std::mutex g_textMutex;
+        std::vector<ThreadText *> g_threadTexts;
+
+        thread_local ThreadText *t_text = nullptr;
+        thread_local bool t_textGone = false; // set when this thread's holder is destroyed (thread exit)
+
+        struct ThreadTextHolder
+        {
+            ThreadText *text = nullptr;
+            ~ThreadTextHolder()
+            {
+                if (!text)
+                    return;
+                {
+                    std::lock_guard<std::mutex> lock(g_textMutex);
+                    for (size_t i = 0; i < g_threadTexts.size(); ++i)
+                        if (g_threadTexts[i] == text)
+                        {
+                            g_threadTexts.erase(g_threadTexts.begin() + static_cast<std::ptrdiff_t>(i));
+                            break;
+                        }
+                    std::lock_guard<std::mutex> own(text->mutex);
+                    text->writeAll();
+                }
+                delete text;
+                t_text = nullptr;
+                t_textGone = true;
+            }
+        };
+        thread_local ThreadTextHolder t_textHolder;
+
+        ThreadText *currentText()
+        {
+            if (t_text || t_textGone)
+                return t_text;
+            auto *text = new ThreadText;
+            {
+                std::lock_guard<std::mutex> lock(g_textMutex);
+                g_threadTexts.push_back(text);
+            }
+            t_textHolder.text = text;
+            t_text = text;
+            return text;
+        }
+
+        void appendText(size_t which, const char *data, size_t size)
+        {
+            ThreadText *text = currentText();
+            if (!text) // the thread is already being torn down: write straight through
+            {
+                writeText(which, data, size);
+                return;
+            }
+            std::lock_guard<std::mutex> lock(text->mutex);
+            std::string &pending = text->text[which];
+            pending.append(data, size);
+            const size_t lastNewline = pending.rfind('\n');
+            if (lastNewline != std::string::npos)
+            {
+                writeText(which, pending.data(), lastNewline + 1);
+                pending.erase(0, lastNewline + 1);
+            }
+            if (pending.size() > kUnfinishedLimit)
+            {
+                writeText(which, pending.data(), pending.size());
+                pending.clear();
+            }
+        }
+
+        // The stream buffer behind std::cout / std::cerr / std::clog. No put area: every character goes through
+        // overflow/xsputn into the thread's text. sync() (std::flush, std::endl, unitbuf) only flushes the C stream,
+        // i.e. lines already handed over; it never writes unfinished text (unitbuf calls it after every <<).
+        class LineBuffer : public std::streambuf
+        {
+        public:
+            explicit LineBuffer(size_t which) : m_which(which) {}
+
+        protected:
+            int_type overflow(int_type ch) override
+            {
+                if (!traits_type::eq_int_type(ch, traits_type::eof()))
+                {
+                    const char c = traits_type::to_char_type(ch);
+                    appendText(m_which, &c, 1);
+                }
+                return traits_type::not_eof(ch);
+            }
+            std::streamsize xsputn(const char *data, std::streamsize size) override
+            {
+                if (size > 0)
+                    appendText(m_which, data, static_cast<size_t>(size));
+                return size;
+            }
+            int sync() override
+            {
+                std::fflush(streamFile(m_which));
+                return 0;
+            }
+
+        private:
+            size_t m_which;
+        };
+
+        void writeAllThreadTexts()
+        {
+            std::lock_guard<std::mutex> lock(g_textMutex);
+            for (ThreadText *text : g_threadTexts)
+            {
+                std::lock_guard<std::mutex> own(text->mutex);
+                text->writeAll();
+            }
+        }
+    }
+
+    bool installLineStreams()
+    {
+        if (const char *direct = std::getenv("PS2X_STDIO_DIRECT"); direct && *direct == '1')
+            return false;
+        static bool installed = false;
+        static std::mutex installMutex;
+        std::lock_guard<std::mutex> lock(installMutex);
+        if (installed)
+            return false;
+        // Never destroyed: the streams can be used until the very end of the process.
+        static auto *out = new LineBuffer(0);
+        static auto *err = new LineBuffer(1);
+        static auto *log = new LineBuffer(2);
+        std::cout.flush();
+        std::cerr.flush();
+        std::clog.flush();
+        std::cout.rdbuf(out);
+        std::cerr.rdbuf(err);
+        std::clog.rdbuf(log);
+        std::atexit(writeAllThreadTexts);
+        installed = true;
+        return true;
+    }
+
     bool installStdio()
     {
         if (const char *direct = std::getenv("PS2X_STDIO_DIRECT"); direct && *direct == '1')
@@ -258,6 +437,7 @@ namespace ps2x::stdio_pump
 
     void drain()
     {
+        writeAllThreadTexts(); // issue 023 step 7T: every thread's unfinished line, before the pipe is written out
         std::fflush(stdout);
         std::fflush(stderr);
         std::vector<Pump *> pumps;

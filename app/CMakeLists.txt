@@ -339,6 +339,12 @@ if(DW5XL_BUILD_TESTS)
     target_include_directories(dw5xl_stdio_pump_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
     add_test(NAME stdio_pump COMMAND dw5xl_stdio_pump_test)
     set_tests_properties(stdio_pump PROPERTIES TIMEOUT 20)
+    # Issue 023 step 7T: log lines from many threads arrive whole.
+    add_executable(dw5xl_log_lines_whole_test tests/log_lines_whole_test.cpp
+                   "${PS2RECOMP_DIR}/ps2xRuntime/src/lib/ps2_stdio_pump.cpp")
+    target_include_directories(dw5xl_log_lines_whole_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME log_lines_whole COMMAND dw5xl_log_lines_whole_test)
+    set_tests_properties(log_lines_whole PROPERTIES TIMEOUT 30)
     # ThreadSanitizer variant: the queue, PS2Memory, VIF1 parser and GIF arbiter
     # are recompiled instrumented; their archive copies are then never pulled in.
     option(DW5XL_TSAN_TESTS "Build the ThreadSanitizer variant of the VU1 async queue test" ON)

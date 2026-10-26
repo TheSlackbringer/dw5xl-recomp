@@ -31,4 +31,9 @@ namespace ps2x::stdio_pump
     // destination they share one pipe and thread, so their writes stay in program order across the two; different
     // destinations get one pump each. Returns true if at least one descriptor is pumped.
     bool installPair(int first, int second, size_t pipeBytes);
+
+    // Issue 023 step 7T: std::cout, std::cerr and std::clog collect each thread's text and write every finished line
+    // with one write, so a line written as a chain of << is never split by another thread's output. Does nothing
+    // when PS2X_STDIO_DIRECT=1 or when called again. Returns true if the streams were set up.
+    bool installLineStreams();
 }
