@@ -1,0 +1,51 @@
+# Builds the Linux release builder image (issue 041: Steam Runtime 3 sniper SDK, clang 23 and the approved libc++
+# packages of one apt.llvm.org snapshot) and publishes it to ghcr.io. Runs rarely: on demand, or when its inputs
+# change. Using a new image is a separate, reviewed commit that writes the printed digest into
+# tools/release/linux-builder-image; the release job never builds or changes the image itself.
+name: builder-image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, 'ci/**']
+    paths:
+      - tools/release/linux.Containerfile
+      - tools/release/write_libcxx_manifest.py
+      - .github/workflows/builder-image.yml
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the image
+        run: docker build --pull -t dw5xl-release-linux -f tools/release/linux.Containerfile tools/release
+      - name: Check the approved libc++ packages
+        run: |
+          docker run --rm --network=none dw5xl-release-linux \
+            python3 /usr/local/bin/write_libcxx_manifest.py --check /approved-debs
+      - name: Publish
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/dw5xl-release-linux"
+          tag="$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}"
+          docker tag dw5xl-release-linux "$image:$tag"
+          docker push "$image:$tag"
+          ref=$(docker inspect --format '{{index .RepoDigests 0}}' "$image:$tag")
+          {
+            echo "Published \`$image:$tag\`. To use it, write this line into \`tools/release/linux-builder-image\`:"
+            echo '```'
+            echo "$ref"
+            echo '```'
+            echo 'Approved libc++ packages:'
+            echo '```json'
+            docker run --rm --network=none "$image:$tag" cat /approved-debs/manifest.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$ref"
