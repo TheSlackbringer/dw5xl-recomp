@@ -4,7 +4,7 @@
   "wikidata": "Q247161",
   "system": "PS2",
   "type": "recomp",
-  "status": "in-progress",
+  "status": "playable",
   "toolchain": "Ps2recomp",
   "original": { "region": "Europe", "serial": "SLES-53860" },
   "targets": ["Linux", "Windows"]
