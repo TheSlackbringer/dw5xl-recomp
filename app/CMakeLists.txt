@@ -228,6 +228,8 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_field_history_test tests/field_history_test.cpp)
     target_include_directories(dw5xl_field_history_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
     add_test(NAME field_history COMMAND dw5xl_field_history_test)
+    add_executable(dw5xl_menu_assets_test tests/menu_assets_test.cpp)
+    add_test(NAME menu_assets COMMAND dw5xl_menu_assets_test)
     # Issue 025 profiling markers (a debugging tool, owner 2026-10-22: not part of CI or normal test runs): built and
     # run only in diagnostic builds. The first test compiles them in itself; the _off test checks that a build without
     # DW5XL_DEVELOPER_DIAGNOSTICS only gets empty inline functions.
