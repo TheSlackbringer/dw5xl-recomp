@@ -10,6 +10,7 @@
 #include "gs/gs_trace.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_device_queue.h"
+#include "runtime/ps2_settings.h"
 #include "runtime/ps2_stdio_pump.h"
 #include "runtime/ps2_profile_markers.h"
 #include "vif1_capture.h"
@@ -813,13 +814,20 @@ namespace ps2x_dev
 
 namespace
 {
-// Unknown or missing values return fallback. Older SSAA-based scale values are
-// treated as native output (anti-aliasing is configured separately).
-static uint32_t loadIniValue(const char *wantedKey, std::initializer_list<uint32_t> allowed, uint32_t fallback)
+// The settings file: dw5xl.ini in the working directory. DW5XL-DEBUG: PS2X_SETTINGS_FILE=<path> uses another file
+// (test runs, so they never change the player's settings).
+static const char *iniPath()
 {
-    std::ifstream file("dw5xl.ini");
+    static const std::string path = [] { const char *v = std::getenv("PS2X_SETTINGS_FILE"); return std::string(v && *v ? v : "dw5xl.ini"); }();
+    return path.c_str();
+}
+
+// The value of `wantedKey` in the settings file, trimmed; false if the file or the key is missing.
+static bool loadIniString(const char *wantedKey, std::string &out)
+{
+    std::ifstream file(iniPath());
     if (!file.is_open())
-        return fallback;
+        return false;
     std::string line;
     while (std::getline(file, line))
     {
@@ -848,29 +856,40 @@ static uint32_t loadIniValue(const char *wantedKey, std::initializer_list<uint32
 
         if (key == wantedKey)
         {
-            try {
-                const int value = std::stoi(val);
-                for (uint32_t a : allowed)
-                    if (value >= 0 && static_cast<uint32_t>(value) == a)
-                        return a;
-                return fallback;
-            } catch (...) {
-                return fallback;
-            }
+            out = val;
+            return true;
         }
     }
-    return fallback;
+    return false;
+}
+
+// Unknown or missing values return fallback. Older SSAA-based scale values are
+// treated as native output (anti-aliasing is configured separately).
+static uint32_t loadIniValue(const char *wantedKey, std::initializer_list<uint32_t> allowed, uint32_t fallback)
+{
+    std::string val;
+    if (!loadIniString(wantedKey, val))
+        return fallback;
+    try {
+        const int value = std::stoi(val);
+        for (uint32_t a : allowed)
+            if (value >= 0 && static_cast<uint32_t>(value) == a)
+                return a;
+        return fallback;
+    } catch (...) {
+        return fallback;
+    }
 }
 
 static uint32_t loadResolutionScaleFromIni() { return loadIniValue("resolution_scale", {1u, 2u, 4u}, 1u); }
 static uint32_t loadAASamplesFromIni() { return loadIniValue("aa_samples", {1u, 2u, 4u, 8u, 16u}, 0u); }
 
-static void saveIniValue(const std::string &wantedKey, uint32_t value)
+static void saveIniText(const std::string &wantedKey, const std::string &value)
 {
     std::vector<std::string> lines;
     bool found = false;
     {
-        std::ifstream file("dw5xl.ini");
+        std::ifstream file(iniPath());
         if (file.is_open())
         {
             std::string line;
@@ -906,7 +925,7 @@ static void saveIniValue(const std::string &wantedKey, uint32_t value)
 
                     if (key == wantedKey)
                     {
-                        std::string newLine = wantedKey + "=" + std::to_string(value);
+                        std::string newLine = wantedKey + "=" + value;
                         if (!comment.empty())
                             newLine += " " + comment;
                         lines.push_back(newLine);
@@ -921,10 +940,10 @@ static void saveIniValue(const std::string &wantedKey, uint32_t value)
 
     if (!found)
     {
-        lines.push_back(wantedKey + "=" + std::to_string(value));
+        lines.push_back(wantedKey + "=" + value);
     }
 
-    std::ofstream out("dw5xl.ini");
+    std::ofstream out(iniPath());
     if (out.is_open())
     {
         for (const auto &l : lines)
@@ -933,6 +952,8 @@ static void saveIniValue(const std::string &wantedKey, uint32_t value)
         }
     }
 }
+
+static void saveIniValue(const std::string &wantedKey, uint32_t value) { saveIniText(wantedKey, std::to_string(value)); }
 
 // The player's F3 anti-aliasing choice (kept when F4 changes the output scale).
 static uint32_t s_aaChoice = 1u;
@@ -960,7 +981,49 @@ static void applySavedOutputSettings(GS &gs)
     std::fprintf(stderr, "[output] scale=%ux aa=%ux (source: scale %s, aa %s)\n", gs.getResolutionScale(), gs.getAASamples(),
                  (scaleEnv && *scaleEnv) ? "PS2X_GS_SCALE" : "dw5xl.ini", (aaEnv && *aaEnv) ? "PS2X_GS_SSAA" : "dw5xl.ini");
 }
+
+// Issue 023 step 3S: vsync and window mode are player settings, `vsync=on|off` (off by default for now) and
+// `display=window|fullscreen` in dw5xl.ini; PS2X_VSYNC=on|off (or 1|0) overrides vsync. `source` names where the
+// value came from (for the log).
+static bool parseOnOff(const std::string &v, bool &on)
+{
+    if (v == "on" || v == "1" || v == "true") { on = true; return true; }
+    if (v == "off" || v == "0" || v == "false") { on = false; return true; }
+    return false;
+}
+static bool loadVsyncSetting(const char *&source)
+{
+    bool on = false;
+    if (const char *env = std::getenv("PS2X_VSYNC"); env && parseOnOff(env, on)) { source = "PS2X_VSYNC"; return on; }
+    std::string v;
+    if (loadIniString("vsync", v) && parseOnOff(v, on)) { source = "dw5xl.ini"; return on; }
+    source = "default";
+    return false;
+}
+static bool loadFullscreenSetting()
+{
+    std::string v;
+    return loadIniString("display", v) && v == "fullscreen";
+}
 } // namespace
+
+namespace ps2x::settings
+{
+    bool loadText(const char *key, std::string &value) { return loadIniString(key, value); }
+    void saveText(const std::string &key, const std::string &value) { saveIniText(key, value); }
+    void saveNumber(const std::string &key, uint32_t value) { saveIniValue(key, value); }
+    void setAntiAliasing(GS &gs, uint32_t samples)
+    {
+        s_aaChoice = samples;
+        gs.setAASamples(samples);
+        saveIniValue("aa_samples", samples);
+    }
+    void setResolutionScale(GS &gs, uint32_t scale)
+    {
+        gs.setResolutionScale(scale);
+        saveIniValue("resolution_scale", gs.getResolutionScale());
+    }
+}
 
 
 
@@ -1595,17 +1658,18 @@ bool PS2Runtime::initialize(const char *title)
 #else
         {
             const char *hidden = std::getenv("PS2X_HIDDEN");
-            // DW5XL-DEBUG issue 023 (step 3 experiment): PS2X_VSYNC=1 swaps on the display's refresh (swap interval 1)
-            // instead of immediately; with field pacing (the default) that is one picture per PS2 field, shown on a refresh.
-            const char *vsync = std::getenv("PS2X_VSYNC");
-            const bool vsyncOn = vsync && *vsync == '1';
+            // Issue 023 step 3S: with vsync on the window swaps on a display refresh (swap interval 1) instead of
+            // immediately; with field pacing (the default) that is one picture per PS2 field, shown on a refresh.
+            const char *vsyncSource = "default";
+            const bool vsyncOn = loadVsyncSetting(vsyncSource);
             SetConfigFlags(FLAG_WINDOW_RESIZABLE |
                            ((hidden && *hidden && *hidden != '0') ? FLAG_WINDOW_HIDDEN : 0) |
                            (vsyncOn ? FLAG_VSYNC_HINT : 0));
-            if (vsyncOn)
-                std::fprintf(stderr, "[window] vsync on (PS2X_VSYNC=1)\n");
+            std::fprintf(stderr, "[window] vsync %s (%s)\n", vsyncOn ? "on" : "off", vsyncSource);
         }
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        if (loadFullscreenSetting() && !IsWindowHidden())   // issue 023 3S: display=fullscreen (borderless)
+            ToggleBorderlessWindowed();
         InitAudioDevice();
         // DW5XL-DEBUG (issue 025): PS2X_MUTE=1 silences the output for test runs where no silent sink exists
         // (Windows); the audio device and stream keep running exactly as in normal play, only the volume is 0.
@@ -3605,6 +3669,8 @@ void PS2Runtime::run()
             }
         }
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        m_pictureRect[0] = dstRect.x; m_pictureRect[1] = dstRect.y;   // issue 023 3S: for overlays over the picture
+        m_pictureRect[2] = dstRect.width; m_pictureRect[3] = dstRect.height;
         ps2_host_input::drawMouseCaptureIndicator(dstRect.x, dstRect.y, dstRect.width, dstRect.height);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
@@ -3727,6 +3793,24 @@ void PS2Runtime::run()
             DrawText(buildText, 16, y + 5, kFontSize, WHITE);
         }
 
+        // DW5XL-DEBUG issue 023 3S: PS2X_WINDOW_SHOT=<field>:<path.png> saves the whole window (overlays included)
+        // on the first frame at or after that field — the frame dumps hold only the game picture.
+        {
+            static uint64_t s_shotTick = 0; static std::string s_shotPath; static bool s_shotInit = false;
+            if (!s_shotInit) {
+                s_shotInit = true;
+                if (const char *v = std::getenv("PS2X_WINDOW_SHOT"); v && std::strchr(v, ':')) {
+                    s_shotTick = std::strtoull(v, nullptr, 10); s_shotPath = std::strchr(v, ':') + 1;
+                }
+            }
+            if (!s_shotPath.empty() && currentVsync >= s_shotTick) {
+                ::Image shot = LoadImageFromScreen();
+                ExportImage(shot, s_shotPath.c_str());
+                UnloadImage(shot);
+                std::fprintf(stderr, "[window:shot] field %llu -> %s\n", static_cast<unsigned long long>(currentVsync), s_shotPath.c_str());
+                s_shotPath.clear();
+            }
+        }
         EndDrawing();
 
         if (WindowShouldClose())

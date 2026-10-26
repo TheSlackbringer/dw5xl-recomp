@@ -14,6 +14,7 @@
 #include "install_state.h"
 #include "ps2_debug_panel.h"
 #include "wizard_ui.h"
+#include "dw5xl_pc_settings.h"
 
 #include "imgui.h"
 #include "raylib.h"
@@ -296,5 +297,10 @@ void dw5xlConfigureDebugPanel(PS2DebugPanel &panel)
         panel.setVisible(false);
         std::fprintf(stderr, "[install] F1 debugger %s\n", enabled ? "on (PS2X_DEBUG_UI=1)" : "off (player build)");
     }
-    panel.setOverlay(overlayWanted, drawOverlay);
+    else if (const char *debug = std::getenv("PS2X_DEBUG_UI"); debug && *debug == '0')
+        panel.setVisible(false);   // DW5XL-DEBUG: developer run without the F1 debugger open (window screenshots)
+    // the disc prompt and (issue 023 3S) the PC SETTINGS rows share the imgui overlay
+    static bool s_discs = false;
+    panel.setOverlay([] { s_discs = overlayWanted(); return s_discs || dw5xl::pcsettings::overlayWanted(); },
+                     [] { if (dw5xl::pcsettings::overlayWanted()) dw5xl::pcsettings::drawOverlay(); if (s_discs) drawOverlay(); });
 }

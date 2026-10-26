@@ -21,4 +21,7 @@ void input(Input in);
 Snapshot snapshot();
 void setValues(const Values &values);   // window thread: the current settings when the screen opens
 void clearChanged();                    // window thread: after applying and saving
+// Window thread, inside the overlay's imgui frame: true while the screen is open; draws its rows over the game.
+bool overlayWanted();
+void drawOverlay();
 }

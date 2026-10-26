@@ -495,6 +495,8 @@ public:
     inline PS2Memory &memory() { return m_memory; }
     inline const PS2Memory &memory() const { return m_memory; }
 
+    // Issue 023 3S: where the game picture was last drawn in the window (x, y, width, height in window pixels).
+    void pictureRect(float &x, float &y, float &w, float &h) const { x = m_pictureRect[0]; y = m_pictureRect[1]; w = m_pictureRect[2]; h = m_pictureRect[3]; }
     inline GS &gs() { return m_gs; }
     inline const GS &gs() const { return m_gs; }
     inline void setResolutionScale(uint32_t scale) { m_gs.setResolutionScale(scale); }
@@ -588,6 +590,7 @@ private:
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     std::atomic<bool> m_missingFunctionReported{false};
     std::atomic<bool> m_stopRequested{false};
+    float m_pictureRect[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     DebugUiCallback m_debugUiInitCallback = nullptr;
     DebugUiCallback m_debugUiDrawCallback = nullptr;
     DebugUiCallback m_debugUiShutdownCallback = nullptr;
