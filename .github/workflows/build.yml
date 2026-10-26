@@ -88,6 +88,9 @@ jobs:
     needs: linux
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read # the builder image on ghcr.io (issue 041)
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -107,10 +110,6 @@ jobs:
           import hashlib, json, urllib.request
           root = Path('/tmp/linux-builder-tools')
           inputs = json.loads(Path('tools/release/linux-tools.json').read_text())
-          for item in json.loads(Path('tools/release/linux-libcxx-packages.json').read_text()):
-              inputs.append({'filename': 'libcxx/' + Path(item['Filename']).name,
-                             'url': 'https://apt.llvm.org/bullseye/' + item['Filename'],
-                             'size': int(item['Size']), 'sha256': item['SHA256']})
           for item in inputs:
               path = root / item['filename']
               path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,17 +119,19 @@ jobs:
               if path.suffix == '.AppImage':
                   path.chmod(0o755)
           PY
-      - name: Build the Steam Runtime compiler container
+      - name: Pull the pinned builder image (issue 041; compiler and libc++ inside, no apt.llvm.org)
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if ! command -v podman >/dev/null; then
             sudo apt-get update
             sudo apt-get install -y podman
           fi
-          podman build -t dw5xl-release-linux -f tools/release/linux.Containerfile tools/release
+          echo "$TOKEN" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          podman pull "$(cat tools/release/linux-builder-image)"
       - name: Build and package offline (no game data)
         env:
           DW5XL_LINUX_SDK_WORK: ${{ runner.temp }}/linux-sdk
-          DW5XL_LINUX_LIBCXX_DEBS: /tmp/linux-builder-tools/libcxx
           DW5XL_RECOMP_DEPS: ${{ github.workspace }}/build-recomp/_deps
           DW5XL_FFMPEG_SOURCE: /tmp/linux-builder-tools/ffmpeg-7.1.tar.xz
           DW5XL_APPIMAGE_TOOLS: /tmp/linux-builder-tools/appimage-tools

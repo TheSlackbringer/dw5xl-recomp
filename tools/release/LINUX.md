@@ -22,12 +22,11 @@ uploaded to the same numbered draft only after all required jobs pass.
 Publishing remains an owner action.
 
 Local prerequisites are Podman, Python and the existing dependency sources.
-Build `tools/release/linux.Containerfile` as `dw5xl-release-linux` once. The
-release build itself runs with networking disabled and never installs host
+Pull the builder image once: `podman pull "$(cat tools/release/linux-builder-image)"`.
+The release build itself runs with networking disabled and never installs host
 packages. Supply these already downloaded inputs:
 
 ```sh
-export DW5XL_LINUX_LIBCXX_DEBS=/path/to/approved-libcxx-debs
 export DW5XL_DEP_ROOT=/path/to/app/deps
 export DW5XL_RECOMP_DEPS=/path/to/recompiler/build/_deps
 export DW5XL_FFMPEG_SOURCE=/path/to/ffmpeg-7.1.tar.xz
@@ -41,9 +40,25 @@ bash tools/release/build_linux.sh
 `rlimgui-src` source checkouts. `DW5XL_RECOMP_DEPS` holds the five dependency
 checkouts populated by configuring PS2Recomp. No game data is used.
 
-The approved libc++ packages are pinned in `linux-libcxx-packages.json`;
 `linux-tools.json` pins the AppImage tools and FFmpeg source. CI checks size and
 SHA-256 before use. Local builds never fetch missing inputs automatically.
+
+## Builder image
+
+The compiler and the libc++ that the package ships come from one image:
+`tools/release/linux.Containerfile` (Steam Runtime 3 sniper SDK, pinned by
+digest, plus clang/lld/llvm 23 and the six libc++ `.deb` files of the same
+apt.llvm.org snapshot in `/approved-debs`, listed with name, version, size and
+SHA-256 in `/approved-debs/manifest.json`). The workflow `builder-image`
+builds it and publishes it to `ghcr.io/theslackbringer/dw5xl-release-linux`;
+`tools/release/linux-builder-image` holds the exact image (by digest) that CI and
+local release builds use. The release build checks the `.deb` files against the
+manifest before using them, and makes no request to apt.llvm.org.
+
+To update the compiler or libc++: run the `builder-image` workflow (Actions,
+"Run workflow"), check the libc++ version in its summary, and commit the printed
+image line into `tools/release/linux-builder-image`. `DW5XL_LINUX_IMAGE`
+overrides the image for a local test, e.g. one built from the Containerfile.
 
 The script builds the launcher and recompiler, runs the setup tests, scans the
 AppDir for forbidden game content, and writes an AppImage and SHA-256 sidecar
