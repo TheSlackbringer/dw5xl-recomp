@@ -644,8 +644,14 @@ void GS::noteDisplayWriteUnlocked(uint32_t basePage, uint32_t fbw, uint8_t psm, 
         ++m_displayWritesSinceRead;
 }
 
-void GS::noteDrawWriteUnlocked(const GSContext &context)
+void GS::noteDrawWriteUnlocked(const GSContext &context, bool textured)
 {
+    // Issue 023 step 2K: a game that draws each picture for one interlaced field offsets it by half a line
+    // (XYOFFSET.ofy, 1/16 pixel units); a copy keeps the field of the buffer it copies.
+    const uint32_t source = context.tex0.tbp0 / 32u;
+    const uint8_t copied = textured && context.tex0.tbp0 % 32u == 0u && source < m_pictureTarget.size()
+                               ? m_pictureTarget[source] : 0u;
+    m_pictureTarget[context.frame.fbp & 0x1FFu] = copied ? copied : uint8_t((context.xyoffset.ofy & 8u) ? 2u : 1u);
     // Draws come in long runs with the same frame and scissor: the overlap is computed once per run.
     displayPagesUnlocked();
     const GSFrameReg &f = context.frame;
@@ -704,6 +710,11 @@ void GS::submitFieldScanout(const GSPresentationRequest &captured)
     request.display2 = captured.display2;
     request.bgcolor = captured.bgcolor;
     request.vsyncTick = captured.vsyncTick;
+    {
+        // Issue 023 step 2K: the field the displayed buffer's picture was drawn for (read circuit 1 when enabled).
+        const uint64_t dispfb = (captured.pmode & 1u) ? captured.dispfb1 : captured.dispfb2;
+        request.fieldTarget = int8_t(m_pictureTarget[dispfb & 0x1FFu]) - 1;
+    }
 
     // Issue 023 step 2R: when the game made no new picture during this field (no GS write touched the displayed
     // buffer and the display registers are unchanged since the previous read), the buffer still holds the previous
@@ -1752,6 +1763,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             const uint32_t x1 = x0 + std::max<uint32_t>(m_trxreg.rrw, 1u) - 1u;
             const uint32_t y1 = y0 + std::max<uint32_t>(m_trxreg.rrh, 1u) - 1u;
             noteDisplayWriteUnlocked(page, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, x0, y0, x1, y1);
+            m_pictureTarget[page & 0x1FFu] = 0u; // issue 023 step 2K: not drawn for a field
             if (m_bitbltbuf.dbp % 32u != 0u)
                 noteDisplayWriteUnlocked(page + 1u, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, x0, y0, x1, y1);
         }
@@ -1948,7 +1960,7 @@ void GS::vertexKick(bool drawing)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
-        noteDrawWriteUnlocked(batch.state.context); // issue 023 step 2R
+        noteDrawWriteUnlocked(batch.state.context, batch.state.prim.tme); // issue 023 steps 2R, 2K
         // DW5XL-DEBUG issue 023: PS2X_VBL_DRAW_TRACE=1 counts draws into the displayed frame buffer and elsewhere;
         // the EE scheduler prints and resets the counts at every VBlankStart/VBlankEnd (guest order with
         // PS2X_GS_ASYNC=0 PS2X_VU1_ASYNC=0).

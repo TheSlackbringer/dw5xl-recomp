@@ -42,6 +42,7 @@ struct VulkanGsScanoutState
         bool highResolution = false;
         bool frameFields = false;
         bool fieldMode = false;
+        int8_t fieldTarget = -1; // issue 023 step 2K: the field the picture was drawn for, -1 if not known
         bool pending = false;
     };
     std::array<RbSlot, 3> slots{};
@@ -62,6 +63,7 @@ struct VulkanGsScanoutState
         bool highResolution = false;
         bool frameFields = false;
         bool fieldMode = false;
+        int8_t fieldTarget = -1; // issue 023 step 2K: the field the picture was drawn for, -1 if not known
     };
     std::vector<StagedRead> staged;
     // Copied reads keep their buffers until the next presentation releases them under the device lock.

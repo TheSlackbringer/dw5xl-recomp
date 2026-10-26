@@ -112,6 +112,7 @@ void consumeSlot(Vulkan::Device &device, VulkanGsScanoutState &state, VulkanGsSc
     read.highResolution = slot.highResolution;
     read.frameFields = slot.frameFields;
     read.fieldMode = slot.fieldMode;
+    read.fieldTarget = slot.fieldTarget;
     state.staged.push_back(std::move(read));
 
     slot.buf.reset();
@@ -332,6 +333,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
                            height >> outputShift;
     curSlot.frameFields = frameFields;
     curSlot.fieldMode = fieldMode;
+    curSlot.fieldTarget = request.fieldTarget;
 
     auto command = device.request_command_buffer();
     command->copy_image_to_buffer(*curSlot.buf, *output.image, 0, {}, {width, height, 1},
@@ -464,15 +466,26 @@ bool finishVulkanGsPresentInto(Vulkan::Device &device, VulkanGsScanoutState &sta
         // per row, two hex digits) before it is woven.
         if (s_weaveTrace)
         {
+            // PS2X_WEAVE_TRACE_COLS=x0:x1 (DW5XL-DEBUG issue 023 2J): the row profile covers only these columns, e.g. a
+            // part of the HUD that never changes, so a picture that moves by one line shows without the 3D scene's noise.
+            static const std::pair<uint32_t, uint32_t> s_cols = []
+            {
+                unsigned a = 0u, b = 0u;
+                const char *v = std::getenv("PS2X_WEAVE_TRACE_COLS");
+                if (v && std::sscanf(v, "%u:%u", &a, &b) == 2 && b > a)
+                    return std::pair<uint32_t, uint32_t>(a, b);
+                return std::pair<uint32_t, uint32_t>(0u, 0xFFFFFFFFu);
+            }();
+            const uint32_t x0 = std::min(s_cols.first, read.w), x1 = std::max(x0 + 1u, std::min(s_cols.second, read.w));
             static const char kHex[] = "0123456789abcdef";
             std::string rows;
             for (uint32_t y = 0; y < read.h; ++y)
             {
                 const uint8_t *row = frame.pixels.data() + static_cast<size_t>(y) * read.w * 4u;
                 uint32_t sum = 0u;
-                for (uint32_t x = 0; x < read.w; ++x)
+                for (uint32_t x = x0; x < x1 && x < read.w; ++x)
                     sum += row[x * 4u] + row[x * 4u + 1u] + row[x * 4u + 2u];
-                const uint32_t mean = sum / (read.w * 3u);
+                const uint32_t mean = sum / ((x1 - x0) * 3u);
                 rows.push_back(kHex[(mean >> 4) & 15u]);
                 rows.push_back(kHex[mean & 15u]);
             }
@@ -496,7 +509,42 @@ bool finishVulkanGsPresentInto(Vulkan::Device &device, VulkanGsScanoutState &sta
             else
             {
                 weaver->present(frame.pixels, frame.width, frame.height, read.w * 4u, read.vsyncTick, oddField,
-                                weaveMode);
+                                weaveMode, read.fieldTarget);
+                // DW5XL-DEBUG issue 023 2J: with PS2X_WEAVE_TRACE=1 the woven picture's row profile (columns from
+                // PS2X_WEAVE_TRACE_COLS), its field's parity and how it was built (pair / stale / doubled).
+                if (s_weaveTrace)
+                {
+                    static const std::pair<uint32_t, uint32_t> s_outCols = []
+                    {
+                        unsigned a = 0u, b = 0u;
+                        const char *v = std::getenv("PS2X_WEAVE_TRACE_COLS");
+                        if (v && std::sscanf(v, "%u:%u", &a, &b) == 2 && b > a)
+                            return std::pair<uint32_t, uint32_t>(a, b);
+                        return std::pair<uint32_t, uint32_t>(0u, 0xFFFFFFFFu);
+                    }();
+                    const uint32_t w = frame.width;
+                    const uint32_t x0 = std::min(s_outCols.first, w), x1 = std::max(x0 + 1u, std::min(s_outCols.second, w));
+                    static const char kHex[] = "0123456789abcdef";
+                    const auto kind = weaver->lastKind();
+                    std::string rows;
+                    for (uint32_t y = 0; y < frame.height; ++y)
+                    {
+                        const uint8_t *row = frame.pixels.data() + static_cast<size_t>(y) * read.w * 4u;
+                        uint32_t sum = 0u;
+                        for (uint32_t x = x0; x < x1 && x < w; ++x)
+                            sum += row[x * 4u] + row[x * 4u + 1u] + row[x * 4u + 2u];
+                        const uint32_t mean = sum / ((x1 - x0) * 3u);
+                        rows.push_back(kHex[(mean >> 4) & 15u]);
+                        rows.push_back(kHex[mean & 15u]);
+                    }
+                    std::fprintf(stderr, "[weave:out] tick=%llu odd=%d kind=%s h=%u %s target=%d\n",
+                                 static_cast<unsigned long long>(read.vsyncTick), oddField ? 1 : 0,
+                                 kind == ReusableFieldWeaver::Kind::Pair ? "pair"
+                                 : kind == ReusableFieldWeaver::Kind::StalePair ? "stale"
+                                 : kind == ReusableFieldWeaver::Kind::Doubled ? "doubled"
+                                 : kind == ReusableFieldWeaver::Kind::Kept ? "kept" : "none",
+                                 frame.height, rows.c_str(), read.fieldTarget);
+                }
             }
         }
     }

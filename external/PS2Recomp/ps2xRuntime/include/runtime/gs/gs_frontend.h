@@ -294,7 +294,7 @@ private:
     };
     void noteDisplayWriteUnlocked(uint32_t basePage, uint32_t fbw, uint8_t psm, uint32_t x0, uint32_t y0,
                                   uint32_t x1, uint32_t y1);
-    void noteDrawWriteUnlocked(const GSContext &context);
+    void noteDrawWriteUnlocked(const GSContext &context, bool textured = false);
     const std::bitset<512> &displayPagesUnlocked();
     std::bitset<512> m_displayPages;
     DisplayRegs m_displayPagesRegs{};
@@ -306,6 +306,10 @@ private:
         bool overlaps = false;
     } m_drawOverlap;
     uint64_t m_displayWritesSinceRead = 0;
+    // Issue 023 step 2K, per frame buffer (FBP): the field its picture was drawn for — 1 + the half-line bit of
+    // XYOFFSET.ofy of the draws into it (1 even, 2 odd), carried along by a draw textured from another buffer's base
+    // (a copy); 0 = not known (never drawn, or written by a transfer).
+    std::array<uint8_t, 512> m_pictureTarget{};
     DisplayRegs m_lastFieldReadRegs{};
     bool m_hasLastFieldRead = false;
     // Output scale/AA change, reset or a loaded save state: the next field is read even without a GS write.

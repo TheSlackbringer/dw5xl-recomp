@@ -2425,7 +2425,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
             return;
         }
         weaver.present(frame.pixels, frame.width, frame.height,
-                              kHostFrameWidth * 4u, request.vsyncTick, oddField, mode);
+                              kHostFrameWidth * 4u, request.vsyncTick, oddField, mode, request.fieldTarget);
     };
     const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
     const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);

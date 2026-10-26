@@ -137,5 +137,110 @@ int main() {
     h=2;p=rows({100,100}); require(faintComb.present(p,1,h,8,70,false,Mode::HalfHeightFrame));
     h=2;p=rows({115,115}); require(faintComb.present(p,1,h,8,71,true,Mode::HalfHeightFrame));
     require(p.at(2*8) >= 110); // opposite-field row pulled toward its moving neighbours
+    // Issue 023 step 2K: pictures placed by the field the game drew them for (`target`, from XYOFFSET's half line).
+    {
+        // A picture of a 2-pixel-wide, 8-row scene for one target: rows target, target+2, ... Pixel 0 is a still HUD
+        // column (bright on row 5 only), pixel 1 moves (a new value in every picture).
+        auto picture = [](unsigned target, uint8_t moving) {
+            std::vector<uint8_t> field;
+            for (unsigned y = target; y < 8u; y += 2u) {
+                const uint8_t hud = y == 5u ? 250 : uint8_t(20 + y);
+                field.insert(field.end(), {hud, hud, hud, 255, moving, moving, moving, 255});
+            }
+            return field;
+        };
+        // Normal play (every field a new picture, target = field parity): exactly the output without targets.
+        ReusableFieldWeaver plain, targeted;
+        for (uint64_t tick = 100; tick < 120; ++tick) {
+            const bool odd = (tick & 1u) != 0;
+            auto a = picture(odd ? 1u : 0u, uint8_t(tick * 7u)), b = a;
+            uint32_t ha = 4, hb = 4;
+            require(plain.present(a, 2, ha, 8, tick, odd, Mode::HalfHeightFrame));
+            require(targeted.present(b, 2, hb, 8, tick, odd, Mode::HalfHeightFrame, odd ? 1 : 0));
+            require(ha == hb && a == b);
+        }
+        // A game that draws every picture with the same offset (no field target) is woven as without targets.
+        ReusableFieldWeaver plainFixed, targetedFixed;
+        for (uint64_t tick = 100; tick < 120; ++tick) {
+            const bool odd = (tick & 1u) != 0;
+            auto a = picture(0u, uint8_t(tick * 7u)), b = a;
+            uint32_t ha = 4, hb = 4;
+            require(plainFixed.present(a, 2, ha, 8, tick, odd, Mode::HalfHeightFrame));
+            require(targetedFixed.present(b, 2, hb, 8, tick, odd, Mode::HalfHeightFrame, 0));
+            require(ha == hb && a == b);
+        }
+        // Drops: pictures several fields apart, in irregular target order and often shown in the other field. The
+        // still HUD column (pixel 0) is the whole woven scene in every picture; a still label on rows 4-5 between
+        // moving rows (pixel 2) keeps its edges; the moving pixel (1) shows the current picture on its rows.
+        auto labelled = [&](unsigned target, uint8_t moving) {
+            auto field = picture(target, moving);
+            std::vector<uint8_t> out;
+            for (unsigned i = 0, y = target; y < 8u; ++i, y += 2u) {
+                out.insert(out.end(), field.begin() + i * 8, field.begin() + i * 8 + 8);
+                const uint8_t v = (y == 4u || y == 5u) ? 240 : moving;
+                out.insert(out.end(), {v, v, v, 255});
+            }
+            return out;
+        };
+        ReusableFieldWeaver drops;
+        // Also two consecutive fields with new pictures of one target (212, 218) and a render shown again (217).
+        const struct { uint64_t tick; unsigned target; bool again; } shown[] = {
+            {200, 0, false}, {201, 1, false}, {202, 0, false}, {203, 1, false}, // normal play first
+            {207, 0, false}, {211, 0, false}, {212, 0, false}, {216, 1, false}, {217, 1, true}, {218, 1, false},
+            {221, 0, false}, {225, 1, false}, {229, 1, false}, {234, 1, false}, {238, 0, false}, {243, 1, false}};
+        uint8_t moving = 1;
+        std::vector<uint8_t> previous;
+        for (const auto &s : shown) {
+            h = 4;
+            p = labelled(s.target, s.again ? moving : ++moving);
+            require(drops.present(p, 3, h, 12, s.tick, (s.tick & 1u) != 0, Mode::HalfHeightFrame, int(s.target)));
+            require(h == 8);
+            if (s.again) // shown again: the window picture does not change
+                require(p == previous);
+            previous = p;
+            if (s.tick < 203) // from the second pair on, both fields' histories prove the HUD still
+                continue;
+            const bool kept = drops.lastKind() == ReusableFieldWeaver::Kind::Kept;
+            for (unsigned y = 0; y < 8; ++y) {
+                require(p[y * 12] == (y == 5u ? 250 : 20 + y));
+                if (y == 4u || y == 5u)
+                    require(p[y * 12 + 8] == 240);
+                if (s.tick >= 207 && ((kept && !s.again) || (y & 1u) == s.target))
+                    require(p[y * 12 + 4] == moving);
+            }
+        }
+        // After per-field pictures, a game drawing with one offset again (new pictures of one target in field after
+        // field) is woven as without targets again: the third picture switches back (its history, kept by target rows,
+        // starts over: one line-doubled picture), pairs again from the fourth.
+        ReusableFieldWeaver back;
+        for (uint64_t tick = 400; tick < 410; ++tick) {
+            const unsigned target = tick < 404 ? unsigned(tick & 1u) : 0u;
+            h = 4;
+            p = picture(target, uint8_t(tick * 7u));
+            require(back.present(p, 2, h, 8, tick, (tick & 1u) != 0, Mode::HalfHeightFrame, int(target)));
+            if (tick >= 407)
+                require(back.lastKind() == ReusableFieldWeaver::Kind::Pair);
+        }
+        // A new scene during drops (same target twice after the cut): nothing of the old scene is woven in.
+        auto scene = [](unsigned target, uint8_t base) {
+            std::vector<uint8_t> field;
+            for (unsigned y = target; y < 8u; y += 2u) {
+                const uint8_t v = uint8_t(base + y);
+                field.insert(field.end(), {v, v, v, 255, v, v, v, 255});
+            }
+            return field;
+        };
+        ReusableFieldWeaver cut;
+        const struct { uint64_t tick; unsigned target; uint8_t base; } cutShown[] = {
+            {300, 0, 10}, {301, 1, 10}, {302, 0, 10}, {303, 1, 10}, {308, 0, 100}, {312, 0, 100}, {317, 0, 100}};
+        for (const auto &s : cutShown) {
+            h = 4;
+            p = scene(s.target, s.base);
+            require(cut.present(p, 2, h, 8, s.tick, (s.tick & 1u) != 0, Mode::HalfHeightFrame, int(s.target)));
+            if (s.base == 100)
+                for (unsigned y = 0; y < 8; ++y)
+                    require(p[y * 8] >= 100 && p[y * 8 + 4] >= 100); // new scene only (old: 10..17)
+        }
+    }
     std::cout << "Field history tests passed\n";
 }

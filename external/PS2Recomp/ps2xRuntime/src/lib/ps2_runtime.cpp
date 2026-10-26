@@ -1170,15 +1170,26 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                          static_cast<unsigned long long>(fnv(copyHeight / 2u, copyHeight)), copyHeight);
             // Row profile (mean brightness of every row, two hex digits per row): a picture that moves vertically shows
             // up as a shifted profile without writing whole frames (PNG dumps change the timing and hide the jump).
+            // PS2X_WEAVE_TRACE_COLS=x0:x1 (DW5XL-DEBUG issue 023 2J): the row profile covers only these columns, e.g. a
+            // part of the HUD that never changes, so a picture that moves by one line shows without the 3D scene's noise.
+            static const std::pair<uint32_t, uint32_t> s_cols = []
+            {
+                unsigned a = 0u, b = 0u;
+                const char *v = std::getenv("PS2X_WEAVE_TRACE_COLS");
+                if (v && std::sscanf(v, "%u:%u", &a, &b) == 2 && b > a)
+                    return std::pair<uint32_t, uint32_t>(a, b);
+                return std::pair<uint32_t, uint32_t>(0u, 0xFFFFFFFFu);
+            }();
+            const uint32_t x0 = std::min(s_cols.first, copyWidth), x1 = std::max(x0 + 1u, std::min(s_cols.second, copyWidth));
             static std::string s_rows;
             s_rows.clear();
             for (uint32_t y = 0; y < copyHeight; ++y)
             {
                 const uint8_t *row = ps2x_dev::s_lastFrame.data() + static_cast<size_t>(y) * rowBytes;
                 uint32_t sum = 0u;
-                for (uint32_t x = 0; x < copyWidth; ++x)
+                for (uint32_t x = x0; x < x1 && x < copyWidth; ++x)
                     sum += row[x * 4u] + row[x * 4u + 1u] + row[x * 4u + 2u];
-                const uint32_t mean = sum / (copyWidth * 3u);
+                const uint32_t mean = sum / ((x1 - x0) * 3u);
                 static const char kHex[] = "0123456789abcdef";
                 s_rows.push_back(kHex[(mean >> 4) & 15u]);
                 s_rows.push_back(kHex[mean & 15u]);
