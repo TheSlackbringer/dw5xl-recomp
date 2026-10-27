@@ -1000,6 +1000,15 @@ static bool loadVsyncSetting(const char *&source)
     source = "default";
     return false;
 }
+// Issue 023 3S: the F2 frame rate overlay is a player setting too, `show_fps=on|off` (off by default); PS2X_FPS=1
+// turns it on for a run.
+static bool loadShowFpsSetting()
+{
+    if (const char *env = std::getenv("PS2X_FPS"); env && *env && *env != '0') return true;
+    std::string v;
+    bool on = false;
+    return loadIniString("show_fps", v) && parseOnOff(v, on) && on;
+}
 static bool loadFullscreenSetting()
 {
     std::string v;
@@ -3707,15 +3716,16 @@ void PS2Runtime::run()
         devHarness.captureHostFrame();
 
         // Function keys: one table, runtime/hotkeys.h (owner layout 2026-10-20: F2 FPS, F3 AA, F4 scale, F8 build ID).
-        // On-screen FPS & VSync rate overlay for playtesting (disabled by default for release; enabled via PS2X_FPS=1 or toggled with F2)
-        static bool s_showFpsOverlay = []() {
-            const char *env = std::getenv("PS2X_FPS");
-            return env && *env && *env != '0';
-        }();
+        // On-screen FPS & VSync rate overlay: the show_fps setting (PC SETTINGS, issue 023 3S), toggled and saved
+        // with F2 too; PS2X_FPS=1 turns it on for a run.
+        static const bool s_showFpsInit = [this]() { m_showFps.store(loadShowFpsSetting(), std::memory_order_relaxed); return true; }();
+        (void)s_showFpsInit;
         if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::FpsOverlay)))
         {
-            s_showFpsOverlay = !s_showFpsOverlay;
+            setShowFps(!showFps());
+            ps2x::settings::saveText("show_fps", showFps() ? "on" : "off");
         }
+        const bool s_showFpsOverlay = showFps();
         // F8: build ID and game tick, to match screenshots with logs (off by default).
         static bool s_showBuildOverlay = false;
         if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::BuildOverlay)))

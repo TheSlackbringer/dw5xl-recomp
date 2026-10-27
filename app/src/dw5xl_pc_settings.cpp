@@ -31,6 +31,8 @@
 #include <mutex>
 #include <string>
 
+namespace dw5xl::pcsettings { bool trace(); }   // PS2X_PCSETTINGS_TRACE (below)
+
 namespace {
 using namespace dw5xl::menu;
 using MImage = dw5xl::menu::Image;
@@ -44,6 +46,7 @@ constexpr uint32_t kAdjustDraw = 0x002C8FA0u;         // SCREEN ADJUST screen dr
 constexpr uint32_t kAdjustGuides = 0x002C90C0u;       // SCREEN ADJUST picture-position guides (per frame)
 constexpr uint32_t kButtonBar = 0x00264020u;          // button bar text (id, ...)
 constexpr uint32_t kBarStep = 0x00263DF0u;            // button bar, per frame: only while a menu screen is up
+constexpr uint32_t kMenuSound = 0x00149900u;          // menu sound (0, id): 0 cursor, 1 value changed, 3 confirm, 4 back
 constexpr uint32_t kAdjustSlot = 3u;                  // SCREEN ADJUST's title slot argument
 constexpr uint32_t kAdjustBar = 0x27u, kSettingsBar = 5u;   // "Default / Adjust / Back" -> "Select / Change / Back"
 constexpr int kWordRow = 3;                           // SCREEN ADJUST's row in the word strip (sub-file 12)
@@ -51,6 +54,9 @@ constexpr double kBackHoldSeconds = 0.75;             // the pad's Back held thi
 
 PS2Runtime::RecompiledFunction g_original[10] = {};
 enum Slot { ListOpen, Title, OffsetX, OffsetY, OffsetSet, OffsetApply, AdjustDraw, ButtonBar, AdjustGuides, BarStep };
+// From the title's entrance until the Options list opens again: SCREEN ADJUST's own drawing stays off, also while
+// the routine fades out after Back (the rows close with the title).
+std::atomic<bool> g_adjustHidden{false};
 
 uint8_t *ptr(uint8_t *ram, uint32_t address) { return ram + (address & 0x01FFFFFFu); }
 uint32_t rd32(uint8_t *ram, uint32_t address) { uint32_t v; std::memcpy(&v, ptr(ram, address), 4); return v; }
@@ -173,6 +179,7 @@ std::array<uint8_t, 16> g_patchedMark{};
 void listOpen(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
 {
     if (getRegU32(ctx, 4) == 1u) {
+        g_adjustHidden.store(false, std::memory_order_relaxed);
         const uint32_t container = rd32(ram, kMenuContainerPtr);
         uint32_t a = 0, n = 0; std::vector<Tim2Picture> store;
         const Tim2Picture *t = subFile(ram, container, 12, a, n) ? tim(ram, a, n, store) : nullptr;
@@ -191,7 +198,10 @@ void listOpen(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
 // --- the screen: the game's SCREEN ADJUST routine runs it --------------------------------------------------------
 void title(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
 {
-    if (getRegU32(ctx, 4) == kAdjustSlot) dw5xl::pcsettings::setOpen(getRegU32(ctx, 5) != 0u);
+    if (getRegU32(ctx, 4) == kAdjustSlot) {
+        dw5xl::pcsettings::setOpen(getRegU32(ctx, 5) != 0u);
+        if (getRegU32(ctx, 5) != 0u) g_adjustHidden.store(true, std::memory_order_relaxed);
+    }
     g_original[Title](ram, ctx, runtime);
 }
 void offsetX(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
@@ -210,7 +220,17 @@ void offsetSet(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
     if (!dw5xl::pcsettings::isOpen()) return g_original[OffsetSet](ram, ctx, runtime);
     const int32_t x = int32_t(getRegU32(ctx, 4)), y = int32_t(getRegU32(ctx, 5));
     using dw5xl::pcsettings::Input;
-    dw5xl::pcsettings::input(y < 0 ? Input::Up : y > 0 ? Input::Down : x < 0 ? Input::Left : x > 0 ? Input::Right : Input::Default);
+    const Input in = y < 0 ? Input::Up : y > 0 ? Input::Down : x < 0 ? Input::Left : x > 0 ? Input::Right : Input::Default;
+    const bool changed = dw5xl::pcsettings::input(in);
+    // The game's other Options screens sound a cursor move (0) and a changed value (1); SCREEN ADJUST itself already
+    // sounds Start (3, DEFAULT) and Back (4). Continue into the game's sound call, which returns to this call's caller.
+    if (changed && in != Input::Default) {
+        ctx->r[4] = _mm_set_epi64x(0, 0);
+        ctx->r[5] = _mm_set_epi64x(0, (in == Input::Up || in == Input::Down) ? 0 : 1);
+        ctx->pc = kMenuSound;
+        if (dw5xl::pcsettings::trace()) std::fprintf(stderr, "[pc-settings] menu sound %d\n", int(getRegU32(ctx, 5)));
+        return;
+    }
     ret(ctx, 0);
 }
 void offsetApply(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
@@ -220,12 +240,12 @@ void offsetApply(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
 }
 void adjustDraw(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
 {
-    if (dw5xl::pcsettings::isOpen()) return ret(ctx, 0);
+    if (g_adjustHidden.load(std::memory_order_relaxed)) return ret(ctx, 0);
     g_original[AdjustDraw](ram, ctx, runtime);
 }
 void adjustGuides(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
 {
-    if (dw5xl::pcsettings::isOpen()) return ret(ctx, 0);
+    if (g_adjustHidden.load(std::memory_order_relaxed)) return ret(ctx, 0);
     g_original[AdjustGuides](ram, ctx, runtime);
 }
 void buttonBar(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
@@ -284,7 +304,7 @@ namespace {
 std::mutex g_mutex;
 Snapshot g_state;                                  // guarded by g_mutex
 std::atomic<bool> g_open{false};                   // the Options menu's screen is open
-constexpr int kValueCount[kRows] = {2, 3, 5, 2, 0};
+constexpr int kValueCount[kRows] = {2, 3, 5, 2, 2, 0};
 }
 // DW5XL-DEBUG issue 023 3S: PS2X_PCSETTINGS_TRACE=1 logs opening, closing and every navigation input.
 bool trace() { static const bool on = [] { const char *v = std::getenv("PS2X_PCSETTINGS_TRACE"); return v && *v == '1'; }(); return on; }
@@ -308,11 +328,12 @@ void setOpen(bool open)
         g_open.store(open, std::memory_order_release);
 }
 bool isOpen() { return g_open.load(std::memory_order_acquire); }
-void input(Input in)
+bool input(Input in)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     Snapshot &s = g_state;
-    int *value[kRows] = {&s.values.vsync, &s.values.resolution, &s.values.antiAliasing, &s.values.display, nullptr};
+    const Snapshot before = s;
+    int *value[kRows] = {&s.values.vsync, &s.values.resolution, &s.values.antiAliasing, &s.values.display, &s.values.showFps, nullptr};
     switch (in) {
     case Input::Up: do s.row = (s.row + kRows - 1) % kRows; while (kValueCount[s.row] == 0 && s.row != kDefaultRow); break;
     case Input::Down: do s.row = (s.row + 1) % kRows; while (kValueCount[s.row] == 0 && s.row != kDefaultRow); break;
@@ -322,8 +343,9 @@ void input(Input in)
     }
     ++s.version;
     if (trace())
-        std::fprintf(stderr, "[pc-settings] input %d -> row %d values vsync=%d res=%d aa=%d display=%d\n", int(in), s.row,
-                     s.values.vsync, s.values.resolution, s.values.antiAliasing, s.values.display);
+        std::fprintf(stderr, "[pc-settings] input %d -> row %d values vsync=%d res=%d aa=%d display=%d fps=%d\n", int(in), s.row,
+                     s.values.vsync, s.values.resolution, s.values.antiAliasing, s.values.display, s.values.showFps);
+    return s.row != before.row || s.changed != before.changed || std::memcmp(&s.values, &before.values, sizeof(Values)) != 0;
 }
 Snapshot snapshot() { std::lock_guard<std::mutex> lock(g_mutex); return g_state; }
 void setValues(const Values &v) { std::lock_guard<std::mutex> lock(g_mutex); g_state.values = v; g_state.needsInit = false; ++g_state.version; }
@@ -335,6 +357,7 @@ namespace {
 using dw5xl::pcsettings::Input;
 using dw5xl::pcsettings::Mode;
 constexpr uint16_t kPadTriangle = 0x1000u;            // the game's Back in its menus
+constexpr uint16_t kPadStart = 0x0008u;               // SCREEN ADJUST's reset (DEFAULT)
 std::atomic<bool> g_backHeld{false};
 // Opened during the fighting (the battle code overlay is loaded and none of its menus is up): the paused game
 // darkened behind the screen; anywhere else (title, main menu, Options, the battle's pause menu and other menus) the
@@ -452,8 +475,10 @@ bool frame(bool allowOpen)
         else if (p.left) input(Input::Left);
         else if (p.right) input(Input::Right);
     }
+    // Cross on DEFAULT. In the Options menu it taps Start, the routine's own reset, so the game sounds it too.
     const Snapshot s = snapshot();
-    if (s.mode != Mode::Closed && s.row == kDefaultRow && p.cross) input(Input::Default);
+    if (s.mode == Mode::InPlay && s.row == kDefaultRow && p.cross) input(Input::Default);
+    else if (s.mode == Mode::Options && s.row == kDefaultRow && p.cross) ps2_host_input::tapGameButtons(kPadStart);
     if (!shot.empty()) g_runtime->requestWindowShot(shot);
     return snapshot().mode != Mode::Closed;
 }
@@ -472,16 +497,16 @@ const std::array<std::pair<int, const char *>, 30> kWords{{{0, "SETTINGS"}, {1, 
     {12, "VIBRATION"}, {13, "BOW CONTROL"}, {14, "SETUP"}, {15, "SYSTEM"}, {16, "BGM VOLUME"}, {17, "SE VOLUME"},
     {18, "SOUND TEST"}, {19, "SAVE"}, {20, "LOAD"}, {22, "ENDING - WEI"}, {23, "ENDING - WU"}, {24, "ENDING - SHU"},
     {25, "ENDING - OTHER"}, {26, "OTHER"}, {27, "OPENING EDIT"}, {28, "VARIATIONS"}, {29, "REPEAT"}, {30, "PLAY"}, {31, "MAP EVENT"}}};
-const char *kLabels[4] = {"VSYNC", "RESOLUTION", "ANTI-ALIASING", "DISPLAY"};
+const char *kLabels[5] = {"VSYNC", "RESOLUTION", "ANTI-ALIASING", "DISPLAY", "SHOW FPS"};
 const char *kHelp[kRows] = {"Waits for each display refresh: no tearing.", "Internal resolution of the picture.",
                             "Smooths the edges of the picture.", "Plays in a window or fullscreen.",
-                            "Restores the default settings."};
+                            "Shows the frame rate in the top left corner (also F2).", "Restores the default settings."};
 constexpr uint32_t kScales[3] = {1, 2, 4}, kSamples[5] = {1, 2, 4, 8, 16};
 
 struct Tex { Texture2D t{}; int w = 0, h = 0; };      // w, h: the picture's size in its source texels
 struct Assets {
     bool tried = false, ok = false;
-    Tex label[4], labelDefault, onOff[2][2];          // onOff[ON/OFF][white/yellow]
+    Tex label[5], labelDefault, onOff[2][2];          // onOff[ON/OFF][white/yellow]
     Tex word[2][2];                                   // WINDOW / FULLSCREEN, white / yellow
     Tex number[2][5][2];                              // [resolution / anti-aliasing][value][white / yellow]
     Tex glow, help[kRows];
@@ -556,7 +581,7 @@ void buildAssets()
         }
         return buildWord(ls, 9, 2, 4);
     };
-    for (int i = 0; i < 4; ++i) { const MImage w = word(kLabels[i]); if (!w.w) return; A.label[i] = upload(w); }
+    for (int i = 0; i < 5; ++i) { const MImage w = word(kLabels[i]); if (!w.w) return; A.label[i] = upload(w); }
     A.labelDefault = upload(crop(strip, 0, 9 * 24, 208, 24));
     // ON / OFF in the value strip's two palettes; which palette is yellow decides "current"
     const MImage v0 = decodeTim2(ptr(ram, a13), n13, *t13, 0), v1 = decodeTim2(ptr(ram, a13), n13, *t13, 1);
@@ -687,6 +712,8 @@ void applyChanges(const dw5xl::pcsettings::Snapshot &s)
     const bool full = s.values.display == 1, isFull = IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE);
     if (full != isFull && !IsWindowHidden()) ToggleBorderlessWindowed();
     ps2x::settings::saveText("display", full ? "fullscreen" : "window");
+    g_runtime->setShowFps(s.values.showFps == 0);
+    ps2x::settings::saveText("show_fps", s.values.showFps == 0 ? "on" : "off");
     clearChanged();
 }
 }
@@ -703,6 +730,7 @@ void drawOverlay()
         v.resolution = scale >= 4 ? 2 : scale >= 2 ? 1 : 0;
         v.antiAliasing = samples >= 16 ? 4 : samples >= 8 ? 3 : samples >= 4 ? 2 : samples >= 2 ? 1 : 0;
         v.display = IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE) ? 1 : 0;
+        v.showFps = g_runtime->showFps() ? 0 : 1;
         setValues(v);
         s = snapshot();
     }
@@ -741,12 +769,12 @@ void drawOverlay()
             image(dl, m, A.barText[i], iconX[i] + 13, 410, float(A.barText[i].w) * 0.75f, 20);
         }
     }
-    const int screenRow[kRows] = {0, 1, 2, 3, 5};
+    const int screenRow[kRows] = {0, 1, 2, 3, 4, 6};
     const float rowY = 100.0f + 34.0f * screenRow[s.row];
     image(dl, m, A.glow, 0, rowY - 2, 144, 32, IM_COL32(255, 208, 96, 128));
     int labelW = 0; for (const Tex &t : A.label) labelW = std::max(labelW, t.w);
     const float valueX = std::max(184.0f, 24.0f - 4.0f + float(labelW) + 14.0f);
-    const int values[4] = {s.values.vsync, s.values.resolution, s.values.antiAliasing, s.values.display};
+    const int values[5] = {s.values.vsync, s.values.resolution, s.values.antiAliasing, s.values.display, s.values.showFps};
     for (int r = 0; r < kRows; ++r) {
         const float y = 100.0f + 34.0f * screenRow[r];
         const ImU32 labelTint = r == s.row ? IM_COL32_WHITE : IM_COL32(160, 160, 160, 255);
@@ -754,11 +782,11 @@ void drawOverlay()
         image(dl, m, A.label[r], 24 - 4, y, float(A.label[r].w), 28, labelTint);
         separator(dl, m, y + 27, 448, 496);
         float x = valueX;
-        const int count = r == 0 ? 2 : r == 1 ? 3 : r == 2 ? 5 : 2;
+        const int count = r == 1 ? 3 : r == 2 ? 5 : 2;
         for (int v = 0; v < count; ++v) {
             const int cur = v == values[r] ? 1 : 0;
-            if (r == 0 || (r == 2 && v == 0)) {                       // ON / OFF pictures (OFF also for anti-aliasing)
-                const Tex &t = A.onOff[r == 0 ? v : 1][cur];
+            if (r == 0 || r == 4 || (r == 2 && v == 0)) {             // ON / OFF pictures (OFF also for anti-aliasing)
+                const Tex &t = A.onOff[r == 2 ? 1 : v][cur];
                 image(dl, m, t, x, y, float(t.w), 28); x += float(t.w) + 12;
             } else if (r == 3) {
                 const Tex &t = A.word[v][cur];

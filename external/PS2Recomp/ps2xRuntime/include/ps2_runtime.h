@@ -498,6 +498,9 @@ public:
     // Issue 023 3S: where the game picture was last drawn in the window (x, y, width, height in window pixels).
     // Issue 023 3S: pauses the whole guest for a host screen (window thread): EE held, IOP clock and audio stopped.
     void setHostPaused(bool paused);
+    // Issue 023 3S: the frame rate overlay (F2, PC SETTINGS "SHOW FPS"); the caller saves the setting.
+    bool showFps() const { return m_showFps.load(std::memory_order_relaxed); }
+    void setShowFps(bool on) { m_showFps.store(on, std::memory_order_relaxed); }
     uint64_t hostPausedNanoseconds(uint64_t steadyNowNs) const;   // total paused time up to now (IOP clock)
     // DW5XL-DEBUG issue 023 3S (window thread): save the whole window, overlays included, at the end of this frame.
     void requestWindowShot(const std::string &path) { m_windowShotRequest = path; }
@@ -597,6 +600,7 @@ private:
     std::atomic<bool> m_stopRequested{false};
     float m_pictureRect[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     std::string m_windowShotRequest;
+    std::atomic<bool> m_showFps{false};
     mutable std::mutex m_hostPauseMutex;
     uint64_t m_hostPauseStartNs = 0, m_hostPausedTotalNs = 0;   // guarded by m_hostPauseMutex
     DebugUiCallback m_debugUiInitCallback = nullptr;
