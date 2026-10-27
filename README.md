@@ -142,20 +142,37 @@ In this developer setup, saves are stored in `game/dw5xl/mc0/`. Keep that direct
 | Keyboard | PS2 input |
 | --- | --- |
 | Enter / Tab | Start / Select |
-| X or Space / C or Esc | Cross / Circle |
+| X or Space / C | Cross / Circle |
 | Z / V | Square / Triangle |
 | Arrow keys or WASD | D-pad |
 | Q / E | L1 / R1 |
 | Left Shift / Right Shift | L2 / R2 |
 
-Gamepads are also supported.
+| Esc | PC SETTINGS (see below) |
+
+Gamepads are also supported. Holding the gamepad's Back/Select button for ¾ of a second opens PC SETTINGS; a short press is still Select in the game.
+
+### PC SETTINGS
+
+The game's Options menu has a **PC SETTINGS** entry (in place of the PS2's SCREEN ADJUST), drawn in the game's own style. You can also open it at any time with **Esc** or by holding the gamepad's **Back** button: the game pauses (picture, music and input) until you close it again with Esc, Triangle or Back.
+
+| Setting | Values |
+| --- | --- |
+| VSYNC | On / Off |
+| RESOLUTION | 640×512 (1×), 1280×1024 (2×), 2560×2048 (4×) |
+| ANTI-ALIASING | Off, 2×, 4×, 8×, 16× |
+| DISPLAY | Window / Fullscreen |
+| SHOW FPS | On / Off (the F2 overlay) |
+| DEFAULT | Restores the default settings |
+
+Up/Down picks a setting, Left/Right changes it, and Cross on DEFAULT resets them all. Changes apply right away and are saved to `dw5xl.ini`.
 
 ### Function keys and display
 
 | Key | Description |
 | --- | --- |
 | **F1** | Runtime debugger (developer builds; off in the release unless `PS2X_DEBUG_UI=1`). |
-| **F2** | Toggle real game FPS, VSync rate, resolution scale, and AA sample HUD counter. |
+| **F2** | Toggle real game FPS, VSync rate, resolution scale, and AA sample HUD counter (the SHOW FPS setting; saved to `dw5xl.ini`). |
 | **F3** | Cycle anti-aliasing sample multiplier ($1\times \to 2\times \to 4\times \to 8\times \to 16\times$) and persist to `dw5xl.ini`. |
 | **F4** | Cycle internal resolution scale live ($1\times \to 2\times \to 4\times$) and persist to `dw5xl.ini`. |
 | **F5** | Save state (🚧 in development). |
