@@ -124,6 +124,12 @@ namespace
         ctx->pc = ::getRegU32(ctx, 31);
     }
 
+    void overrideSubtractHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        setReturnU32(ctx, ::getRegU32(ctx, 4) - ::getRegU32(ctx, 5));
+        ctx->pc = ::getRegU32(ctx, 31);
+    }
+
     void overrideBrokenHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         setReturnU32(ctx, 0xDEADBEEFu);
@@ -1001,6 +1007,66 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(getRegS32(env.ctx, 2), -4, "__divdi3 should divide signed 64-bit values");
         });
 
+        tc.Run("numeric FD Alarm release removes the queued alarm", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t handler = 0x00270000u;
+            env.runtime.registerFunction(handler, &alarmNoopHandler);
+            setRegU32(env.ctx, 4, 0xFFFFu);
+            setRegU32(env.ctx, 5, handler);
+            SetAlarm(env.rdram.data(), &env.ctx, &env.runtime);
+            const int32_t id = getRegS32(env.ctx, 2);
+            t.IsTrue(id > 0, "control must create the alarm before testing release");
+            setRegU32(env.ctx, 4, static_cast<uint32_t>(id));
+            t.IsTrue(callSyscall(0xFDu, env.rdram.data(), &env.ctx, &env.runtime),
+                     "FD must dispatch the missing release alias");
+            t.Equals(getRegS32(env.ctx, 2), KE_OK, "numeric release returns cancellation success");
+            CancelAlarm(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), KE_ERROR, "released alarm must no longer be queued");
+        });
+
+        tc.Run("negative FE Alarm creation enters the existing native queue", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t handler = 0x00270000u;
+            env.runtime.registerFunction(handler, &alarmNoopHandler);
+            setRegU32(env.ctx, 2, static_cast<uint32_t>(KE_ERROR));
+            setRegU32(env.ctx, 4, 0xFFFFu);
+            setRegU32(env.ctx, 5, handler);
+            t.IsTrue(callSyscall(0u - 0xFEu, env.rdram.data(), &env.ctx, &env.runtime),
+                     "negative FE must dispatch interrupt-form creation");
+            const int32_t id = getRegS32(env.ctx, 2);
+            t.IsTrue(id > 0, "interrupt-form creation must return a real alarm ID");
+            setRegU32(env.ctx, 4, static_cast<uint32_t>(id));
+            CancelAlarm(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), KE_OK, "created alarm must exist in the native queue");
+        });
+
+        tc.Run("existing Alarm fallback numbers retain their queue behavior", [](TestCase &t)
+        {
+            for (const uint32_t create : {0x18u, 0xFCu, 0u - 0x1Eu, 0u - 0xFDu})
+            {
+                for (const uint32_t cancel : {0x19u, 0xFEu, 0u - 0x1Fu, 0u - 0xFFu})
+                {
+                    TestEnv env;
+                    constexpr uint32_t handler = 0x00270000u;
+                    env.runtime.registerFunction(handler, &alarmNoopHandler);
+                    setRegU32(env.ctx, 4, 0xFFFFu);
+                    setRegU32(env.ctx, 5, handler);
+                    t.IsTrue(callSyscall(create, env.rdram.data(), &env.ctx, &env.runtime),
+                             "existing creation number must still dispatch");
+                    const int32_t id = getRegS32(env.ctx, 2);
+                    t.IsTrue(id > 0, "existing creation returns a usable ID");
+                    setRegU32(env.ctx, 4, static_cast<uint32_t>(id));
+                    t.IsTrue(callSyscall(cancel, env.rdram.data(), &env.ctx, &env.runtime),
+                             "existing cancellation number must still dispatch");
+                    t.Equals(getRegS32(env.ctx, 2), KE_OK, "existing cancellation consumes the alarm");
+                    CancelAlarm(env.rdram.data(), &env.ctx, &env.runtime);
+                    t.Equals(getRegS32(env.ctx, 2), KE_ERROR, "old aliases must consume exactly one alarm");
+                }
+            }
+        });
+
         tc.Run("ReleaseAlarm aliases CancelAlarm and cache syscalls succeed", [](TestCase &t)
         {
             TestEnv env;
@@ -1403,6 +1469,86 @@ void register_ps2_runtime_kernel_tests()
             }
         });
 
+        tc.Run("negative syscalls select installed positive services and preserve the caller", [](TestCase &t)
+        {
+            for (const uint32_t index : {0xFEu, 0xFFu, 0x91u})
+            {
+                TestEnv env;
+                constexpr uint32_t handler = 0x00200000u;
+                env.runtime.registerFunction(handler, overrideReturnHandler);
+                env.runtime.registerFunction(K_OVERRIDE_ENTRY, schedulerOverrideEntry);
+                env.runtime.registerFunction(K_OVERRIDE_RESUME, schedulerOverrideResume);
+                env.runtime.setEeSyscallOverride(env.rdram.data(), index, handler);
+                gOverrideSyscall = 0u - index;
+                R5900Context main{}; main.pc = K_OVERRIDE_ENTRY;
+                setRegU32(main, 3, gOverrideSyscall);
+                setRegU32(main, 4, 7u); setRegU32(main, 5, 5u);
+                setRegU32(main, 28, 0x12345678u); setRegU32(main, 29, 0x1E000u);
+                env.runtime.eeScheduler().reset(env.rdram.data(), main);
+                env.runtime.eeScheduler().run();
+                t.Equals(getRegS32(gOverrideResult, 2), 12, "negative call must execute the installed service");
+                t.Equals(::getRegU32(&gOverrideResult, 3), gOverrideSyscall, "original signed syscall register is retained");
+                t.Equals(::getRegU32(&gOverrideResult, 4), 7u, "parent argument must be preserved");
+                t.Equals(::getRegU32(&gOverrideResult, 28), 0x12345678u, "parent GP must be restored");
+                t.Equals(::getRegU32(&gOverrideResult, 29), 0x1E000u, "parent stack must be restored");
+            }
+        });
+
+        tc.Run("exact negative syscall override wins over a positive alias", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t index = 0x91u;
+            env.runtime.registerFunction(0x200000u, overrideReturnHandler);
+            env.runtime.registerFunction(0x200010u, overrideSubtractHandler);
+            env.runtime.registerFunction(K_OVERRIDE_ENTRY, schedulerOverrideEntry);
+            env.runtime.registerFunction(K_OVERRIDE_RESUME, schedulerOverrideResume);
+            env.runtime.setEeSyscallOverride(env.rdram.data(), index, 0x200000u);
+            env.runtime.setEeSyscallOverride(env.rdram.data(), 0u - index, 0x200010u);
+            gOverrideSyscall = 0u - index;
+            R5900Context main{}; main.pc = K_OVERRIDE_ENTRY;
+            setRegU32(main, 4, 7u); setRegU32(main, 5, 5u);
+            env.runtime.eeScheduler().reset(env.rdram.data(), main);
+            env.runtime.eeScheduler().run();
+            t.Equals(getRegS32(gOverrideResult, 2), 2, "explicit negative override must retain precedence");
+        });
+
+        tc.Run("negative alias of a missing installed native target reports failure", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(K_OVERRIDE_ENTRY, schedulerOverrideEntry);
+            env.runtime.registerFunction(K_OVERRIDE_RESUME, schedulerOverrideResume);
+            env.runtime.setEeSyscallOverride(env.rdram.data(), 0x91u, 0x200000u);
+            gOverrideSyscall = 0u - 0x91u;
+            R5900Context main{}; main.pc = K_OVERRIDE_ENTRY;
+            env.runtime.eeScheduler().reset(env.rdram.data(), main);
+            env.runtime.eeScheduler().run();
+            t.Equals(getRegS32(gOverrideResult, 2), KE_ERROR, "unavailable installed service cannot fabricate success");
+        });
+
+        tc.Run("negative eight keeps its nonlocal installed return contract", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(0x200000u, overrideReturnHandler);
+            env.runtime.registerFunction(0x200010u, overrideSubtractHandler);
+            env.runtime.setEeSyscallOverride(env.rdram.data(), 8u, 0x200000u);
+            setRegU32(env.ctx, 29, 0x1E000u); setRegU32(env.ctx, 31, 0x12340u);
+            t.IsTrue(callSyscall(0u - 8u, env.rdram.data(), &env.ctx, &env.runtime), "installed return must dispatch");
+            t.Equals(env.ctx.pc, 0x200000u, "return is a direct context transfer, not a nested invocation");
+            t.Equals(::getRegU32(&env.ctx, 29), 0x1E000u, "nonlocal return must retain original stack");
+            t.Equals(::getRegU32(&env.ctx, 31), 0x12340u, "nonlocal return must retain original link");
+            env.runtime.setEeSyscallOverride(env.rdram.data(), 0u - 8u, 0x200010u);
+            t.IsTrue(callSyscall(0u - 8u, env.rdram.data(), &env.ctx, &env.runtime), "exact negative return must dispatch");
+            t.Equals(env.ctx.pc, 0x200010u, "exact negative return service retains precedence");
+        });
+
+        tc.Run("uninstalled extreme negative syscall remains unhandled", [](TestCase &t)
+        {
+            TestEnv env;
+            setRegU32(env.ctx, 2, 0x12345678u);
+            t.IsFalse(callSyscall(0x80000000u, env.rdram.data(), &env.ctx, &env.runtime), "INT_MIN must not overflow or resolve spuriously");
+            t.Equals(::getRegU32(&env.ctx, 2), 0x12345678u, "unhandled lookup must not modify return state");
+        });
+
         tc.Run("SetSyscall override runs as a scheduler invocation", [](TestCase &t)
         {
             TestEnv env;
@@ -1550,6 +1696,26 @@ void register_ps2_runtime_kernel_tests()
                      "the sleeping invocation should yield to the driver, resume its own frame, then restore the base frame");
             t.Equals(static_cast<uint32_t>(getRegS32(gOverrideResult, 2)), 0xB10C0EDu,
                      "the invocation result should reach the preserved base context after the wait");
+        });
+
+        tc.Run("negative alias reentrancy shares the installed positive invocation guard", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t table = 0x3000u;
+            constexpr uint32_t values[] = {0xCAFEBABEu, 0x11223344u, 0x55667788u};
+            env.runtime.registerFunction(0x200020u, overrideRecursiveFindAddressHandler);
+            env.runtime.registerFunction(K_OVERRIDE_ENTRY, schedulerOverrideEntry);
+            env.runtime.registerFunction(K_OVERRIDE_RESUME, schedulerOverrideResume);
+            env.runtime.setEeSyscallOverride(env.rdram.data(), 0x83u, 0x200020u);
+            writeGuestWords(env.rdram.data(), table, values, std::size(values));
+            gOverrideSyscall = 0u - 0x83u;
+            R5900Context main{}; main.pc = K_OVERRIDE_ENTRY;
+            setRegU32(main, 4, table); setRegU32(main, 5, table + sizeof(values));
+            setRegU32(main, 6, 0x11223344u);
+            env.runtime.eeScheduler().reset(env.rdram.data(), main);
+            env.runtime.eeScheduler().run();
+            t.Equals(::getRegU32(&gOverrideResult, 2), table + 4u,
+                     "signed alias must enter once and let its positive reentrant call reach the builtin");
         });
 
         tc.Run("exit handlers run as ordered invocation frames before the thread becomes dormant", [](TestCase &t)

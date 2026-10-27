@@ -36,7 +36,18 @@ def sha(blob):
 def snapshot(path, limit):
     try:
         with path.open('rb') as stream:
-            data = stream.read(limit+1)
+            # The allowance can be hundreds of MiB even for a tiny generated file.
+            # Keep one handle and the same one-byte oversize check without asking
+            # the host to allocate an allowance-sized read buffer for every file.
+            chunks = []
+            remaining = limit + 1
+            while remaining:
+                chunk = stream.read(min(64 << 10, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b''.join(chunks)
     except OSError as exc:
         raise Invalid('INPUT_READ', f'{path.name}: {exc.strerror}') from exc
     if len(data)>limit:
