@@ -389,17 +389,36 @@ namespace ps2_syscalls
 
     bool dispatchSyscallOverride(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime || !ctx)
+        {
+            return false;
+        }
+
+        uint32_t installedNumber = syscallNumber;
         uint32_t handler = 0u;
-        if (!runtime || !ctx ||
-            !runtime->findEeSyscallOverride(syscallNumber, handler) ||
-            handler == 0u)
+        if (!runtime->findEeSyscallOverride(installedNumber, handler))
+        {
+            // Interrupt-form calls use a negative number for the installed
+            // positive service. Keep explicit negative overrides authoritative,
+            // and do not rewrite the caller's syscall register or fallback ABI.
+            if (static_cast<int32_t>(syscallNumber) >= 0)
+            {
+                return false;
+            }
+            installedNumber = 0u - syscallNumber;
+            if (!runtime->findEeSyscallOverride(installedNumber, handler))
+            {
+                return false;
+            }
+        }
+        if (handler == 0u)
         {
             return false;
         }
 
         EeScheduler &scheduler = runtime->eeScheduler();
         scheduler.bindMainContextForSyscall(*ctx, rdram);
-        if (scheduler.hasInvocation(GuestInvocationKind::SyscallOverride, syscallNumber))
+        if (scheduler.hasInvocation(GuestInvocationKind::SyscallOverride, installedNumber))
         {
             return false;
         }
@@ -412,7 +431,7 @@ namespace ps2_syscalls
 
         GuestInvocation invocation{};
         invocation.kind = GuestInvocationKind::SyscallOverride;
-        invocation.tag = syscallNumber;
+        invocation.tag = installedNumber;
         invocation.context = *ctx;
         invocation.context.pc = handler;
         SET_GPR_U32(&invocation.context, 29, scheduler.invocationStackTop());

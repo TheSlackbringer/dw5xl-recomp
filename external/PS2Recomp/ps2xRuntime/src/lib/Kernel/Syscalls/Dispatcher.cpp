@@ -95,11 +95,13 @@ namespace ps2_syscalls
             SetAlarm(rdram, ctx, runtime);
             return true;
         case 0x19:
+        case 0xFD:
         case 0xFE:
             CancelAlarm(rdram, ctx, runtime);
             return true;
         case static_cast<uint32_t>(-0x1E):
         case static_cast<uint32_t>(-0xFD):
+        case static_cast<uint32_t>(-0xFE):
             iSetAlarm(rdram, ctx, runtime);
             return true;
         case static_cast<uint32_t>(-0x1F):
