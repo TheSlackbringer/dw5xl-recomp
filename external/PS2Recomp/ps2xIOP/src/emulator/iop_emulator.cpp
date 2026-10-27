@@ -125,6 +125,8 @@ namespace ps2x::iop::detail
                 host.audioSamples(samples);
             });
             memory.spu2().setIrqCallback([this] { pendingSoundInterrupt = true; });
+            memory.spu2().setKeyOnCallback([this] { return host.wantsSpu2KeyOns(); },
+                                           [this](const Spu2KeyOn &keyOn) { host.spu2KeyOn(keyOn); });
             kernel.setHostWaitPump([this]
             {
                 // Only for a top-level host call (an RPC server function); never re-enter the scheduler.

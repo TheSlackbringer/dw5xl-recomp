@@ -19,6 +19,7 @@
 #include "runtime/ee_scheduler.h"
 #include "runtime/host_input.h"
 #include "runtime/ps2_settings.h"
+#include "ps2x/iop/spu2_sound.h"
 
 #include <array>
 #include <atomic>
@@ -52,8 +53,8 @@ constexpr uint32_t kAdjustBar = 0x27u, kSettingsBar = 5u;   // "Default / Adjust
 constexpr int kWordRow = 3;                           // SCREEN ADJUST's row in the word strip (sub-file 12)
 constexpr double kBackHoldSeconds = 0.75;             // the pad's Back held this long opens the screen during play
 
-PS2Runtime::RecompiledFunction g_original[10] = {};
-enum Slot { ListOpen, Title, OffsetX, OffsetY, OffsetSet, OffsetApply, AdjustDraw, ButtonBar, AdjustGuides, BarStep };
+PS2Runtime::RecompiledFunction g_original[11] = {};
+enum Slot { ListOpen, Title, OffsetX, OffsetY, OffsetSet, OffsetApply, AdjustDraw, ButtonBar, AdjustGuides, BarStep, MenuSound };
 // From the title's entrance until the Options list opens again: SCREEN ADJUST's own drawing stays off, also while
 // the routine fades out after Back (the rows close with the title).
 std::atomic<bool> g_adjustHidden{false};
@@ -266,11 +267,54 @@ void barStep(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
     g_original[BarStep](ram, ctx, runtime);
 }
 
+// The game's menu sounds for the in-play screen, where the game and its sound processor are paused: learned when the
+// game plays them (title, menus): the id asked of 0x149900, then the SPU2 voices keyed on within a few fields (one-shot
+// samples only), replayed on their own (ps2x::iop::renderSpu2KeyOns).
+constexpr size_t kSoundIds = 8;
+constexpr uint64_t kSoundWindowFields = 4;
+struct LearnedSound { std::vector<ps2x::iop::Spu2KeyOn> voices; uint64_t version = 0; };
+std::mutex g_soundMutex;
+std::array<LearnedSound, kSoundIds> g_sounds;               // guarded by g_soundMutex
+std::atomic<int> g_soundRequest{-1};
+std::atomic<uint64_t> g_soundRequestField{0};
+std::vector<ps2x::iop::Spu2KeyOn> g_soundVoices;            // the game's thread only
+void menuSound(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t id = getRegU32(ctx, 5);
+    if (dw5xl::pcsettings::trace())
+        std::fprintf(stderr, "[pc-settings] game sound (%u, %u) at field %llu\n", getRegU32(ctx, 4), id,
+                     static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()));
+    if (getRegU32(ctx, 4) == 0u && id < kSoundIds) {
+        g_soundVoices.clear();
+        g_soundRequestField.store(runtime->eeScheduler().currentVSyncTick(), std::memory_order_relaxed);
+        g_soundRequest.store(int(id), std::memory_order_relaxed);
+    }
+    g_original[MenuSound](ram, ctx, runtime);
+}
+bool soundWanted()
+{
+    return g_soundRequest.load(std::memory_order_relaxed) >= 0 &&
+           g_runtime->eeScheduler().currentVSyncTick() <= g_soundRequestField.load(std::memory_order_relaxed) + kSoundWindowFields;
+}
+void soundKeyOn(const ps2x::iop::Spu2KeyOn &keyOn)
+{
+    const int id = g_soundRequest.load(std::memory_order_relaxed);
+    if (dw5xl::pcsettings::trace())
+        std::fprintf(stderr, "[pc-settings] key-on core %u voice %u pitch %04x %zu bytes%s for sound %d at field %llu\n",
+                     keyOn.core, keyOn.voice, keyOn.pitch, keyOn.adpcm.size(), keyOn.loops ? " (loops)" : "", id,
+                     static_cast<unsigned long long>(g_runtime->eeScheduler().currentVSyncTick()));
+    if (id < 0 || keyOn.loops || keyOn.adpcm.size() > 128u * 1024u || g_soundVoices.size() >= 4) return;
+    g_soundVoices.push_back(keyOn);
+    std::lock_guard<std::mutex> lock(g_soundMutex);
+    g_sounds[size_t(id)].voices = g_soundVoices;
+    ++g_sounds[size_t(id)].version;
+}
+
 void install(PS2Runtime &runtime)
 {
     g_runtime = &runtime;
     struct Hook { uint32_t address; std::array<uint32_t, 3> code; PS2Runtime::RecompiledFunction fn; };
-    const std::array<Hook, 10> hooks{{
+    const std::array<Hook, 11> hooks{{
         {kListOpen, {0x27bdffd0u, 0xffbf0020u, 0x7fb10010u}, &listOpen},
         {kTitle, {0x27bdffd0u, 0xffbf0020u, 0x7fb10010u}, &title},
         {kOffsetX, {0x27bdfff0u, 0xffbf0000u, 0x0c06b184u}, &offsetX},
@@ -281,6 +325,7 @@ void install(PS2Runtime &runtime)
         {kButtonBar, {0x27bdffb0u, 0x3c020032u, 0xffbf0030u}, &buttonBar},
         {kAdjustGuides, {0x27bdffb0u, 0xffbf0040u, 0x7fb30030u}, &adjustGuides},
         {kBarStep, {0x27bdffa0u, 0x3c010060u, 0xffbf0050u}, &barStep},
+        {kMenuSound, {0x27bdffc0u, 0x240300cau, 0xffbf0030u}, &menuSound},
     }};
     for (const Hook &h : hooks)
         for (int i = 0; i < 3; ++i)
@@ -295,6 +340,7 @@ void install(PS2Runtime &runtime)
     }
     for (const Hook &h : hooks) runtime.replaceFunction(h.address, h.fn);
     ps2_host_input::setBackHoldAction(kBackHoldSeconds, &backHeld);
+    runtime.setSpu2KeyOnObserver(&soundWanted, &soundKeyOn);
     std::fprintf(stderr, "[dw5xl:pc-settings] installed (Options: SCREEN ADJUST -> PC SETTINGS)\n");
 }
 }
@@ -364,6 +410,44 @@ std::atomic<bool> g_backHeld{false};
 // Options menu's background replaces the game's picture.
 bool g_overBattle = false;
 void backHeld() { g_backHeld.store(true, std::memory_order_release); }
+
+// A learned menu sound, rendered once per learned version and played through the host's audio device.
+struct PlayableSound { Sound sound{}; uint64_t version = 0; bool loaded = false; };
+std::array<PlayableSound, kSoundIds> g_playable;
+void playMenuSound(int id)
+{
+    if (!IsAudioDeviceReady() || id < 0 || size_t(id) >= kSoundIds) return;
+    std::vector<ps2x::iop::Spu2KeyOn> voices;
+    uint64_t version = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_soundMutex);
+        // the Options screens' cursor (0) is learned only once Options was visited; the main menu's cursor (2) always
+        // plays before a battle
+        if (id == 0 && g_sounds[0].voices.empty()) id = 2;
+        voices = g_sounds[size_t(id)].voices;
+        version = g_sounds[size_t(id)].version;
+    }
+    if (voices.empty()) {
+        if (dw5xl::pcsettings::trace()) std::fprintf(stderr, "[pc-settings] in-play sound %d: not learned yet\n", id);
+        return;
+    }
+    PlayableSound &p = g_playable[size_t(id)];
+    if (!p.loaded || p.version != version) {
+        std::vector<int16_t> pcm = ps2x::iop::renderSpu2KeyOns(voices, 48000u * 2u);
+        if (pcm.size() < 4) return;
+        if (p.loaded) UnloadSound(p.sound);
+        ::Wave wave{unsigned(pcm.size() / 2), 48000u, 16u, 2u, pcm.data()};
+        p.sound = LoadSoundFromWave(wave);
+        p.version = version;
+        p.loaded = true;
+        if (dw5xl::pcsettings::trace())
+            std::fprintf(stderr, "[pc-settings] in-play sound %d: %zu voice(s), %zu frames\n", id, voices.size(), pcm.size() / 2);
+        // DW5XL-DEBUG issue 023 3S: PS2X_PCSETTINGS_SOUND_DUMP=<dir> saves each rendered sound as menu_sound_<id>.wav
+        if (const char *dir = std::getenv("PS2X_PCSETTINGS_SOUND_DUMP"); dir && *dir)
+            ExportWave(wave, (std::string(dir) + "/menu_sound_" + std::to_string(id) + ".wav").c_str());
+    }
+    PlaySound(p.sound);
+}
 
 void openInPlay()
 {
@@ -469,15 +553,16 @@ bool frame(bool allowOpen)
     if (mode == Mode::Closed && (esc || held) && allowOpen) openInPlay();
     else if (mode == Mode::Options && esc) ps2_host_input::tapGameButtons(kPadTriangle);   // the game's Back
     else if (mode == Mode::InPlay) {
-        if (esc || held || p.back) closeInPlay();
-        else if (p.up) input(Input::Up);
-        else if (p.down) input(Input::Down);
-        else if (p.left) input(Input::Left);
-        else if (p.right) input(Input::Right);
+        // the game's menu sounds: 0 cursor, 1 value changed, 3 confirm, 4 back
+        if (esc || held || p.back) { playMenuSound(4); closeInPlay(); }
+        else if (p.up) { if (input(Input::Up)) playMenuSound(0); }
+        else if (p.down) { if (input(Input::Down)) playMenuSound(0); }
+        else if (p.left) { if (input(Input::Left)) playMenuSound(1); }
+        else if (p.right) { if (input(Input::Right)) playMenuSound(1); }
     }
     // Cross on DEFAULT. In the Options menu it taps Start, the routine's own reset, so the game sounds it too.
     const Snapshot s = snapshot();
-    if (s.mode == Mode::InPlay && s.row == kDefaultRow && p.cross) input(Input::Default);
+    if (s.mode == Mode::InPlay && s.row == kDefaultRow && p.cross) { input(Input::Default); playMenuSound(3); }
     else if (s.mode == Mode::Options && s.row == kDefaultRow && p.cross) ps2_host_input::tapGameButtons(kPadStart);
     if (!shot.empty()) g_runtime->requestWindowShot(shot);
     return snapshot().mode != Mode::Closed;

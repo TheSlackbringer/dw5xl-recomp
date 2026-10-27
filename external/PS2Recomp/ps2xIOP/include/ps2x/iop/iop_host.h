@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ps2x/iop/iop_types.h"
+#include "ps2x/iop/spu2_sound.h"
 
 #include <array>
 #include <cstddef>
@@ -106,6 +107,10 @@ namespace ps2x::iop
 
         // Native hosts may clock the IOP independently of slow EE rendering.
         // nullopt retains deterministic EE/8 cycle accounting for other hosts.
+        // DW5XL (issue 023 3S): SPU2 key-ons with their samples, while the host wants them (spu2_sound.h).
+        virtual bool wantsSpu2KeyOns() const { return false; }
+        virtual void spu2KeyOn(const Spu2KeyOn &) {}
+
         virtual std::optional<uint64_t> monotonicNanoseconds() const noexcept
         {
             return std::nullopt;

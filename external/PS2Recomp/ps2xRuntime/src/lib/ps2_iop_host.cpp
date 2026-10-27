@@ -274,6 +274,17 @@ void PS2IopHostAdapter::audioSamples(std::span<const int16_t> stereo48k)
     m_runtime.audioBackend().submitPcm(stereo48k);
 }
 
+bool PS2IopHostAdapter::wantsSpu2KeyOns() const
+{
+    return m_runtime.spu2KeyOnWanted();
+}
+
+void PS2IopHostAdapter::spu2KeyOn(const ps2x::iop::Spu2KeyOn &keyOn)
+{
+    if (const auto &observer = m_runtime.spu2KeyOnObserver())
+        observer(keyOn);
+}
+
 std::optional<uint64_t> PS2IopHostAdapter::monotonicNanoseconds() const noexcept
 {
     // Issue 023 3S: the IOP's time stops while a host screen pauses the game (no catch-up burst on resume).

@@ -61,6 +61,8 @@ public:
                       ps2x::iop::GuestBuffer send,
                       ps2x::iop::GuestBuffer receive) override;
     void audioSamples(std::span<const int16_t> stereo48k) override;
+    bool wantsSpu2KeyOns() const override;
+    void spu2KeyOn(const ps2x::iop::Spu2KeyOn &keyOn) override;
     std::optional<uint64_t> monotonicNanoseconds() const noexcept override;
     std::optional<bool> readMappedCdSectors(uint32_t lsn, uint32_t sectors,
                                           void *destination, size_t size) override;

@@ -1,5 +1,6 @@
 #pragma once
 #include "ps2x/state_archive.h"
+#include "ps2x/iop/spu2_sound.h"
 
 #include <cstdint>
 #include <functional>
@@ -45,6 +46,8 @@ namespace ps2x::iop::detail
         void flushPcm();
         void setPcmCallback(std::function<void(std::span<const int16_t>)> callback);
         void setIrqCallback(std::function<void()> callback);
+        // DW5XL (issue 023 3S): every key-on while wanted() is true, with the voice's sample (see spu2_sound.h).
+        void setKeyOnCallback(std::function<bool()> wanted, std::function<void(const Spu2KeyOn &)> callback);
         [[nodiscard]] Statistics statistics() const;
 
     private:

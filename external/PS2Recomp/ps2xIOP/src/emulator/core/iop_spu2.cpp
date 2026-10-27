@@ -189,6 +189,8 @@ namespace ps2x::iop::detail
         std::vector<int16_t> pcm;
         std::function<void(std::span<const int16_t>)> pcmCallback;
         std::function<void()> irqCallback;
+        std::function<bool()> keyOnWanted;                       // issue 023 3S
+        std::function<void(const Spu2KeyOn &)> keyOnCallback;
         uint64_t remainder = 0;
         Statistics stats;
         bool trace = traceEnabled();
@@ -355,6 +357,57 @@ namespace ps2x::iop::detail
             }
             return voice.decoded[voice.sampleIndex++];
         }
+        // Issue 023 3S: the voice as it starts, with its sample (no IRQ side effects: plain RAM reads).
+        void reportKeyOn(unsigned core, unsigned index)
+        {
+            Spu2KeyOn k;
+            k.core = core;
+            k.voice = index;
+            k.volumeLeft = reg(core, index * 16);
+            k.volumeRight = reg(core, index * 16 + 2);
+            k.pitch = reg(core, index * 16 + 4);
+            k.adsr1 = reg(core, index * 16 + 6);
+            k.adsr2 = reg(core, index * 16 + 8);
+            k.dryLeft = (mask(core, 0x188) >> index) & 1;
+            k.dryRight = (mask(core, 0x190) >> index) & 1;
+            // the voice's core dry mix, its master volume, and for core 0 core 1's external input and master
+            const auto gain = [&](unsigned channel) {
+                const uint16_t mmix = reg(core, 0x198);
+                if (!(mmix & (channel ? 0x400 : 0x800)))
+                    return 0;
+                const auto &master = channel ? cores[core].masterRight : cores[core].masterLeft;
+                int g = master.level;
+                if (core == 0)
+                {
+                    if (!(reg(1, 0x198) & (channel ? 0x4 : 0x8)))
+                        return 0;
+                    g = mul(g, static_cast<int16_t>(ext(1, 8 + channel * 2)));
+                    g = mul(g, (channel ? cores[1].masterRight : cores[1].masterLeft).level);
+                }
+                return g;
+            };
+            k.gainLeft = gain(0);
+            k.gainRight = gain(1);
+            constexpr uint32_t MaxBlocks = 16384; // 256 KiB: longer samples are streams
+            uint32_t word = address(core, 0x1c0 + index * 12) & ~7u;
+            k.loops = true;
+            for (uint32_t block = 0; block != MaxBlocks; ++block, word = (word + 8) & RamMask)
+            {
+                for (unsigned i = 0; i != 8; ++i)
+                {
+                    const uint16_t value = ram[(word + i) & RamMask];
+                    k.adpcm.push_back(static_cast<uint8_t>(value));
+                    k.adpcm.push_back(static_cast<uint8_t>(value >> 8));
+                }
+                const uint8_t flags = static_cast<uint8_t>(ram[word & RamMask] >> 8);
+                if (flags & 1)
+                {
+                    k.loops = (flags & 2) != 0;
+                    break;
+                }
+            }
+            keyOnCallback(k);
+        }
         void keys(unsigned core)
         {
             auto &state = cores[core];
@@ -364,6 +417,8 @@ namespace ps2x::iop::detail
                 const uint32_t bit = 1u << index;
                 if (state.keyOn & bit)
                 {
+                    if (keyOnCallback && keyOnWanted && keyOnWanted())
+                        reportKeyOn(core, index);
                     const Volume left = voice.left, right = voice.right;
                     voice = {};
                     voice.left = left;
@@ -606,6 +661,11 @@ namespace ps2x::iop::detail
     };
 
     IopSpu2::IopSpu2() : m_impl(std::make_unique<Impl>()) { m_impl->reset(); }
+    void IopSpu2::setKeyOnCallback(std::function<bool()> wanted, std::function<void(const Spu2KeyOn &)> callback)
+    {
+        m_impl->keyOnWanted = std::move(wanted);
+        m_impl->keyOnCallback = std::move(callback);
+    }
     IopSpu2::~IopSpu2() = default;
     void IopSpu2::reset() { m_impl->reset(); }
     uint16_t IopSpu2::read16(uint32_t offset) const
@@ -834,5 +894,75 @@ namespace ps2x::iop::detail
         a.value(s.remainder);
         if (a.loading())
             s.pcm.clear(); // host output buffer: refilled from the restored voices
+    }
+}
+
+namespace ps2x::iop
+{
+    std::vector<int16_t> renderSpu2KeyOns(std::span<const Spu2KeyOn> voices, uint32_t maxFrames)
+    {
+        // Core 1 only, voices from 4 (0-3 feed the SPU2's capture buffers), samples from RAM halfword 0x10000.
+        constexpr uint32_t Core1 = 0x400, Base = 0x10000;
+        detail::IopSpu2 spu;
+        std::vector<int16_t> out;
+        spu.setPcmCallback([&](std::span<const int16_t> samples) { out.insert(out.end(), samples.begin(), samples.end()); });
+        spu.write16(Core1 + 0x19a, 0x8000);            // core on, no reverb, no DMA
+        spu.write16(Core1 + 0x198, 0x0c00);            // voices to the dry output
+        spu.write16(0x760 + 0x28, 0x3fff);             // core 1 master volume ~1.0
+        spu.write16(0x762 + 0x28, 0x3fff);
+        uint32_t address = Base, vmixl = 0, vmixr = 0, keys = 0;
+        std::vector<unsigned> used;
+        for (size_t i = 0; i != voices.size() && i < 20; ++i)
+        {
+            const Spu2KeyOn &k = voices[i];
+            const unsigned v = 4 + static_cast<unsigned>(i);
+            const uint32_t words = static_cast<uint32_t>(k.adpcm.size() / 2);
+            if (!words || address + words > 0xfffff)
+                continue;
+            spu.write16(Core1 + 0x1a8, static_cast<uint16_t>((address >> 16) & 15)); // TSA
+            spu.write16(Core1 + 0x1aa, static_cast<uint16_t>(address));
+            std::vector<uint8_t> data = k.adpcm;
+            spu.dmaTransfer(1, true, data.data(), words / 2);
+            spu.completeDma(1);
+            spu.write16(Core1 + v * 16 + 0, k.volumeLeft);
+            spu.write16(Core1 + v * 16 + 2, k.volumeRight);
+            spu.write16(Core1 + v * 16 + 4, k.pitch);
+            spu.write16(Core1 + v * 16 + 6, k.adsr1);
+            spu.write16(Core1 + v * 16 + 8, k.adsr2);
+            spu.write16(Core1 + 0x1c0 + v * 12 + 0, static_cast<uint16_t>((address >> 16) & 15));
+            spu.write16(Core1 + 0x1c0 + v * 12 + 2, static_cast<uint16_t>(address));
+            if (k.dryLeft) vmixl |= 1u << v;
+            if (k.dryRight) vmixr |= 1u << v;
+            keys |= 1u << v;
+            used.push_back(static_cast<unsigned>(i));
+            address = (address + words + 7) & ~7u;
+        }
+        if (!keys)
+            return out;
+        spu.write16(Core1 + 0x188, static_cast<uint16_t>(vmixl));
+        spu.write16(Core1 + 0x18a, static_cast<uint16_t>(vmixl >> 16));
+        spu.write16(Core1 + 0x190, static_cast<uint16_t>(vmixr));
+        spu.write16(Core1 + 0x192, static_cast<uint16_t>(vmixr >> 16));
+        spu.write16(Core1 + 0x1a0, static_cast<uint16_t>(keys));
+        spu.write16(Core1 + 0x1a2, static_cast<uint16_t>(keys >> 16));
+        constexpr uint32_t Chunk = 480; // 10 ms
+        for (uint32_t frames = 0; frames < maxFrames; frames += Chunk)
+        {
+            spu.advance(static_cast<uint64_t>(Chunk) * detail::IopSpu2::CyclesPerFrame);
+            bool sounding = false;
+            for (unsigned i : used)
+                sounding = sounding || spu.read16(Core1 + (4 + i) * 16 + 0xa) != 0;
+            if (!sounding && frames >= Chunk * 2)
+                break;
+        }
+        spu.flushPcm();
+        // the gains after the voice volume, from the capture (core 1's master here is ~1.0)
+        const int32_t gainLeft = voices[used.front()].gainLeft, gainRight = voices[used.front()].gainRight;
+        for (size_t i = 0; i + 1 < out.size(); i += 2)
+        {
+            out[i] = static_cast<int16_t>(std::clamp<int64_t>((static_cast<int64_t>(out[i]) * gainLeft) >> 15, -32768, 32767));
+            out[i + 1] = static_cast<int16_t>(std::clamp<int64_t>((static_cast<int64_t>(out[i + 1]) * gainRight) >> 15, -32768, 32767));
+        }
+        return out;
     }
 }

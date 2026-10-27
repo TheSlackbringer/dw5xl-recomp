@@ -35,6 +35,7 @@
 #include "runtime/ps2_rom_device.h"
 #include "runtime/ps2_vfs.h"
 #include "ps2x/iop/iop_types.h"
+#include "ps2x/iop/spu2_sound.h"
 
 namespace ps2x::iop
 {
@@ -498,6 +499,16 @@ public:
     // Issue 023 3S: where the game picture was last drawn in the window (x, y, width, height in window pixels).
     // Issue 023 3S: pauses the whole guest for a host screen (window thread): EE held, IOP clock and audio stopped.
     void setHostPaused(bool paused);
+    // Issue 023 3S: SPU2 key-ons with their samples while wanted() is true (set once, before the game runs; both are
+    // called on the game's thread).
+    using Spu2KeyOnObserver = std::function<void(const ps2x::iop::Spu2KeyOn &)>;
+    void setSpu2KeyOnObserver(std::function<bool()> wanted, Spu2KeyOnObserver observer)
+    {
+        m_spu2KeyOnWanted = std::move(wanted);
+        m_spu2KeyOnObserver = std::move(observer);
+    }
+    bool spu2KeyOnWanted() const { return m_spu2KeyOnWanted && m_spu2KeyOnObserver && m_spu2KeyOnWanted(); }
+    const Spu2KeyOnObserver &spu2KeyOnObserver() const { return m_spu2KeyOnObserver; }
     // Issue 023 3S: the frame rate overlay (F2, PC SETTINGS "SHOW FPS"); the caller saves the setting.
     bool showFps() const { return m_showFps.load(std::memory_order_relaxed); }
     void setShowFps(bool on) { m_showFps.store(on, std::memory_order_relaxed); }
@@ -601,6 +612,8 @@ private:
     float m_pictureRect[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     std::string m_windowShotRequest;
     std::atomic<bool> m_showFps{false};
+    std::function<bool()> m_spu2KeyOnWanted;
+    Spu2KeyOnObserver m_spu2KeyOnObserver;
     mutable std::mutex m_hostPauseMutex;
     uint64_t m_hostPauseStartNs = 0, m_hostPausedTotalNs = 0;   // guarded by m_hostPauseMutex
     DebugUiCallback m_debugUiInitCallback = nullptr;
