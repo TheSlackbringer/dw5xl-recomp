@@ -12,6 +12,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "dw5xl_menu_assets.h"
+#include "ipu_idec.h"
 #include "dw5xl_pc_settings.h"
 #include "imgui.h"
 #include "raylib.h"
@@ -42,13 +43,14 @@ constexpr uint32_t kOffsetSet = 0x001AD470u, kOffsetApply = 0x001AD430u;
 constexpr uint32_t kAdjustDraw = 0x002C8FA0u;         // SCREEN ADJUST screen drawing (per frame)
 constexpr uint32_t kAdjustGuides = 0x002C90C0u;       // SCREEN ADJUST picture-position guides (per frame)
 constexpr uint32_t kButtonBar = 0x00264020u;          // button bar text (id, ...)
+constexpr uint32_t kBarStep = 0x00263DF0u;            // button bar, per frame: only while a menu screen is up
 constexpr uint32_t kAdjustSlot = 3u;                  // SCREEN ADJUST's title slot argument
 constexpr uint32_t kAdjustBar = 0x27u, kSettingsBar = 5u;   // "Default / Adjust / Back" -> "Select / Change / Back"
 constexpr int kWordRow = 3;                           // SCREEN ADJUST's row in the word strip (sub-file 12)
 constexpr double kBackHoldSeconds = 0.75;             // the pad's Back held this long opens the screen during play
 
-PS2Runtime::RecompiledFunction g_original[9] = {};
-enum Slot { ListOpen, Title, OffsetX, OffsetY, OffsetSet, OffsetApply, AdjustDraw, ButtonBar, AdjustGuides };
+PS2Runtime::RecompiledFunction g_original[10] = {};
+enum Slot { ListOpen, Title, OffsetX, OffsetY, OffsetSet, OffsetApply, AdjustDraw, ButtonBar, AdjustGuides, BarStep };
 
 uint8_t *ptr(uint8_t *ram, uint32_t address) { return ram + (address & 0x01FFFFFFu); }
 uint32_t rd32(uint8_t *ram, uint32_t address) { uint32_t v; std::memcpy(&v, ptr(ram, address), 4); return v; }
@@ -233,13 +235,22 @@ void buttonBar(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
 }
 
 PS2Runtime *g_runtime = nullptr;
-void backHeld();   // the doors (below)
+void backHeld();
+
+// The field of the button bar's last per-frame step (+1; 0 = never). The battle's own menus (pause menu, battle log)
+// step it every field from their frame step (ovl01 0x6907F0); the fighting never does (measured on the battle route).
+std::atomic<uint64_t> g_barStepField{0};
+void barStep(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    g_barStepField.store(runtime->eeScheduler().currentVSyncTick() + 1u, std::memory_order_relaxed);
+    g_original[BarStep](ram, ctx, runtime);
+}
 
 void install(PS2Runtime &runtime)
 {
     g_runtime = &runtime;
     struct Hook { uint32_t address; std::array<uint32_t, 3> code; PS2Runtime::RecompiledFunction fn; };
-    const std::array<Hook, 9> hooks{{
+    const std::array<Hook, 10> hooks{{
         {kListOpen, {0x27bdffd0u, 0xffbf0020u, 0x7fb10010u}, &listOpen},
         {kTitle, {0x27bdffd0u, 0xffbf0020u, 0x7fb10010u}, &title},
         {kOffsetX, {0x27bdfff0u, 0xffbf0000u, 0x0c06b184u}, &offsetX},
@@ -249,6 +260,7 @@ void install(PS2Runtime &runtime)
         {kAdjustDraw, {0x27bdffb0u, 0xffbf0040u, 0x7fb30030u}, &adjustDraw},
         {kButtonBar, {0x27bdffb0u, 0x3c020032u, 0xffbf0030u}, &buttonBar},
         {kAdjustGuides, {0x27bdffb0u, 0xffbf0040u, 0x7fb30030u}, &adjustGuides},
+        {kBarStep, {0x27bdffa0u, 0x3c010060u, 0xffbf0050u}, &barStep},
     }};
     for (const Hook &h : hooks)
         for (int i = 0; i < 3; ++i)
@@ -324,6 +336,10 @@ using dw5xl::pcsettings::Input;
 using dw5xl::pcsettings::Mode;
 constexpr uint16_t kPadTriangle = 0x1000u;            // the game's Back in its menus
 std::atomic<bool> g_backHeld{false};
+// Opened during the fighting (the battle code overlay is loaded and none of its menus is up): the paused game
+// darkened behind the screen; anywhere else (title, main menu, Options, the battle's pause menu and other menus) the
+// Options menu's background replaces the game's picture.
+bool g_overBattle = false;
 void backHeld() { g_backHeld.store(true, std::memory_order_release); }
 
 void openInPlay()
@@ -331,8 +347,13 @@ void openInPlay()
     if (!dw5xl::pcsettings::switchMode(Mode::Closed, Mode::InPlay)) return;
     ps2_host_input::setGameInputBlocked(true);
     g_runtime->setHostPaused(true);
-    std::fprintf(stderr, "[dw5xl:pc-settings] opened during play at field %llu: game paused\n",
-                 static_cast<unsigned long long>(g_runtime->eeScheduler().currentVSyncTick()));
+    const RecompiledModule *module = g_runtime->activeCompiledModule();
+    const uint64_t field = g_runtime->eeScheduler().currentVSyncTick(), stepped = g_barStepField.load(std::memory_order_relaxed);
+    const bool battleMenu = stepped != 0u && stepped + 2u >= field;   // a menu stepped in one of the last fields
+    g_overBattle = module && module->identity && std::strcmp(module->identity, "dw5xl_ovl01") == 0 && !battleMenu;
+    std::fprintf(stderr, "[dw5xl:pc-settings] opened during play at field %llu (overlay %s%s): game paused, %s\n",
+                 static_cast<unsigned long long>(field), module && module->identity ? module->identity : "none",
+                 battleMenu ? ", a menu" : "", g_overBattle ? "darkened" : "menu background");
 }
 void closeInPlay()
 {
@@ -466,6 +487,7 @@ struct Assets {
     Tex glow, help[kRows];
     uint8_t line[4] = {};                             // separator colour (already tinted as the game draws it)
     Tex title, icon[3], barText[3];                   // in play: the screen title and the bar (Select, Change, Back)
+    Tex sky, ground, emblem;                          // in play outside battle: the Options menu's background
 } g_assets;
 
 Tex upload(const MImage &img)
@@ -587,6 +609,30 @@ void buildAssets()
     const Tim2Picture *t7 = tim(ram, a7, n7, s7);
     if (!t7) return;
     A.title = upload(decodeTim2(ram + a7, n7, *t7));
+    // the Options background: the sky (sub-file 0, an ipu2 archive of IDEC pictures: +8 width, +10 height,
+    // +0x10 {offset, size} per picture; its first picture), the ground (sub-file 2) and the emblem (boot pictures)
+    uint32_t a0, n0, a2, n2; std::vector<Tim2Picture> s2;
+    if (!subFile(ram, container, 0, a0, n0) || n0 < 0x18 || !subFile(ram, container, 2, a2, n2)) return;
+    const uint8_t *archive = ptr(ram, a0);
+    const int skyW = archive[8] | archive[9] << 8, skyH = archive[10] | archive[11] << 8;
+    const uint32_t skyAt = le32(archive + 0x10), skySize = le32(archive + 0x14);
+    if (skyW <= 0 || skyH <= 0 || skyW % 16 || skyH % 16 || skyW > 1024 || skyH > 1024 || skySize < 2 ||
+        uint64_t(skyAt) + skySize > n0) return;
+    const uint32_t mbs = uint32_t(skyW / 16) * uint32_t(skyH / 16);
+    std::vector<uint8_t> blocks(size_t(mbs) * 1024u);
+    ipu::IdecConfig idec; idec.flags = archive[skyAt]; idec.quantiserCode = 1;
+    const ipu::IdecResult decoded = ipu::decodeIdec(archive + skyAt, skySize, 8u, idec, mbs, blocks.data());
+    if (!decoded.error.empty() || decoded.macroblocks != mbs) return;
+    MImage sky(skyW, skyH);                           // macroblocks of 16x16 RGBA in row order
+    for (uint32_t i = 0; i < mbs; ++i)
+        for (int y = 0; y < 16; ++y)
+            std::memcpy(sky.at(int(i % uint32_t(skyW / 16)) * 16, int(i / uint32_t(skyW / 16)) * 16 + y), &blocks[size_t(i) * 1024u + size_t(y) * 64u], 64);
+    for (size_t i = 3; i < sky.rgba.size(); i += 4) sky.rgba[i] = 255;
+    A.sky = upload(sky);
+    const Tim2Picture *t2 = tim(ram, a2, n2, s2);
+    if (!t2) return;
+    A.ground = upload(decodeTim2(ram + a2, n2, *t2));
+    A.emblem = upload(crop(decodeTim2(boot.data(), boot.size(), bootPics[0], 69), 96, 224, 104, 72));
     // the help lines in the small font of the executable (glyphs from '!' at 0x216230, palette 0x215F90)
     const auto exe = readFile(PS2Runtime::getIoPaths().elfPath);
     if (exe.size() < 0x216230 + 95 * 160) return;
@@ -669,8 +715,15 @@ void drawOverlay()
     ImDrawList *dl = ImGui::GetBackgroundDrawList();
     const Assets &A = g_assets;
     if (s.mode == Mode::InPlay) {
-        // the paused game darkened; the title and the button bar as the Options screens show them
-        dl->AddRectFilled(m.at(0, 0), m.at(512, 448), IM_COL32(0, 0, 0, 205));
+        // in battle the paused game darkened, elsewhere the Options background (as the game draws it: sky 512x168,
+        // ground from y 140, emblem top left); the title and the button bar as the Options screens show them
+        if (g_overBattle) dl->AddRectFilled(m.at(0, 0), m.at(512, 448), IM_COL32(0, 0, 0, 205));
+        else {
+            dl->AddRectFilled(m.at(0, 0), m.at(512, 448), IM_COL32(0, 0, 0, 255));
+            image(dl, m, A.sky, 0, 0, 512, 168);
+            image(dl, m, A.ground, 0, 140, 512, 308);
+            image(dl, m, A.emblem, 0, 0, 104, 84);
+        }
         image(dl, m, A.title, 16, 20, 280, 46);
         separator(dl, m, 57, 512, 512);
         // the bar: a dark band between two light lines, fading in from the left (measured on the SETTINGS screen)
