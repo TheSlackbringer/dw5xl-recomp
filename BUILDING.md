@@ -72,14 +72,9 @@ PS2X_GS_BACKEND=vulkan ../../app/build/dw5xl ./SLES_538.60
 
 In this developer setup, saves are stored in `game/dw5xl/mc0/` and settings in `game/dw5xl/dw5xl.ini`. Keep them when updating your build.
 
-## Developer keys and switches
+## Developer switches
 
-| Key | Description |
-| --- | --- |
-| **F1** | Runtime debugger (developer builds; off in the release unless `PS2X_DEBUG_UI=1`). |
-| **F5** / **F9** | Save / load state (🚧 in development). |
-
-Environment variables on startup: `PS2X_FPS=1` turns the F2 overlay on, `PS2X_GS_SCALE=1|2|4` sets the startup resolution scale, `PS2X_GS_SSAA=1|2|4|8|16` the anti-aliasing sample count and `PS2X_VSYNC=on|off` the vsync setting (keep scale and anti-aliasing at `1` when profiling performance).
+The F1 runtime debugger is off in the release unless `PS2X_DEBUG_UI=1`. Environment variables on startup: `PS2X_FPS=1` turns the F2 overlay on, `PS2X_GS_SCALE=1|2|4` sets the startup resolution scale, `PS2X_GS_SSAA=1|2|4|8|16` the anti-aliasing sample count and `PS2X_VSYNC=on|off` the vsync setting (keep scale and anti-aliasing at `1` when profiling performance).
 
 ## Development
 

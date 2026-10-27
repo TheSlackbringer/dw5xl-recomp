@@ -77,10 +77,13 @@ Up/Down picks a setting, Left/Right changes it, and Cross on DEFAULT resets them
 
 | Key | Description |
 | --- | --- |
+| **F1** | Runtime debugger (developer builds only). |
 | **F2** | Show or hide the frame rate (same as SHOW FPS). |
 | **F3** | Cycle anti-aliasing (1× → 2× → 4× → 8× → 16×). |
 | **F4** | Cycle the resolution (1× → 2× → 4×). |
+| **F5** | Save state (🚧 in development). |
 | **F8** | Show the build ID and game tick (for bug reports). |
+| **F9** | Load state (🚧 in development). |
 | **F10** | Discs window: see the installed discs, add or repair the DW5 disc, check the files. |
 
 ## Building from source
