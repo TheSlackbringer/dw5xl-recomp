@@ -26,3 +26,14 @@ Run these checks after boundary/entry/branch emission changes and as fast regres
 checks. Real-disc map qualification is a separate targeted investigation: see
 `tools/debug/validate_function_map.md`. Successful synthetic cases do not establish
 whole-game equivalence, arbitrary indirect-target completeness or FPS improvements.
+
+The selected-binding evidence checker also has standalone, standard-library-only fixtures:
+
+```sh
+python -m unittest discover -s tools/tests -p test_audit_bindings.py -v
+```
+
+These need no compiler or runtime build. Linux CI includes them in the public Python
+discovery above; the Windows test job runs them natively to cover host file/link behavior.
+See [audit_bindings.md](../debug/audit_bindings.md) for the versioned schema, offline
+workflow, evidence scopes, report statuses and authored example generator.

@@ -87,6 +87,16 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
   investigations. Check edited maps before regeneration; audit corresponding generated output afterwards.
   Record the selected passes, findings and coverage limits in the issue's work log. Unrelated changes,
   ordinary play and FPS profiling do not require it. See `tools/debug/validate_function_map.md`.
+- **Selected SDK binding reviews:** Use `tools/debug/audit_bindings.py`
+  when investigating a suspected SDK replacement error or reviewing changes
+  to binding selection, arguments, returns, memory/state effects, callbacks
+  or ownership. Audit only the relevant bindings and questions.
+  Establish original expectations independently and cite the evidence.
+  Record the report, checked cases and remaining uncertainty in the issue's
+  work log. Missing evidence remains unresolved; a clean report does not
+  prove complete behavioral or gameplay equivalence.
+  Ordinary play, FPS profiling and unrelated changes do not require an audit.
+  See `tools/debug/audit_bindings.md`.
 - **GPU renderer only** (Vulkan/paraLLEl-GS) for development and tests; no CPU-renderer work unless asked.
 - **The port is not specific to one machine.** Keep fixes portable across supported hardware and the
   planned Linux/Windows targets. The test machine's CPU/GPU are test equipment, not product requirements. Label

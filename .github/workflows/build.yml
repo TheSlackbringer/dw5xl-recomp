@@ -253,6 +253,12 @@ jobs:
     needs: windows-build
     runs-on: windows-latest # real Windows, no GPU
     steps:
+      - uses: actions/checkout@v7
+      - name: Test binding evidence and host file/link behavior (synthetic only)
+        shell: pwsh
+        run: |
+          python -c "import sys; assert sys.version_info >= (3, 11)"
+          python -B -m unittest discover -s tools/tests -p test_audit_bindings.py -v
       - uses: actions/download-artifact@v8
         with:
           name: windows-tests
