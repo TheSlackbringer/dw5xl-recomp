@@ -23,13 +23,16 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <mutex>
+#include <optional>
 #include <string>
 
 namespace dw5xl::pcsettings { bool trace(); }   // PS2X_PCSETTINGS_TRACE (below)
@@ -174,6 +177,108 @@ bool patchTitle(uint8_t *ram, uint32_t container)
     return true;
 }
 
+std::vector<uint8_t> readFile(const std::filesystem::path &p, uint64_t offset = 0, uint64_t size = 0)
+{
+    std::ifstream f(p, std::ios::binary); if (!f) return {};
+    if (!size) { f.seekg(0, std::ios::end); size = uint64_t(f.tellg()) - offset; }
+    std::vector<uint8_t> out(size); f.seekg(std::streamoff(offset)); f.read(reinterpret_cast<char *>(out.data()), std::streamsize(size));
+    return f ? out : std::vector<uint8_t>{};
+}
+
+// A container read from the disc: every sub-file inside the buffer.
+bool containerFits(const std::vector<uint8_t> &c)
+{
+    if (c.size() < 16) return false;
+    const uint32_t count = le32(c.data());
+    if (count == 0u || count > 4096u) return false;
+    uint64_t end = uint64_t((count + 4u) >> 2) * 16u;
+    if (4u + 4u * uint64_t(count) > c.size()) return false;
+    for (uint32_t i = 0; i < count; ++i) end += uint64_t(le32(c.data() + 4 + 4 * i)) * 16u;
+    return end <= c.size();
+}
+
+// The Options menu file (LINKDATA entry 41, LZP2) from the disc, unpacked: the file the game unpacks into its RAM.
+// Empty if it cannot be read. `index` gets the LINKDATA index.
+std::vector<uint8_t> readMenuFile(std::vector<LinkEntry> *index = nullptr)
+{
+    const auto dir = PS2Runtime::getIoPaths().elfDirectory;
+    const auto idxFile = readFile(dir / "LINKDATA.IDX");
+    const auto idx = parseLinkIndex(idxFile.data(), idxFile.size());
+    if (index) *index = idx;
+    if (idx.size() <= 41) return {};
+    const auto packed = readFile(dir / "LINKDATA.BIN", idx[41].offset(), idx[41].size);
+    std::vector<uint8_t> menuFile;
+    if (!unpackLzp2(packed.data(), packed.size(), menuFile) || !containerFits(menuFile)) return {};
+    return menuFile;
+}
+
+// Issue 023 (vsync, criterion 3): building the list entry and the title takes ~180 ms (the title's glow and palette
+// fitting), and the game's thread waits for listOpen, so the PS2's fields stopped meanwhile. Both are built once when
+// the game starts, on a thread of their own, from the disc's copy of the menu file (the helpers address it like the
+// game's RAM copy, at address 0). listOpen copies the finished sub-files when the game's copies of the sub-files they
+// are made from are the disc's, byte for byte; otherwise it builds them in place, as before.
+constexpr std::array<uint32_t, 5> kPatchedFrom{3, 4, 5, 7, 12};   // titles OPTIONS, SETTINGS, CONTROLS, SCREEN ADJUST; word strip
+struct Prebuilt
+{
+    bool word = false, title = false;               // what patchListWord / patchTitle returned
+    std::array<std::vector<uint8_t>, 5> original;   // kPatchedFrom as on the disc
+    std::vector<uint8_t> titlePicture, strip;       // sub-files 7 and 12 after the patch
+};
+Prebuilt prebuild()
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    Prebuilt p;
+    std::vector<uint8_t> file = readMenuFile();
+    uint32_t a[5], n[5];
+    for (size_t i = 0; i < kPatchedFrom.size(); ++i) {
+        if (file.empty() || !subFile(file.data(), 0u, kPatchedFrom[i], a[i], n[i])) {
+            std::fprintf(stderr, "[dw5xl:pc-settings] menu pictures not prebuilt: menu file not read from the disc\n");
+            return {};
+        }
+        p.original[i].assign(file.data() + a[i], file.data() + a[i] + n[i]);
+    }
+    p.word = patchListWord(file.data(), 0u);
+    p.title = p.word && patchTitle(file.data(), 0u);
+    p.titlePicture.assign(file.data() + a[3], file.data() + a[3] + n[3]);
+    p.strip.assign(file.data() + a[4], file.data() + a[4] + n[4]);
+    std::fprintf(stderr, "[dw5xl:pc-settings] menu pictures prebuilt from the disc in %.1f ms: list entry %s, title %s\n",
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                 p.word ? "PC SETTINGS" : "unchanged", p.title ? "PC SETTINGS" : "unchanged");
+    return p;
+}
+std::future<Prebuilt> g_prebuilding;   // started by install()
+
+// The game's copy of the patched sub-files gets the prebuilt bytes if every sub-file they are made from is the disc's.
+bool copyPrebuilt(uint8_t *ram, uint32_t container, bool &word, bool &title)
+{
+    static std::optional<Prebuilt> s_prebuilt;   // the game's thread only; waits once if the build is still running
+    if (!s_prebuilt) {
+        if (!g_prebuilding.valid()) return false;
+        s_prebuilt = g_prebuilding.get();
+    }
+    const Prebuilt &p = *s_prebuilt;
+    if (!p.word) return false;
+    uint32_t a[5], n[5];
+    for (size_t i = 0; i < kPatchedFrom.size(); ++i)
+        if (!subFile(ram, container, kPatchedFrom[i], a[i], n[i]) || n[i] != p.original[i].size() ||
+            std::memcmp(ptr(ram, a[i]), p.original[i].data(), n[i]) != 0)
+            return false;
+    std::memcpy(ptr(ram, a[3]), p.titlePicture.data(), n[3]);
+    std::memcpy(ptr(ram, a[4]), p.strip.data(), n[4]);
+    word = p.word;
+    title = p.title;
+    return true;
+}
+
+// FNV-1a of a sub-file, for the log: the same pictures give the same number whichever way they were made.
+uint32_t subFileHash(uint8_t *ram, uint32_t container, uint32_t file)
+{
+    uint32_t a = 0, n = 0, h = 2166136261u;
+    if (subFile(ram, container, file, a, n))
+        for (uint32_t i = 0; i < n; ++i) h = (h ^ ptr(ram, a)[i]) * 16777619u;
+    return h;
+}
+
 // Patched once per loaded menu file; the marker is the patched row's first bytes.
 uint32_t g_patchedContainer = 0;
 std::array<uint8_t, 16> g_patchedMark{};
@@ -186,9 +291,21 @@ void listOpen(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
         const Tim2Picture *t = subFile(ram, container, 12, a, n) ? tim(ram, a, n, store) : nullptr;
         uint8_t *row = t ? ptr(ram, a) + t->pixels + size_t(kWordRow * 24 + 8) * 104 : nullptr;
         if (row && (container != g_patchedContainer || std::memcmp(row, g_patchedMark.data(), 16) != 0)) {
-            const bool word = patchListWord(ram, container), title = word && patchTitle(ram, container);
-            std::fprintf(stderr, "[dw5xl:pc-settings] menu pictures at 0x%08x: list entry %s, title %s\n", container,
-                         word ? "PC SETTINGS" : "unchanged", title ? "PC SETTINGS" : "unchanged");
+            // The game's thread waits for this (its fields stop meanwhile): the time shows what it costs.
+            // DW5XL-DEBUG: PS2X_PCSETTINGS_INPLACE=1 builds the pictures here, as before the prebuild (to compare).
+            static const bool s_inPlace = [] { const char *v = std::getenv("PS2X_PCSETTINGS_INPLACE"); return v && *v == '1'; }();
+            const auto t0 = std::chrono::steady_clock::now();
+            bool word = false, title = false;
+            const bool prebuilt = !s_inPlace && copyPrebuilt(ram, container, word, title);
+            if (!prebuilt) {
+                word = patchListWord(ram, container);
+                title = word && patchTitle(ram, container);
+            }
+            std::fprintf(stderr, "[dw5xl:pc-settings] menu pictures at 0x%08x: list entry %s, title %s (%s, %.2f ms; "
+                         "title %08x, strip %08x)\n", container, word ? "PC SETTINGS" : "unchanged",
+                         title ? "PC SETTINGS" : "unchanged", prebuilt ? "prebuilt" : "built here",
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                         subFileHash(ram, container, 7), subFileHash(ram, container, 12));
             g_patchedContainer = container;
             std::memcpy(g_patchedMark.data(), row, 16);
         }
@@ -341,6 +458,7 @@ void install(PS2Runtime &runtime)
     for (const Hook &h : hooks) runtime.replaceFunction(h.address, h.fn);
     ps2_host_input::setBackHoldAction(kBackHoldSeconds, &backHeld);
     runtime.setSpu2KeyOnObserver(&soundWanted, &soundKeyOn);
+    g_prebuilding = std::async(std::launch::async, &prebuild);
     std::fprintf(stderr, "[dw5xl:pc-settings] installed (Options: SCREEN ADJUST -> PC SETTINGS)\n");
 }
 }
@@ -609,37 +727,14 @@ Tex upload(const MImage &img)
     return t;
 }
 MImage tinted(MImage img, const float k[3]) { for (size_t i = 0; i < img.rgba.size(); i += 4) for (int c = 0; c < 3; ++c) img.rgba[i + c] = uint8_t(std::min(255.0f, img.rgba[i + c] * k[c])); return img; }
-std::vector<uint8_t> readFile(const std::filesystem::path &p, uint64_t offset = 0, uint64_t size = 0)
-{
-    std::ifstream f(p, std::ios::binary); if (!f) return {};
-    if (!size) { f.seekg(0, std::ios::end); size = uint64_t(f.tellg()) - offset; }
-    std::vector<uint8_t> out(size); f.seekg(std::streamoff(offset)); f.read(reinterpret_cast<char *>(out.data()), std::streamsize(size));
-    return f ? out : std::vector<uint8_t>{};
-}
-
-// A container read from the disc: every sub-file inside the buffer.
-bool containerFits(const std::vector<uint8_t> &c)
-{
-    if (c.size() < 16) return false;
-    const uint32_t count = le32(c.data());
-    if (count == 0u || count > 4096u) return false;
-    uint64_t end = uint64_t((count + 4u) >> 2) * 16u;
-    if (4u + 4u * uint64_t(count) > c.size()) return false;
-    for (uint32_t i = 0; i < count; ++i) end += uint64_t(le32(c.data() + 4 + 4 * i)) * 16u;
-    return end <= c.size();
-}
-
 void buildAssets()
 {
     Assets &A = g_assets; A.tried = true;
     // the Options menu file (LINKDATA entry 41, LZP2) and the boot pictures (entry 0, not packed), from the disc
     const auto dir = PS2Runtime::getIoPaths().elfDirectory;
-    const auto idxFile = readFile(dir / "LINKDATA.IDX");
-    const auto idx = parseLinkIndex(idxFile.data(), idxFile.size());
-    if (idx.size() <= 41) return;
-    const auto packed = readFile(dir / "LINKDATA.BIN", idx[41].offset(), idx[41].size);
-    std::vector<uint8_t> menuFile;
-    if (!unpackLzp2(packed.data(), packed.size(), menuFile) || !containerFits(menuFile)) return;
+    std::vector<LinkEntry> idx;
+    std::vector<uint8_t> menuFile = readMenuFile(&idx);
+    if (menuFile.empty()) return;
     uint8_t *ram = menuFile.data();                   // the helpers address the file like the game's RAM copy
     const uint32_t container = 0u;
     uint32_t a12, n12, a13, n13; std::vector<Tim2Picture> s12, s13;
