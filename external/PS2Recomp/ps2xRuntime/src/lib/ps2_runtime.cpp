@@ -45,6 +45,7 @@
 #include <string>
 #include <cmath>
 #include "runtime/hotkeys.h"
+#include "runtime/ps2_present_feedback.h"
 
 namespace ps2_stubs
 {
@@ -1053,6 +1054,11 @@ static int configuredHostTargetFps()
     return 0;
 }
 
+// DW5XL-DEBUG issue 023 3S: the field the window frame being drawn shows and whether it carries a new picture
+// (set by UploadFrame, logged after the swap with PS2X_PRESENT_LOG).
+static uint64_t s_windowFrameField = 0;
+static bool s_windowFrameNewPicture = false;
+
 // The texture grows to the largest presented image (4x output); smaller frames
 // occupy its top-left corner. Display dimensions keep the logical aspect ratio.
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight,
@@ -1118,6 +1124,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         static const bool s_fieldPaced = configuredHostTargetFps() == 0;
         rt->gs().latchHostPresentationFrame(s_fieldPaced && currentTick > 0u ? currentTick - 1u
                                                                                : std::numeric_limits<uint64_t>::max());
+        s_windowFrameField = s_fieldPaced && currentTick > 0u ? currentTick - 1u : currentTick;
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
@@ -1137,6 +1144,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                      static_cast<unsigned long long>(generation),
                      (!s_hasUploadedFrame || (needsLatch && generation != s_lastUploadedGeneration)) ? 1 : 0);
     }
+    s_windowFrameNewPicture = false;
     if (s_hasUploadedFrame && (!needsLatch || generation == s_lastUploadedGeneration))
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
@@ -1239,6 +1247,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         UpdateTexture(tex, s_paddedUploadBuffer.data());
         ps2x_dev::s_lastFrame.swap(s_paddedUploadBuffer);
     }
+    s_windowFrameNewPicture = true;
 
     // DW5XL-DEBUG issue 023: PS2X_WEAVE_TRACE=1 logs a fingerprint of every uploaded picture (FNV-1a over the copied
     // rows) and of its top and bottom half, so a picture that alternates between two versions shows up.
@@ -1705,6 +1714,7 @@ bool PS2Runtime::initialize(const char *title)
             std::fprintf(stderr, "[window] vsync %s (%s)\n", vsyncOn ? "on" : "off", vsyncSource);
         }
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        ps2x::present_feedback::start(GetWindowHandle()); // DW5XL-DEBUG issue 023 3S: PS2X_PRESENT_LOG
         if (loadFullscreenSetting() && !IsWindowHidden())   // issue 023 3S: display=fullscreen (borderless)
             ToggleBorderlessWindowed();
         InitAudioDevice();
@@ -3851,6 +3861,7 @@ void PS2Runtime::run()
             }
         }
         EndDrawing();
+        ps2x::present_feedback::frameSwapped(s_windowFrameField, s_windowFrameNewPicture); // DW5XL-DEBUG issue 023 3S
 
         if (WindowShouldClose())
         {

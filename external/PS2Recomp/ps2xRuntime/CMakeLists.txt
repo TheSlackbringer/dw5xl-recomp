@@ -412,6 +412,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_runtime.cpp
     src/lib/ps2_save_state.cpp
     src/lib/ps2_stdio_pump.cpp
+    src/lib/ps2_present_feedback.cpp
     src/lib/ps2_component_state.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vif1_capture.cpp
