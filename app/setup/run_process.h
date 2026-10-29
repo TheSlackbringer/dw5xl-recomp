@@ -14,7 +14,7 @@ struct ProcessResult
     bool started = false;
     int exitCode = -1;
     bool cancelled = false; // stopped because `cancel` was set
-    std::string error;      // why it could not be started
+    std::string error;      // start, observation or owned-process cleanup failure
 };
 
 // Runs `program` with `args` in `workingDirectory`; stdout and stderr go to `logFile` (appended).

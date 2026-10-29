@@ -12,6 +12,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include "windows_process_job.h"
 #else
 #include <cerrno>
 #include <chrono>
@@ -126,31 +127,40 @@ ProcessResult runProcess(const std::filesystem::path &program, const std::vector
     if (!contained)
     {
         TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, INFINITE);
         if (job) CloseHandle(job);
         CloseHandle(pi.hThread);CloseHandle(pi.hProcess);CloseHandle(log);
         result.error = "cannot safely contain the child process tree";
         return result;
     }
-    ResumeThread(pi.hThread);
-    result.started = true;
-    while (WaitForSingleObject(pi.hProcess, 100) == WAIT_TIMEOUT)
+    if (ResumeThread(pi.hThread) == DWORD(-1))
+        result.error = "cannot resume contained child (error " + std::to_string(GetLastError()) + ")";
+    else result.started = true;
+    while (result.started)
     {
+        const DWORD state = WaitForSingleObject(pi.hProcess, 100);
+        if (state == WAIT_OBJECT_0) break;
+        if (state != WAIT_TIMEOUT)
+        {
+            result.error = "cannot wait for child (error " + std::to_string(GetLastError()) + ")";
+            break;
+        }
         if (cancel && *cancel)
         {
-            if (job)
-                TerminateJobObject(job, 1);
-            else
-                TerminateProcess(pi.hProcess, 1);
-            WaitForSingleObject(pi.hProcess, INFINITE);
             result.cancelled = true;
             break;
         }
     }
+    // Normal exit may also leave owned descendants. The old KILL_ON_JOB_CLOSE
+    // policy already stopped them, but returning must wait for actual completion.
+    windows_process::stopAndWait(job, result.error);
+    CloseHandle(job);
+    if (WaitForSingleObject(pi.hProcess, INFINITE) != WAIT_OBJECT_0 && result.error.empty())
+        result.error = "cannot wait for direct child cleanup (error " + std::to_string(GetLastError()) + ")";
     DWORD code = 1;
-    GetExitCodeProcess(pi.hProcess, &code);
-    result.exitCode = int(code);
-    if (job)
-        CloseHandle(job);
+    if (!GetExitCodeProcess(pi.hProcess, &code) && result.error.empty())
+        result.error = "cannot read child exit code (error " + std::to_string(GetLastError()) + ")";
+    result.exitCode = result.error.empty() ? int(code) : -1;
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     CloseHandle(log);

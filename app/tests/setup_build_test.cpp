@@ -361,6 +361,53 @@ int main(int argc, char **argv)
             fs::remove_all(dir);
         }
 #endif
+#ifdef _WIN32
+        { // Cancelling one owned tree must complete without stopping an independent launch.
+            const auto dir=fs::temp_directory_path()/"dw5xl_setup_windows_independent_test";
+            fs::remove_all(dir);fs::create_directories(dir);
+            std::atomic<bool> stop{false},finished{false};
+            std::mutex readyMutex;std::condition_variable ready;HANDLE sentinel=nullptr;
+            ProcessResult survivor;
+            std::thread independent([&] {
+                survivor=runProcessObserved(fs::absolute(argv[0]),{"--leaf"},dir,dir/"independent.log",
+                    [&](const std::string &line) {
+                        if(line.rfind("leaf ",0)==0) {
+                            HANDLE child=OpenProcess(SYNCHRONIZE,FALSE,DWORD(std::stoul(line.substr(5))));
+                            {std::lock_guard lock(readyMutex);sentinel=child;}
+                            ready.notify_one();
+                        }
+                        return true;
+                    },&stop);
+                finished=true;
+            });
+            try
+            {
+                {std::unique_lock lock(readyMutex);
+                 require(ready.wait_for(lock,std::chrono::seconds(2),[&] {return sentinel!=nullptr;}),
+                         "independent Windows process starts within two seconds");}
+                HANDLE leaf=nullptr;
+                const auto start=std::chrono::steady_clock::now();
+                const auto result=runProcessObserved(fs::absolute(argv[0]),{"--tree",dir.string()},dir,dir/"tree.log",
+                    [&](const std::string &line) {
+                        if(line.rfind("leaf ",0)!=0) return true;
+                        leaf=OpenProcess(SYNCHRONIZE,FALSE,DWORD(std::stoul(line.substr(5))));return false;
+                    });
+                const bool terminated=leaf && WaitForSingleObject(leaf,0)==WAIT_OBJECT_0;
+                if(leaf) CloseHandle(leaf);
+                require(result.started && result.cancelled && result.error.empty(),"owned Windows tree cancellation succeeds");
+                require(std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()<2,
+                        "independent-tree cancellation retains the two-second bound");
+                require(terminated,"nested Windows descendant is terminated before return");
+                require(!finished && WaitForSingleObject(sentinel,0)==WAIT_TIMEOUT,
+                        "independent Windows process survives other tree cancellation");
+            }
+            catch(...) {stop=true;independent.join();if(sentinel) CloseHandle(sentinel);throw;}
+            stop=true;independent.join();
+            require(survivor.started && survivor.cancelled && survivor.error.empty() &&
+                        WaitForSingleObject(sentinel,0)==WAIT_OBJECT_0,"independent Windows process can be cancelled separately");
+            CloseHandle(sentinel);fs::remove_all(dir);
+        }
+#endif
         std::cout << "setup build tests passed\n";
         return 0;
     }
