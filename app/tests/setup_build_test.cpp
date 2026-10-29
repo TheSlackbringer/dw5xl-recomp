@@ -12,6 +12,15 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <unistd.h>
+#include <signal.h>
+#include <cerrno>
+#endif
 
 using namespace dw5xl::setup;
 namespace fs = std::filesystem;
@@ -121,6 +130,7 @@ void linuxUpdateTests()
     require(prepareLinuxBuildRoot(moved, data, selected, error), "update from a different AppImage mount");
     require(selected == data / "builder" && fs::last_write_time(selected / "app" / "file") == old,
             "unchanged sources keep their path and timestamp across releases");
+    require(prepareBuildRoot(moved,data,selected,error),"the same stable source cache is used on Windows");
     require(!fs::exists(selected / "app" / "stale") && fs::file_size(selected / "external" / "file") == 7,
             "removed sources disappear and changed files update");
 #ifndef _WIN32
@@ -154,6 +164,18 @@ void cancelTest(const char *self)
 
 int main(int argc, char **argv)
 {
+    if(argc==2 && std::string(argv[1])=="--leaf")
+    {
+#ifdef _WIN32
+        const auto pid=GetCurrentProcessId();
+#else
+        const auto pid=getpid();
+#endif
+        std::cout<<"leaf "<<pid<<'\n'<<std::flush;
+        std::this_thread::sleep_for(std::chrono::seconds(30));return 0;
+    }
+    if(argc==3 && std::string(argv[1])=="--tree")
+        return runProcess(fs::absolute(argv[0]),{"--leaf"},fs::current_path(),fs::path(argv[2])/"tree.log").exitCode;
     // Child mode for cancelTest: sleep and exit, never test (and so never start another child).
     if (const char *child = std::getenv("DW5XL_SLEEP_CHILD"); child && *child == '1')
     {
@@ -166,6 +188,10 @@ int main(int argc, char **argv)
         require(none.done == 0 && none.total == 0, "no progress before Ninja runs");
         const BuildProgress p = parseNinjaProgress("[1/9] Building a\n[7/43210] Building CXX object x.o\n");
         require(p.done == 7 && p.total == 43210, "last [done/total] wins");
+        require(parseNinjaProgress("[9/10] Linking CXX executable game").phase=="link",
+                "linking has distinct activity without inventing a separate percentage");
+        const auto bad=parseNinjaProgress("[9999999999999999999999/9] partial [8/2] [1/");
+        require(bad.done==0 && bad.total==0,"malformed, overflowing and impossible counters are ignored");
 
         BuildTools windows;
         windows.cmake = "C:/DW5XL/tools/cmake/bin/cmake.exe";
@@ -215,6 +241,36 @@ int main(int argc, char **argv)
         layoutTests();
         linuxUpdateTests();
         cancelTest(argc > 0 ? argv[0] : "");
+        { // 042: cancel only after the real grandchild has started, then verify it terminated.
+            const auto dir=fs::temp_directory_path()/"dw5xl_setup_tree_test";
+            fs::remove_all(dir);fs::create_directories(dir);unsigned long leaf=0;
+#ifdef _WIN32
+            HANDLE process=nullptr;
+#endif
+            const auto begin=std::chrono::steady_clock::now();
+            const auto result=runProcessObserved(fs::absolute(argv[0]),{"--tree",dir.string()},dir,dir/"tree.log",
+                [&](const std::string &line) {
+                    if(line.rfind("leaf ",0)!=0) return true;
+                    leaf=std::stoul(line.substr(5));
+#ifdef _WIN32
+                    process=OpenProcess(SYNCHRONIZE,FALSE,DWORD(leaf));
+#endif
+                    return false;
+                });
+            require(result.started && result.cancelled && leaf,"running grandchild observed before cancellation");
+            require(std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count()<2,
+                    "actual child/tree cancellation completes within two seconds");
+#ifdef _WIN32
+            require(process && WaitForSingleObject(process,0)==WAIT_OBJECT_0,"grandchild is terminated");
+            CloseHandle(process);
+#else
+            const bool absent=kill(pid_t(leaf),0)==-1 && errno==ESRCH;
+            std::ifstream state("/proc/"+std::to_string(leaf)+"/stat");std::string stat;std::getline(state,stat);
+            const bool zombie=stat.find(") Z ")!=std::string::npos;
+            require(absent || zombie,"grandchild stopped executing");
+#endif
+            fs::remove_all(dir);
+        }
         std::cout << "setup build tests passed\n";
         return 0;
     }

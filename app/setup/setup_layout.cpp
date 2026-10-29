@@ -1,5 +1,6 @@
 #include "setup_layout.h"
 #include "codegen.h"
+#include "setup_cache.h"
 
 #include <fstream>
 #include <iterator>
@@ -9,9 +10,15 @@ namespace fs = std::filesystem;
 
 bool prepareLinuxBuildRoot(const fs::path &root, const fs::path &data, fs::path &buildRoot, std::string &error)
 {
+    return prepareBuildRoot(root,data,buildRoot,error);
+}
+
+bool prepareBuildRoot(const fs::path &root,const fs::path &data,fs::path &buildRoot,std::string &error,
+                      const std::function<bool(uint64_t,uint64_t)> &progress)
+{
     buildRoot = data / "builder";
     for (const char *folder : {"app", "external", "recomp", "tools"})
-        if (!syncDirectory(root / folder, buildRoot / folder, error, true))
+        if (!syncDirectory(root / folder, buildRoot / folder, error, true,progress))
             return false;
     const auto read = [](const fs::path &path) {
         std::ifstream in(path, std::ios::binary);
@@ -20,13 +27,7 @@ bool prepareLinuxBuildRoot(const fs::path &root, const fs::path &data, fs::path 
     const std::string version = read(root / "BUILD_ID");
     if (version != read(buildRoot / "BUILD_ID"))
     {
-        std::ofstream out(buildRoot / "BUILD_ID", std::ios::binary | std::ios::trunc);
-        out << version;
-        if (!out.flush())
-        {
-            error = "cannot write the Linux builder version in " + buildRoot.string();
-            return false;
-        }
+        if(!atomicWrite(buildRoot/"BUILD_ID",version,error)) return false;
     }
     return true;
 }

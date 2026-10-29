@@ -6,6 +6,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include "stage_timing.h"
 
 namespace dw5xl::setup {
 
@@ -22,7 +23,7 @@ struct BuildTools
 struct BuildProgress
 {
     int done = 0, total = 0; // Ninja's [done/total]; total 0 while configuring
-    std::string phase;       // "configure" / "build"
+    std::string phase;       // "configure" / "build" / "link"
 };
 
 // The CMake arguments used to configure the game build (also used by the test and CI).
@@ -35,6 +36,7 @@ std::vector<std::string> gameConfigureArgs(const std::filesystem::path &root, co
 // (CMakeCache.txt, CMakeFiles/) is removed so the next configure starts fresh; compiled files stay. Returns true if
 // it reset the configuration.
 bool resetBuildIfMoved(const std::filesystem::path &buildDir, const std::filesystem::path &sourceDir);
+std::string toolchainIdentity(const std::filesystem::path &root,const BuildTools &tools,std::string &error);
 
 // Ninja's progress in a build log: the last "[done/total]" (0/0 if none yet).
 BuildProgress parseNinjaProgress(const std::string &logText);
@@ -45,6 +47,7 @@ BuildProgress parseNinjaProgress(const std::string &logText);
 bool buildGame(const std::filesystem::path &root, const std::filesystem::path &buildDir, const BuildTools &tools,
                const std::filesystem::path &logFile, const std::function<void(const BuildProgress &)> &progress,
                std::filesystem::path &executable, std::string &error, const std::atomic<bool> *cancel = nullptr,
-               const std::filesystem::path &recompRoot = {});
+               const std::filesystem::path &recompRoot = {}, ps2recomp::timing::Session *timing = nullptr,
+               uint64_t timingParent = 0);
 
 } // namespace dw5xl::setup

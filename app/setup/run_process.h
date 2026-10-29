@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <functional>
 
 namespace dw5xl::setup {
 
@@ -21,6 +22,12 @@ struct ProcessResult
 ProcessResult runProcess(const std::filesystem::path &program, const std::vector<std::string> &args,
                          const std::filesystem::path &workingDirectory, const std::filesystem::path &logFile,
                          const std::atomic<bool> *cancel = nullptr);
+
+// Incremental bounded log consumption. A false callback or cancel stops the same child/tree; raw logs remain intact.
+ProcessResult runProcessObserved(const std::filesystem::path &program, const std::vector<std::string> &args,
+                                  const std::filesystem::path &workingDirectory, const std::filesystem::path &logFile,
+                                  const std::function<bool(const std::string &)> &line,
+                                  const std::atomic<bool> *cancel = nullptr);
 
 // Starts `program` and returns at once (the game from the wizard's Play button); it keeps running after the
 // caller exits. false + error if it could not be started.

@@ -136,12 +136,46 @@ int main()
             require(contains(st.error, stepName(Step::LiftVu1)) && contains(st.error, "boom"), "step + reason");
             require(f.calls == std::vector<std::string>{"generate", "lift"}, "build not started");
         }
+        for(const std::string stage:{"generate","build"})
+        { // 042: generation/native failure invalidates old completion, preserves cards/settings and permits retry.
+            Fakes f;f.failIn=stage;auto o=options(dir/("failed-"+stage),iso);o.releaseId="retry-fixture";
+            fs::create_directories(o.effectiveBuildDir());
+            fs::create_directories(o.root/"game/test/mc0");
+            const std::vector<uint8_t> saved={'s','a','v','e'},settings={'s','e','t'};
+            write(o.root/"game/test/mc0/card",saved);write(o.root/"settings.ini",settings);
+            write(o.effectiveBuildDir()/"built-from.txt",{'o','l','d'});
+            write(o.effectiveBuildDir()/"ready.record",{'o','l','d'});
+            const auto st=runWith(o,f);
+            require(st.failed && !st.finished,"failed generation/native build is not complete");
+            require(!fs::exists(o.effectiveBuildDir()/"built-from.txt") && !fs::exists(o.effectiveBuildDir()/"ready.record"),
+                    "failed release retains no completed-build marker");
+            require(slurp(o.root/"game/test/mc0/card")==saved && slurp(o.root/"settings.ini")==settings,
+                    "failure preserves cards/settings byte for byte");
+            Fakes retry;require(runWith(o,retry).finished,"clean retry succeeds after generation/native failure");
+            require(slurp(o.root/"game/test/mc0/card")==saved && slurp(o.root/"settings.ini")==settings,
+                    "retry preserves cards/settings byte for byte");
+        }
         { // cancel
             Fakes f;
             f.waitForCancel = true;
             const auto st = runWith(options(dir / "f", iso), f, true);
             require(st.cancelled && !st.failed && !st.finished, "cancel is reported as cancelled, not failed");
             require(f.calls == std::vector<std::string>{"generate"}, "nothing runs after cancel");
+        }
+        { // 042: a competing pipeline is refused before it creates logs or calls a build step.
+            Fakes first;first.waitForCancel=true;
+            auto o=options(dir/"concurrent",iso);
+            SetupRun active(o,first.steps());active.start();
+            for(int i=0;i<500 && active.status().step!=Step::Generate;++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            require(active.status().step==Step::Generate,"first pipeline reached protected generation");
+            const auto logs=[&] {size_t n=0;for(const auto &e:fs::directory_iterator(o.effectiveLogDir())) if(e.is_regular_file()) ++n;return n;};
+            const auto before=logs();Fakes second;
+            SetupRun competing(o,second.steps());competing.start();
+            require(!competing.wait() && competing.status().failed && second.calls.empty(),
+                    "second pipeline cannot mutate the shared setup");
+            require(logs()==before,"second pipeline is refused before writing shared logs");
+            active.cancel();require(!active.wait() && active.status().cancelled,"first pipeline stops cleanly");
         }
         { // release layout: package (root) and player data folder apart
             Fakes f;
@@ -198,6 +232,27 @@ int main()
             Fakes f;
             const auto st = runWith(options(dir / "z", iso), f);
             require(st.finished && st.overall > 0.999 && st.plan.size() == 5, "overall 1.0, five planned steps");
+        }
+        { // 042: 100% and release completion are published only after all bookkeeping succeeds.
+            Fakes f;auto o=options(dir/"release",iso);o.releaseId="fixture-042";
+            auto steps=f.steps();const auto build=steps.build;
+            SetupRun *active=nullptr;
+            steps.build=[&](const SetupOptions &opts,StepContext &ctx,fs::path &exe,std::string &error) {
+                const bool ok=build(opts,ctx,exe,error);
+                const auto st=active->status();
+                require(!st.finished && st.overall<1.0,"last build edge is not a completed setup");
+                write(exe,std::vector<uint8_t>{'e','x','e'});return ok;
+            };
+            SetupRun run(o,steps);active=&run;run.start();
+            const std::string expectedMarker="fixture-042\n";
+            require(run.wait() && slurp(o.effectiveBuildDir()/"built-from.txt")==std::vector<uint8_t>(expectedMarker.begin(),expectedMarker.end()),
+                    "finished release has an atomically published build marker");
+            fs::remove(o.effectiveBuildDir()/"built-from.txt");
+            fs::create_directory(o.effectiveBuildDir()/"built-from.txt");
+            write(o.effectiveBuildDir()/"built-from.txt/block",std::vector<uint8_t>{'x'});
+            SetupRun broken(o,steps);active=&broken;broken.start();
+            require(!broken.wait() && broken.status().failed && !broken.status().finished,
+                    "completion publication failure cannot report success");
         }
         for (int i = 0; i <= kStepCount; ++i)
             require(stepName(Step(i)) && *stepName(Step(i)), "every step has a name");

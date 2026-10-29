@@ -32,3 +32,7 @@ __pycache__/
 /dist/
 /BUILD_ID
 /build-recomp*/
+
+# Local setup ownership and validated generation records
+/setup.lock
+/cache/generation/

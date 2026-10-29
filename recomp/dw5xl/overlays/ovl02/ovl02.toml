@@ -8,6 +8,8 @@ raw_code_offset = 0x80
 ghidra_output = "recomp/dw5xl/overlays/ovl02/ghidra_functions.code.csv"
 output = "recomp/dw5xl/overlays/ovl02/output"
 single_file_output = false
+# Preserve native unity groups while avoiding one on-disk file per function.
+output_file_batch_size = 64
 patch_syscalls = false
 patch_cop0 = true
 patch_cache = true

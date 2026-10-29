@@ -263,6 +263,11 @@ jobs:
         with:
           name: windows-tests
           path: dist
+      - name: Check reproducible translator identity
+        shell: pwsh
+        env:
+          PS2X_TEST_RECOMPILER: ${{ github.workspace }}/dist/ps2_recomp.exe
+        run: python -B -m unittest discover -s tools/tests -p test_producer_rebuild.py -v
       - name: Run the tests that need no game data
         shell: pwsh
         working-directory: dist

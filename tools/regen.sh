@@ -61,7 +61,7 @@ if [[ "$selection" == main || "$selection" == all ]]; then
     # Stop on input/translation errors rather than silently compiling stale lifted output.
     lifter="${DW5XL_VU1LIFT:-$root/app/build/dw5xl_vu1lift}"
     mkdir -p "$root/recomp/dw5xl/vu1" "$root/recomp/dw5xl/vu0"
-    "$lifter" "$root/game/dw5xl/SLES_538.60" "$root/recomp/dw5xl/vu1/dw5xl_vu1_lifted.cpp"
+    "$lifter" --sharded "$root/game/dw5xl/SLES_538.60" "$root/recomp/dw5xl/vu1"
     # Issue 025: the VU0 microprograms (VCALLMS) from the same executable, into recomp/dw5xl/vu0/.
     "$lifter" --vu0 "$root/game/dw5xl/SLES_538.60" "$root/recomp/dw5xl/vu0/dw5xl_vu0_lifted.cpp"
 fi

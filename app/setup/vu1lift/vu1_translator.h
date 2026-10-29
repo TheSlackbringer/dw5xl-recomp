@@ -9,6 +9,12 @@
 #include <vector>
 
 namespace dw5xl::vu1lift {
+// Exact disc files referenced by the selected generation ranges (for semantic cache keys).
+std::vector<std::filesystem::path> inputFiles(const std::filesystem::path &elf, bool vu0);
+// Whole segment bodies are copied byte for byte; only the owner emits registration data.
+std::map<std::string,std::string> partitionVu1Sources(const std::string &prologue,
+    const std::vector<std::pair<std::string,std::string>> &segments,const std::vector<std::string> &ownerData,
+    const std::string &registration,size_t maxUnitBytes=512*1024);
 
 // Translates one VU1 program segment starting at entryPc in a 16 KiB microcode image (translate_segment).
 std::string translateSegment(const std::vector<uint8_t> &code, uint32_t entryPc, const std::string &name,
@@ -22,7 +28,8 @@ std::vector<uint32_t> findReachable(const std::vector<uint8_t> &code, uint32_t e
 // staticTiming(name) mirrors DW5XL_VU1_STATIC (default: all segments).
 bool generateLiftedVu1(const std::filesystem::path &elf, std::string &text, std::string &error,
                        const std::function<void(const std::string &)> &log = {},
-                       const std::function<bool(const std::string &)> &staticTiming = {});
+                       const std::function<bool(const std::string &)> &staticTiming = {},
+                       std::map<std::string,std::string> *sources=nullptr);
 
 // The VU0 microprograms the game starts with VCALLMS (issue 025): the same translator with the VU0 target (4 KB
 // micro memory), inputs from kVu0Ranges.

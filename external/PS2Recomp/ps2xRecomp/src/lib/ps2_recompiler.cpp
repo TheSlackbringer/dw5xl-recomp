@@ -2,6 +2,7 @@
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/control_flow_utils.h"
 #include "ps2recomp/types.h"
+#include "ps2recomp/output_batch.h"
 #include "ps2recomp/elf_parser.h"
 #include "ps2recomp/r5900_decoder.h"
 #include "ps2_runtime_calls.h"
@@ -22,6 +23,7 @@
 #include <limits>
 #include <functional>
 #include <thread>
+#include <set>
 
 namespace fs = std::filesystem;
 
@@ -842,10 +844,13 @@ namespace ps2recomp
 
     bool PS2Recompiler::initialize()
     {
+        timing::Stage initialize(m_timing, "initialize", m_timingParent);
         try
         {
             m_reporter.progress("parsing config");
+            timing::Stage config(m_timing, "config", initialize.id());
             m_config = m_configManager.loadConfig();
+            config.finish();
             m_skipFunctions.clear();
             m_skipFunctionStarts.clear();
             m_stubFunctions.clear();
@@ -903,6 +908,7 @@ namespace ps2recomp
             }
 
             m_reporter.progress("parsing ELF");
+            timing::Stage inputMap(m_timing, "input_map", initialize.id());
             m_elfParser = std::make_unique<ElfParser>(m_config.inputPath);
             m_elfParser->setReporter(&m_reporter);
             const bool rawModule = m_config.inputFormat == "raw";
@@ -1058,19 +1064,25 @@ namespace ps2recomp
 
             fs::create_directories(m_config.outputPath);
 
+            inputMap.count("functions", m_functions.size());
+            inputMap.finish();
+            initialize.finish();
             return true;
         }
         catch (const std::exception &e)
         {
             m_reporter.error("initialize", e.what());
+            initialize.finish("failed");
             return false;
         }
     }
 
     bool PS2Recompiler::recompile()
     {
+        timing::Stage pass(m_timing, "recompile", m_timingParent);
         try
         {
+            timing::Stage analysis(m_timing, "analysis", pass.id());
             {
                 std::ostringstream msg;
                 msg << "recompiling " << m_functions.size() << " functions";
@@ -1115,8 +1127,10 @@ namespace ps2recomp
                 }
             }
 
+            uint64_t analysedCount=0;
             for (auto &function : m_functions)
             {
+                analysis.progress(analysedCount++,m_functions.size());
                 m_reporter.recordFunctionProcessed();
                 const bool correctnessCritical = isCorrectnessCriticalFunction(function);
 
@@ -1199,8 +1213,21 @@ namespace ps2recomp
 #endif
             }
 
-            discoverAdditionalEntryPoints();
-            discoverNativeContinuations();
+            analysis.progress(m_functions.size(),m_functions.size());
+            analysis.count("functions", m_functions.size());
+            analysis.finish();
+            {
+                timing::Stage entries(m_timing, "entry_discovery", pass.id());
+                discoverAdditionalEntryPoints();
+                entries.count("functions_after", m_functions.size());
+                entries.finish();
+            }
+            {
+                timing::Stage continuations(m_timing, "continuation_discovery", pass.id());
+                discoverNativeContinuations();
+                continuations.count("functions_after", m_functions.size());
+                continuations.finish();
+            }
 
             if (failedCount > 0)
             {
@@ -1210,17 +1237,25 @@ namespace ps2recomp
             }
 
             m_reporter.progress("recompilation pass completed");
+            pass.finish(correctnessCriticalFailureCount == 0u ? "success" : "failed");
             return correctnessCriticalFailureCount == 0u;
         }
         catch (const std::exception &e)
         {
             m_reporter.error("recompile", e.what());
+            pass.finish("failed");
             return false;
         }
     }
 
     void PS2Recompiler::generateOutput()
     {
+        timing::Stage output(m_timing, "output", m_timingParent);
+        std::atomic<uint64_t> generationJobUs{0}; // overlapping worker wall intervals, never elapsed output time
+        std::atomic<uint64_t> writerUs{0}, functionFiles{0}, functionBytes{0};
+        uint64_t writerWaitUs = 0, parallelWriters = 0;
+        size_t physicalBatches = 0;
+        std::string batchedRegistration;
         if (m_invalidDelaySlot)
             throw std::runtime_error("Cannot generate output after a required delay-slot failure");
         try
@@ -1367,7 +1402,7 @@ namespace ps2recomp
 
             m_reporter.recordGeneratedFunctions(outputFunctions.size());
 
-            const size_t outputWorkerCount = m_config.lowMemoryMode ? 1 : resolveOutputWorkerCount(m_config.outputWorkerThreads);
+            const size_t outputWorkerCount = m_config.lowMemoryMode || m_config.outputFileBatchSize ? 1 : resolveOutputWorkerCount(m_config.outputWorkerThreads);
             if (outputFunctions.size() > 1 && outputWorkerCount > 1)
             {
                 {
@@ -1408,12 +1443,9 @@ namespace ps2recomp
                 }
                 catch (const std::exception &e)
                 {
-                    {
-                        std::ostringstream msg;
-                        msg << "Error generating code: " << e.what();
-                        m_reporter.errorAt("codegen", function.name, function.start, msg.str());
-                    }
-                    throw;
+                    std::ostringstream msg;
+                    msg << "Error generating " << function.name << " at 0x" << std::hex << function.start << ": " << e.what();
+                    throw std::runtime_error(msg.str()); // owning thread reports worker errors after joining
                 }
             };
 
@@ -1629,6 +1661,30 @@ namespace ps2recomp
                     m_reporter.progress(msg.str());
                 }
             }
+            else if (m_config.outputFileBatchSize)
+            {
+                std::map<std::string, const Function *> ordered;
+                for (const Function *function : outputFunctions)
+                    if (!ordered.emplace(getOutputPath(*function).filename().string(), function).second)
+                        throw std::runtime_error("Duplicate batch output destination");
+                if (!ordered.emplace("register_functions.cpp", nullptr).second)
+                    throw std::runtime_error("Conflicting registration output filename");
+                batchedRegistration = m_codeGenerator->generateFunctionRegistration(m_functions, m_generatedStubs);
+                OutputBatchWriter writer(m_config.outputPath, m_config.outputFileBatchSize);
+                uint64_t emitted=0;
+                output.progress(0,ordered.size());
+                for (const auto &[name, function] : ordered)
+                {
+                    const auto start = m_timing ? m_timing->now() : 0;
+                    const std::string text = function ? generateFunctionCode(*m_codeGenerator, *function, true) : batchedRegistration;
+                    if (m_timing) generationJobUs.fetch_add(m_timing->now() - start);
+                    writer.append(name, text);
+                    output.progress(++emitted,ordered.size());
+                    if (function) { ++functionFiles; functionBytes += text.size(); }
+                }
+                writer.finish();
+                physicalBatches = writer.batchCount();
+            }
             else
             {
                 struct GeneratedFile
@@ -1638,24 +1694,43 @@ namespace ps2recomp
                 };
 
                 std::vector<fs::path> outputPaths;
+                std::set<std::string> destinations;
+                std::set<fs::path> directories;
                 outputPaths.reserve(outputFunctions.size());
                 for (const Function *function : outputFunctions)
                 {
-                    outputPaths.push_back(getOutputPath(*function));
+                    const fs::path path = getOutputPath(*function);
+                    std::string key = path.filename().string();
+#ifdef _WIN32
+                    for (char &c : key) c = char(std::tolower(static_cast<unsigned char>(c)));
+#endif
+                    if (!destinations.insert(key).second)
+                        throw std::runtime_error("Duplicate generated output destination: " + path.string());
+                    directories.insert(path.parent_path());
+                    outputPaths.push_back(path);
                 }
+                for (const auto &dir : directories) fs::create_directories(dir);
 
                 auto generateFile = [&](CodeGenerator &codeGenerator, size_t outputIndex) -> GeneratedFile
                 {
-                    return GeneratedFile{outputPaths[outputIndex], generateFunctionCode(codeGenerator, *outputFunctions[outputIndex], true)};
+                    const auto start = m_timing ? m_timing->now() : 0;
+                    GeneratedFile result{outputPaths[outputIndex], generateFunctionCode(codeGenerator, *outputFunctions[outputIndex], true)};
+                    if (m_timing) generationJobUs.fetch_add(m_timing->now() - start, std::memory_order_relaxed);
+                    return result;
                 };
 
                 auto writeGeneratedFile = [&](GeneratedFile generated)
                 {
-                    fs::create_directories(generated.outputPath.parent_path());
-                    if (!writeToFile(generated.outputPath.string(), generated.code))
-                    {
+                    const auto start = m_timing ? m_timing->now() : 0;
+                    // The worker owns this unique file. Report errors after joining, on the owner thread.
+                    std::ofstream file(generated.outputPath);
+                    file << generated.code;
+                    file.close();
+                    if (!file)
                         throw std::runtime_error("Failed to write function output: " + generated.outputPath.string());
-                    }
+                    functionFiles.fetch_add(1, std::memory_order_relaxed);
+                    functionBytes.fetch_add(generated.code.size(), std::memory_order_relaxed);
+                    if (m_timing) writerUs.fetch_add(m_timing->now() - start, std::memory_order_relaxed);
                 };
 
                 if (outputWorkerCount <= 1)
@@ -1663,15 +1738,17 @@ namespace ps2recomp
                     for (size_t outputIndex = 0; outputIndex < outputFunctions.size(); ++outputIndex)
                     {
                         writeGeneratedFile(generateFile(*m_codeGenerator, outputIndex));
+                        output.progress(outputIndex+1,outputFunctions.size());
                     }
                 }
                 else
                 {
+                    parallelWriters = outputWorkerCount;
                     std::mutex outputMutex;
                     std::condition_variable workAvailable;
                     std::condition_variable resultAvailable;
                     std::queue<size_t> pendingWork;
-                    std::queue<GeneratedFile> readyFiles;
+                    std::queue<size_t> readyFiles;
                     std::exception_ptr workerException;
                     bool stopWorkers = false;
                     size_t outstandingWork = 0;
@@ -1700,9 +1777,10 @@ namespace ps2recomp
                             try
                             {
                                 GeneratedFile generated = generateFile(generator, outputIndex);
+                                writeGeneratedFile(std::move(generated));
                                 {
                                     std::lock_guard<std::mutex> lock(outputMutex);
-                                    readyFiles.push(std::move(generated));
+                                    readyFiles.push(outputIndex);
                                     --outstandingWork;
                                 }
                                 resultAvailable.notify_one();
@@ -1771,8 +1849,10 @@ namespace ps2recomp
                         while (writtenCount < outputFunctions.size())
                         {
                             std::unique_lock<std::mutex> lock(outputMutex);
+                            const auto waitStart = m_timing ? m_timing->now() : 0;
                             resultAvailable.wait(lock, [&]()
                                                  { return workerException || !readyFiles.empty() || (outstandingWork == 0 && nextFunction >= outputFunctions.size()); });
+                            if (m_timing) writerWaitUs += m_timing->now() - waitStart;
 
                             if (workerException)
                             {
@@ -1786,12 +1866,11 @@ namespace ps2recomp
                                 break;
                             }
 
-                            GeneratedFile generated = std::move(readyFiles.front());
                             readyFiles.pop();
                             lock.unlock();
 
-                            writeGeneratedFile(std::move(generated));
                             ++writtenCount;
+                            output.progress(writtenCount,outputFunctions.size());
                             scheduleAvailableWork();
                         }
 
@@ -1817,13 +1896,16 @@ namespace ps2recomp
             m_generatedStubs.clear();
 
             fs::path registerPath = fs::path(m_config.outputPath) / "register_functions.cpp";
-            if (!writeToFile(registerPath.string(), registerFunctions))
+            if (m_config.outputFileBatchSize && registerFunctions != batchedRegistration)
+                throw std::runtime_error("Registration changed during batched generation");
+            if (!m_config.outputFileBatchSize && !writeToFile(registerPath.string(), registerFunctions))
             {
                 throw std::runtime_error("Failed to write function registration file: " + registerPath.string());
             }
             {
                 std::ostringstream msg;
-                msg << "generated function registration file: " << registerPath;
+                if (m_config.outputFileBatchSize) msg << "generated function registration in indexed batches";
+                else msg << "generated function registration file: " << registerPath;
                 m_reporter.progress(msg.str());
             }
 
@@ -1831,10 +1913,20 @@ namespace ps2recomp
             {
                 throw std::runtime_error("Failed to generate stub header");
             }
+            output.count("functions", m_functions.size());
+            output.count("function_files", functionFiles.load());
+            output.count("function_bytes", functionBytes.load());
+            output.count("generation_job_us_overlapping", generationJobUs.load());
+            output.count("function_writer_job_us_overlapping", writerUs.load());
+            output.count("parallel_function_writers", parallelWriters);
+            output.count("physical_batches", physicalBatches);
+            output.count("completion_queue_wait_us", writerWaitUs);
+            output.finish();
         }
         catch (const std::exception &e)
         {
             m_reporter.error("output", e.what());
+            output.finish("failed");
             m_reporter.printSummary(std::cout);
             throw;
         }
@@ -1879,7 +1971,7 @@ namespace ps2recomp
             // ss << "} // namespace ps2recomp\n";
 
             fs::path headerPath = fs::path(m_config.outputPath) / "ps2_recompiled_stubs.h";
-            writeToFile(headerPath.string(), ss.str());
+            if(!writeToFile(headerPath.string(),ss.str())) return false;
 
             {
                 std::ostringstream msg;
@@ -1925,7 +2017,7 @@ namespace ps2recomp
             ss << "\n#endif // PS2_RECOMPILED_FUNCTIONS_H\n";
 
             fs::path headerPath = fs::path(m_config.outputPath) / "ps2_recompiled_functions.h";
-            writeToFile(headerPath.string(), ss.str());
+            if(!writeToFile(headerPath.string(),ss.str())) return false;
 
             {
                 std::ostringstream msg;
@@ -2550,7 +2642,8 @@ namespace ps2recomp
         file << content;
         file.close();
 
-        return true;
+        if (!file) m_reporter.error("file", "Failed to finish output file: " + path);
+        return bool(file);
     }
 
     std::filesystem::path PS2Recompiler::getOutputPath(const Function &function) const

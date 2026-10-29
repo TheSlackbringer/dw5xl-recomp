@@ -1,5 +1,6 @@
 #include "build_game.h"
 #include "run_process.h"
+#include "setup_cache.h"
 
 #include <atomic>
 #include <cctype>
@@ -8,6 +9,7 @@
 #include <iterator>
 #include <regex>
 #include <thread>
+#include <charconv>
 
 namespace dw5xl::setup {
 namespace fs = std::filesystem;
@@ -19,36 +21,19 @@ std::string utf8(const fs::path &path)
     return std::string(text.begin(), text.end());
 }
 
-std::string readText(const fs::path &path)
-{
-    std::ifstream in(path, std::ios::binary);
-    return {std::istreambuf_iterator<char>(in), {}};
-}
-
-// Runs a step in a worker thread and reports Ninja's progress from its log while it runs.
+// Consume only new output; growing build logs are never reread on each UI poll.
 ProcessResult runWithProgress(const fs::path &program, const std::vector<std::string> &args,
                               const fs::path &workingDirectory, const fs::path &logFile, const std::string &phase,
                               const std::function<void(const BuildProgress &)> &progress,
                               const std::atomic<bool> *cancel)
 {
-    ProcessResult result;
-    std::atomic<bool> finished{false};
-    std::thread worker([&] {
-        result = runProcess(program, args, workingDirectory, logFile, cancel);
-        finished = true;
-    });
-    while (!finished)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        if (progress)
-        {
-            BuildProgress p = parseNinjaProgress(readText(logFile));
-            p.phase = phase;
-            progress(p);
-        }
-    }
-    worker.join();
-    return result;
+    if(progress) progress({0,0,phase});
+    return runProcessObserved(program,args,workingDirectory,logFile,[&](const std::string &line) {
+        BuildProgress p=parseNinjaProgress(line);
+        if(phase=="configure" || p.phase.empty()) p.phase=phase;
+        if(progress && (p.total>0 || phase=="configure")) progress(p);
+        return true;
+    },cancel);
 }
 } // namespace
 
@@ -140,15 +125,32 @@ BuildProgress parseNinjaProgress(const std::string &logText)
     const std::string tail = logText.substr(from);
     for (std::sregex_iterator it(tail.begin(), tail.end(), re), end; it != end; ++it)
     {
-        p.done = std::stoi((*it)[1].str());
-        p.total = std::stoi((*it)[2].str());
+        const auto done=(*it)[1].str(),total=(*it)[2].str();int n=0,t=0;
+        if(std::from_chars(done.data(),done.data()+done.size(),n).ec==std::errc{} &&
+           std::from_chars(total.data(),total.data()+total.size(),t).ec==std::errc{} && t>0 && n<=t)
+        {
+            p.done=n;p.total=t;
+            const auto after=size_t(it->position()+it->length());
+            p.phase=tail.compare(after,9," Linking ")==0?"link":"build";
+        }
     }
     return p;
 }
 
+std::string toolchainIdentity(const fs::path &root,const BuildTools &tools,std::string &error)
+{
+    std::vector<CacheInput> inputs;
+    const auto sdk=!tools.llvmMingwRoot.empty()?tools.llvmMingwRoot:tools.linuxToolchainRoot;
+    if(sdk.empty()) return {}; // developer PATH tools retain CMake's existing detection path
+    if(!treeInputs(sdk,"compiler-sdk",inputs,error)) return {};
+    inputs.push_back({"toolchain",root/"tools"/(!tools.llvmMingwRoot.empty()?"windows/llvm-mingw.cmake":"linux/clang.cmake")});
+    return cacheKey(inputs,{{"purpose","native-toolchain-1"}},error);
+}
+
 bool buildGame(const fs::path &root, const fs::path &buildDir, const BuildTools &tools, const fs::path &logFile,
                const std::function<void(const BuildProgress &)> &progress, fs::path &executable, std::string &error,
-               const std::atomic<bool> *cancel, const fs::path &recompRoot)
+               const std::atomic<bool> *cancel, const fs::path &recompRoot,
+               ps2recomp::timing::Session *timing, uint64_t timingParent)
 {
     std::error_code ec;
     fs::create_directories(buildDir, ec);
@@ -157,9 +159,27 @@ bool buildGame(const fs::path &root, const fs::path &buildDir, const BuildTools 
     if (resetBuildIfMoved(buildDir, root / "app"))
         std::ofstream(logFile, std::ios::app) << "-- the release moved to " << utf8(root)
                                               << ": the build configuration was reset\n";
+    ps2recomp::timing::Stage toolIdentityTime(timing,"compiler_identity",timingParent);
+    const auto identity=toolchainIdentity(root,tools,error);
+    toolIdentityTime.field("compiler_sdk_sha256",identity.empty()?"unavailable":identity);
+    const auto identityFile=buildDir/"setup-toolchain.record";
+    if(!tools.llvmMingwRoot.empty() || !tools.linuxToolchainRoot.empty())
+    {
+        if(identity.empty()) return false;
+        std::ifstream old(identityFile);std::string previous;std::getline(old,previous);old.close();
+        if(previous!=identity && fs::exists(buildDir/"CMakeCache.txt"))
+        {
+            // CMakeFiles owns compiler/PCH objects; downloaded dependency sources in _deps are preserved.
+            fs::remove(buildDir/"CMakeCache.txt");fs::remove_all(buildDir/"CMakeFiles");
+            std::ofstream(logFile,std::ios::app)<<"-- bundled compiler identity changed: resetting native configuration and objects\n";
+        }
+    }
+    toolIdentityTime.finish();
+    ps2recomp::timing::Stage configureTime(timing, "configure", timingParent);
     const ProcessResult configure =
         runWithProgress(tools.cmake, gameConfigureArgs(root, buildDir, tools, recompRoot), root, logFile, "configure", progress,
                         cancel);
+    configureTime.finish(configure.started && configure.exitCode == 0 ? "success" : configure.cancelled ? "cancelled" : "failed");
     if (configure.cancelled)
     {
         error = "cancelled";
@@ -175,9 +195,24 @@ bool buildGame(const fs::path &root, const fs::path &buildDir, const BuildTools 
         error = "configuring the build failed; see " + logFile.string();
         return false;
     }
+    if(!identity.empty() && !atomicWrite(identityFile,identity+"\n",error)) return false;
+    ps2recomp::timing::Stage ninjaTime(timing, "ninja", timingParent);
     const ProcessResult build =
         runWithProgress(tools.cmake, {"--build", utf8(buildDir), "--target", "dw5xl"}, root, logFile, "build", progress,
                         cancel);
+    ninjaTime.finish(build.started && build.exitCode == 0 ? "success" : build.cancelled ? "cancelled" : "failed");
+    if (timing)
+    {
+        ps2recomp::timing::Stage snapshot(timing, "ninja_log_snapshot", timingParent);
+        const fs::path original = buildDir / ".ninja_log";
+        if (fs::exists(original))
+        {
+            fs::copy_file(original, logFile.parent_path() / ("ninja-" + timing->run() + ".tsv"),
+                          fs::copy_options::overwrite_existing, ec);
+            snapshot.finish(ec ? "failed" : "success");
+        }
+        else snapshot.finish("unavailable");
+    }
     if (build.cancelled)
     {
         error = "cancelled";

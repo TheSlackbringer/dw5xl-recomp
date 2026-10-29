@@ -1,4 +1,10 @@
 #include "run_process.h"
+#include <array>
+#include <chrono>
+#include <condition_variable>
+#include <fstream>
+#include <mutex>
+#include <thread>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -105,12 +111,21 @@ ProcessResult runProcess(const std::filesystem::path &program, const std::vector
     }
     // A job holds the program and everything it starts, so a cancel stops the whole tree.
     HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    bool contained = false;
     if (job)
     {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
-        AssignProcessToJobObject(job, pi.hProcess);
+        contained = SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) &&
+                    AssignProcessToJobObject(job, pi.hProcess);
+    }
+    if (!contained)
+    {
+        TerminateProcess(pi.hProcess, 1);
+        if (job) CloseHandle(job);
+        CloseHandle(pi.hThread);CloseHandle(pi.hProcess);CloseHandle(log);
+        result.error = "cannot safely contain the child process tree";
+        return result;
     }
     ResumeThread(pi.hThread);
     result.started = true;
@@ -199,7 +214,6 @@ ProcessResult runProcess(const std::filesystem::path &program, const std::vector
     }
     result.started = true;
     int status = 0;
-    auto cancelledAt = std::chrono::steady_clock::time_point{};
     for (;;)
     {
         const pid_t done = waitpid(pid, &status, cancel ? WNOHANG : 0);
@@ -212,15 +226,8 @@ ProcessResult runProcess(const std::filesystem::path &program, const std::vector
         }
         if (cancel && *cancel)
         {
-            const auto now = std::chrono::steady_clock::now();
-            if (!result.cancelled)
-            {
-                result.cancelled = true;
-                cancelledAt = now;
-                kill(-pid, SIGTERM);
-            }
-            else if (now - cancelledAt > std::chrono::seconds(3))
-                kill(-pid, SIGKILL);
+            result.cancelled = true;
+            kill(-pid, SIGKILL); // explicit cancellation of build tools; no delayed, machine-tuned grace period
         }
         if (cancel)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -258,5 +265,72 @@ bool launchDetached(const std::filesystem::path &program, const std::vector<std:
 }
 
 #endif
+
+ProcessResult runProcessObserved(const std::filesystem::path &program,const std::vector<std::string> &args,
+                                  const std::filesystem::path &workingDirectory,const std::filesystem::path &logFile,
+                                  const std::function<bool(const std::string &)> &line,const std::atomic<bool> *cancel)
+{
+    ProcessResult result;
+    if(cancel && *cancel) {result.cancelled=true;return result;}
+    std::error_code ec;
+    uintmax_t offset=std::filesystem::file_size(logFile,ec);
+    if(ec) offset=0;
+    std::atomic<bool> stop{false};
+    std::mutex mutex;std::condition_variable changed;bool finished=false;
+    std::thread worker([&] {
+        try {result=runProcess(program,args,workingDirectory,logFile,&stop);}
+        catch(const std::exception &e) {result.error=e.what();}
+        {std::lock_guard lock(mutex);finished=true;}
+        changed.notify_one();
+    });
+    std::ifstream input;
+    std::string pending;
+    auto consume=[&] {
+        const auto size=std::filesystem::file_size(logFile,ec);
+        if(ec) return;
+        if(size<offset) {offset=0;pending.clear();}
+        if(!input.is_open()) input.open(logFile,std::ios::binary);
+        if(!input.is_open()) return;
+        input.clear();input.seekg(std::streamoff(offset));
+        std::array<char,65536> block;
+        for(int batch=0;batch<4;++batch)
+        {
+            input.read(block.data(),block.size());const auto got=input.gcount();
+            if(!got) break;
+            offset+=uintmax_t(got);pending.append(block.data(),size_t(got));
+            size_t at=0;
+            while((at=pending.find('\n'))!=std::string::npos)
+            {
+                std::string complete=pending.substr(0,at);pending.erase(0,at+1);
+                if(!complete.empty() && complete.back()=='\r') complete.pop_back();
+                if(line && !line(complete)) stop=true;
+            }
+            if(pending.size()>131072) pending.erase(0,pending.size()-131072);
+        }
+    };
+    try
+    {
+        for(;;)
+        {
+            if(cancel && *cancel) stop=true;
+            consume();
+            std::unique_lock lock(mutex);
+            if(finished) break;
+            changed.wait_for(lock,std::chrono::milliseconds(100),[&] {return finished;});
+        }
+        worker.join();
+        // Remaining complete lines and a final unbuffered partial line are bounded as above.
+        consume();
+        if(!pending.empty() && line && !line(pending)) stop=true;
+    }
+    catch(...)
+    {
+        stop=true;
+        if(worker.joinable()) worker.join();
+        throw;
+    }
+    if(stop) result.cancelled=true;
+    return result;
+}
 
 } // namespace dw5xl::setup

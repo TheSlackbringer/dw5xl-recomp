@@ -12,6 +12,7 @@
 #include "install_state.h"
 #include "run_process.h"
 #include "setup_layout.h"
+#include "setup_cache.h"
 #include "wizard_ui.h"
 
 #include <cstdio>
@@ -35,6 +36,7 @@ struct Args
     fs::path xlIso, dw5Iso, root;
     bool noWindow = false;
     bool rebuild = false;
+    bool checkReady=false;
 };
 
 std::string firstLine(const fs::path &path)
@@ -60,6 +62,7 @@ Args parseArgs(int argc, char **argv)
             a.root = fromUtf8(argv[++i]);
         else if (arg == "--no-window")
             a.noWindow = true;
+        else if(arg=="--check-ready") a.checkReady=true;
         else if (arg == "--rebuild")
             a.rebuild = true;
     }
@@ -100,6 +103,10 @@ int main(int argc, char **argv)
         if (data.empty())
             layoutError = "no player data folder (LOCALAPPDATA / HOME not set)";
         options.dataDir = data;
+        options.releaseId=release;
+        options.usePersistentBuilder=true;
+        options.reuseGenerated=true;
+        options.forceGenerate=args.rebuild;
         game = options.effectiveBuildDir() / (kWindows ? "dw5xl.exe" : "dw5xl");
         stamp = options.effectiveBuildDir() / "built-from.txt";
     }
@@ -122,24 +129,11 @@ int main(int argc, char **argv)
         return 0;
 #endif
     };
-    const auto markBuilt = [&] { std::ofstream(stamp) << release << "\n"; };
-    if (!release.empty() && layoutError.empty() && !args.rebuild && !args.noWindow && fs::exists(game) &&
-        firstLine(stamp) == release && installed())
-        return startGame(); // built for this release: play
-
-#ifndef _WIN32
-    if (!release.empty() && layoutError.empty())
-    {
-        fs::path cached;
-        if (prepareLinuxBuildRoot(root, data, cached, layoutError) &&
-            findLayout(cached, false, layout, layoutError))
-        {
-            options.root = cached;
-            options.recompiler = layout.recompiler;
-            options.tools = layout.tools;
-        }
-    }
-#endif
+    std::string readyError;
+    const bool ready=!release.empty() && layoutError.empty() && !args.rebuild &&
+        fs::exists(game) && installed() && buildReady(root,options.effectiveBuildDir(),release,readyError);
+    if(args.checkReady) {std::printf("%s\n",ready?"ready":"setup required");return ready?0:3;}
+    if(ready && !args.noWindow) return startGame();
 
     if (args.noWindow)
     {
@@ -156,8 +150,6 @@ int main(int argc, char **argv)
         options.xlIso = args.xlIso;
         options.dw5Iso = args.dw5Iso;
         const int rc = runWizardConsole(options);
-        if (rc == 0 && !release.empty())
-            markBuilt();
         return rc;
     }
     WizardConfig config{options, layoutError, args.xlIso, args.dw5Iso};
@@ -169,7 +161,6 @@ int main(int argc, char **argv)
     }
     if (runWizardWindow(config) && !release.empty())
     {
-        markBuilt();
         return startGame();
     }
     return 0;

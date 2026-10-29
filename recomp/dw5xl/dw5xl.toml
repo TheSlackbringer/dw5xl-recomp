@@ -13,6 +13,8 @@ output = "recomp/dw5xl/output/"
 
 # Single file output mode (recommended for large games)
 single_file_output = false
+# Preserve native unity groups while avoiding one on-disk file per function.
+output_file_batch_size = 64
 
 # Patch policy (instruction-driven handling is preferred for syscalls)
 patch_syscalls = false
