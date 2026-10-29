@@ -2,6 +2,7 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <fstream>
 #include <mutex>
 #include <thread>
@@ -20,6 +21,9 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __linux__
+#include "linux_process_supervisor.h"
+#endif
 extern char **environ;
 #endif
 
@@ -192,6 +196,120 @@ ProcessResult runProcess(const std::filesystem::path &program, const std::vector
         argv.push_back(arg.data());
     argv.push_back(nullptr);
 
+#ifdef __linux__
+    if (cancel && *cancel) { result.cancelled = true; return result; }
+    // Resolve PATH candidates before fork; the supervisor never allocates or
+    // takes locks inherited from another thread of the graphical launcher.
+    std::vector<std::string> paths;
+    if (owned[0].find('/') != std::string::npos) paths.push_back(owned[0]);
+    else
+    {
+        const char *value = std::getenv("PATH");
+        const std::string path = value ? value : "/bin:/usr/bin";
+        size_t begin = 0;
+        do
+        {
+            const size_t end = path.find(':', begin);
+            const auto folder = path.substr(begin, end == std::string::npos ? end : end - begin);
+            paths.push_back(folder.empty() ? owned[0] : folder + "/" + owned[0]);
+            if (end == std::string::npos) break;
+            begin = end + 1;
+        } while (true);
+    }
+    std::vector<const char *> programs;
+    for (const auto &path : paths) programs.push_back(path.c_str());
+    const char *cwd = workingDirectory.empty() ? nullptr : workingDirectory.c_str();
+    // Keep temporary descriptors out of stdio and serialize their preparation
+    // with fork, so concurrent launches cannot inherit another launch as stdin.
+    static std::mutex descriptorMutex;
+    std::unique_lock descriptorLock(descriptorMutex);
+    const int input = fcntl(STDIN_FILENO, F_DUPFD_CLOEXEC, 5);
+    if (input < 0 && errno != EBADF)
+    { result.error = "cannot preserve process input (error " + std::to_string(errno) + ")"; return result; }
+    const int opened = open(logFile.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (opened < 0)
+    {
+        result.error = "cannot open the log (error " + std::to_string(errno) + ")";
+        if (input >= 0) close(input);
+        return result;
+    }
+    const int log = fcntl(opened, F_DUPFD_CLOEXEC, 5);
+    close(opened);
+    int channels[2];
+    if (log < 0 || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, channels) < 0)
+    {
+        const int error = errno;
+        if (log >= 0) close(log);
+        if (input >= 0) close(input);
+        result.error = "cannot create process ownership channel (error " + std::to_string(error) + ")";
+        return result;
+    }
+    const int parentChannel = fcntl(channels[0], F_DUPFD_CLOEXEC, 5);
+    const int childChannel = parentChannel < 0 ? -1 : fcntl(channels[1], F_DUPFD_CLOEXEC, 5);
+    close(channels[0]); close(channels[1]);
+    struct rlimit limit{};
+    if (childChannel < 0 || getrlimit(RLIMIT_NOFILE, &limit) < 0)
+    {
+        const int error = errno;
+        close(log); if (parentChannel >= 0) close(parentChannel); if (childChannel >= 0) close(childChannel);
+        if (input >= 0) close(input);
+        result.error = "cannot prepare process ownership (error " + std::to_string(error) + ")";
+        return result;
+    }
+    const int maxFd = limit.rlim_cur > INT_MAX ? INT_MAX : int(limit.rlim_cur);
+    const pid_t pid = fork();
+    if (pid == 0)
+        linux_process::supervise(childChannel, log, input, maxFd, cwd, argv.data(), environ,
+                                 programs.data(), programs.size());
+    const int forkError = errno;
+    close(childChannel); close(log); if (input >= 0) close(input);
+    descriptorLock.unlock();
+    if (pid < 0)
+    {
+        close(parentChannel);
+        result.error = "cannot start process supervisor (error " + std::to_string(forkError) + ")";
+        return result;
+    }
+    bool finished = false;
+    while (!finished)
+    {
+        if (cancel && *cancel && !result.cancelled)
+        {
+            result.cancelled = true;
+            if (!linux_process::sendMessage(parentChannel, {linux_process::Message::Finished, 0, 0}))
+                result.error = "cannot request process-tree cancellation (error " + std::to_string(errno) + ")";
+        }
+        struct pollfd event{parentChannel, POLLIN, 0};
+        const int ready = poll(&event, 1, cancel ? 100 : -1);
+        if (ready < 0)
+        {
+            if (errno == EINTR) continue;
+            result.error = "cannot observe process supervisor (error " + std::to_string(errno) + ")";
+            break;
+        }
+        if (!ready) continue;
+        linux_process::Message message{};
+        const auto received = recv(parentChannel, &message, sizeof(message), 0);
+        if (received != sizeof(message))
+        {
+            result.error = "process supervisor ended without a completion record";
+            break;
+        }
+        if (message.kind == linux_process::Message::Started) result.started = true;
+        else
+        {
+            result.exitCode = message.code;
+            if (message.error) result.error = "process supervisor error " + std::to_string(message.error);
+            finished = true;
+        }
+    }
+    close(parentChannel); // also requests cleanup if observing the child failed
+    int status = 0;
+    pid_t done;
+    do { done = waitpid(pid, &status, 0); } while (done < 0 && errno == EINTR);
+    if (done < 0) result.error = "cannot reap process supervisor (error " + std::to_string(errno) + ")";
+    return result;
+#else
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, logFile.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -234,6 +352,7 @@ ProcessResult runProcess(const std::filesystem::path &program, const std::vector
     }
     result.exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
     return result;
+#endif
 }
 
 bool launchDetached(const std::filesystem::path &program, const std::vector<std::string> &args,

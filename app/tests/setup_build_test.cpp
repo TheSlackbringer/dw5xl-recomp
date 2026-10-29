@@ -8,10 +8,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <condition_variable>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <mutex>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -20,6 +22,8 @@
 #include <unistd.h>
 #include <signal.h>
 #include <cerrno>
+#include <sys/wait.h>
+#include <fcntl.h>
 #endif
 
 using namespace dw5xl::setup;
@@ -164,6 +168,17 @@ void cancelTest(const char *self)
 
 int main(int argc, char **argv)
 {
+    if(argc==2 && std::string(argv[1])=="--exit-seven") return 7;
+#ifdef __linux__
+    if(argc==2 && std::string(argv[1])=="--check-closed-input")
+        return fcntl(STDIN_FILENO,F_GETFD)<0 && errno==EBADF ? 0 : 6;
+    if(argc==2 && std::string(argv[1])=="--closed-input-owner")
+    {
+        close(STDIN_FILENO);
+        const auto r=runProcess(fs::absolute(argv[0]),{"--check-closed-input"},fs::current_path(),"input.log");
+        return r.started && r.exitCode==0 && r.error.empty() ? 0 : 6;
+    }
+#endif
     if(argc==2 && std::string(argv[1])=="--leaf")
     {
 #ifdef _WIN32
@@ -176,6 +191,24 @@ int main(int argc, char **argv)
     }
     if(argc==3 && std::string(argv[1])=="--tree")
         return runProcess(fs::absolute(argv[0]),{"--leaf"},fs::current_path(),fs::path(argv[2])/"tree.log").exitCode;
+    if(argc==3 && std::string(argv[1])=="--observed-tree")
+        return runProcessObserved(fs::absolute(argv[0]),{"--tree",argv[2]},fs::current_path(),
+            fs::path(argv[2])/"tree.log",[](const std::string &) {return true;}).exitCode;
+#ifdef __linux__
+    if(argc==2 && std::string(argv[1])=="--escaped-tree")
+    {
+        const pid_t leaf=fork();
+        if(leaf<0) return 3;
+        if(leaf==0)
+        {
+            if(setsid()<0) _exit(4);
+            std::cout<<"leaf "<<getpid()<<'\n'<<std::flush;
+            std::this_thread::sleep_for(std::chrono::seconds(30));_exit(0);
+        }
+        int status=0;
+        return waitpid(leaf,&status,0)==leaf ? 0 : 5;
+    }
+#endif
     // Child mode for cancelTest: sleep and exit, never test (and so never start another child).
     if (const char *child = std::getenv("DW5XL_SLEEP_CHILD"); child && *child == '1')
     {
@@ -271,6 +304,63 @@ int main(int argc, char **argv)
 #endif
             fs::remove_all(dir);
         }
+#ifdef __linux__
+        { // Independent concurrent launches must not share cancellation ownership.
+            const auto dir=fs::temp_directory_path()/"dw5xl_setup_independent_tree_test";
+            fs::remove_all(dir);fs::create_directories(dir);
+            std::atomic<bool> stop{false},finished{false};
+            std::mutex readyMutex;std::condition_variable ready;pid_t sentinel=0;
+            ProcessResult survivor;
+            std::thread independent([&] {
+                survivor=runProcessObserved(fs::absolute(argv[0]),{"--leaf"},dir,dir/"independent.log",
+                    [&](const std::string &line) {
+                        if(line.rfind("leaf ",0)==0) {
+                            {std::lock_guard lock(readyMutex);sentinel=pid_t(std::stoul(line.substr(5)));}
+                            ready.notify_one();
+                        }
+                        return true;
+                    },&stop);
+                finished=true;
+            });
+            try
+            {
+                {std::unique_lock lock(readyMutex);
+                 require(ready.wait_for(lock,std::chrono::seconds(2),[&] {return sentinel!=0;}),
+                         "independent process starts within two seconds");}
+                for(const auto &mode : {std::string("--observed-tree"),std::string("--escaped-tree")})
+                {
+                    unsigned long leaf=0;
+                    const auto start=std::chrono::steady_clock::now();
+                    std::vector<std::string> args{mode};
+                    if(mode=="--observed-tree") args.push_back(dir.string());
+                    const auto r=runProcessObserved(fs::absolute(argv[0]),args,dir,dir/"tree.log",
+                        [&](const std::string &line) {
+                            if(line.rfind("leaf ",0)!=0) return true;
+                            leaf=std::stoul(line.substr(5));return false;
+                        });
+                    require(r.started && r.cancelled && r.error.empty() && leaf,
+                            "nested observer or new-session descendant is observed and cancelled");
+                    require(std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()<2,
+                            "nested/new-session cancellation retains the two-second bound");
+                    require(kill(pid_t(leaf),0)<0 && errno==ESRCH,"owned escaped descendant is reaped");
+                    require(!finished && kill(sentinel,0)==0,"independent concurrent process survives cancellation");
+                }
+            }
+            catch(...) {stop=true;independent.join();throw;}
+            stop=true;independent.join();
+            require(survivor.started && survivor.cancelled && survivor.error.empty(),
+                    "independent process can be cancelled separately");
+            const auto input=runProcess(fs::absolute(argv[0]),{"--closed-input-owner"},dir,dir/"input-owner.log");
+            require(input.started && input.exitCode==0 && input.error.empty(),
+                    "closed stdin is not replaced by an inherited ownership socket");
+            const auto nonzero=runProcess(fs::absolute(argv[0]),{"--exit-seven"},dir,dir/"exit.log");
+            require(nonzero.started && nonzero.exitCode==7 && nonzero.error.empty(),
+                    "supervision preserves the actual command exit code");
+            const auto missing=runProcess(dir/"absent-program",{},dir,dir/"missing.log");
+            require(!missing.started && !missing.error.empty(),"exec failure is not reported as a started command");
+            fs::remove_all(dir);
+        }
+#endif
         std::cout << "setup build tests passed\n";
         return 0;
     }
