@@ -8,10 +8,23 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <condition_variable>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <mutex>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <unistd.h>
+#include <signal.h>
+#include <cerrno>
+#include <sys/wait.h>
+#include <fcntl.h>
+#endif
 
 using namespace dw5xl::setup;
 namespace fs = std::filesystem;
@@ -121,6 +134,7 @@ void linuxUpdateTests()
     require(prepareLinuxBuildRoot(moved, data, selected, error), "update from a different AppImage mount");
     require(selected == data / "builder" && fs::last_write_time(selected / "app" / "file") == old,
             "unchanged sources keep their path and timestamp across releases");
+    require(prepareBuildRoot(moved,data,selected,error),"the same stable source cache is used on Windows");
     require(!fs::exists(selected / "app" / "stale") && fs::file_size(selected / "external" / "file") == 7,
             "removed sources disappear and changed files update");
 #ifndef _WIN32
@@ -154,6 +168,47 @@ void cancelTest(const char *self)
 
 int main(int argc, char **argv)
 {
+    if(argc==2 && std::string(argv[1])=="--exit-seven") return 7;
+#ifdef __linux__
+    if(argc==2 && std::string(argv[1])=="--check-closed-input")
+        return fcntl(STDIN_FILENO,F_GETFD)<0 && errno==EBADF ? 0 : 6;
+    if(argc==2 && std::string(argv[1])=="--closed-input-owner")
+    {
+        close(STDIN_FILENO);
+        const auto r=runProcess(fs::absolute(argv[0]),{"--check-closed-input"},fs::current_path(),"input.log");
+        return r.started && r.exitCode==0 && r.error.empty() ? 0 : 6;
+    }
+#endif
+    if(argc==2 && std::string(argv[1])=="--leaf")
+    {
+#ifdef _WIN32
+        const auto pid=GetCurrentProcessId();
+#else
+        const auto pid=getpid();
+#endif
+        std::cout<<"leaf "<<pid<<'\n'<<std::flush;
+        std::this_thread::sleep_for(std::chrono::seconds(30));return 0;
+    }
+    if(argc==3 && std::string(argv[1])=="--tree")
+        return runProcess(fs::absolute(argv[0]),{"--leaf"},fs::current_path(),fs::path(argv[2])/"tree.log").exitCode;
+    if(argc==3 && std::string(argv[1])=="--observed-tree")
+        return runProcessObserved(fs::absolute(argv[0]),{"--tree",argv[2]},fs::current_path(),
+            fs::path(argv[2])/"tree.log",[](const std::string &) {return true;}).exitCode;
+#ifdef __linux__
+    if(argc==2 && std::string(argv[1])=="--escaped-tree")
+    {
+        const pid_t leaf=fork();
+        if(leaf<0) return 3;
+        if(leaf==0)
+        {
+            if(setsid()<0) _exit(4);
+            std::cout<<"leaf "<<getpid()<<'\n'<<std::flush;
+            std::this_thread::sleep_for(std::chrono::seconds(30));_exit(0);
+        }
+        int status=0;
+        return waitpid(leaf,&status,0)==leaf ? 0 : 5;
+    }
+#endif
     // Child mode for cancelTest: sleep and exit, never test (and so never start another child).
     if (const char *child = std::getenv("DW5XL_SLEEP_CHILD"); child && *child == '1')
     {
@@ -166,6 +221,10 @@ int main(int argc, char **argv)
         require(none.done == 0 && none.total == 0, "no progress before Ninja runs");
         const BuildProgress p = parseNinjaProgress("[1/9] Building a\n[7/43210] Building CXX object x.o\n");
         require(p.done == 7 && p.total == 43210, "last [done/total] wins");
+        require(parseNinjaProgress("[9/10] Linking CXX executable game").phase=="link",
+                "linking has distinct activity without inventing a separate percentage");
+        const auto bad=parseNinjaProgress("[9999999999999999999999/9] partial [8/2] [1/");
+        require(bad.done==0 && bad.total==0,"malformed, overflowing and impossible counters are ignored");
 
         BuildTools windows;
         windows.cmake = "C:/DW5XL/tools/cmake/bin/cmake.exe";
@@ -215,6 +274,140 @@ int main(int argc, char **argv)
         layoutTests();
         linuxUpdateTests();
         cancelTest(argc > 0 ? argv[0] : "");
+        { // 042: cancel only after the real grandchild has started, then verify it terminated.
+            const auto dir=fs::temp_directory_path()/"dw5xl_setup_tree_test";
+            fs::remove_all(dir);fs::create_directories(dir);unsigned long leaf=0;
+#ifdef _WIN32
+            HANDLE process=nullptr;
+#endif
+            const auto begin=std::chrono::steady_clock::now();
+            const auto result=runProcessObserved(fs::absolute(argv[0]),{"--tree",dir.string()},dir,dir/"tree.log",
+                [&](const std::string &line) {
+                    if(line.rfind("leaf ",0)!=0) return true;
+                    leaf=std::stoul(line.substr(5));
+#ifdef _WIN32
+                    process=OpenProcess(SYNCHRONIZE,FALSE,DWORD(leaf));
+#endif
+                    return false;
+                });
+            require(result.started && result.cancelled && leaf,"running grandchild observed before cancellation");
+            require(std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count()<2,
+                    "actual child/tree cancellation completes within two seconds");
+#ifdef _WIN32
+            require(process && WaitForSingleObject(process,0)==WAIT_OBJECT_0,"grandchild is terminated");
+            CloseHandle(process);
+#else
+            const bool absent=kill(pid_t(leaf),0)==-1 && errno==ESRCH;
+            std::ifstream state("/proc/"+std::to_string(leaf)+"/stat");std::string stat;std::getline(state,stat);
+            const bool zombie=stat.find(") Z ")!=std::string::npos;
+            require(absent || zombie,"grandchild stopped executing");
+#endif
+            fs::remove_all(dir);
+        }
+#ifdef __linux__
+        { // Independent concurrent launches must not share cancellation ownership.
+            const auto dir=fs::temp_directory_path()/"dw5xl_setup_independent_tree_test";
+            fs::remove_all(dir);fs::create_directories(dir);
+            std::atomic<bool> stop{false},finished{false};
+            std::mutex readyMutex;std::condition_variable ready;pid_t sentinel=0;
+            ProcessResult survivor;
+            std::thread independent([&] {
+                survivor=runProcessObserved(fs::absolute(argv[0]),{"--leaf"},dir,dir/"independent.log",
+                    [&](const std::string &line) {
+                        if(line.rfind("leaf ",0)==0) {
+                            {std::lock_guard lock(readyMutex);sentinel=pid_t(std::stoul(line.substr(5)));}
+                            ready.notify_one();
+                        }
+                        return true;
+                    },&stop);
+                finished=true;
+            });
+            try
+            {
+                {std::unique_lock lock(readyMutex);
+                 require(ready.wait_for(lock,std::chrono::seconds(2),[&] {return sentinel!=0;}),
+                         "independent process starts within two seconds");}
+                for(const auto &mode : {std::string("--observed-tree"),std::string("--escaped-tree")})
+                {
+                    unsigned long leaf=0;
+                    const auto start=std::chrono::steady_clock::now();
+                    std::vector<std::string> args{mode};
+                    if(mode=="--observed-tree") args.push_back(dir.string());
+                    const auto r=runProcessObserved(fs::absolute(argv[0]),args,dir,dir/"tree.log",
+                        [&](const std::string &line) {
+                            if(line.rfind("leaf ",0)!=0) return true;
+                            leaf=std::stoul(line.substr(5));return false;
+                        });
+                    require(r.started && r.cancelled && r.error.empty() && leaf,
+                            "nested observer or new-session descendant is observed and cancelled");
+                    require(std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()<2,
+                            "nested/new-session cancellation retains the two-second bound");
+                    require(kill(pid_t(leaf),0)<0 && errno==ESRCH,"owned escaped descendant is reaped");
+                    require(!finished && kill(sentinel,0)==0,"independent concurrent process survives cancellation");
+                }
+            }
+            catch(...) {stop=true;independent.join();throw;}
+            stop=true;independent.join();
+            require(survivor.started && survivor.cancelled && survivor.error.empty(),
+                    "independent process can be cancelled separately");
+            const auto input=runProcess(fs::absolute(argv[0]),{"--closed-input-owner"},dir,dir/"input-owner.log");
+            require(input.started && input.exitCode==0 && input.error.empty(),
+                    "closed stdin is not replaced by an inherited ownership socket");
+            const auto nonzero=runProcess(fs::absolute(argv[0]),{"--exit-seven"},dir,dir/"exit.log");
+            require(nonzero.started && nonzero.exitCode==7 && nonzero.error.empty(),
+                    "supervision preserves the actual command exit code");
+            const auto missing=runProcess(dir/"absent-program",{},dir,dir/"missing.log");
+            require(!missing.started && !missing.error.empty(),"exec failure is not reported as a started command");
+            fs::remove_all(dir);
+        }
+#endif
+#ifdef _WIN32
+        { // Cancelling one owned tree must complete without stopping an independent launch.
+            const auto dir=fs::temp_directory_path()/"dw5xl_setup_windows_independent_test";
+            fs::remove_all(dir);fs::create_directories(dir);
+            std::atomic<bool> stop{false},finished{false};
+            std::mutex readyMutex;std::condition_variable ready;HANDLE sentinel=nullptr;
+            ProcessResult survivor;
+            std::thread independent([&] {
+                survivor=runProcessObserved(fs::absolute(argv[0]),{"--leaf"},dir,dir/"independent.log",
+                    [&](const std::string &line) {
+                        if(line.rfind("leaf ",0)==0) {
+                            HANDLE child=OpenProcess(SYNCHRONIZE,FALSE,DWORD(std::stoul(line.substr(5))));
+                            {std::lock_guard lock(readyMutex);sentinel=child;}
+                            ready.notify_one();
+                        }
+                        return true;
+                    },&stop);
+                finished=true;
+            });
+            try
+            {
+                {std::unique_lock lock(readyMutex);
+                 require(ready.wait_for(lock,std::chrono::seconds(2),[&] {return sentinel!=nullptr;}),
+                         "independent Windows process starts within two seconds");}
+                HANDLE leaf=nullptr;
+                const auto start=std::chrono::steady_clock::now();
+                const auto result=runProcessObserved(fs::absolute(argv[0]),{"--tree",dir.string()},dir,dir/"tree.log",
+                    [&](const std::string &line) {
+                        if(line.rfind("leaf ",0)!=0) return true;
+                        leaf=OpenProcess(SYNCHRONIZE,FALSE,DWORD(std::stoul(line.substr(5))));return false;
+                    });
+                const bool terminated=leaf && WaitForSingleObject(leaf,0)==WAIT_OBJECT_0;
+                if(leaf) CloseHandle(leaf);
+                require(result.started && result.cancelled && result.error.empty(),"owned Windows tree cancellation succeeds");
+                require(std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()<2,
+                        "independent-tree cancellation retains the two-second bound");
+                require(terminated,"nested Windows descendant is terminated before return");
+                require(!finished && WaitForSingleObject(sentinel,0)==WAIT_TIMEOUT,
+                        "independent Windows process survives other tree cancellation");
+            }
+            catch(...) {stop=true;independent.join();if(sentinel) CloseHandle(sentinel);throw;}
+            stop=true;independent.join();
+            require(survivor.started && survivor.cancelled && survivor.error.empty() &&
+                        WaitForSingleObject(sentinel,0)==WAIT_OBJECT_0,"independent Windows process can be cancelled separately");
+            CloseHandle(sentinel);fs::remove_all(dir);
+        }
+#endif
         std::cout << "setup build tests passed\n";
         return 0;
     }

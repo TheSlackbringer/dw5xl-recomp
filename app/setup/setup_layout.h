@@ -27,5 +27,8 @@ bool findLayout(const std::filesystem::path &root, bool windows, SetupLayout &la
 // path, preserving identical files so updates can reuse compiler output.
 bool prepareLinuxBuildRoot(const std::filesystem::path &root, const std::filesystem::path &data,
                            std::filesystem::path &buildRoot, std::string &error);
+bool prepareBuildRoot(const std::filesystem::path &root, const std::filesystem::path &data,
+                      std::filesystem::path &buildRoot, std::string &error,
+                      const std::function<bool(uint64_t,uint64_t)> &progress = {});
 
 } // namespace dw5xl::setup

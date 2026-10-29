@@ -45,6 +45,7 @@ cmake -S /src/app -B /src/app/build-linux-builder "${common[@]}" \
     > /sdk/configure.log 2>&1
 cmake --build /src/app/build-linux-builder --target dw5xl_setup dw5xl_setup_disc_test \
     dw5xl_setup_build_test dw5xl_setup_codegen_test dw5xl_setup_pipeline_test dw5xl_setup_install_test \
+    dw5xl_setup_cache_test dw5xl_setup_sync_test dw5xl_setup_timing_test dw5xl_setup_vu_layout_test \
     > /sdk/build.log 2>&1
 ctest --test-dir /src/app/build-linux-builder -R "^setup_" --no-tests=error --output-on-failure > /sdk/setup-tests.log 2>&1
 cmake -S /src/external/PS2Recomp -B /src/build-recomp-linux-builder "${common[@]}" \

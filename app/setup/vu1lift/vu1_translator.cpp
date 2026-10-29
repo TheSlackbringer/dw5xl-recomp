@@ -1843,9 +1843,40 @@ struct Vu0Target
 };
 } // namespace
 
+std::map<std::string,std::string> partitionVu1Sources(const std::string &prologue,
+    const std::vector<std::pair<std::string,std::string>> &segments,const std::vector<std::string> &ownerData,
+    const std::string &registration,size_t maxUnitBytes)
+{
+    if(!maxUnitBytes || segments.empty()) throw std::runtime_error("invalid VU1 partition input");
+    std::map<std::string,std::string> files;
+    std::string owner=prologue,unit;size_t index=0;
+    std::string inventory="dw5xl-vu1-sources-1\ndw5xl_vu1_lifted.cpp\n";
+    const auto flush=[&] {
+        if(unit.empty()) return;
+        const std::string name=F("dw5xl_vu1_unit_%03zu.cpp",index++);
+        files.emplace(name,prologue+"\n\n"+unit);inventory+=name+"\n";unit.clear();
+    };
+    std::set<std::string> names;
+    for(const auto &[name,body]:segments)
+    {
+        if(!names.insert(name).second) throw std::runtime_error("duplicate VU1 segment");
+        owner+="\nvoid "+name+"(vl::Run &c);\n";
+        if(!unit.empty() && unit.size()+2+body.size()>maxUnitBytes) flush();
+        if(!unit.empty()) unit+="\n\n";
+        unit+=body;
+    }
+    flush();
+    for(const auto &data:ownerData) owner+="\n\n"+data;
+    owner+="\n\n"+registration;
+    files.emplace("dw5xl_vu1_lifted.cpp",std::move(owner));
+    files.emplace("dw5xl_vu1_sources.txt",std::move(inventory));
+    return files;
+}
+
 bool generateLiftedVu1(const std::filesystem::path &elf, std::string &text, std::string &error,
                        const std::function<void(const std::string &)> &log,
-                       const std::function<bool(const std::string &)> &staticTiming)
+                       const std::function<bool(const std::string &)> &staticTiming,
+                       std::map<std::string,std::string> *sources)
 {
     try
     {
@@ -1854,7 +1885,8 @@ bool generateLiftedVu1(const std::filesystem::path &elf, std::string &text, std:
                 log(line);
         };
         const DiscBins disc = loadDiscBins(elf);
-        std::vector<std::string> out{kPrologue};
+        std::vector<std::string> out{kPrologue},ownerData;
+        std::vector<std::pair<std::string,std::string>> segments;
         std::vector<std::string> regs{"    // Preserved observed full-image registrations (metadata only):"};
         for (const ImageRegistration &r : kImageRegistrations)
             regs.push_back(F("    { 0x%016llxull, 0x%04x, ", (unsigned long long)r.hash, r.pc) + r.name + ", 0u },");
@@ -1892,7 +1924,8 @@ bool generateLiftedVu1(const std::filesystem::path &elf, std::string &text, std:
             }
             if (!missing.empty())
                 fail(std::string("Unextracted reachable instructions in ") + t.name + ": [" + missing + "]");
-            out.push_back(translateSegment(code, t.pc, t.name, !staticTiming || staticTiming(t.name)));
+            auto body=translateSegment(code,t.pc,t.name,!staticTiming || staticTiming(t.name));
+            segments.emplace_back(t.name,body);out.push_back(std::move(body));
             const std::string startField = subStart != t.pc ? F(", 0x%04xu", subStart) : std::string();
             regs.push_back(F("    { 0x%016llxull, 0x%04x, ", (unsigned long long)subHash, t.pc) + t.name +
                            F(", %zuu", subSize) + startField + " },");
@@ -1919,16 +1952,18 @@ bool generateLiftedVu1(const std::filesystem::path &elf, std::string &text, std:
                 }
                 const uint64_t runHash = fnv1a64(joined.data(), joined.size());
                 out.push_back(std::string("static const uint32_t kRuns_") + t.name + "[] = { " + list + " };");
+                ownerData.push_back(out.back());
                 regs.push_back(F("    { 0x%016llxull, 0x%04x, ", (unsigned long long)runHash, t.pc) + t.name +
                                ", 0u, ~0u, false, kRuns_" + t.name + F(", %zuu },", runs.size()));
             }
         }
-        out.push_back(kFlushFunctions);
+        out.push_back(kFlushFunctions);ownerData.push_back(kFlushFunctions);
         regs.push_back("    { 0x5344f2e1f3bd36fbull, 0x0220, lift_flush_0220, 16u },");
         regs.push_back("    { 0x5344f2e1f3bd36fbull, 0x0360, lift_flush_0360, 16u },");
         out.push_back("static const vl::Registration s_battle_registrations[] = {\n" + join(regs, "\n") + "\n};\n" +
                       "static vl::Registrar s_battle_registrar(s_battle_registrations, sizeof(s_battle_registrations) / "
                       "sizeof(s_battle_registrations[0]));\n");
+        if(sources) *sources=partitionVu1Sources(kPrologue,segments,ownerData,out.back());
         text = join(out, "\n\n");
         return true;
     }
@@ -1937,6 +1972,19 @@ bool generateLiftedVu1(const std::filesystem::path &elf, std::string &text, std:
         error = e.what();
         return false;
     }
+}
+
+std::vector<std::filesystem::path> inputFiles(const std::filesystem::path &elf,bool vu0)
+{
+    const Range *ranges=vu0?kVu0Ranges:kRanges;
+    const size_t count=vu0?std::size(kVu0Ranges):std::size(kRanges);
+    std::set<std::string> names;
+    for(size_t i=0;i<count;++i)
+        for(size_t j=0;j<ranges[i].chunkCount;++j)
+            if(ranges[i].chunks[j].source) names.insert(ranges[i].chunks[j].source);
+    std::vector<std::filesystem::path> files{elf};
+    for(const auto &name:names) files.push_back(elf.parent_path()/name);
+    return files;
 }
 
 // The VU0 microprograms (issue 025).

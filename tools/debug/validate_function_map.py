@@ -646,6 +646,17 @@ class Analysis:
         else:self.error('GENERATION_UNVERIFIED','Generation correspondence was not supplied')
         folder=a.generated_dir
         if not folder.is_dir():raise Invalid('GENERATED_READ','Generated directory missing')
+        batch_metadata={}
+        if (folder/'ps2_generated_index.json').exists() or (folder/'ps2_generated_sources.json').exists():
+            try:
+                try:from generated_sources import validate_batch_index,BatchError
+                except ImportError:from tools.debug.generated_sources import validate_batch_index,BatchError
+                index=validate_batch_index(folder,self.limits['generated_bytes'])
+                audit['batch_layout']=dict(batch_size=index['batch_size'],virtual_cpp_files=len(index['files']),
+                                          physical_cpp_files=len(index['batches']),checksums='validated FNV-1a; provenance remains SHA-256')
+                for name in ('ps2_generated_index.json','ps2_generated_sources.json'):
+                    blob=(folder/name).read_bytes();batch_metadata[name]=blob
+            except BatchError as error:raise Invalid('GENERATED_FORMAT',str(error))
         paths=[];count=0
         def walk_error(exc):raise Invalid('GENERATED_READ','Cannot enumerate generated inputs completely')
         for root,dirs,files in os.walk(folder,followlinks=False,onerror=walk_error):
@@ -660,6 +671,8 @@ class Analysis:
                 if path.suffix in ('.cpp','.h','.hpp'):paths.append(path)
         table={};functions={};exits=[];implicit_candidates=[];calls=collections.Counter();total=0;table_files=[]
         wanted={row.start for row,_,_,_ in self.slots}|self.entries
+        for name,blob in batch_metadata.items():
+            audit['files'][name]=sha(blob);total+=len(blob)
         # Only relevant function bodies are retained; all generated inputs are consumed once and hashed.
         for path in sorted(paths,key=lambda p:p.relative_to(folder).as_posix()):
             blob,text=text_snapshot(path,self.limits['generated_bytes']-total)

@@ -274,9 +274,11 @@ elseif(WIN32)
     # whose include directory does not exist at generate time.
     file(MAKE_DIRECTORY "${FFMPEG_INCLUDE_DIR}")
 
+    include("${CMAKE_CURRENT_LIST_DIR}/../cmake/LocalArchive.cmake")
+    ps2x_local_archive_options("${FFMPEG_PREBUILT_URL}" FFMPEG_ARCHIVE_OPTIONS)
     ExternalProject_Add(ffmpeg_external
         URL "${FFMPEG_PREBUILT_URL}"
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        ${FFMPEG_ARCHIVE_OPTIONS}
         PREFIX "${FFMPEG_PREFIX_DIR}"
         CONFIGURE_COMMAND ""
         BUILD_COMMAND ""

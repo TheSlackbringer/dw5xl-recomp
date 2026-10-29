@@ -4,6 +4,7 @@
 #include "code_generator.h"
 #include "config_manager.h"
 #include "recompiler_reporter.h"
+#include "stage_timing.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -34,6 +35,7 @@ namespace ps2recomp
         bool recompile();
         void generateOutput();
         void printReport() const;
+        void setTiming(timing::Session *session, uint64_t parent = 0) { m_timing = session; m_timingParent = parent; }
         const RecompilerReporter::Counters &reportCounters() const { return m_reporter.counters(); }
 
         static StubTarget resolveStubTarget(const std::string& name);
@@ -52,6 +54,8 @@ namespace ps2recomp
         static std::string ClampFilenameLength(const std::string& baseName, const std::string& extension, std::size_t maxLength);
 
     private:
+        timing::Session *m_timing = nullptr;
+        uint64_t m_timingParent = 0;
         ConfigManager m_configManager;
         std::unique_ptr<ElfParser> m_elfParser;
         std::unique_ptr<R5900Decoder> m_decoder;

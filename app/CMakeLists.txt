@@ -12,6 +12,9 @@ set(PS2RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../external/PS2Recomp")
 # release's launcher builds the game (issue 011 v5).
 set(DW5XL_RECOMP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../recomp" CACHE PATH "Folder holding the generated game code")
 set(DW5XL_GENERATED_DIR "${DW5XL_RECOMP_ROOT}/dw5xl/output")
+include(cmake/vu_sources.cmake)
+set(DW5XL_VU1_LIFTED_SRC "${DW5XL_RECOMP_ROOT}/dw5xl/vu1/dw5xl_vu1_lifted.cpp")
+dw5xl_vu_sources("${DW5XL_RECOMP_ROOT}/dw5xl/vu1" DW5XL_VU1_LIFTED_SOURCES)
 
 # Only the runtime (and the IOP module it needs) from PS2Recomp.
 set(PS2X_BUILD_RECOMP OFF CACHE BOOL "" FORCE)
@@ -43,12 +46,13 @@ endif()
 # no game data: the runtime, the tools and the tests below that use no generated code (CI, issue 011).
 option(DW5XL_BUILD_GAME "Build the game (needs locally generated code)" ON)
 if(DW5XL_BUILD_GAME) # --- game: generated main program, lifted VU1, overlays ---
-file(GLOB DW5XL_GENERATED_SOURCES CONFIGURE_DEPENDS "${DW5XL_GENERATED_DIR}/*.cpp")
+include(cmake/generated_sources.cmake)
+dw5xl_generated_sources(dw5xl "${DW5XL_GENERATED_DIR}"
+    "${PS2RECOMP_DIR}/ps2xRuntime/src/main.cpp;${PS2RECOMP_DIR}/ps2xRuntime/src/lib/ps2_debug_panel.cpp"
+    DW5XL_GENERATED_SOURCES DW5XL_BATCHED)
 
 add_executable(dw5xl
     ${DW5XL_GENERATED_SOURCES}
-    "${PS2RECOMP_DIR}/ps2xRuntime/src/main.cpp"
-    "${PS2RECOMP_DIR}/ps2xRuntime/src/lib/ps2_debug_panel.cpp"
     src/dw5xl_pad2.cpp
     src/dw5xl_images.cpp
     src/dw5xl_allocators.cpp
@@ -80,15 +84,18 @@ target_precompile_headers(dw5xl PRIVATE
 )
 # 42k small generated files: batch them so the compiler isn't started 42k times.
 set_target_properties(dw5xl PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
+if(DW5XL_BATCHED)
+    set_target_properties(dw5xl PROPERTIES UNITY_BUILD OFF)
+endif()
 set_source_files_properties(src/dw5xl_allocators.cpp src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp src/dw5xl_install.cpp src/dw5xl_pc_settings.cpp setup/wizard_console.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
 # Lifted VU1 microprograms are translated from the game's own microcode (dw5xl_vu1lift, run by the launcher or
 # tools/regen.sh) into the ignored recomp/dw5xl/vu1/ folder. Game-derived: never committed. Without it,
 # VU1 microcode runs in the interpreter.
 set(DW5XL_VU1_LIFTED_SRC "${DW5XL_RECOMP_ROOT}/dw5xl/vu1/dw5xl_vu1_lifted.cpp")
 if(EXISTS "${DW5XL_VU1_LIFTED_SRC}")
-    target_sources(dw5xl PRIVATE "${DW5XL_VU1_LIFTED_SRC}")
-    set_source_files_properties("${DW5XL_VU1_LIFTED_SRC}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
-    set_property(SOURCE "${DW5XL_VU1_LIFTED_SRC}" APPEND PROPERTY COMPILE_OPTIONS ${DW5XL_STRICT_FP_FLAGS})
+    target_sources(dw5xl PRIVATE ${DW5XL_VU1_LIFTED_SOURCES})
+    set_source_files_properties(${DW5XL_VU1_LIFTED_SOURCES} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
+    set_property(SOURCE ${DW5XL_VU1_LIFTED_SOURCES} APPEND PROPERTY COMPILE_OPTIONS ${DW5XL_STRICT_FP_FLAGS})
 else()
     message(STATUS "No lifted VU1 code (run tools/regen.sh); VU1 microcode will be interpreted")
 endif()
@@ -109,7 +116,7 @@ target_compile_options(dw5xl PRIVATE ${DW5XL_ARCH_FLAGS} ${DW5XL_STRICT_FP_FLAGS
 
 # Overlay headers/symbols are isolated from the base executable's generated code.
 set(DW5XL_OVL00_DIR "${DW5XL_RECOMP_ROOT}/dw5xl/overlays/ovl00/output")
-file(GLOB DW5XL_OVL00_SOURCES CONFIGURE_DEPENDS "${DW5XL_OVL00_DIR}/*.cpp")
+dw5xl_generated_sources(dw5xl_ovl00 "${DW5XL_OVL00_DIR}" "" DW5XL_OVL00_SOURCES DW5XL_OVL00_BATCHED)
 if(NOT DW5XL_OVL00_SOURCES)
     message(FATAL_ERROR "Missing generated OVL00 code; run tools/regen.sh ovl00")
 endif()
@@ -126,11 +133,14 @@ target_precompile_headers(dw5xl_ovl00 PRIVATE
     "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_stubs.h"
 )
 set_target_properties(dw5xl_ovl00 PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
+if(DW5XL_OVL00_BATCHED)
+    set_target_properties(dw5xl_ovl00 PROPERTIES UNITY_BUILD OFF)
+endif()
 target_link_libraries(dw5xl PRIVATE dw5xl_ovl00)
 
 # Overlay headers/symbols are isolated from the base executable's generated code.
 set(DW5XL_OVL01_DIR "${DW5XL_RECOMP_ROOT}/dw5xl/overlays/ovl01/output")
-file(GLOB DW5XL_OVL01_SOURCES CONFIGURE_DEPENDS "${DW5XL_OVL01_DIR}/*.cpp")
+dw5xl_generated_sources(dw5xl_ovl01 "${DW5XL_OVL01_DIR}" "" DW5XL_OVL01_SOURCES DW5XL_OVL01_BATCHED)
 if(NOT DW5XL_OVL01_SOURCES)
     message(FATAL_ERROR "Missing generated OVL01 code; run tools/regen.sh ovl01")
 endif()
@@ -147,10 +157,13 @@ target_precompile_headers(dw5xl_ovl01 PRIVATE
     "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_stubs.h"
 )
 set_target_properties(dw5xl_ovl01 PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
+if(DW5XL_OVL01_BATCHED)
+    set_target_properties(dw5xl_ovl01 PROPERTIES UNITY_BUILD OFF)
+endif()
 target_link_libraries(dw5xl PRIVATE dw5xl_ovl01)
 
 set(DW5XL_OVL02_DIR "${DW5XL_RECOMP_ROOT}/dw5xl/overlays/ovl02/output")
-file(GLOB DW5XL_OVL02_SOURCES CONFIGURE_DEPENDS "${DW5XL_OVL02_DIR}/*.cpp")
+dw5xl_generated_sources(dw5xl_ovl02 "${DW5XL_OVL02_DIR}" "" DW5XL_OVL02_SOURCES DW5XL_OVL02_BATCHED)
 if(NOT DW5XL_OVL02_SOURCES)
     message(FATAL_ERROR "Missing generated OVL02 code; run tools/regen.sh ovl02")
 endif()
@@ -167,13 +180,30 @@ target_precompile_headers(dw5xl_ovl02 PRIVATE
     "${PS2RECOMP_DIR}/ps2xRuntime/include/ps2_stubs.h"
 )
 set_target_properties(dw5xl_ovl02 PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
+if(DW5XL_OVL02_BATCHED)
+    set_target_properties(dw5xl_ovl02 PROPERTIES UNITY_BUILD OFF)
+endif()
 target_link_libraries(dw5xl PRIVATE dw5xl_ovl02)
 endif() # DW5XL_BUILD_GAME
 
 # Setup wizard core (issue 011): reads the player's disc image, checks and extracts it. Needs no game data.
 find_package(Threads REQUIRED)
+add_library(dw5xl_vu_generator OBJECT setup/vu1lift/vu1_timing.cpp setup/vu1lift/vu1_translator.cpp)
+target_link_libraries(dw5xl_vu_generator PRIVATE ffmpeg Threads::Threads)
+set(DW5XL_SETUP_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/setup-generated")
+file(GENERATE OUTPUT "${DW5XL_SETUP_GENERATED}/vu-objects-$<CONFIG>.txt"
+    CONTENT "$<JOIN:$<TARGET_OBJECTS:dw5xl_vu_generator>,\n>\n")
+add_custom_command(OUTPUT "${DW5XL_SETUP_GENERATED}/vu_producer.h"
+    COMMAND "${CMAKE_COMMAND}" "-DOBJECT_LIST=${DW5XL_SETUP_GENERATED}/vu-objects-$<CONFIG>.txt"
+        "-DOUT=${DW5XL_SETUP_GENERATED}/vu_producer.h" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vu_producer.cmake"
+    DEPENDS dw5xl_vu_generator $<TARGET_OBJECTS:dw5xl_vu_generator> "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vu_producer.cmake"
+    VERBATIM)
+add_custom_target(dw5xl_vu_identity DEPENDS "${DW5XL_SETUP_GENERATED}/vu_producer.h")
 add_library(dw5xl_setup_core STATIC setup/iso9660.cpp setup/disc_setup.cpp setup/run_process.cpp setup/codegen.cpp
-    setup/build_game.cpp setup/install_state.cpp setup/setup_layout.cpp setup/setup_pipeline.cpp setup/vu1lift/vu1_timing.cpp setup/vu1lift/vu1_translator.cpp)
+    setup/build_game.cpp setup/install_state.cpp setup/setup_layout.cpp setup/setup_pipeline.cpp setup/setup_cache.cpp
+    $<TARGET_OBJECTS:dw5xl_vu_generator>)
+add_dependencies(dw5xl_setup_core dw5xl_vu_identity)
+target_include_directories(dw5xl_setup_core PRIVATE "${DW5XL_SETUP_GENERATED}")
 target_include_directories(dw5xl_setup_core PUBLIC setup)
 target_link_libraries(dw5xl_setup_core PUBLIC ffmpeg Threads::Threads)
 # VU1/VU0 translator, the only one (issue 025 Step 6): dw5xl_vu1lift [--vu0] <SLES_538.60> <output.cpp>;
@@ -195,6 +225,20 @@ dw5xl_windows_target_options(dw5xl_setup)
 option(DW5XL_BUILD_TESTS "Build runtime and locally generated helper tests" OFF)
 if(DW5XL_BUILD_TESTS)
     enable_testing()
+    add_executable(dw5xl_setup_cache_test tests/setup_cache_test.cpp)
+    target_link_libraries(dw5xl_setup_cache_test PRIVATE dw5xl_setup_core)
+    add_test(NAME setup_cache COMMAND dw5xl_setup_cache_test)
+    add_executable(dw5xl_setup_sync_test tests/setup_sync_test.cpp)
+    target_link_libraries(dw5xl_setup_sync_test PRIVATE dw5xl_setup_core)
+    add_test(NAME setup_sync COMMAND dw5xl_setup_sync_test)
+    add_executable(dw5xl_setup_vu_layout_test tests/setup_vu_layout_test.cpp)
+    target_link_libraries(dw5xl_setup_vu_layout_test PRIVATE dw5xl_setup_core)
+    add_test(NAME setup_vu_layout COMMAND dw5xl_setup_vu_layout_test)
+    add_executable(dw5xl_setup_timing_test tests/setup_timing_test.cpp)
+    target_include_directories(dw5xl_setup_timing_test PRIVATE setup)
+    add_test(NAME setup_timing COMMAND dw5xl_setup_timing_test)
+    add_executable(dw5xl_setup_measure tests/setup_measure.cpp)
+    target_link_libraries(dw5xl_setup_measure PRIVATE dw5xl_setup_core)
     add_executable(dw5xl_setup_disc_test tests/setup_disc_test.cpp)
     target_link_libraries(dw5xl_setup_disc_test PRIVATE dw5xl_setup_core)
     add_test(NAME setup_disc COMMAND dw5xl_setup_disc_test)
@@ -294,15 +338,18 @@ if(DW5XL_BUILD_TESTS)
     target_compile_options(dw5xl_vu0_macro_test PRIVATE ${DW5XL_ARCH_FLAGS} ${DW5XL_STRICT_FP_FLAGS})
     add_test(NAME vu0_macro COMMAND dw5xl_vu0_macro_test)
     if(DW5XL_BUILD_GAME) # these two compile generated game functions
+    dw5xl_generated_function("${DW5XL_GENERATED_DIR}" "FUN_00144c70_0x144c70.cpp" DW5XL_POLL_SEMA_SOURCE)
+    dw5xl_generated_function("${DW5XL_GENERATED_DIR}" "FUN_00110c78_0x110c78.cpp" DW5XL_GS_HELPER_SOURCE)
+    dw5xl_generated_function("${DW5XL_GENERATED_DIR}" "FUN_001111d8_0x1111d8.cpp" DW5XL_GS_HELPER2_SOURCE)
     add_executable(dw5xl_ee_poll_sema_test tests/ee_poll_sema_test.cpp
-        "${DW5XL_GENERATED_DIR}/FUN_00144c70_0x144c70.cpp")
+        "${DW5XL_POLL_SEMA_SOURCE}")
     target_link_libraries(dw5xl_ee_poll_sema_test PRIVATE ps2_runtime)
     target_include_directories(dw5xl_ee_poll_sema_test PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
     target_compile_options(dw5xl_ee_poll_sema_test PRIVATE ${DW5XL_ARCH_FLAGS})
     add_test(NAME ee_poll_sema COMMAND dw5xl_ee_poll_sema_test)
     add_executable(dw5xl_original_gs_helper_test tests/original_gs_helper_test.cpp
-        "${DW5XL_GENERATED_DIR}/FUN_00110c78_0x110c78.cpp"
-        "${DW5XL_GENERATED_DIR}/FUN_001111d8_0x1111d8.cpp")
+        "${DW5XL_GS_HELPER_SOURCE}"
+        "${DW5XL_GS_HELPER2_SOURCE}")
     target_link_libraries(dw5xl_original_gs_helper_test PRIVATE ps2_runtime)
     target_include_directories(dw5xl_original_gs_helper_test PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
     target_compile_options(dw5xl_original_gs_helper_test PRIVATE ${DW5XL_ARCH_FLAGS})
@@ -394,7 +441,7 @@ if(DW5XL_BUILD_TESTS)
     endif()
 
     if(EXISTS "${DW5XL_VU1_LIFTED_SRC}")
-        add_executable(dw5xl_vu1_lift_test tests/vu1_lift_test.cpp "${DW5XL_VU1_LIFTED_SRC}")
+        add_executable(dw5xl_vu1_lift_test tests/vu1_lift_test.cpp ${DW5XL_VU1_LIFTED_SOURCES})
         target_link_libraries(dw5xl_vu1_lift_test PRIVATE ps2_runtime dw5xl_setup_core)
         target_include_directories(dw5xl_vu1_lift_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include"
             "${CMAKE_CURRENT_SOURCE_DIR}")

@@ -9,6 +9,9 @@
 // reachable run is matched greedily (longest prefix found) in the given files.
 #include "vu1_translator.h"
 #include "../sha256.h"
+#include "../codegen.h"
+#include "../setup_cache.h"
+#include "../stage_timing.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -136,6 +139,8 @@ int main(int argc, char **argv)
 {
     if (argc >= 2 && std::strcmp(argv[1], "--find-range") == 0)
         return findRange(argc, argv);
+    const bool sharded=argc==4 && std::strcmp(argv[1],"--sharded")==0;
+    if(sharded) {++argv;--argc;}
     const bool vu0 = argc == 4 && std::strcmp(argv[1], "--vu0") == 0;
     if (vu0)
     {
@@ -144,7 +149,7 @@ int main(int argc, char **argv)
     }
     if (argc != 3)
     {
-        std::fprintf(stderr, "usage: %s [--vu0] <SLES_538.60> <output.cpp>\n"
+        std::fprintf(stderr, "usage: %s [--vu0] <SLES_538.60> <output.cpp>\n       --sharded <SLES_538.60> <output-directory>\n"
                              "       %s --find-range <census image .bin> <entry pc> <name> [disc file ...]\n",
                      argv[0], argv[0]);
         return 2;
@@ -161,12 +166,24 @@ int main(int argc, char **argv)
         return false;
     };
     std::string text, error;
+    std::map<std::string,std::string> sources;
     const auto print = [](const std::string &line) { std::printf("%s\n", line.c_str()); };
     if (!(vu0 ? dw5xl::vu1lift::generateLiftedVu0(argv[1], text, error, print, staticTiming)
-              : dw5xl::vu1lift::generateLiftedVu1(argv[1], text, error, print, staticTiming)))
+              : dw5xl::vu1lift::generateLiftedVu1(argv[1], text, error, print, staticTiming,sharded?&sources:nullptr)))
     {
         std::fprintf(stderr, "dw5xl_vu1lift: %s\n", error.c_str());
         return 1;
+    }
+    if(sharded)
+    {
+        const std::filesystem::path output=argv[2];
+        const auto scratch=output.parent_path()/(".vu1-work-"+ps2recomp::timing::newRunId());
+        std::filesystem::create_directories(scratch);
+        for(const auto &[name,bytes]:sources)
+            if(!dw5xl::setup::atomicWrite(scratch/name,bytes,error)) {std::fprintf(stderr,"%s\n",error.c_str());return 1;}
+        if(!dw5xl::setup::syncDirectory(scratch,output,error)) {std::fprintf(stderr,"%s\n",error.c_str());return 1;}
+        std::filesystem::remove_all(scratch);
+        std::printf("Wrote %zu VU1 output files\n",sources.size());return 0;
     }
     std::ofstream out(argv[2], std::ios::binary);
     out << text;

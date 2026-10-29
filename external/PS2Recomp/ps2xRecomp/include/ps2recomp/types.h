@@ -196,6 +196,7 @@ namespace ps2recomp
         std::string outputPath;
         std::string ghidraMapPath;
         bool singleFileOutput = false;
+        uint32_t outputFileBatchSize = 0; // 0: legacy per-function files; bounded groups otherwise
         bool lowMemoryMode = false;
         uint32_t outputWorkerThreads = 0;
         bool patchSyscalls = false;

@@ -13,6 +13,13 @@ a real-map run. Synthetic tests are fast checks; real inputs never enter CI.
 
 ## Commands
 
+Generated batches (042) keep a complete virtual filename/body index. The audit validates both index manifests,
+ordered group counts, physical files, nonoverlapping ranges and integrity checksums, then scans every physical
+C++ body/table with the same instruction/target/coverage rules as per-function output. Generation provenance
+still uses SHA-256 and now includes the two batch metadata files. The index's FNV-1a checksums are integrity
+checks, not signatures. Missing/stale/corrupt index entries do not fall back to an unverified audit. Developer
+lookup helpers are in `generated_sources.py`; game-derived batches/indexes remain local.
+
 From the repository root, supply all three inputs explicitly:
 
 ```sh

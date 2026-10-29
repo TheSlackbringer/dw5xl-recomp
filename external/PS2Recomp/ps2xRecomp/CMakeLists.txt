@@ -116,6 +116,12 @@ file(GLOB_RECURSE PS2RECOMP_EXE_SOURCES CONFIGURE_DEPENDS
 )
 
 add_executable(ps2_recomp ${PS2RECOMP_EXE_SOURCES})
+# Full executable bytes identify generation semantics. A rebuild date is not a producer change.
+if(MINGW)
+    target_link_options(ps2_recomp PRIVATE -Wl,--no-insert-timestamp)
+elseif(MSVC)
+    target_link_options(ps2_recomp PRIVATE /Brepro)
+endif()
 # DW5XL (issue 011): UTF-8 process code page on Windows, so config and game paths with non-ASCII characters work.
 set(PS2RECOMP_UTF8_RC "${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/windows/utf8.rc")
 if(WIN32 AND EXISTS "${PS2RECOMP_UTF8_RC}")

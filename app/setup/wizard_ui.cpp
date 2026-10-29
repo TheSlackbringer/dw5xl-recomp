@@ -232,14 +232,11 @@ struct Wizard
             ImGui::TextUnformatted(stepName(st.step));
         char label[64];
         std::snprintf(label, sizeof(label), "%d %%", int(st.overall * 100.0));
-        ImGui::ProgressBar(float(st.overall), ImVec2(-1.0f, 28.0f), label);
+        ImGui::ProgressBar(st.finished?1.0f:std::min(float(st.overall),0.999999f), ImVec2(-1.0f, 28.0f), label);
         if (!st.detail.empty() && !st.finished)
             ImGui::TextDisabled("%s", st.detail.c_str());
-        if (st.running && st.overall > 0.15 && seconds > 30.0)
-        {
-            const int left = int(seconds * (1.0 - st.overall) / st.overall / 60.0 + 0.5);
-            ImGui::TextDisabled(left <= 1 ? "About a minute left" : "About %d minutes left", left);
-        }
+        if(st.running)
+            ImGui::TextDisabled("Elapsed: %d:%02d. Overall progress is an estimate.",int(st.elapsedSeconds)/60,int(st.elapsedSeconds)%60);
     }
 
     void frame()
@@ -454,7 +451,7 @@ bool DiscInstallPanel::draw()
     }
     if (busy)
     {
-        ImGui::ProgressBar(float(st.overall), ImVec2(-1.0f, 0.0f), st.detail.c_str());
+        ImGui::ProgressBar(st.finished?1.0f:std::min(float(st.overall),0.999999f), ImVec2(-1.0f, 0.0f), st.detail.c_str());
         if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f)))
             m->run->cancel();
         return false;

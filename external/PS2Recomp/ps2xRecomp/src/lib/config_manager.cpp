@@ -106,6 +106,10 @@ namespace ps2recomp
             config.ghidraMapPath = toml::find_or<std::string>(general, "ghidra_output", "");
             config.outputPath = toml::find<std::string>(general, "output");
             config.singleFileOutput = toml::find_or<bool>(general, "single_file_output", false);
+            const int64_t batchSize = toml::find_or<int64_t>(general, "output_file_batch_size", 0);
+            if (batchSize < 0 || batchSize > 4096 || (batchSize && config.singleFileOutput))
+                throw std::runtime_error("output_file_batch_size must be 0..4096 and cannot accompany single_file_output");
+            config.outputFileBatchSize = uint32_t(batchSize);
             config.lowMemoryMode = toml::find_or<bool>(general, "low_memory_mode", config.lowMemoryMode);
             const int64_t configuredOutputWorkers = toml::find_or<int64_t>(
                 general,
@@ -362,6 +366,7 @@ namespace ps2recomp
         general["ghidra_output"] = config.ghidraMapPath;
         general["output"] = config.outputPath;
         general["single_file_output"] = config.singleFileOutput;
+        general["output_file_batch_size"] = config.outputFileBatchSize;
         general["low_memory_mode"] = config.lowMemoryMode;
         general["output_worker_threads"] = static_cast<int64_t>(config.outputWorkerThreads);
         general["patch_syscalls"] = config.patchSyscalls;

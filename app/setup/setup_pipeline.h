@@ -13,6 +13,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <fstream>
+#include <memory>
+#include <chrono>
 
 namespace dw5xl::setup {
 
@@ -52,6 +55,10 @@ struct SetupOptions
     // With `xlIso` empty and the XL disc already installed in the data folder, Check + Extract are skipped (a new
     // release rebuilds without asking for the disc again).
     std::filesystem::path dataDir;
+    std::string releaseId; // nonempty: release completion belongs to this pipeline, under its lease
+    bool usePersistentBuilder=false;
+    bool reuseGenerated=false;
+    bool forceGenerate=false; // explicit --rebuild bypasses generation reuse
 
     std::filesystem::path effectiveDataDir() const { return dataDir.empty() ? root : dataDir; }
     std::filesystem::path effectiveBuildDir() const
@@ -72,6 +79,7 @@ struct SetupStatus
     std::vector<Step> plan; // the steps this run does (Check/Extract are skipped when the disc is installed, the
                             // build steps in install-only runs)
     std::string detail;    // what the step is doing ("LINKDATA.BIN", "ovl01", "512/1147")
+    double elapsedSeconds=0.0;
     bool running = false;
     bool finished = false; // success
     bool failed = false;
@@ -92,6 +100,8 @@ public:
     void log(const std::string &line);
     bool cancelled() const;
     const std::atomic<bool> *cancelFlag() const; // for tools that stop a running program
+    ps2recomp::timing::Session *timing() const;
+    uint64_t timingParent() const;
 
 private:
     SetupRun &m_run;
@@ -123,6 +133,7 @@ public:
 private:
     friend class StepContext;
     void run();
+    void runSteps();
     void enter(Step step);
     bool fail(const std::string &error);
 
@@ -132,6 +143,11 @@ private:
     mutable std::mutex m_mutex;
     SetupStatus m_status;
     std::thread m_thread;
+    std::ofstream m_timingFile;
+    std::unique_ptr<ps2recomp::timing::Session> m_timing;
+    uint64_t m_timingParent = 0;
+    std::chrono::steady_clock::time_point m_started;
+    bool m_completed=false;
 };
 
 } // namespace dw5xl::setup
