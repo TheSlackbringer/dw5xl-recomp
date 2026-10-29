@@ -121,7 +121,8 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
 - **Use the Ghidra MCP whenever you can** (`mcp__ghidra__*` tools: decompile, xrefs, strings, renames/comments)
   for reverse engineering; call `get_program_info` first. Headless only when the MCP is unreachable (GUI closed),
   for batch jobs, or for parallel agents — always on a copy (see Reference → Ghidra). If the needed program is not
-  the active tab, ask the user to switch it.
+  the active tab, use `ghidra-bethington` with `program=`; for another project, switch with its `open_project`
+  (Reference → Ghidra).
 - **Parallel agents** get self-contained briefs and do analysis/patch-writing in their own worktree or scratch dir
   (Ghidra on their own copy); one integrator builds and runs the game. Each worktree gets its own `app/build-<task>`.
 - **Never delete build dirs containing `_deps`;** no `rm` with bare shell variables (use `"${VAR:?}"`).
@@ -233,15 +234,28 @@ a VRAM snapshot; ~2 MB/tick in battle). `app/build/dw5xl_gsrender <rec> <cpu|vul
 `vendor/parallel-gs-patches/` (shader SPIR-V via `tools/parallel_gs_splice_shader.py`).
 
 ### Ghidra
-- Ghidra 12.1.2 at `/opt/ghidra`. EE language `r5900:LE:32:default` (ghidra-emotionengine-reloaded); IRX modules
-  `MIPS:LE:32:default`. GhidraMCP plugin serves the active CodeBrowser tab at `http://127.0.0.1:8080/` (bridge command
-  and wheel path in `notes/PROJECT_SETUP.md`). Call `get_program_info` first: the GUI may show another program.
+- Ghidra 12.1.4, official build (install path, extensions and MCP registration: `notes/PROJECT_SETUP.md`). EE language
+  `r5900:LE:32:default` (ghidra-emotionengine-reloaded); IRX modules `MIPS:LE:32:default`. GhidraMCP plugin serves the
+  active CodeBrowser tab at `http://127.0.0.1:8080/`. Call `get_program_info` first: the GUI may show another program.
 - **MCP (interactive, fastest for many small lookups):** Ghidra GUI → File → Open Project `ghidra/dw5xl.gpr` →
   double-click the program (SLES_538.60, OVL_00.BIN, LIBSD.IRX …) → CodeBrowser with GhidraMCP serves
   `http://127.0.0.1:8080/`. Tools: get_program_info (FIRST), decompile_function_by_address, disassemble_function,
   get_function_by_address, get_xrefs_to/from, get_function_calls, list_functions/strings/segments,
   rename_function_by_address, set_*_comment. Limits: hardware registers (0x10000000+, 0x12000000+) and scratchpad
   (0x70000000+) have no xrefs → use the `[mmio]` map in `dw5xl.toml`. Unreachable (GUI closed) → headless.
+- **Second MCP, `ghidra-bethington`** (`mcp__ghidra-bethington__*`; bethington GhidraMCP 7.0.0 in the project window,
+  `http://127.0.0.1:8089/`): reaches every program open in the project, so pass `program=<name>` instead of asking for
+  a tab switch (`list_open_programs` shows the names). Call it through its MCP tools, not `curl`; tools missing → ask
+  the user to restart the session.
+- **Switching projects (works unattended):** `open_project` with `path=<absolute .gpr>`, `headless=false`,
+  `program=/<program>`, then `get_program_info` to confirm. It goes through Ghidra's own File → Open Project: saves
+  changed programs and tool layouts, closes the old project's CodeBrowser and opens one on the new program (8080
+  follows). It refuses with an error, not a dialog, while analysis runs or a change can't be saved. This needs the
+  locally patched bethington plugin (`notes/PROJECT_SETUP.md`); the stock 7.0.0 switch breaks the GUI. If the project
+  window doesn't follow or the CodeBrowser just closes, stop and tell the user.
+  Never call `exit_ghidra`, `delete_file`, `archive_project`/`restore_project`, `import_*`, `prompt_policy` or the
+  checkout/server tools; `close_program` only with the default `save=true`. One CodeBrowser at a time: a second can't
+  bind 8080.
 - ONE source project `ghidra/dw5xl.gpr` (renames/comments go here, via GUI/MCP). Headless never runs on it: copy
   `ghidra/dw5xl.gpr` + `ghidra/dw5xl.rep` (KOEISND: `ghidra_iop/koeisnd.*`) to your scratch dir, run
   `analyzeHeadless <dir> dw5xl -process SLES_538.60 -noanalysis -readOnly -scriptPath tools/ghidra_scripts
