@@ -141,7 +141,8 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
                      VulkanGsScanoutState &state,
                      const GSPresentationRequest &request,
                      uint32_t outputScale = 1,
-                     bool flushBeforeVsync = true);
+                     bool flushBeforeVsync = true,
+                     bool antiAliased = false);
 
 // Issue 023. Caller holds the device lock. Stages the finished readbacks in field order without starting a new one.
 void collectVulkanGsReads(Vulkan::Device &device, VulkanGsScanoutState &state);

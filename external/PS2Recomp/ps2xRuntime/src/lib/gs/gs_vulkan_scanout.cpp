@@ -171,7 +171,8 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
                      VulkanGsScanoutState &state,
                      const GSPresentationRequest &request,
                      uint32_t outputScale,
-                     bool flushBeforeVsync)
+                     bool flushBeforeVsync,
+                     bool antiAliased)
 {
     using namespace ParallelGS;
     using namespace Vulkan;
@@ -223,7 +224,11 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     priv.dispfb2 = second.framebuffer; priv.display2 = second.display;
 
     VSyncInfo info{};
-    info.phase = static_cast<uint32_t>(request.vsyncTick & 1u);
+    // Issue 009 v4.2: interlaced frame mode lines the picture up (the half-line shift of the full-height fields) by the
+    // field it was made for (GS::m_pictureTarget, issue 023 step 2K) when known, not by the field it is shown in:
+    // during drops the game shows some pictures in the other field, and they would sit one row off.
+    info.phase = static_cast<uint32_t>(frameFields && request.fieldTarget >= 0 ? request.fieldTarget
+                                                                               : int(request.vsyncTick & 1u));
     info.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     info.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
     info.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
@@ -234,10 +239,15 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     info.adapt_to_internal_horizontal_resolution = false;
     info.raw_circuit_scanout = true;
     info.skip_deinterlace = true;
-    info.high_resolution_scanout = outputScale >= 2;
+    // Issue 009 v4: at 1x too, interlaced frame-mode fields come out at full height (native width), so no two fields
+    // are merged; anything else at 1x (field mode, progressive) is scanned out natively.
+    info.high_resolution_scanout = true;
+    info.high_resolution_vertical_only = outputScale < 2;
+    info.high_resolution_vertical_only_average_x = antiAliased;
     info.high_resolution_scale_log2 = outputScale >= 4 ? 2u : 1u;
-    // Native output averages every anti-aliasing sample into each pixel.
-    info.resolve_super_samples = true;
+    // Native output averages every anti-aliasing sample into each pixel; at 1x without anti-aliasing it reads the
+    // single-sampled picture, as before 1x rendered a 2x2 grid.
+    info.resolve_super_samples = outputScale >= 2 || antiAliased;
 
     if (flushBeforeVsync)
         gs.flush();
@@ -326,7 +336,8 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     curSlot.vsyncTick = request.vsyncTick;
     curSlot.highResolution = output.high_resolution_scanout;
     const uint32_t outputShift = output.high_resolution_scanout ? output.high_resolution_scale_log2 : 0u;
-    curSlot.displayWidth = width >> outputShift;
+    const uint32_t outputShiftX = output.high_resolution_scanout ? output.high_resolution_scale_x_log2 : 0u;
+    curSlot.displayWidth = width >> outputShiftX;
     const auto &nativeCircuit = first.enabled ? first : second;
     curSlot.displayHeight = frameFields ? nativeCircuit.height * 2u :
                            fieldMode ? nativeCircuit.height :
