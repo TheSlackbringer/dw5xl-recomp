@@ -425,6 +425,7 @@ namespace
 //   PS2X_HUD_LOG=1           log the F2 overlay numbers every 0.5 s ([hud] tick fps vsync frameMs maxFrameMs)
 //   PS2X_DUMP_DIR=<dir>      where frame PNGs go (default: cwd)
 //   PS2X_DUMP_EVERY=<n>      dump the presented frame every n vsync ticks
+//   PS2X_DUMP_FROM / _TO=<n> only dump ticks in [from, to] (issue 009: 4x dumps of a few scenes)
 //   PS2X_EXIT_TICK=<n>       dump final.png and _Exit(0) at vsync tick n
 //   PS2X_INPUT="t:BTN[+BTN]:dur,..."  scripted pad presses at vsync tick t
 //   PS2X_CTRL=<file>         command file polled ~10x/s, consumed on read:
@@ -545,6 +546,8 @@ namespace ps2x_dev
         PS2Runtime *runtime = nullptr;
         std::vector<PressEvent> events;
         uint64_t dumpEvery = 0u;
+        uint64_t dumpFrom = 0u;
+        uint64_t dumpTo = std::numeric_limits<uint64_t>::max();
         uint64_t exitTick = 0u;
         uint64_t lastDumpBucket = std::numeric_limits<uint64_t>::max();
         std::string ctrlPath;
@@ -559,6 +562,8 @@ namespace ps2x_dev
         void init()
         {
             dumpEvery = envU64("PS2X_DUMP_EVERY", 0u);
+            dumpFrom = envU64("PS2X_DUMP_FROM", 0u);
+            dumpTo = envU64("PS2X_DUMP_TO", std::numeric_limits<uint64_t>::max());
             exitTick = envU64("PS2X_EXIT_TICK", 0u);
             if (const char *c = std::getenv("PS2X_CTRL"))
                 ctrlPath = c;
@@ -783,7 +788,7 @@ namespace ps2x_dev
                     mask |= ev.mask;
             g_padPressedMask.store(mask, std::memory_order_relaxed);
 
-            if (dumpEvery != 0u)
+            if (dumpEvery != 0u && tick >= dumpFrom && tick <= dumpTo)
             {
                 const uint64_t bucket = tick / dumpEvery;
                 if (bucket != lastDumpBucket)

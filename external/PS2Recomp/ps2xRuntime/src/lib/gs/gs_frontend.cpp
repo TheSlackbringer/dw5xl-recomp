@@ -644,14 +644,34 @@ void GS::noteDisplayWriteUnlocked(uint32_t basePage, uint32_t fbw, uint8_t psm, 
         ++m_displayWritesSinceRead;
 }
 
-void GS::noteDrawWriteUnlocked(const GSContext &context, bool textured)
+void GS::noteDrawWriteUnlocked(const GSContext &context, const GSPrimitiveBatch *draw)
 {
     // Issue 023 step 2K: a game that draws each picture for one interlaced field offsets it by half a line
     // (XYOFFSET.ofy, 1/16 pixel units); a copy keeps the field of the buffer it copies.
+    const bool textured = draw && draw->state.prim.tme;
     const uint32_t source = context.tex0.tbp0 / 32u;
     const uint8_t copied = textured && context.tex0.tbp0 % 32u == 0u && source < m_pictureTarget.size()
                                ? m_pictureTarget[source] : 0u;
-    m_pictureTarget[context.frame.fbp & 0x1FFu] = copied ? copied : uint8_t((context.xyoffset.ofy & 8u) ? 2u : 1u);
+    uint8_t &target = m_pictureTarget[context.frame.fbp & 0x1FFu];
+    if (!copied)
+    {
+        target = uint8_t((context.xyoffset.ofy & 8u) ? 2u : 1u);
+    }
+    else
+    {
+        // Issue 009 v4.2: a game can also make the field in the copy itself — the menus draw their scene the same in
+        // every field and copy it into the display buffer at +0 in even fields and half a line up (vertex Y - ofy) in
+        // odd ones; that copy is for the other field than its source. Their second pass, a 50 % blend half a line
+        // lower, keeps the field of the opaque pass. A pass is blended unless blending is off or its formula gives
+        // the source colour ((A - B) * C + D with A = B and D = Cs).
+        const uint32_t a = uint32_t(context.alpha) & 3u, b = uint32_t(context.alpha >> 2) & 3u;
+        const uint32_t d = uint32_t(context.alpha >> 6) & 3u;
+        if (!draw->state.prim.abe || (a == b && d == 0u))
+        {
+            const int32_t y = static_cast<int32_t>(std::lround(draw->vertices[0].y * 16.0f));
+            target = ((y - static_cast<int32_t>(context.xyoffset.ofy)) & 8) ? uint8_t(3u - copied) : copied;
+        }
+    }
     // Draws come in long runs with the same frame and scissor: the overlap is computed once per run.
     displayPagesUnlocked();
     const GSFrameReg &f = context.frame;
@@ -1960,7 +1980,7 @@ void GS::vertexKick(bool drawing)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
-        noteDrawWriteUnlocked(batch.state.context, batch.state.prim.tme); // issue 023 steps 2R, 2K
+        noteDrawWriteUnlocked(batch.state.context, &batch); // issue 023 steps 2R, 2K; issue 009 v4.2
         // DW5XL-DEBUG issue 023: PS2X_VBL_DRAW_TRACE=1 counts draws into the displayed frame buffer and elsewhere;
         // the EE scheduler prints and resets the counts at every VBlankStart/VBlankEnd (guest order with
         // PS2X_GS_ASYNC=0 PS2X_VU1_ASYNC=0).

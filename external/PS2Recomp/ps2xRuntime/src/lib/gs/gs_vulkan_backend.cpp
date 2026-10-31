@@ -74,8 +74,9 @@ struct GSVulkanBackend::Impl
         if (device.supports_subgroup_size_log2(true, 3, 6)) return 8;
         return 4;
     }
-    // 2x output reads a 2x2 sample grid, 4x output a 4x4 grid.
-    static uint32_t minSamplesFor(uint32_t scale) { return scale == 4u ? 16u : scale == 2u ? 4u : 1u; }
+    // 2x output reads a 2x2 sample grid, 4x output a 4x4 grid. 1x reads the 2x2 grid too: interlaced frame-mode
+    // fields come out at native width and full height (issue 009 v4, paraLLEl-GS patch 0004).
+    static uint32_t minSamplesFor(uint32_t scale) { return scale == 4u ? 16u : 4u; }
     uint32_t supportedScale(uint32_t scale) const
     {
         if (scale == 4u && maxAASamples() >= 16u) return 4u;
@@ -396,7 +397,7 @@ bool GSVulkanBackend::PresentInto(const GSPresentationRequest &request, Presenta
     try
     {
         presentVulkanGs(p.gs, p.device, p.scanoutState, request,
-                        p.currentScale.load(std::memory_order_relaxed), p.dirty);
+                        p.currentScale.load(std::memory_order_relaxed), p.dirty, p.requestedSamples > 1u);
         p.dirty = false;
         gpuScanout = true;
         ++p.gpuPresentations;
@@ -442,7 +443,7 @@ bool GSVulkanBackend::SubmitFieldScanout(const GSPresentationRequest &request)
     try
     {
         presentVulkanGs(p.gs, p.device, p.scanoutState, request,
-                        p.currentScale.load(std::memory_order_relaxed), p.dirty);
+                        p.currentScale.load(std::memory_order_relaxed), p.dirty, p.requestedSamples > 1u);
     }
     catch (const std::exception &error)
     {

@@ -9,14 +9,14 @@ if [ -n "$bad" ]; then
     exit 1
 fi
 
-# The renderer patches must apply in order on the pinned paraLLEl-GS revision (README, step 3),
+# The renderer patches must apply in order on the pinned paraLLEl-GS revision (BUILDING.md),
 # exactly as a fresh checkout applies them: git apply vendor/parallel-gs-patches/*.patch.
 pgs_repo=app/deps/parallel-gs
 if git diff --cached --name-only | grep -q '^vendor/parallel-gs-patches/'; then
-    # The pinned revision lives in one place: the README's checkout command.
-    pgs_rev=$(git show :README.md | sed -n 's#^git -C app/deps/parallel-gs checkout \([0-9a-f]\{40\}\)$#\1#p' | head -1)
+    # The pinned revision lives in one place: BUILDING.md's checkout command.
+    pgs_rev=$(git show :BUILDING.md | sed -n 's#^git -C app/deps/parallel-gs checkout \([0-9a-f]\{40\}\)$#\1#p' | head -1)
     if [ -z "$pgs_rev" ]; then
-        echo "Commit blocked: README.md has no 'git -C app/deps/parallel-gs checkout <revision>' line." >&2
+        echo "Commit blocked: BUILDING.md has no 'git -C app/deps/parallel-gs checkout <revision>' line." >&2
         exit 1
     fi
     if ! git -C "$pgs_repo" cat-file -e "$pgs_rev^{commit}" 2>/dev/null; then
