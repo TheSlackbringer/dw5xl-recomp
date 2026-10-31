@@ -402,6 +402,17 @@ if(DW5XL_BUILD_TESTS)
     target_include_directories(dw5xl_log_lines_whole_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
     add_test(NAME log_lines_whole COMMAND dw5xl_log_lines_whole_test)
     set_tests_properties(log_lines_whole PROPERTIES TIMEOUT 30)
+    # Issue 023 criterion 3 (fix 2): the window shows each field once; it gives up waiting only when the game stalls.
+    add_executable(dw5xl_presentation_wait_test tests/presentation_wait_test.cpp)
+    target_include_directories(dw5xl_presentation_wait_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME presentation_wait COMMAND dw5xl_presentation_wait_test)
+    set_tests_properties(presentation_wait PROPERTIES TIMEOUT 20)
+    # Issue 023 criterion 6: expensive debug lines are computed on a helper thread, in order, and drained at exit.
+    add_executable(dw5xl_deferred_log_test tests/deferred_log_test.cpp
+                   "${PS2RECOMP_DIR}/ps2xRuntime/src/lib/ps2_stdio_pump.cpp")
+    target_include_directories(dw5xl_deferred_log_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME deferred_log COMMAND dw5xl_deferred_log_test)
+    set_tests_properties(deferred_log PROPERTIES TIMEOUT 20)
     # ThreadSanitizer variant: the queue, PS2Memory, VIF1 parser and GIF arbiter
     # are recompiled instrumented; their archive copies are then never pulled in.
     option(DW5XL_TSAN_TESTS "Build the ThreadSanitizer variant of the VU1 async queue test" ON)

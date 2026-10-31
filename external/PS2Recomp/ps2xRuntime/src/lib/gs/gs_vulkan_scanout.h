@@ -144,8 +144,9 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
                      bool flushBeforeVsync = true,
                      bool antiAliased = false);
 
-// Issue 023. Caller holds the device lock. Stages the finished readbacks in field order without starting a new one.
-void collectVulkanGsReads(Vulkan::Device &device, VulkanGsScanoutState &state);
+// Issue 023. Caller holds the device lock. Stages the finished readbacks in field order without starting a new one,
+// none of a field after maxField (fix 2: it stays for that field's own window frame).
+void collectVulkanGsReads(Vulkan::Device &device, VulkanGsScanoutState &state, uint64_t maxField = UINT64_MAX);
 // Caller holds the device lock. The fence of the oldest unfinished readback of field `field` or older (empty if
 // they are all finished): the window waits on it without the device lock.
 Vulkan::Fence pendingFieldReadFence(VulkanGsScanoutState &state, uint64_t field);

@@ -1,8 +1,12 @@
 #include "runtime/ps2_stdio_pump.h"
 
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <streambuf>
@@ -244,6 +248,95 @@ namespace ps2x::stdio_pump
         return installPairLocked(first, second, pipeBytes);
     }
 
+    // Issue 023 criterion 6: expensive debug lines on one helper thread (see the header). The helper starts with the
+    // first post and runs until the process ends; the state is never destroyed, so posts and drains at exit are safe.
+    namespace
+    {
+        struct Deferred
+        {
+            std::mutex mutex;
+            std::condition_variable changed;
+            std::deque<std::pair<std::function<void()>, size_t>> jobs;
+            size_t queuedBytes = 0; // queued jobs and the one running
+            bool running = false;
+            bool started = false;
+            std::thread::id helper;
+            uint64_t waits = 0;
+        };
+
+        Deferred &deferred()
+        {
+            static auto *state = new Deferred;
+            return *state;
+        }
+
+        void deferredLoop()
+        {
+            Deferred &d = deferred();
+            std::unique_lock<std::mutex> lock(d.mutex);
+            d.helper = std::this_thread::get_id();
+            for (;;)
+            {
+                d.changed.wait(lock, [&d] { return !d.jobs.empty(); });
+                auto job = std::move(d.jobs.front());
+                d.jobs.pop_front();
+                d.running = true;
+                lock.unlock();
+                job.first();
+                job.first = nullptr; // release the job's data before its bytes leave the budget
+                lock.lock();
+                d.queuedBytes -= job.second;
+                d.running = false;
+                d.changed.notify_all();
+            }
+        }
+
+        void drainDeferred()
+        {
+            Deferred &d = deferred();
+            std::unique_lock<std::mutex> lock(d.mutex);
+            if (!d.started || std::this_thread::get_id() == d.helper)
+                return;
+            d.changed.wait(lock, [&d] { return d.jobs.empty() && !d.running; });
+        }
+    }
+
+    void postDeferred(std::function<void()> job, size_t bytes)
+    {
+        Deferred &d = deferred();
+        bool waited = false;
+        const auto start = std::chrono::steady_clock::now();
+        {
+            std::unique_lock<std::mutex> lock(d.mutex);
+            if (!d.started)
+            {
+                d.started = true;
+                std::thread(deferredLoop).detach();
+                std::atexit(drainDeferred); // also without a pump (PS2X_STDIO_DIRECT=1); runs before drain's atexit
+            }
+            while (d.queuedBytes != 0 && d.queuedBytes + bytes > kDeferredBytes)
+            {
+                waited = true;
+                d.changed.wait(lock);
+            }
+            d.jobs.emplace_back(std::move(job), bytes);
+            d.queuedBytes += bytes;
+            d.waits += waited ? 1u : 0u;
+        }
+        d.changed.notify_all();
+        if (waited)
+            std::fprintf(stderr, "[log:deferred-wait] waitedUs=%lld\n",
+                         static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - start).count()));
+    }
+
+    uint64_t deferredWaitCount()
+    {
+        Deferred &d = deferred();
+        std::lock_guard<std::mutex> lock(d.mutex);
+        return d.waits;
+    }
+
     // Issue 023 step 7T: whole log lines from the C++ streams. std::cerr is unbuffered (unitbuf), so a chain like
     // `std::cerr << a << b << std::endl` used to be one write per <<, and another thread's line could land in between.
     // Each thread now collects its own text per stream and writes every finished line (up to and including the
@@ -437,6 +530,7 @@ namespace ps2x::stdio_pump
 
     void drain()
     {
+        drainDeferred();       // issue 023 criterion 6: the helper's queued debug lines, while the pumps still run
         writeAllThreadTexts(); // issue 023 step 7T: every thread's unfinished line, before the pipe is written out
         std::fflush(stdout);
         std::fflush(stderr);

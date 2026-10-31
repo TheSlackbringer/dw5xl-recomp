@@ -187,9 +187,9 @@ namespace
             return true;
         }
 
-        bool CollectFieldScanouts(PresentationFrame &out, uint64_t waitForField) override
+        bool CollectFieldScanouts(PresentationFrame &out, uint64_t waitForField, uint64_t maxField) override
         {
-            return m_inner->CollectFieldScanouts(out, waitForField);
+            return m_inner->CollectFieldScanouts(out, waitForField, maxField);
         }
 
         bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override

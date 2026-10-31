@@ -807,7 +807,12 @@ namespace ps2x_dev
                 writePng(dumpDir() + "/final.png");
                 if (const char *t = std::getenv("PS2X_THREADS_AT_EXIT"); t && *t && *t != '0')
                     writeThreads(std::cerr, runtime);
-                std::cerr << "[dev] exit tick " << tick << " reached" << std::endl;
+                // Issue 023 amendment 8M: the exit field that was asked for; the window loop can first see a later one
+                // when its frame was late (then named too).
+                if (tick == exitTick)
+                    std::cerr << "[dev] exit tick " << exitTick << " reached" << std::endl;
+                else
+                    std::cerr << "[dev] exit tick " << exitTick << " reached (window at " << tick << ")" << std::endl;
                 ps2x::device::quiesceAll(std::chrono::milliseconds(2000));
                 ps2prof::flush(); // DW5XL-DEBUG issue 025: _Exit skips atexit
                 GSTrace::shutdown();
@@ -1069,8 +1074,10 @@ static bool s_windowFrameNewPicture = false;
 
 // The texture grows to the largest presented image (4x output); smaller frames
 // occupy its top-left corner. Display dimensions keep the logical aspect ratio.
+// paced (field pacing, issue 023 fix 2): the field the scheduler announced for this frame; nullptr = 60 FPS loop.
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight,
-                        uint32_t &outDisplayWidth, uint32_t &outDisplayHeight)
+                        uint32_t &outDisplayWidth, uint32_t &outDisplayHeight,
+                        const EeScheduler::PresentationField *paced = nullptr)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static uint64_t s_lastUploadedGeneration = 0u;
@@ -1124,17 +1131,32 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     }
     // Fields read on the GS side (issue 023) finish a little after their field ends: the window collects every frame,
     // so a field finished between two field changes is not skipped (a frame without a new field uploads nothing).
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick ||
-                            rt->gs().fieldScanoutsActive();
-    if (needsLatch)
+    bool needsLatch = false;
+    if (paced)
     {
-        // Field pacing shows the field that has just ended (issue 023: read on the GS side at its end).
-        static const bool s_fieldPaced = configuredHostTargetFps() == 0;
-        rt->gs().latchHostPresentationFrame(s_fieldPaced && currentTick > 0u ? currentTick - 1u
-                                                                               : std::numeric_limits<uint64_t>::max());
-        s_windowFrameField = s_fieldPaced && currentTick > 0u ? currentTick - 1u : currentTick;
-        s_lastPresentationTick = currentTick;
-        s_hasLatchedInitialFrame = true;
+        // Field pacing (issue 023 fix 2): the frame shows exactly the field the scheduler announced, and collects no
+        // newer field's read. A frame while the game is stalled (not fresh) shows the last picture again; it only
+        // collects a late read of the field already announced.
+        constexpr uint64_t kNone = std::numeric_limits<uint64_t>::max();
+        needsLatch = paced->fresh || !s_hasLatchedInitialFrame || rt->gs().fieldScanoutsActive();
+        if (needsLatch)
+        {
+            rt->gs().latchHostPresentationFrame(paced->fresh ? paced->field : kNone, paced->field);
+            if (paced->fresh)
+                s_windowFrameField = paced->field;
+            s_hasLatchedInitialFrame = true;
+        }
+    }
+    else
+    {
+        needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick || rt->gs().fieldScanoutsActive();
+        if (needsLatch)
+        {
+            rt->gs().latchHostPresentationFrame();
+            s_windowFrameField = currentTick;
+            s_lastPresentationTick = currentTick;
+            s_hasLatchedInitialFrame = true;
+        }
     }
 
     const uint64_t generation = rt->gs().hostPresentationGeneration();
@@ -1264,21 +1286,6 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         if (s_hashTrace)
         {
             const size_t rowBytes = static_cast<size_t>(texWidth) * 4u;
-            auto fnv = [&](uint32_t y0, uint32_t y1)
-            {
-                uint64_t h = 1469598103934665603ull;
-                for (uint32_t y = y0; y < y1; ++y)
-                {
-                    const uint8_t *row = ps2x_dev::s_lastFrame.data() + static_cast<size_t>(y) * rowBytes;
-                    for (size_t i = 0; i < static_cast<size_t>(copyWidth) * 4u; ++i)
-                        h = (h ^ row[i]) * 1099511628211ull;
-                }
-                return h;
-            };
-            std::fprintf(stderr, "[upload:hash] tick=%llu all=%016llx top=%016llx bottom=%016llx h=%u\n",
-                         static_cast<unsigned long long>(currentTick), static_cast<unsigned long long>(fnv(0, copyHeight)),
-                         static_cast<unsigned long long>(fnv(0, copyHeight / 2u)),
-                         static_cast<unsigned long long>(fnv(copyHeight / 2u, copyHeight)), copyHeight);
             // Row profile (mean brightness of every row, two hex digits per row): a picture that moves vertically shows
             // up as a shifted profile without writing whole frames (PNG dumps change the timing and hide the jump).
             // PS2X_WEAVE_TRACE_COLS=x0:x1 (DW5XL-DEBUG issue 023 2J): the row profile covers only these columns, e.g. a
@@ -1292,21 +1299,46 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                 return std::pair<uint32_t, uint32_t>(0u, 0xFFFFFFFFu);
             }();
             const uint32_t x0 = std::min(s_cols.first, copyWidth), x1 = std::max(x0 + 1u, std::min(s_cols.second, copyWidth));
-            static std::string s_rows;
-            s_rows.clear();
-            for (uint32_t y = 0; y < copyHeight; ++y)
+            // Both lines are computed and written on the log helper from a copy of the uploaded rows (issue 023
+            // criterion 6: the window does not spend its frame on the trace).
+            std::vector<uint8_t> rowsCopy(ps2x_dev::s_lastFrame.begin(),
+                                          ps2x_dev::s_lastFrame.begin() +
+                                              static_cast<std::ptrdiff_t>(std::min(ps2x_dev::s_lastFrame.size(),
+                                                                                   rowBytes * copyHeight)));
+            const size_t copyBytes = rowsCopy.size();
+            ps2x::stdio_pump::postDeferred([pixels = std::move(rowsCopy), rowBytes, copyWidth, copyHeight, x0, x1,
+                                            tick = currentTick]
             {
-                const uint8_t *row = ps2x_dev::s_lastFrame.data() + static_cast<size_t>(y) * rowBytes;
-                uint32_t sum = 0u;
-                for (uint32_t x = x0; x < x1 && x < copyWidth; ++x)
-                    sum += row[x * 4u] + row[x * 4u + 1u] + row[x * 4u + 2u];
-                const uint32_t mean = sum / ((x1 - x0) * 3u);
-                static const char kHex[] = "0123456789abcdef";
-                s_rows.push_back(kHex[(mean >> 4) & 15u]);
-                s_rows.push_back(kHex[mean & 15u]);
-            }
-            std::fprintf(stderr, "[upload:rows] tick=%llu w=%u h=%u %s\n", static_cast<unsigned long long>(currentTick),
-                         copyWidth, copyHeight, s_rows.c_str());
+                auto fnv = [&](uint32_t y0, uint32_t y1)
+                {
+                    uint64_t h = 1469598103934665603ull;
+                    for (uint32_t y = y0; y < y1; ++y)
+                    {
+                        const uint8_t *row = pixels.data() + static_cast<size_t>(y) * rowBytes;
+                        for (size_t i = 0; i < static_cast<size_t>(copyWidth) * 4u; ++i)
+                            h = (h ^ row[i]) * 1099511628211ull;
+                    }
+                    return h;
+                };
+                std::fprintf(stderr, "[upload:hash] tick=%llu all=%016llx top=%016llx bottom=%016llx h=%u\n",
+                             static_cast<unsigned long long>(tick), static_cast<unsigned long long>(fnv(0, copyHeight)),
+                             static_cast<unsigned long long>(fnv(0, copyHeight / 2u)),
+                             static_cast<unsigned long long>(fnv(copyHeight / 2u, copyHeight)), copyHeight);
+                std::string rows;
+                for (uint32_t y = 0; y < copyHeight; ++y)
+                {
+                    const uint8_t *row = pixels.data() + static_cast<size_t>(y) * rowBytes;
+                    uint32_t sum = 0u;
+                    for (uint32_t x = x0; x < x1 && x < copyWidth; ++x)
+                        sum += row[x * 4u] + row[x * 4u + 1u] + row[x * 4u + 2u];
+                    const uint32_t mean = sum / ((x1 - x0) * 3u);
+                    static const char kHex[] = "0123456789abcdef";
+                    rows.push_back(kHex[(mean >> 4) & 15u]);
+                    rows.push_back(kHex[mean & 15u]);
+                }
+                std::fprintf(stderr, "[upload:rows] tick=%llu w=%u h=%u %s\n", static_cast<unsigned long long>(tick),
+                             copyWidth, copyHeight, rows.c_str());
+            }, copyBytes);
         }
     }
     ps2x_dev::s_lastFrameW = copyWidth;
@@ -3641,15 +3673,19 @@ void PS2Runtime::run()
 
     uint64_t tick = 0;
     const int hostFpsOverride = configuredHostTargetFps();
-    uint64_t lastPresentationField = 0;
+    uint64_t lastShownField = ps2x::presentation::kNoField; // issue 023 fix 2: the field the last frame showed
     ps2x_dev::Harness devHarness;
     devHarness.runtime = this;
     devHarness.init();
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
-        if (hostFpsOverride == 0 && m_eeScheduler)
+        const bool fieldPaced = hostFpsOverride == 0 && m_eeScheduler;
+        EeScheduler::PresentationField paced{};
+        if (fieldPaced)
         {
-            m_eeScheduler->waitForNextPresentationField(lastPresentationField);
+            paced = m_eeScheduler->waitForPresentationField(lastShownField);
+            if (paced.fresh)
+                lastShownField = paced.field;
         }
         m_audioBackend.updatePcmStream();
         devHarness.step(m_eeScheduler->currentVSyncTick());
@@ -3690,7 +3726,7 @@ void PS2Runtime::run()
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         uint32_t displayWidth = FB_WIDTH;
         uint32_t displayHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight, displayWidth, displayHeight);
+        UploadFrame(frameTex, this, presentWidth, presentHeight, displayWidth, displayHeight, fieldPaced ? &paced : nullptr);
 
         BeginDrawing();
         ClearBackground(BLACK);

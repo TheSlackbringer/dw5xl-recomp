@@ -796,7 +796,7 @@ void GS::submitFieldScanout(const GSPresentationRequest &captured)
     m_fieldScanoutCv.notify_all();
 }
 
-void GS::latchHostPresentationFrame(uint64_t waitForField)
+void GS::latchHostPresentationFrame(uint64_t waitForField, uint64_t maxField)
 {
     GSPresentationRequest request{};
     {
@@ -827,7 +827,7 @@ void GS::latchHostPresentationFrame(uint64_t waitForField)
         }
         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
         if (m_backend)
-            updated = m_backend->CollectFieldScanouts(m_latchedFrame, waitForField);
+            updated = m_backend->CollectFieldScanouts(m_latchedFrame, waitForField, maxField);
     }
     else
     {

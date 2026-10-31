@@ -2,6 +2,7 @@
 
 #include "ps2_runtime.h"
 #include "runtime/state_archive.h"
+#include "runtime/presentation_pacing.h"
 
 #include <array>
 #include <atomic>
@@ -347,7 +348,16 @@ public:
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
     void stepVSyncTicksForTesting(uint64_t ticks = 1) noexcept;
-    uint64_t waitForNextPresentationField(uint64_t &lastTick) const;
+    // Issue 023 criterion 3 (fix 2): the field the window shows next, one field identity (ps2x::presentation): the
+    // newest field whose end was announced (VBlankEnd), fresh when it is newer than lastShown (kNoField: none shown
+    // yet). Waits for it until the window gives up because the game is stalled (a whole field after that field's
+    // scheduled end), then returns lastShown again, not fresh, so the window keeps drawing the last picture.
+    struct PresentationField
+    {
+        uint64_t field = ps2x::presentation::kNoField;
+        bool fresh = false;
+    };
+    PresentationField waitForPresentationField(uint64_t lastShown) const;
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
@@ -481,6 +491,11 @@ private:
     std::atomic<uint64_t> m_presentationTick{0};
     mutable std::mutex m_presentationMutex;
     mutable std::condition_variable m_presentationCv;
+    // Issue 023 fix 2: when the end of field m_scheduledEndField is to be announced (its VBlankEnd); later fields
+    // follow one field period apart. Written at VBlankStart under m_presentationMutex; not known after reset/load.
+    uint64_t m_scheduledEndField = 0;
+    std::chrono::steady_clock::time_point m_scheduledEndTime{};
+    bool m_scheduledEndKnown = false;
     std::atomic<bool> m_palVideoMode{false};
     uint32_t m_vsyncFlagAddress = 0;
     uint32_t m_vsyncTickAddress = 0;

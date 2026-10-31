@@ -194,6 +194,10 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_invocationSequence = 0;
     m_vsyncTick.store(0u, std::memory_order_release);
     m_presentationTick.store(0u, std::memory_order_release);
+    {
+        std::lock_guard presentationLock(m_presentationMutex);
+        m_scheduledEndKnown = false; // issue 023 fix 2
+    }
     m_palVideoMode.store(false, std::memory_order_relaxed);
     m_vsyncFlagAddress = 0;
     m_vsyncTickAddress = 0;
@@ -1551,24 +1555,27 @@ void EeScheduler::stepVSyncTicksForTesting(uint64_t ticks) noexcept
     m_vsyncTick.fetch_add(ticks, std::memory_order_acq_rel);
 }
 
-uint64_t EeScheduler::waitForNextPresentationField(uint64_t &lastTick) const
+EeScheduler::PresentationField EeScheduler::waitForPresentationField(uint64_t lastShown) const
 {
-    // The host window shows each guest field once: wait for the next VBlankEnd (or one field period, so the
-    // window stays responsive while the game is stalled).
-    uint64_t cur = m_presentationTick.load(std::memory_order_acquire);
-    if (cur <= lastTick)
-    {
-        std::unique_lock lock(m_presentationMutex);
-        m_presentationCv.wait_for(lock, vblankPeriod(palVideoMode()), [this, lastTick]()
-                                  { return m_presentationTick.load(std::memory_order_acquire) > lastTick ||
-                                           m_stopRequested.load(std::memory_order_acquire); });
-        cur = m_presentationTick.load(std::memory_order_acquire);
-    }
-    if (cur > lastTick)
-    {
-        lastTick = cur;
-    }
-    return cur != 0u ? cur : m_vsyncTick.load(std::memory_order_acquire);
+    // Issue 023 criterion 3 (fix 2): one field identity, the announced field. The window waits for a field newer than
+    // the one it showed; it gives up only when that field is a whole field past its scheduled end (the game is
+    // stalled), so ordinary jitter never makes it show the previous picture again (023 work.md 2026-10-31).
+    namespace pp = ps2x::presentation;
+    const auto period = vblankPeriod(palVideoMode());
+    std::unique_lock lock(m_presentationMutex);
+    const auto announced = [this] { return pp::announcedField(m_presentationTick.load(std::memory_order_acquire)); };
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t wanted = lastShown == pp::kNoField ? 0u : lastShown + 1u;
+    auto scheduledEnd = now;
+    if (m_scheduledEndKnown && wanted >= m_scheduledEndField)
+        scheduledEnd = m_scheduledEndTime + period * static_cast<int64_t>(wanted - m_scheduledEndField);
+    m_presentationCv.wait_until(lock, pp::giveUp(scheduledEnd, now, period), [&] {
+        return pp::isNewer(announced(), lastShown) || m_stopRequested.load(std::memory_order_acquire);
+    });
+    const uint64_t field = announced();
+    if (pp::isNewer(field, lastShown))
+        return {field, true};
+    return {lastShown, false};
 }
 
 uint32_t EeScheduler::setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp)
@@ -2184,6 +2191,14 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               hostFieldStart + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+                {
+                    // Issue 023 fix 2: the end of the field ending now (m_vsyncTick) is announced at that VBlankEnd;
+                    // the window's stall rule measures lateness against it (later fields: one period apart).
+                    std::lock_guard presentationLock(m_presentationMutex);
+                    m_scheduledEndField = m_vsyncTick;
+                    m_scheduledEndTime = hostFieldStart + kVBlankDuration;
+                    m_scheduledEndKnown = true;
+                }
                 scheduleEvent(scheduled.deadlineCycle + vblankPeriodCycles(palVideoMode()),
                               hostFieldStart + vblankPeriod(palVideoMode()),
                               EeEvent{EeEventType::VBlankStart, 0, 0});
@@ -2845,6 +2860,10 @@ void EeScheduler::serializeState(ps2x::StateArchive &a)
     {
         m_vsyncTick.store(vsyncTick, std::memory_order_release);
         m_presentationTick.store(presentationTick, std::memory_order_release);
+        {
+            std::lock_guard presentationLock(m_presentationMutex);
+            m_scheduledEndKnown = false; // issue 023 fix 2: rescheduled after the load
+        }
         m_palVideoMode.store(pal, std::memory_order_release);
         m_checkpointPending.store(false, std::memory_order_release);
         updateNextDeadline();

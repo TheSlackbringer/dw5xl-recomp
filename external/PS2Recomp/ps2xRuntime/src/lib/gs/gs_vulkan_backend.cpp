@@ -459,7 +459,7 @@ bool GSVulkanBackend::SubmitFieldScanout(const GSPresentationRequest &request)
     ++p.gpuPresentations;
     return true;
 }
-bool GSVulkanBackend::CollectFieldScanouts(PresentationFrame &out, uint64_t waitForField)
+bool GSVulkanBackend::CollectFieldScanouts(PresentationFrame &out, uint64_t waitForField, uint64_t maxField)
 {
     auto lock = m_impl->access(); auto &p = *m_impl;
     p.scanoutState.recycleRetired();
@@ -476,7 +476,7 @@ bool GSVulkanBackend::CollectFieldScanouts(PresentationFrame &out, uint64_t wait
             fence.reset();
         }
     }
-    collectVulkanGsReads(p.device, p.scanoutState);
+    collectVulkanGsReads(p.device, p.scanoutState, maxField);
     // Copy without the device lock, as PresentInto does.
     std::vector<VulkanGsScanoutState::StagedRead> reads = std::move(p.scanoutState.staged);
     p.scanoutState.staged.clear();

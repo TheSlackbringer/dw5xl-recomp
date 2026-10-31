@@ -33,17 +33,19 @@ public:
 
     // Issue 023: end-of-field scanout. SubmitFieldScanout runs on the GS side in order with the game's GS work, at the
     // end of field request.vsyncTick, and starts reading that field; CollectFieldScanouts (window thread) turns the
-    // finished reads into `out`, first waiting for the read of field `waitForField` if it is not UINT64_MAX.
+    // finished reads into `out`, first waiting for the read of field `waitForField` if it is not UINT64_MAX; reads of
+    // fields after `maxField` stay for a later call (issue 023 fix 2: a frame shows exactly the field it was given).
     // Renderers without it return false and the window reads at host time (Present/PresentInto).
     virtual bool SubmitFieldScanout(const GSPresentationRequest &request)
     {
         (void)request;
         return false;
     }
-    virtual bool CollectFieldScanouts(PresentationFrame &out, uint64_t waitForField)
+    virtual bool CollectFieldScanouts(PresentationFrame &out, uint64_t waitForField, uint64_t maxField = UINT64_MAX)
     {
         (void)out;
         (void)waitForField;
+        (void)maxField;
         return false;
     }
 

@@ -146,7 +146,8 @@ public:
     void submitFieldScanout(const GSPresentationRequest &captured);
     bool fieldScanoutsActive() const { return m_fieldScanouts.load(std::memory_order_acquire); }
     // waitForField: the field the window is about to show (field pacing), UINT64_MAX = take what is finished.
-    void latchHostPresentationFrame(uint64_t waitForField = UINT64_MAX);
+    // maxField (issue 023 fix 2): reads of later fields stay for their own frame (UINT64_MAX = no limit).
+    void latchHostPresentationFrame(uint64_t waitForField = UINT64_MAX, uint64_t maxField = UINT64_MAX);
     uint64_t hostPresentationGeneration() const;
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
