@@ -3,6 +3,7 @@
 #include "runtime/state_archive.h"
 
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <string>
@@ -159,6 +160,57 @@ int main()
         refused = true;
     }
     check(refused, "a state out of step with the code is refused");
+
+    // Issue 027 v3: a structure that changed size between the build that saved and the build that loads is refused
+    // (the size record), even where the bytes that follow would happen to fill the bigger structure.
+    struct Small { uint32_t a; };
+    struct Grown { uint32_t a; uint32_t added; };
+    refused = false;
+    try
+    {
+        Small one{1u}, two{2u};
+        StateArchive w = StateArchive::writer();
+        w.value(one);
+        w.value(two);
+        Grown g{};
+        StateArchive t = StateArchive::reader(w.data());
+        t.value(g);
+    }
+    catch (const StateError &)
+    {
+        refused = true;
+    }
+    check(refused, "a structure saved smaller than this build's is refused");
+    refused = false;
+    try
+    {
+        std::vector<Small> smalls{{1u}, {2u}, {3u}, {4u}};
+        StateArchive w = StateArchive::writer();
+        w.vector(smalls);
+        w.vector(smalls); // enough bytes follow for the bigger elements: only the size record can tell
+        std::vector<Grown> grown;
+        StateArchive t = StateArchive::reader(w.data());
+        t.vector(grown);
+    }
+    catch (const StateError &)
+    {
+        refused = true;
+    }
+    check(refused, "a list whose element size changed is refused");
+
+    // The gap after `irq` holds whatever memory had there; it is saved as zero, so the same state gives the same bytes.
+    struct Gapped { int32_t irq; uint64_t delay; };
+    {
+        Gapped g;
+        std::memset(&g, 0xAB, sizeof(g));
+        g.irq = 1;
+        g.delay = 2;
+        StateArchive w = StateArchive::writer();
+        w.value(g);
+        const std::vector<uint8_t> &bytes = w.data(); // 4-byte size record, then the object
+        check(bytes.size() == 4 + sizeof(Gapped) && bytes[4 + 4] == 0 && bytes[4 + 7] == 0,
+              "padding inside a saved structure is written as zero");
+    }
 
     std::printf("%s\n", failures ? "STATE ARCHIVE TESTS FAILED" : "ALL STATE ARCHIVE TESTS PASSED");
     return failures ? 1 : 0;

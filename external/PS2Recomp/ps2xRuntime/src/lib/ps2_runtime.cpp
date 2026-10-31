@@ -557,6 +557,7 @@ namespace ps2x_dev
         std::chrono::steady_clock::time_point statsStart{};
         uint64_t statsTick = 0u;
         uint64_t statsFlips = 0u;
+        uint64_t statsLoads = 0u;
         uint64_t lastDispfb = 0u;
 
         void init()
@@ -693,11 +694,13 @@ namespace ps2x_dev
                 ++statsFlips;
             }
             const auto now = std::chrono::steady_clock::now();
-            if (statsStart == std::chrono::steady_clock::time_point{})
+            // A state load (issue 027) jumps the field number: the second it falls in played none of those fields.
+            if (statsStart == std::chrono::steady_clock::time_point{} || runtime->stateLoadCount() != statsLoads)
             {
                 statsStart = now;
                 statsTick = tick;
                 statsFlips = 0u;
+                statsLoads = runtime->stateLoadCount();
                 return;
             }
             const double secs = std::chrono::duration<double>(now - statsStart).count();
@@ -3764,6 +3767,27 @@ void PS2Runtime::run()
             m_gs.setAASamples(s_aaChoice);
             saveIniValue("aa_samples", s_aaChoice);
         }
+        // Issue 027 v3: F5 saves the game to the quick slot; F9 loads it, keeping the running game in before-load.state
+        // first; Shift+F9 goes back to that. The scheduler carries them out at its next quiet point. The folder is
+        // states/ next to the game's executable (PS2X_STATE_DIR for tests, so they never touch the player's states).
+        {
+            static const std::filesystem::path s_stateDir = []
+            {
+                const char *dir = std::getenv("PS2X_STATE_DIR");
+                return dir && *dir ? std::filesystem::path(dir) : getIoPaths().elfDirectory / "states";
+            }();
+            const uint64_t tick = eeScheduler().currentVSyncTick();
+            const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+            const bool loadKey = IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::LoadState));
+            const std::string quick = (s_stateDir / "quick.state").string(), backup = (s_stateDir / "before-load.state").string();
+            using Kind = EeScheduler::StateRequestKind;
+            if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::SaveState)) || ps2_host_input::scriptedKeyPress("F5", tick))
+                eeScheduler().requestState(Kind::Save, quick);
+            else if ((loadKey && shift) || ps2_host_input::scriptedKeyPress("SHIFT+F9", tick))
+                eeScheduler().requestState(Kind::Load, backup);
+            else if (loadKey || ps2_host_input::scriptedKeyPress("F9", tick))
+                eeScheduler().requestState(Kind::Load, quick, backup);
+        }
 
         // F2 overlay numbers (issue 014), about once a second. VSync = guest fields per second, timed by the fields'
         // own emission times (so a steady 50 reads 50.0, not 49/51 from where the window falls). FPS = the
@@ -3795,26 +3819,34 @@ void PS2Runtime::run()
             } while (tick != gsRegs.vsyncTick.load(std::memory_order_acquire));
             const uint64_t gameFrames = ps2x::device::gameFrameCount();
             const uint64_t moviePictures = ps2_stubs::moviePictureCount();
-            const double frames = static_cast<double>(std::max(gameFrames - s_lastGameFrames, moviePictures - s_lastMoviePictures));
-            const int64_t spanNs = tickNs - s_lastVsyncNs;
-            if (s_lastVsyncNs != 0 && tick > s_lastVsyncTick && spanNs > 0)
+            // DW5XL (issue 027): a state load jumps the field number, and this window played none of those fields;
+            // the numbers start again from the next window.
+            static uint64_t s_stateLoads = 0;
+            const uint64_t stateLoads = stateLoadCount();
+            if (stateLoads == s_stateLoads)
             {
-                const double span = static_cast<double>(spanNs) * 1e-9;
-                s_vsyncRate = static_cast<float>(static_cast<double>(tick - s_lastVsyncTick) / span);
-                // A screen shows at most one frame per field: frames are counted at the sample moments, not
-                // exactly on field boundaries, so clamp the +-1 slack.
-                s_gameFps = std::min(s_vsyncRate, static_cast<float>(frames / span));
+                const double frames = static_cast<double>(std::max(gameFrames - s_lastGameFrames, moviePictures - s_lastMoviePictures));
+                const int64_t spanNs = tickNs - s_lastVsyncNs;
+                if (s_lastVsyncNs != 0 && tick > s_lastVsyncTick && spanNs > 0)
+                {
+                    const double span = static_cast<double>(spanNs) * 1e-9;
+                    s_vsyncRate = static_cast<float>(static_cast<double>(tick - s_lastVsyncTick) / span);
+                    // A screen shows at most one frame per field: frames are counted at the sample moments, not
+                    // exactly on field boundaries, so clamp the +-1 slack.
+                    s_gameFps = std::min(s_vsyncRate, static_cast<float>(frames / span));
+                }
+                else
+                {
+                    s_vsyncRate = 0.0f; // no new field: the guest clock is stalled
+                    s_gameFps = static_cast<float>(frames / elapsedFps);
+                }
+                // PS2X_HUD_LOG=1 logs the F2 overlay numbers (game FPS, guest VSync, worst host frame) for unattended runs.
+                static const bool s_hudLog = [] { const char *v = std::getenv("PS2X_HUD_LOG"); return v && *v && *v != '0'; }();
+                if (s_hudLog)
+                    std::fprintf(stderr, "[hud] tick=%llu fps=%.1f vsync=%.1f frameMs=%.1f maxFrameMs=%.1f\n",
+                                 static_cast<unsigned long long>(currentVsync), s_gameFps, s_vsyncRate, GetFrameTime() * 1000.0f, s_maxFrameMs);
             }
-            else
-            {
-                s_vsyncRate = 0.0f; // no new field: the guest clock is stalled
-                s_gameFps = static_cast<float>(frames / elapsedFps);
-            }
-            // PS2X_HUD_LOG=1 logs the F2 overlay numbers (game FPS, guest VSync, worst host frame) for unattended runs.
-            static const bool s_hudLog = [] { const char *v = std::getenv("PS2X_HUD_LOG"); return v && *v && *v != '0'; }();
-            if (s_hudLog)
-                std::fprintf(stderr, "[hud] tick=%llu fps=%.1f vsync=%.1f frameMs=%.1f maxFrameMs=%.1f\n",
-                             static_cast<unsigned long long>(currentVsync), s_gameFps, s_vsyncRate, GetFrameTime() * 1000.0f, s_maxFrameMs);
+            s_stateLoads = stateLoads;
             s_lastVsyncTick = tick;
             s_lastVsyncNs = tickNs;
             s_lastGameFrames = gameFrames;
@@ -3845,6 +3877,15 @@ void PS2Runtime::run()
             DrawRectangle(8, y, MeasureText(buildText, kFontSize) + 16, kFontSize + 10, Fade(BLACK, 0.75f));
             DrawText(buildText, 16, y + 5, kFontSize, WHITE);
         }
+        // Issue 027 v3: the result of F5 / F9 for a few seconds, centred at the bottom of the window.
+        if (const std::string message = stateMessage(); !message.empty() && !IsWindowHidden())
+        {
+            constexpr int kFontSize = 22;
+            const int textW = MeasureText(message.c_str(), kFontSize);
+            const int x = (GetScreenWidth() - textW) / 2, y = GetScreenHeight() - kFontSize - 40;
+            DrawRectangle(x - 12, y - 7, textW + 24, kFontSize + 14, Fade(BLACK, 0.75f));
+            DrawText(message.c_str(), x, y, kFontSize, WHITE);
+        }
 
         // DW5XL-DEBUG issue 023 3S: PS2X_WINDOW_SHOT=<field>:<path.png> saves the whole window (overlays included)
         // on the first frame at or after that field — the frame dumps hold only the game picture.
@@ -3858,6 +3899,7 @@ void PS2Runtime::run()
             }
             if (!m_windowShotRequest.empty() && s_shotPath.empty()) { s_shotPath = m_windowShotRequest; s_shotTick = 0; m_windowShotRequest.clear(); }
             if (!s_shotPath.empty() && currentVsync >= s_shotTick) {
+                rlDrawRenderBatchActive(); // raylib's text and boxes of this frame are still batched until now
                 ::Image shot = LoadImageFromScreen();
                 ExportImage(shot, s_shotPath.c_str());
                 UnloadImage(shot);

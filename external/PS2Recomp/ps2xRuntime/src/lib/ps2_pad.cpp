@@ -154,6 +154,21 @@ namespace ps2_host_input
         gState.verdite = true;
     }
 
+    bool scriptedKeyPress(const char *name, uint64_t vsyncTick)
+    {
+        initScript();
+        static std::vector<bool> fired; // window thread only; the events never change after initScript
+        if (fired.size() != gEvents.size())
+            fired.assign(gEvents.size(), false);
+        for (size_t i = 0; i < gEvents.size(); ++i)
+            if (!fired[i] && gEvents[i].name == name && vsyncTick >= gEvents[i].tick)
+            {
+                fired[i] = true;
+                return true;
+            }
+        return false;
+    }
+
     void setGameInputBlocked(bool blocked) { gInputBlocked.store(blocked); }
     void setBackHoldAction(double seconds, void (*action)()) { gBackHoldSeconds = seconds; gBackHoldAction = action; }
     void tapGameButtons(uint16_t mask)

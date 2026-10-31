@@ -2599,12 +2599,13 @@ void EeScheduler::publishIdleDebugContext()
 
 // ---- DW5XL (issue 027): save states --------------------------------------------------------------------------------
 
-void EeScheduler::requestState(StateRequestKind kind, std::string path)
+void EeScheduler::requestState(StateRequestKind kind, std::string path, std::string backup)
 {
     {
         std::lock_guard lock(m_stateRequestMutex);
         m_stateRequestKind = kind;
         m_stateRequestPath = std::move(path);
+        m_stateRequestBackup = std::move(backup);
         m_stateRequestPending.store(kind != StateRequestKind::None, std::memory_order_release);
     }
     std::lock_guard lock(m_eventMutex); // wake an idle executor so it reaches the top of run()
@@ -2665,16 +2666,17 @@ bool EeScheduler::serviceStateRequest()
     }
     s_lastRefusal.clear();
     StateRequestKind kind;
-    std::string path;
+    std::string path, backup;
     {
         std::lock_guard lock(m_stateRequestMutex);
         kind = m_stateRequestKind;
         path = m_stateRequestPath;
+        backup = m_stateRequestBackup;
         m_stateRequestKind = StateRequestKind::None;
         m_stateRequestPending.store(false, std::memory_order_release);
     }
     bool retry = false;
-    const bool ok = m_runtime.performStateRequest(kind == StateRequestKind::Save, path, retry);
+    const bool ok = m_runtime.performStateRequest(kind == StateRequestKind::Save, path, retry, backup);
     if (retry)
     {
         std::lock_guard lock(m_stateRequestMutex); // the drain made new work: handle it, come back next pass
@@ -2682,6 +2684,7 @@ bool EeScheduler::serviceStateRequest()
         {
             m_stateRequestKind = kind;
             m_stateRequestPath = path;
+            m_stateRequestBackup = backup;
             m_stateRequestPending.store(true, std::memory_order_release);
         }
         return false;

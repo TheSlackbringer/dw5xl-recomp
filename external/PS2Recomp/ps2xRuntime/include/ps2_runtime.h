@@ -17,6 +17,7 @@
 #include <smmintrin.h> // For SSE4.1 instructions
 #endif
 #include <atomic>
+#include <chrono>
 #include <array>
 #include <mutex>
 #include <filesystem>
@@ -442,7 +443,13 @@ public:
     // on the executor. A state from another build or format is refused before anything changes.
     // retry: the drain at the start made new work (device completions, events); the scheduler keeps the request and
     // tries again at its next quiet point.
-    bool performStateRequest(bool save, const std::string &path, bool &retry);
+    // backup (a load only): the running game is saved there first, once the state has passed its checks.
+    bool performStateRequest(bool save, const std::string &path, bool &retry, const std::string &backup = {});
+    // Issue 027 v3: a short message about a save or load, shown in the window for a few seconds (any thread).
+    void showStateMessage(std::string text);
+    std::string stateMessage() const; // empty once it has been shown long enough
+    // States loaded so far: a load jumps the field number, so rate counters (PS2X_STATS, the F2 numbers) restart.
+    uint64_t stateLoadCount() const { return m_stateLoads.load(std::memory_order_acquire); }
     // Components outside the runtime (the app's overlays, IPU decoder, pad bridge, ...) add their state here; they
     // are saved and loaded in registration order, each under its own section tag.
     using StateHook = std::function<void(ps2x::StateArchive &)>;
@@ -612,6 +619,10 @@ private:
     float m_pictureRect[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     std::string m_windowShotRequest;
     std::atomic<bool> m_showFps{false};
+    std::atomic<uint64_t> m_stateLoads{0};
+    mutable std::mutex m_stateMessageMutex;
+    std::string m_stateMessage;
+    std::chrono::steady_clock::time_point m_stateMessageTime{};
     std::function<bool()> m_spu2KeyOnWanted;
     Spu2KeyOnObserver m_spu2KeyOnObserver;
     mutable std::mutex m_hostPauseMutex;
