@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
-Name=Dynasty Warriors 5 Xtreme Legends
-Comment=Build and play using your own PAL disc image
+Name=DW5XL Recomp
+Comment=Build and play Dynasty Warriors 5 Xtreme Legends (PAL) from your own disc image
 Exec=dw5xl_setup
 Icon=dw5xl
 Categories=Game;ActionGame;

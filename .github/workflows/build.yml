@@ -148,6 +148,7 @@ jobs:
           path: |
             dist/*.AppImage
             dist/*.AppImage.sha256
+            dist/*.AppImage.zsync
           retention-days: 14
           compression-level: 0
       - uses: actions/upload-artifact@v7
@@ -295,7 +296,7 @@ jobs:
           exit 0
 
   draft:
-    # Reuse the numbered draft until the owner publishes it, then start the next alpha.
+    # Reuse the numbered draft until the owner publishes it, then start the next beta.
     needs: [linux, linux-package, windows-build, windows-test]
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04

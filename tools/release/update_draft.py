@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Update the numbered builder draft; publishing remains an owner action.
 
-Keep updating alpha.N while it is a draft. Once published (including as a
-prerelease), leave it alone and create alpha.N+1 on the next successful build.
+Keep updating beta.N while it is a draft. Once published (including as a
+prerelease), leave it alone and create beta.N+1 on the next successful build.
+Drafts are full releases, so AppImage updaters (which follow the latest full
+release) see them once published; marking one as a prerelease is the owner's choice.
+The AppImage's .zsync names the AppImage, so it is renamed and rewritten with it.
 The archive's BUILD_ID remains the source revision so updates still rebuild.
 """
 import argparse
@@ -13,7 +16,14 @@ from pathlib import Path
 import re
 import subprocess
 
+import zsync_file
+
 NOTES_DIR = Path(__file__).with_name('notes')
+SERIES = 'v0.1.0-beta'
+RETIRED_SERIES = ('v0.1.0-alpha',)  # an unpublished draft of these becomes the next draft of SERIES
+# Package file names per platform: prefix + version + suffix (issue 044: the AppImage names the project, not Linux),
+# and whether AppImage updaters need a .zsync next to it.
+PACKAGES = (('DW5XL-', '-windows-x64.zip', False), ('DW5XL-RECOMP-', '-x86_64.AppImage', True))
 
 
 class PublishedDuringUpdate(Exception):
@@ -50,7 +60,7 @@ class GitHub:
         return self.api(f'releases/{release_id}', method='PATCH', payload=payload)
 
     def create(self, payload):
-        return self.api('releases', method='POST', payload={**payload, 'draft': True, 'prerelease': True})
+        return self.api('releases', method='POST', payload={**payload, 'draft': True, 'prerelease': False})
 
     def upload(self, release_id, files):
         release = self.require_draft(release_id)
@@ -62,7 +72,7 @@ class GitHub:
         self.api(f'releases/assets/{asset_id}', method='DELETE')
 
 
-def select_release(releases, series='v0.1.0-alpha'):
+def select_release(releases, series=SERIES):
     pattern = re.compile(re.escape(series) + r'\.([1-9][0-9]*)\Z')
     numbered = [(int(match[1]), release) for release in releases
                 if (match := pattern.fullmatch(release['tag_name']))]
@@ -73,25 +83,42 @@ def select_release(releases, series='v0.1.0-alpha'):
         number += 1
     else:
         number = 1
-    # Migrate the old rolling draft, preserving its identity and owner comments.
-    legacy = next((release for release in releases
-                   if release['tag_name'] == 'windows-next' and release['draft']), None)
+    # Migrate the old rolling draft or a draft of a retired series, preserving its identity and owner comments.
+    retired = re.compile('(' + '|'.join(map(re.escape, RETIRED_SERIES)) + r')\.[1-9][0-9]*\Z')
+    legacy = next((release for release in releases if release['draft'] and
+                   (release['tag_name'] == 'windows-next' or retired.fullmatch(release['tag_name']))), None)
     return f'{series}.{number}', legacy
 
 
-def package_for_version(source, version):
-    suffix = next((suffix for suffix in ('windows-x64.zip', 'linux-x86_64.AppImage')
-                   if source.name.endswith('-' + suffix)), None)
-    if suffix is None:
+def package_kind(source):
+    kind = next((kind for kind in PACKAGES if source.name.startswith(kind[0]) and source.name.endswith(kind[1])), None)
+    if kind is None:
         raise ValueError(f'unknown builder package: {source.name}')
-    target = source.with_name(f'DW5XL-{version}-{suffix}')
+    return kind
+
+
+def update_file(source):
+    """The checked .zsync of an AppImage, or None for a package that has none; ValueError if it is missing or wrong."""
+    if not package_kind(source)[2]:
+        return None
+    zsync = Path(str(source) + '.zsync')
+    if not zsync.is_file():
+        raise ValueError(f'{source.name}: {zsync.name} is missing; AppImage updaters need it')
+    zsync_file.check(zsync, source)
+    return zsync
+
+
+def package_for_version(source, version):
+    prefix, suffix, _ = package_kind(source)
+    zsync = update_file(source)
+    target = source.with_name(f'{prefix}{version}{suffix}')
     if target != source:
         source.rename(target)
     checksum = Path(str(target) + '.sha256')
     with target.open('rb') as stream:
         digest = hashlib.file_digest(stream, 'sha256').hexdigest()
     checksum.write_text(f'{digest}  {target.name}\n')
-    return target, checksum
+    return (target, checksum) if zsync is None else (target, checksum, zsync_file.rename(zsync, target))
 
 
 def release_body(version, commit, run_id, subject, platforms):
@@ -104,9 +131,11 @@ def release_body(version, commit, run_id, subject, platforms):
     return notes.read_text().rstrip() + '\n\n---\n\n' + metadata if notes.is_file() else metadata
 
 
-def update_draft(github, source, commit, run_id, subject, series='v0.1.0-alpha'):
+def update_draft(github, source, commit, run_id, subject, series=SERIES):
     sources = [source] if isinstance(source, Path) else list(source)
     platforms = 'Windows and Linux' if len(sources) > 1 else 'Windows'
+    for package in sources:
+        update_file(package)  # refuse before the draft changes
     for _ in range(3):
         version, release = select_release(github.releases(), series)
         payload = {
@@ -141,10 +170,9 @@ def main():
     parser.add_argument('--repo', default=os.environ.get('GH_REPO'))
     parser.add_argument('--commit', default=os.environ.get('GITHUB_SHA'))
     parser.add_argument('--run-id', default=os.environ.get('GITHUB_RUN_ID', 'local'))
-    parser.add_argument('--series', default='v0.1.0-alpha')
+    parser.add_argument('--series', default=SERIES)
     args = parser.parse_args()
-    windows = list(args.dist.glob('DW5XL-*-windows-x64.zip'))
-    linux = list(args.dist.glob('DW5XL-*-linux-x86_64.AppImage'))
+    windows, linux = (list(args.dist.glob(f'{prefix}*{suffix}')) for prefix, suffix, _ in PACKAGES)
     if not args.repo or not args.commit or len(windows) != 1 or len(linux) > 1:
         parser.error('repo, commit, exactly one Windows zip and at most one Linux AppImage are required')
     update_draft(GitHub(args.repo), windows + linux, args.commit, args.run_id,

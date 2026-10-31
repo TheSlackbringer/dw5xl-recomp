@@ -16,7 +16,11 @@ Not checked here (do it before publishing): `run.py full` green on this commit, 
 import argparse, hashlib, os, re, shutil, subprocess, sys, zipfile
 from pathlib import Path
 
+import zsync_file
+
 REPO = Path(__file__).resolve().parents[2]
+# Issue 044: AppImage updaters look for this file pattern in the latest full GitHub release.
+UPDATE_INFORMATION = 'gh-releases-zsync|TheSlackbringer|dw5xl-recomp|latest|DW5XL-RECOMP-*x86_64.AppImage.zsync'
 LLVM_MINGW_HOST = Path(os.environ.get('LLVM_MINGW_ROOT',
                                       Path.home() / '.local/opt/llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64'))
 WIN_TOOLS = Path(os.environ.get('DW5XL_WIN_TOOLS', Path.home() / '.local/opt/windows-builder-tools'))
@@ -271,6 +275,11 @@ def windows(build, recomp_build, test):
     return archive
 
 
+def linux_package_name(version):
+    # Issue 044: named after the project; no "linux", since every AppImage is for Linux.
+    return f'DW5XL-RECOMP-{version}-x86_64'
+
+
 def linux(build, recomp_build, sdk, ffmpeg, appimage_tools, test):
     """Build an AppDir containing the setup launcher, sources and an offline SDK."""
     launcher = build / 'dw5xl_setup'
@@ -280,7 +289,7 @@ def linux(build, recomp_build, sdk, ffmpeg, appimage_tools, test):
         if not path.exists():
             fail(f'{path} missing')
     version = version_for(test)
-    name = f'DW5XL-{version}-linux-x86_64'
+    name = linux_package_name(version)
     dist = REPO / 'dist'
     stage = dist / f'{name}.AppDir'
     if stage.exists():
@@ -355,8 +364,16 @@ exec "$root/usr/bin/dw5xl_setup" --root "$root" "$@"
     runtime = build / 'appimage-runtime-x86_64'
     with image_tool.open('rb') as stream:
         runtime.write_bytes(stream.read(offset))
-    subprocess.run([str(image_tool), '--no-appstream', '--runtime-file', str(runtime), str(stage), str(archive)],
-                   env=env, check=True)
+    # -u embeds the update information and has appimagetool's bundled zsyncmake write the .zsync, into the current
+    # folder. appimagetool only warns when zsyncmake is missing, so the .zsync is checked here.
+    zsync = dist / f'{archive.name}.zsync'
+    zsync.unlink(missing_ok=True)
+    subprocess.run([str(image_tool), '--no-appstream', '--runtime-file', str(runtime), '-u', UPDATE_INFORMATION,
+                    str(stage), str(archive)], env=env, check=True, cwd=dist)
+    try:
+        zsync_file.check(zsync, archive)
+    except (OSError, ValueError) as error:
+        fail(f'no matching update file next to the AppImage: {error}')
     Path(str(archive) + '.sha256').write_text(f'{sha256(archive)}  {archive.name}\n')
     print(f'{archive} ({archive.stat().st_size / 2**20:.0f} MB)')
     return archive

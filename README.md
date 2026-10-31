@@ -36,7 +36,7 @@ Other regions and revisions are not supported (every file is checked against kno
 Download the latest release from the [Releases](https://github.com/TheSlackbringer/dw5xl-recomp/releases) page. It contains our program, the source code, a compiler and the tools; nothing else needs to be installed and nothing is downloaded while it builds.
 
 - **Windows:** unzip `DW5XL-<version>-windows-x64.zip` close to the drive root, e.g. `C:\Games\` (deep paths trip up Windows), and start **`DW5XL.exe`**. It is not signed: if Windows says *"Windows protected your PC"*, choose **More info → Run anyway**.
-- **Linux:** make `DW5XL-<version>-linux-x86_64.AppImage` executable and open it.
+- **Linux:** make `DW5XL-RECOMP-<version>-x86_64.AppImage` executable and open it. AppImage update tools such as AppImageUpdate can update it to the newest release.
 
 **First start:** choose your XL disc image (and optionally the DW5 one) and press **Start**. The disc is checked, and the game is translated and compiled for your PC — about 10 minutes, once. Every later start opens the game directly; a new release rebuilds once without asking for the disc again.
 

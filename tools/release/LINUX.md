@@ -61,7 +61,8 @@ image line into `tools/release/linux-builder-image`. `DW5XL_LINUX_IMAGE`
 overrides the image for a local test, e.g. one built from the Containerfile.
 
 The script builds the launcher and recompiler, runs the setup tests, scans the
-AppDir for forbidden game content, and writes an AppImage and SHA-256 sidecar
+AppDir for forbidden game content, and writes
+`DW5XL-RECOMP-<version>-x86_64.AppImage` with SHA-256 and `.zsync` sidecars
 under `dist/`. SDK export, compiler, test and packaging logs stay in
 `DW5XL_LINUX_SDK_WORK`. A clean checkout is required; `--test` permits local
 changes and labels the resulting package for testing.
@@ -69,3 +70,25 @@ changes and labels the resulting package for testing.
 For systems without FUSE, AppImage's standard `APPIMAGE_EXTRACT_AND_RUN=1`
 environment setting can be used. The launcher stays alive while its game child
 runs so the bundled runtime libraries remain available.
+
+## Updates
+
+The AppImage carries update information for AppImage updaters such as
+AppImageUpdate: `gh-releases-zsync|TheSlackbringer|dw5xl-recomp|latest|DW5XL-RECOMP-*x86_64.AppImage.zsync`
+(`UPDATE_INFORMATION` in `make_release.py`). An updater asks GitHub for the
+latest full release, which skips pre-releases, and downloads the changed parts
+of the AppImage that its `.zsync` names. appimagetool writes the `.zsync` with
+its bundled `zsyncmake`; the build fails unless it exists and matches the
+AppImage, because appimagetool only warns when it cannot make one.
+
+The `.zsync` names the AppImage by file name. The draft job renames the
+AppImage from the commit to the release tag, so it also renames the `.zsync`
+and rewrites its `Filename:` and `URL:` lines (`zsync_file.py`); the checksums
+inside describe the bytes and stay valid. Renaming a release or its tag is
+harmless; renaming the AppImage or `.zsync` asset by hand breaks updates for
+that release. Drafts are created as full releases so that a published release
+reaches updaters; marking one as a pre-release hides it from them.
+
+Updating the AppImage updates the builder only. The player's files stay in
+`$XDG_DATA_HOME/dw5xl`; the first start of a newer AppImage rebuilds the game
+once without asking for the disc again, and later starts open the game directly.
