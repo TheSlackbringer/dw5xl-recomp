@@ -3767,6 +3767,27 @@ void PS2Runtime::run()
             m_gs.setAASamples(s_aaChoice);
             saveIniValue("aa_samples", s_aaChoice);
         }
+        // Issue 027 v3: F5 saves the game to the quick slot; F9 loads it, keeping the running game in before-load.state
+        // first; Shift+F9 goes back to that. The scheduler carries them out at its next quiet point. The folder is
+        // states/ next to the game's executable (PS2X_STATE_DIR for tests, so they never touch the player's states).
+        {
+            static const std::filesystem::path s_stateDir = []
+            {
+                const char *dir = std::getenv("PS2X_STATE_DIR");
+                return dir && *dir ? std::filesystem::path(dir) : getIoPaths().elfDirectory / "states";
+            }();
+            const uint64_t tick = eeScheduler().currentVSyncTick();
+            const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+            const bool loadKey = IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::LoadState));
+            const std::string quick = (s_stateDir / "quick.state").string(), backup = (s_stateDir / "before-load.state").string();
+            using Kind = EeScheduler::StateRequestKind;
+            if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::SaveState)) || ps2_host_input::scriptedKeyPress("F5", tick))
+                eeScheduler().requestState(Kind::Save, quick);
+            else if ((loadKey && shift) || ps2_host_input::scriptedKeyPress("SHIFT+F9", tick))
+                eeScheduler().requestState(Kind::Load, backup);
+            else if (loadKey || ps2_host_input::scriptedKeyPress("F9", tick))
+                eeScheduler().requestState(Kind::Load, quick, backup);
+        }
 
         // F2 overlay numbers (issue 014), about once a second. VSync = guest fields per second, timed by the fields'
         // own emission times (so a steady 50 reads 50.0, not 49/51 from where the window falls). FPS = the
@@ -3856,6 +3877,15 @@ void PS2Runtime::run()
             DrawRectangle(8, y, MeasureText(buildText, kFontSize) + 16, kFontSize + 10, Fade(BLACK, 0.75f));
             DrawText(buildText, 16, y + 5, kFontSize, WHITE);
         }
+        // Issue 027 v3: the result of F5 / F9 for a few seconds, centred at the bottom of the window.
+        if (const std::string message = stateMessage(); !message.empty() && !IsWindowHidden())
+        {
+            constexpr int kFontSize = 22;
+            const int textW = MeasureText(message.c_str(), kFontSize);
+            const int x = (GetScreenWidth() - textW) / 2, y = GetScreenHeight() - kFontSize - 40;
+            DrawRectangle(x - 12, y - 7, textW + 24, kFontSize + 14, Fade(BLACK, 0.75f));
+            DrawText(message.c_str(), x, y, kFontSize, WHITE);
+        }
 
         // DW5XL-DEBUG issue 023 3S: PS2X_WINDOW_SHOT=<field>:<path.png> saves the whole window (overlays included)
         // on the first frame at or after that field — the frame dumps hold only the game picture.
@@ -3869,6 +3899,7 @@ void PS2Runtime::run()
             }
             if (!m_windowShotRequest.empty() && s_shotPath.empty()) { s_shotPath = m_windowShotRequest; s_shotTick = 0; m_windowShotRequest.clear(); }
             if (!s_shotPath.empty() && currentVsync >= s_shotTick) {
+                rlDrawRenderBatchActive(); // raylib's text and boxes of this frame are still batched until now
                 ::Image shot = LoadImageFromScreen();
                 ExportImage(shot, s_shotPath.c_str());
                 UnloadImage(shot);

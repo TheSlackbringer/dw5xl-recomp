@@ -12,9 +12,9 @@ namespace ps2x::hotkeys
         FpsOverlay,   // F2: frame rate overlay (issue 014)
         AntiAliasing, // F3: anti-aliasing choice, saved in dw5xl.ini
         OutputScale,  // F4: output resolution 1x / 2x / 4x, saved in dw5xl.ini
-        SaveState,    // F5: save state (issue 027, not available yet)
+        SaveState,    // F5: save the game to the quick slot (issue 027 v3)
         BuildOverlay, // F8: build ID and game tick overlay (issue 012)
-        LoadState,    // F9: load state (issue 027, not available yet)
+        LoadState,    // F9: load the quick slot; Shift+F9 undoes the last F9 (issue 027 v3)
         Discs,        // F10: Discs window (installed mode)
     };
 

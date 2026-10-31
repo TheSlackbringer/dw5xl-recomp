@@ -376,9 +376,10 @@ public:
 
     // DW5XL (issue 027): save states. A state is taken or restored only at a quiet point: at the top of run(), with
     // no host callback pending anywhere (no invocation in progress, no resume or wait completion, no queued event).
-    // Requests from any thread are carried out there, on the executor.
+    // Requests from any thread are carried out there, on the executor. `backup` (a load from F9, issue 027 v3): the
+    // running game is saved there first, so the load can be undone.
     enum class StateRequestKind : uint8_t { None, Save, Load };
-    void requestState(StateRequestKind kind, std::string path);
+    void requestState(StateRequestKind kind, std::string path, std::string backup = {});
     [[nodiscard]] bool stateQuiet(std::string *reason = nullptr) const;
     void serializeState(ps2x::StateArchive &archive);
 
@@ -499,6 +500,7 @@ private:
     std::atomic<bool> m_stateRequestPending{false};
     StateRequestKind m_stateRequestKind = StateRequestKind::None;
     std::string m_stateRequestPath;
+    std::string m_stateRequestBackup;
     uint64_t m_stateSaveAtTick = 0;  // PS2X_SAVE_STATE_AT=<tick>:<file> (0 = off)
     std::string m_stateSaveAtPath;
     uint64_t m_stateLoadAtTick = 0;  // PS2X_LOAD_STATE=<file> (loaded once the game reached this field)

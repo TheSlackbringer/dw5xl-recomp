@@ -54,6 +54,25 @@ namespace
         return identity;
     }
 
+    // The window message for a refused save or load (issue 027 v3).
+    std::string refusalMessage(bool save, const std::string &reason)
+    {
+        const auto has = [&](const char *text) { return reason.find(text) != std::string::npos; };
+        if (save)
+            return has("movie")         ? "Can't save now: a movie is playing"
+                   : has("memory card") ? "Can't save now: the memory card is in use"
+                                        : "Can't save now: " + reason;
+        if (has("cannot open"))
+            return "No saved state to load";
+        if (has("state format") || has("bytes in the state") || has("section"))
+            return "Can't load: the state is from another version of the port";
+        if (has("from game"))
+            return "Can't load: the state is from another version of the game";
+        if (has("damaged") || has("is not a"))
+            return "Can't load: the state file is damaged";
+        return "Can't load: " + reason;
+    }
+
     struct Header
     {
         char magic[8];
@@ -221,7 +240,21 @@ void PS2Runtime::serializeState(ps2x::StateArchive &a)
     a.tag("DONE");
 }
 
-bool PS2Runtime::performStateRequest(bool save, const std::string &path, bool &retry)
+void PS2Runtime::showStateMessage(std::string text)
+{
+    std::cerr << "[state] message: " << text << std::endl;
+    std::lock_guard lock(m_stateMessageMutex);
+    m_stateMessage = std::move(text);
+    m_stateMessageTime = std::chrono::steady_clock::now();
+}
+
+std::string PS2Runtime::stateMessage() const
+{
+    std::lock_guard lock(m_stateMessageMutex);
+    return std::chrono::steady_clock::now() - m_stateMessageTime < std::chrono::seconds(3) ? m_stateMessage : std::string();
+}
+
+bool PS2Runtime::performStateRequest(bool save, const std::string &path, bool &retry, const std::string &backup)
 {
     const auto started = std::chrono::steady_clock::now();
     retry = false;
@@ -237,10 +270,8 @@ bool PS2Runtime::performStateRequest(bool save, const std::string &path, bool &r
             retry = true;
             return false;
         }
-        const auto saveTo = [&](const std::string &target)
+        const auto writeState = [&](const std::string &target, const ps2x::StateArchive &body)
         {
-            ps2x::StateArchive body = ps2x::StateArchive::writer();
-            serializeState(body);
             Header header{};
             std::memcpy(header.magic, kMagic, sizeof(kMagic));
             header.version = kFormatVersion;
@@ -254,9 +285,16 @@ bool PS2Runtime::performStateRequest(bool save, const std::string &path, bool &r
             std::cerr << "[state] saved " << target << " at tick " << m_memory.gs().vsyncTick << " (" << file.size() / (1024 * 1024)
                       << " MiB, " << ms << " ms)" << std::endl;
         };
+        const auto saveTo = [&](const std::string &target)
+        {
+            ps2x::StateArchive body = ps2x::StateArchive::writer();
+            serializeState(body);
+            writeState(target, body);
+        };
         if (save)
         {
             saveTo(path);
+            showStateMessage("State saved");
             return true;
         }
 
@@ -289,6 +327,8 @@ bool PS2Runtime::performStateRequest(bool save, const std::string &path, bool &r
         // a section differs) puts the game back as it was instead of leaving it half-loaded.
         ps2x::StateArchive before = ps2x::StateArchive::writer();
         serializeState(before);
+        if (!backup.empty()) // F9: the game as it was, so the load can be undone (Shift+F9)
+            writeState(backup, before);
         ps2x::StateArchive body = ps2x::StateArchive::reader(std::move(bodyBytes));
         try
         {
@@ -316,6 +356,7 @@ bool PS2Runtime::performStateRequest(bool save, const std::string &path, bool &r
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
         std::cerr << "[state] loaded " << path << " (saved at tick " << m_memory.gs().vsyncTick << ", " << ms
                   << " ms)" << std::endl;
+        showStateMessage("State loaded");
         // Test switch: save again at once, before the game runs a single step (save -> load -> save identity).
         if (const char *again = std::getenv("PS2X_STATE_RESAVE"); again && *again)
             saveTo(again);
@@ -324,6 +365,7 @@ bool PS2Runtime::performStateRequest(bool save, const std::string &path, bool &r
     catch (const std::exception &e)
     {
         std::cerr << "[state] " << (save ? "save" : "load") << " refused: " << e.what() << std::endl;
+        showStateMessage(refusalMessage(save, e.what()));
         return false;
     }
 }
