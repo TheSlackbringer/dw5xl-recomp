@@ -11,13 +11,16 @@ touched. It uses PCSX2's software renderer (accurate reference; Vulkan cannot
 present on Xvfb) and its own F8 screenshot hotkey.
 
   tools/pcsx2_reference.py --out <dir> --seconds 540 [--interval 0.5]
-                           [--keys "15:x,20:Return"] [--iso <file>]
+                           [--keys "15:x,20:Return"] [--iso <file>] [--mc-folder <saves>]
 
 Keys are X keysym names at seconds after launch (combine with +, e.g. Shift_L+F8
 for a one-frame GS dump, Control_L+Shift_L+F8 to start/stop a multi-frame dump;
 dumps land next to the screenshots); the copied config maps
 Cross = X, Start = Return, Circle = C, Square = Z, Triangle = V, D-pad = arrows.
-Screenshots land in <out>/snaps (PCSX2 names them by wall-clock time; sort by
+--mc-folder copies a folder of saves (the port's memory-card layout) into the throwaway config as PCSX2's
+slot 1 folder card, with a formatted card header when it has none; the card stays in
+<out>/pcsx2home/PCSX2/memcards/Mcd001.ps2 after the run. --mc-file does the same with a copy of a .ps2 card
+file (folder cards show only the running disc's saves; a card file shows all of them). Screenshots land in <out>/snaps (PCSX2 names them by wall-clock time; sort by
 name). Audio goes to the dw5xl_codex_tests null sink. The output is game-derived:
 keep it out of git (e.g. notes/evidence or a scratch directory).
 
@@ -29,6 +32,7 @@ import glob
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -55,7 +59,21 @@ def set_key(ini, section, key, value):
     return ini[:m.end()] + body + ini[end:]
 
 
-def make_config(out):
+def folder_card_superblock():
+    """Block 0 of a formatted 8 MB PS2 memory card, as PCSX2 keeps it in a folder card's _pcsx2_superblock (8 KiB;
+    PCSX2 counts the card as formatted when byte 0x16 is the 'o' of the magic). The standard values of an 8 MB card:
+    512-byte pages, 2 pages per cluster, 16 per erase block, 8192 clusters, data from cluster 41 to 8135, the root
+    directory at cluster 0, backup blocks 1023/1022, the indirect FAT cluster 8, no bad blocks, PS2 card."""
+    sb = bytearray(b'\xff' * 8192)
+    struct.pack_into('<28s12sHHHHIIIIII8x', sb, 0, b'Sony PS2 Memory Card Format ', b'1.2.0.0', 512, 2, 16, 0xFF00,
+                     8192, 41, 8135, 0, 1023, 1022)
+    struct.pack_into('<32I', sb, 0x50, 8, *([0] * 31))
+    struct.pack_into('<32I', sb, 0xD0, *([0xFFFFFFFF] * 32))
+    struct.pack_into('<BB', sb, 0x150, 2, 0x52)
+    return bytes(sb)
+
+
+def make_config(out, mc_folder=None, mc_file=None):
     home = os.path.join(out, 'pcsx2home')
     cfg = os.path.join(home, 'PCSX2')
     os.makedirs(os.path.join(cfg, 'inis'), exist_ok=True)
@@ -75,9 +93,30 @@ def make_config(out):
     for button, key in PAD_KEYS.items():
         ini = set_key(ini, 'Pad1', button, key)
     ini = set_key(ini, 'Hotkeys', 'Screenshot', 'Keyboard/F8')
+    if mc_file:
+        # Slot 1: a copy of a PCSX2 card file (.ps2); slot 2 off.
+        shutil.copyfile(mc_file, os.path.join(cfg, 'memcards', 'Mcd001.ps2'))
+        ini = set_key(ini, 'MemoryCards', 'Slot1_Enable', 'true')
+        ini = set_key(ini, 'MemoryCards', 'Slot1_Filename', 'Mcd001.ps2')
+        ini = set_key(ini, 'MemoryCards', 'Slot2_Enable', 'false')
+    elif mc_folder:
+        # Slot 1: a copy of a folder of PS2 saves as a PCSX2 folder card (a directory at the slot path); slot 2 off.
+        card = os.path.join(cfg, 'memcards', 'Mcd001.ps2')
+        shutil.copytree(mc_folder, card, copy_function=shutil.copyfile)
+        for root, dirs, files in os.walk(card):
+            for name in dirs + files:
+                os.chmod(os.path.join(root, name), 0o755 if name in dirs else 0o644)
+        os.chmod(card, 0o755)
+        superblock = os.path.join(card, '_pcsx2_superblock')
+        if not os.path.exists(superblock) or os.path.getsize(superblock) != 8192:
+            open(superblock, 'wb').write(folder_card_superblock())
+        ini = set_key(ini, 'MemoryCards', 'Slot1_Enable', 'true')
+        ini = set_key(ini, 'MemoryCards', 'Slot1_Filename', 'Mcd001.ps2')
+        ini = set_key(ini, 'MemoryCards', 'Slot2_Enable', 'false')
     open(os.path.join(cfg, 'inis', 'PCSX2.ini'), 'w').write(ini)
-    for card in glob.glob(os.path.join(OWNER_CFG, 'memcards', '*.ps2')):
-        shutil.copy2(card, os.path.join(cfg, 'memcards'))
+    if not mc_folder and not mc_file:
+        for card in glob.glob(os.path.join(OWNER_CFG, 'memcards', '*.ps2')):
+            shutil.copy2(card, os.path.join(cfg, 'memcards'))
     return home
 
 
@@ -90,6 +129,11 @@ def main():
     ap.add_argument('--iso', default=None)
     ap.add_argument('--app', default=DEFAULT_APP)
     ap.add_argument('--display', default=':77')
+    ap.add_argument('--mc-folder', default=None,
+                    help='a folder of PS2 saves (e.g. game/test-save/<card>) used as slot 1, as a PCSX2 folder card')
+    ap.add_argument('--mc-file', default=None, help='a PCSX2 card file (.ps2) whose copy is slot 1')
+    ap.add_argument('--xshots', action='store_true',
+                    help='also capture the whole private display every interval (PCSX2\'s own menus are not in its screenshots)')
     args = ap.parse_args()
 
     iso = args.iso or next(iter(glob.glob(os.path.join(REPO, 'discs', 'dw5xl', '*.iso'))), None)
@@ -97,7 +141,7 @@ def main():
         sys.exit('no disc image (pass --iso)')
     out = os.path.abspath(args.out)
     os.makedirs(out, exist_ok=True)
-    home = make_config(out)
+    home = make_config(out, args.mc_folder, args.mc_file)
     keys = []
     for item in filter(None, args.keys.split(',')):
         parts = item.split(':')
@@ -161,8 +205,18 @@ def main():
         d.sync()
         return True
 
+    def xshot(index):
+        from PIL import Image
+        geometry = root.get_geometry()
+        raw = root.get_image(0, 0, geometry.width, geometry.height, X.ZPixmap, 0xFFFFFFFF)
+        Image.frombytes('RGB', (geometry.width, geometry.height), raw.data, 'raw', 'BGRX').save(
+            os.path.join(out, 'xshots', '%04d.png' % index))
+
+    if args.xshots:
+        os.makedirs(os.path.join(out, 'xshots'), exist_ok=True)
     start = time.time()
     next_shot = start + args.interval
+    shot_index = 0
     try:
         while time.time() - start < args.seconds and proc.poll() is None:
             now = time.time()
@@ -171,6 +225,9 @@ def main():
                 print('%.1fs key %s: %s' % (now - start, k, 'sent' if press(k, hold) else 'no window yet'), flush=True)
             if now >= next_shot:
                 press('F8')
+                if args.xshots:
+                    xshot(shot_index)
+                shot_index += 1
                 next_shot += args.interval
             time.sleep(0.02)
     finally:
