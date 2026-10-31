@@ -276,6 +276,7 @@ bool PS2Runtime::performStateRequest(bool save, const std::string &path, bool &r
             requestStop();
             return false;
         }
+        m_stateLoads.fetch_add(1u, std::memory_order_release);
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
         std::cerr << "[state] loaded " << path << " (saved at tick " << m_memory.gs().vsyncTick << ", " << ms
                   << " ms)" << std::endl;

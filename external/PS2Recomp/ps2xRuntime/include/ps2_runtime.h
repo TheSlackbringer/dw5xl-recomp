@@ -443,6 +443,8 @@ public:
     // retry: the drain at the start made new work (device completions, events); the scheduler keeps the request and
     // tries again at its next quiet point.
     bool performStateRequest(bool save, const std::string &path, bool &retry);
+    // States loaded so far: a load jumps the field number, so rate counters (PS2X_STATS, the F2 numbers) restart.
+    uint64_t stateLoadCount() const { return m_stateLoads.load(std::memory_order_acquire); }
     // Components outside the runtime (the app's overlays, IPU decoder, pad bridge, ...) add their state here; they
     // are saved and loaded in registration order, each under its own section tag.
     using StateHook = std::function<void(ps2x::StateArchive &)>;
@@ -612,6 +614,7 @@ private:
     float m_pictureRect[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     std::string m_windowShotRequest;
     std::atomic<bool> m_showFps{false};
+    std::atomic<uint64_t> m_stateLoads{0};
     std::function<bool()> m_spu2KeyOnWanted;
     Spu2KeyOnObserver m_spu2KeyOnObserver;
     mutable std::mutex m_hostPauseMutex;

@@ -557,6 +557,7 @@ namespace ps2x_dev
         std::chrono::steady_clock::time_point statsStart{};
         uint64_t statsTick = 0u;
         uint64_t statsFlips = 0u;
+        uint64_t statsLoads = 0u;
         uint64_t lastDispfb = 0u;
 
         void init()
@@ -693,11 +694,13 @@ namespace ps2x_dev
                 ++statsFlips;
             }
             const auto now = std::chrono::steady_clock::now();
-            if (statsStart == std::chrono::steady_clock::time_point{})
+            // A state load (issue 027) jumps the field number: the second it falls in played none of those fields.
+            if (statsStart == std::chrono::steady_clock::time_point{} || runtime->stateLoadCount() != statsLoads)
             {
                 statsStart = now;
                 statsTick = tick;
                 statsFlips = 0u;
+                statsLoads = runtime->stateLoadCount();
                 return;
             }
             const double secs = std::chrono::duration<double>(now - statsStart).count();
@@ -3795,26 +3798,34 @@ void PS2Runtime::run()
             } while (tick != gsRegs.vsyncTick.load(std::memory_order_acquire));
             const uint64_t gameFrames = ps2x::device::gameFrameCount();
             const uint64_t moviePictures = ps2_stubs::moviePictureCount();
-            const double frames = static_cast<double>(std::max(gameFrames - s_lastGameFrames, moviePictures - s_lastMoviePictures));
-            const int64_t spanNs = tickNs - s_lastVsyncNs;
-            if (s_lastVsyncNs != 0 && tick > s_lastVsyncTick && spanNs > 0)
+            // DW5XL (issue 027): a state load jumps the field number, and this window played none of those fields;
+            // the numbers start again from the next window.
+            static uint64_t s_stateLoads = 0;
+            const uint64_t stateLoads = stateLoadCount();
+            if (stateLoads == s_stateLoads)
             {
-                const double span = static_cast<double>(spanNs) * 1e-9;
-                s_vsyncRate = static_cast<float>(static_cast<double>(tick - s_lastVsyncTick) / span);
-                // A screen shows at most one frame per field: frames are counted at the sample moments, not
-                // exactly on field boundaries, so clamp the +-1 slack.
-                s_gameFps = std::min(s_vsyncRate, static_cast<float>(frames / span));
+                const double frames = static_cast<double>(std::max(gameFrames - s_lastGameFrames, moviePictures - s_lastMoviePictures));
+                const int64_t spanNs = tickNs - s_lastVsyncNs;
+                if (s_lastVsyncNs != 0 && tick > s_lastVsyncTick && spanNs > 0)
+                {
+                    const double span = static_cast<double>(spanNs) * 1e-9;
+                    s_vsyncRate = static_cast<float>(static_cast<double>(tick - s_lastVsyncTick) / span);
+                    // A screen shows at most one frame per field: frames are counted at the sample moments, not
+                    // exactly on field boundaries, so clamp the +-1 slack.
+                    s_gameFps = std::min(s_vsyncRate, static_cast<float>(frames / span));
+                }
+                else
+                {
+                    s_vsyncRate = 0.0f; // no new field: the guest clock is stalled
+                    s_gameFps = static_cast<float>(frames / elapsedFps);
+                }
+                // PS2X_HUD_LOG=1 logs the F2 overlay numbers (game FPS, guest VSync, worst host frame) for unattended runs.
+                static const bool s_hudLog = [] { const char *v = std::getenv("PS2X_HUD_LOG"); return v && *v && *v != '0'; }();
+                if (s_hudLog)
+                    std::fprintf(stderr, "[hud] tick=%llu fps=%.1f vsync=%.1f frameMs=%.1f maxFrameMs=%.1f\n",
+                                 static_cast<unsigned long long>(currentVsync), s_gameFps, s_vsyncRate, GetFrameTime() * 1000.0f, s_maxFrameMs);
             }
-            else
-            {
-                s_vsyncRate = 0.0f; // no new field: the guest clock is stalled
-                s_gameFps = static_cast<float>(frames / elapsedFps);
-            }
-            // PS2X_HUD_LOG=1 logs the F2 overlay numbers (game FPS, guest VSync, worst host frame) for unattended runs.
-            static const bool s_hudLog = [] { const char *v = std::getenv("PS2X_HUD_LOG"); return v && *v && *v != '0'; }();
-            if (s_hudLog)
-                std::fprintf(stderr, "[hud] tick=%llu fps=%.1f vsync=%.1f frameMs=%.1f maxFrameMs=%.1f\n",
-                             static_cast<unsigned long long>(currentVsync), s_gameFps, s_vsyncRate, GetFrameTime() * 1000.0f, s_maxFrameMs);
+            s_stateLoads = stateLoads;
             s_lastVsyncTick = tick;
             s_lastVsyncNs = tickNs;
             s_lastGameFrames = gameFrames;
