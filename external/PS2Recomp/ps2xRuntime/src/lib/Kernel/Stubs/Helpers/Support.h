@@ -1984,10 +1984,23 @@ namespace
         a.tag("SUPP");
         a.map(g_cdFilesByKey, [](ps2x::StateArchive &x, CdFileEntry &e)
         {
+            // Relative to the game folder when the file is inside it (issue 027 v3): a moved folder still loads.
             std::string path = e.hostPath.string();
+            uint8_t inGameFolder = 0u;
+            if (x.saving())
+            {
+                std::error_code ec;
+                const std::filesystem::path relative = std::filesystem::relative(e.hostPath, getCdRootPath(), ec);
+                if (!ec && !relative.empty() && *relative.begin() != "..")
+                {
+                    path = relative.generic_string();
+                    inGameFolder = 1u;
+                }
+            }
+            x.value(inGameFolder);
             x.string(path);
             if (x.loading())
-                e.hostPath = path;
+                e.hostPath = inGameFolder ? getCdRootPath() / std::filesystem::path(path) : std::filesystem::path(path);
             x.value(e.sizeBytes);
             x.value(e.baseLbn); // the game may keep pseudo LBNs it was given: they must stay the same
             x.value(e.sectors);

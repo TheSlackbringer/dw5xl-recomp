@@ -56,13 +56,25 @@ namespace ps2x
             m_pos += size;
         }
 
-        // Copies the object's bytes, padding included: a save -> load -> save round trip keeps them, but two
-        // independently built objects can differ in their padding, so compare states only by round trip.
+        // Copies the object's bytes. Padding between and after fields holds whatever memory had there before; it is
+        // saved as zero, so the same state always gives the same bytes (the round-trip proof).
         template <typename T>
         void value(T &v)
         {
             static_assert(std::is_trivially_copyable_v<T>, "StateArchive::value needs a trivially copyable type");
-            raw(&v, sizeof(T));
+            size(sizeof(T));
+            items(&v, 1);
+        }
+
+        // The size record (issue 027 v3): every structure is saved with its size, so a state made by another build
+        // loads as long as what is saved is unchanged, and a structure that grew or shrank is refused.
+        void size(size_t bytes)
+        {
+            uint32_t recorded = static_cast<uint32_t>(bytes);
+            raw(&recorded, sizeof(recorded));
+            if (loading() && recorded != bytes)
+                throw StateError("a saved structure has " + std::to_string(recorded) + " bytes in the state and " +
+                                 std::to_string(bytes) + " in this build (the state format changed)");
         }
 
         // A count written before a container; loading rejects absurd counts instead of allocating them.
@@ -87,9 +99,10 @@ namespace ps2x
         {
             static_assert(std::is_trivially_copyable_v<T>, "StateArchive::vector needs trivially copyable elements");
             const uint64_t n = count(v.size());
+            size(sizeof(T));
             if (loading())
                 v.resize(size_t(n));
-            raw(v.data(), size_t(n) * sizeof(T));
+            items(v.data(), size_t(n));
         }
 
         void boolVector(std::vector<bool> &v)
@@ -194,6 +207,26 @@ namespace ps2x
         }
 
     private:
+        // n objects of T: types without padding as they are; others through a copy whose padding is zeroed.
+        template <typename T>
+        void items(T *first, size_t n)
+        {
+            if (loading() || std::has_unique_object_representations_v<T>)
+            {
+                raw(first, n * sizeof(T));
+                return;
+            }
+            std::vector<uint8_t> copy(n * sizeof(T));
+            std::memcpy(copy.data(), first, copy.size());
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_clear_padding)
+            for (size_t i = 0; i < n; ++i)
+                __builtin_clear_padding(reinterpret_cast<T *>(copy.data() + i * sizeof(T)));
+#endif
+#endif
+            raw(copy.data(), copy.size());
+        }
+
         StateArchive(bool saving, std::vector<uint8_t> data) : m_saving(saving), m_data(std::move(data)) {}
         bool m_saving;
         std::vector<uint8_t> m_data;

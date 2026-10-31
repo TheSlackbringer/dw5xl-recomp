@@ -463,7 +463,13 @@ namespace ps2x::iop::detail
         a.value(m_interruptMask);
         a.value(m_interruptControl);
         bool hasDma = m_dmaStart.has_value();
-        DmaStart dma = hasDma ? *m_dmaStart : DmaStart{};
+        DmaStart dma;
+        std::memset(&dma, 0, sizeof(dma)); // its padding too: the same state always gives the same bytes
+        if (hasDma)
+        {
+            dma.irq = m_dmaStart->irq;
+            dma.delayCycles = m_dmaStart->delayCycles;
+        }
         a.value(hasDma);
         a.value(dma);
         if (a.loading())
