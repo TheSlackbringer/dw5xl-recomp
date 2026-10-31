@@ -81,10 +81,15 @@ Up/Down picks a setting, Left/Right changes it, and Cross on DEFAULT resets them
 | **F2** | Show or hide the frame rate (same as SHOW FPS). |
 | **F3** | Cycle anti-aliasing (1× → 2× → 4× → 8× → 16×). |
 | **F4** | Cycle the resolution (1× → 2× → 4×). |
-| **F5** | Save state (🚧 in development). |
+| **F5** | Save state: saves the game as it is right now to the quick slot. Not possible while a movie plays or the memory card is in use. |
 | **F8** | Show the build ID and game tick (for bug reports). |
-| **F9** | Load state (🚧 in development). |
+| **F9** | Load state: goes back to the moment of the last F5. |
+| **Shift+F9** | Undo the last load: goes back to where you were before pressing F9. |
 | **F10** | Discs window: see the installed discs, add or repair the DW5 disc, check the files. |
+
+Save states are kept in the `states` folder next to the game files and keep working after updates; a state is only refused when an update changed what a state holds.
+
+Save states and memory-card saves are separate: a state does not change your memory card. When you load a state made before your last in-game save, the game shows the save it had at that moment; the newer save is still on the card and the game reads it the next time it starts. Saving in the game after such a load replaces the newer save.
 
 ## Building from source
 
