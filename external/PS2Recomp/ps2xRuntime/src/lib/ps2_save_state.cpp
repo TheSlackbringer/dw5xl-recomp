@@ -246,6 +246,19 @@ void PS2Runtime::showStateMessage(std::string text)
     std::lock_guard lock(m_stateMessageMutex);
     m_stateMessage = std::move(text);
     m_stateMessageTime = std::chrono::steady_clock::now();
+    ++m_stateMessages;
+}
+
+uint64_t PS2Runtime::stateMessageCount() const
+{
+    std::lock_guard lock(m_stateMessageMutex);
+    return m_stateMessages;
+}
+
+std::string PS2Runtime::lastStateMessage() const
+{
+    std::lock_guard lock(m_stateMessageMutex);
+    return m_stateMessage;
 }
 
 std::string PS2Runtime::stateMessage() const
@@ -281,6 +294,10 @@ bool PS2Runtime::performStateRequest(bool save, const std::string &path, bool &r
             std::memcpy(file.data(), &header, sizeof(Header));
             file.insert(file.end(), body.data().begin(), body.data().end());
             writeFileAtomically(target, file);
+            {
+                std::lock_guard lock(m_savedStatesMutex);   // its picture is written by the window thread
+                m_savedStates.push_back(target);
+            }
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
             std::cerr << "[state] saved " << target << " at tick " << m_memory.gs().vsyncTick << " (" << file.size() / (1024 * 1024)
                       << " MiB, " << ms << " ms)" << std::endl;
