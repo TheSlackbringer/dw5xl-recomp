@@ -47,6 +47,29 @@ class FetchInputs(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('missing', result.stderr)
 
+    def test_network_errors_are_retried_then_given_up(self):
+        import importlib.util, urllib.error
+        spec = importlib.util.spec_from_file_location('fetch_inputs', SCRIPT)
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        module.PAUSE = 0.0
+        self.addCleanup(setattr, module.urllib.request, 'urlretrieve', module.urllib.request.urlretrieve)
+        calls = []
+        def flaky(url, path):                         # fails twice, then works
+            calls.append(url)
+            if len(calls) < 3:
+                raise urllib.error.URLError(ConnectionResetError(104, 'Connection reset by peer'))
+            Path(path).write_bytes(self.source.read_bytes())
+        module.urllib.request.urlretrieve = flaky
+        out = self.tmp / 'inputs'
+        (out / 'sub').mkdir(parents=True)
+        module.download(self.item['url'], out / 'sub/input.bin')
+        self.assertEqual(len(calls), 3)
+        def down(url, path):
+            raise urllib.error.URLError(ConnectionResetError(104, 'Connection reset by peer'))
+        module.urllib.request.urlretrieve = down
+        with self.assertRaises(urllib.error.URLError):
+            module.download(self.item['url'], out / 'sub/other.bin')
+
     def test_pin_lists_are_well_formed(self):
         for name in ('linux-tools.json', 'windows-tools.json'):
             items = json.loads((HERE / name).read_text())

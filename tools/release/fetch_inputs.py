@@ -4,9 +4,26 @@
 checked; release builds then take them from the image and download nothing.
   fetch_inputs.py LIST DIR          downloads every file of LIST into DIR and checks it (at image build time)
   fetch_inputs.py --check LIST DIR  the files in DIR are exactly the ones LIST pins (no network)
+A download that fails on the network (a reset or refused connection, a timeout) is tried again, up to ATTEMPTS
+times with growing pauses (ffmpeg.org resets GitHub's runners now and then); a size or SHA-256 mismatch fails at once.
 AppImages are made executable."""
-import hashlib, json, sys, urllib.request
+import hashlib, json, sys, time, urllib.error, urllib.request
 from pathlib import Path
+
+ATTEMPTS, PAUSE = 5, 15.0   # seconds before the 2nd try, doubled before each later one
+
+
+def download(url, path):
+    for attempt in range(1, ATTEMPTS + 1):
+        try:
+            urllib.request.urlretrieve(url, path)
+            return
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+            if isinstance(e, urllib.error.HTTPError) or attempt == ATTEMPTS:
+                raise
+            pause = PAUSE * 2 ** (attempt - 1)
+            print(f'download of {url} failed ({e}); try {attempt + 1} of {ATTEMPTS} in {pause:.0f} s', flush=True)
+            time.sleep(pause)
 
 
 def mismatch(path, item):
@@ -32,7 +49,7 @@ def main(argv):
         path = root / item['filename']
         if not check:
             path.parent.mkdir(parents=True, exist_ok=True)
-            urllib.request.urlretrieve(item['url'], path)
+            download(item['url'], path)
         problem = mismatch(path, item)
         if problem:
             sys.exit(f'input check failed: {problem}')
