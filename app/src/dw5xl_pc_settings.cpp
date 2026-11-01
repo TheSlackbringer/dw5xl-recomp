@@ -1281,12 +1281,18 @@ void helpLines(ImDrawList *dl, const Map &m, std::string text)
     }
 }
 const ImU32 kDim = IM_COL32(160, 160, 160, 255);
+// The selected row's glow: as PC SETTINGS draws it, but at least as wide as the row's label (owner 2026-11-01: on
+// UNDO LAST LOAD it covered only part of the row).
+void rowGlow(ImDrawList *dl, const Map &m, float y, const Tex &label)
+{
+    image(dl, m, g_assets.glow, 0, y - 2, std::max(144.0f, 24 - 4 + float(label.w) + 24), 32, IM_COL32(255, 208, 96, 128));
+}
 
 // The MENU: RESUME, SAVE STATE, LOAD STATE, PC SETTINGS, in the rows of the PC SETTINGS screen.
 void drawMenu(ImDrawList *dl, const Map &m)
 {
     const Assets &A = g_assets; const MenuState &M = g_menu;
-    image(dl, m, A.glow, 0, 100.0f + 34.0f * M.menuRow - 2, 144, 32, IM_COL32(255, 208, 96, 128));
+    rowGlow(dl, m, 100.0f + 34.0f * M.menuRow, A.menuLabel[M.menuRow]);
     for (int r = 0; r < kMenuRows; ++r) {
         const float y = 100.0f + 34.0f * r;
         image(dl, m, A.menuLabel[r], 24 - 4, y, float(A.menuLabel[r].w), 28, r == M.menuRow ? IM_COL32_WHITE : kDim);
@@ -1302,7 +1308,7 @@ void drawList(ImDrawList *dl, const Map &m)
     const Assets &A = g_assets; const MenuState &M = g_menu;
     const bool load = M.screen == Screen::LoadList;
     auto rowY = [](int r) { return r == kUndoRow ? 312.0f : 100.0f + 34.0f * float(r); };
-    image(dl, m, A.glow, 0, rowY(M.listRow) - 2, 144, 32, IM_COL32(255, 208, 96, 128));
+    rowGlow(dl, m, rowY(M.listRow), M.listRow == 0 ? A.quick : M.listRow == kUndoRow ? A.undo : A.slot);
     for (int r = 0; r < (load ? kSlots + 1 : kSlots); ++r) {
         const float y = rowY(r);
         const SlotInfo &slot = M.slots[size_t(r)];
