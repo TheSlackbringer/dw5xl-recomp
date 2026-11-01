@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -251,7 +252,10 @@ namespace ps2x::iop::detail
         case 22: // RpcLoop
             // Issue 009 v4.4 (design 1a): this thread runs the requests of queue a0 (startRpc wakes it for each).
             if (const int thread = m_kernel.currentThreadId())
+            {
                 m_queueThreads[cpu.gpr[4]] = thread;
+                std::fprintf(stderr, "[iop-rpc] queue 0x%x: loop thread %d\n", cpu.gpr[4], thread);
+            }
             m_kernel.sleepCurrent(cpu);
             setV0(0);
             return true;
@@ -450,8 +454,40 @@ namespace ps2x::iop::detail
     {
         a.tag("IRPC");
         a.podMap(m_servers);
-        a.podMap(m_queueThreads); // issue 009 v4.4; requests in flight: none at a quiet point
         a.value(m_nextDmaId);
         a.value(m_sifInitialized);
+        // Issue 009 v4.7: the queue -> loop thread table (design 1a, v4.4) is not saved, so a state keeps the format of
+        // builds without it (027 v3: states from other builds load). It is found again from the IOP threads: at a quiet
+        // point no request is in flight, so each loop thread sleeps in sceSifRpcLoop with its queue in a0. The kernel's
+        // threads are loaded before this (IopEmulator::serializeState).
+        if (a.loading())
+        {
+            m_queueThreads.clear();
+            m_loops.clear();
+            m_inFlight = 0u;
+            for (const auto &[sid, server] : m_servers)
+            {
+                if (server.queue == 0u || m_queueThreads.count(server.queue))
+                    continue;
+                int found = 0, matches = 0;
+                m_kernel.forEachThread([&](const IopThread &thread)
+                                       {
+                                           if (thread.state == IopThreadState::Sleep && thread.cpu.gpr[4] == server.queue)
+                                           {
+                                               found = thread.id;
+                                               ++matches;
+                                           }
+                                       });
+                if (matches == 1)
+                {
+                    m_queueThreads[server.queue] = found;
+                    std::fprintf(stderr, "[iop-rpc] queue 0x%x: loop thread %d (found again after a load)\n", server.queue,
+                                 found);
+                }
+                else
+                    std::fprintf(stderr, "[iop-rpc] queue 0x%x: %d sleeping threads with it in a0 after a load; its "
+                                         "requests run at once\n", server.queue, matches);
+            }
+        }
     }
 }

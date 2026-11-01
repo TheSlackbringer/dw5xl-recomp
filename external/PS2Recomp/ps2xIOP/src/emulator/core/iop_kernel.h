@@ -88,6 +88,12 @@ namespace ps2x::iop::detail
             const auto it = m_threads.find(id);
             return it == m_threads.end() ? nullptr : &it->second;
         }
+        template <typename Fn>
+        void forEachThread(Fn &&fn) const
+        {
+            for (const IopThread *thread : m_threadList)
+                fn(*thread);
+        }
 
         // Runs other IOP threads for one scheduling slice on behalf of guest code executing outside
         // any IOP thread (an RPC server function called by the host). Returns whether any IOP thread
