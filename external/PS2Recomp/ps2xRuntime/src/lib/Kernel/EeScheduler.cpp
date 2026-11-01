@@ -418,7 +418,7 @@ void EeScheduler::run()
         // No EE time is added here meanwhile (no field passes, so the game's clock must not run ahead of the IOP and
         // the picture); the IOP is moved on to the PC clock while it has work.
         const bool pauseWaiting = m_hostPaused.load(std::memory_order_acquire) && !m_pauseHeld.load(std::memory_order_acquire);
-        if (pauseWaiting && m_runtime.iopBusy())
+        if (pauseWaiting)
         {
             m_runtime.syncIopToHostClock();
         }
@@ -544,6 +544,8 @@ namespace
     // its estimated cycle count reaches the field. Written under m_eventMutex, read by the executor at checkpoints.
     std::atomic<int64_t> g_nextFieldHostDeadlineNs{0};
     uint32_t g_fieldClockPoll = 0u;
+    int64_t g_pauseResumedNs = 0;     // DW5XL-DEBUG issue 009 v4.7 (executor): the last resume, for the first fields after it
+    int g_fieldsAfterResume = 0;
     constexpr uint32_t kFieldClockPollInterval = 64u;
 
     int64_t steadyNs(std::chrono::steady_clock::time_point time) noexcept
@@ -2056,6 +2058,8 @@ void EeScheduler::processPendingEvents()
         // movie streams all the time) is held anyway after kPauseQuietWaitNs, so EE, IOP clock and sound still stop
         // together. Such a "busy" hold cannot be saved as it is: a save or load asked then lets the game run on (no
         // field passes) for up to kPauseStateWaitNs to reach a quiet point, else it is refused ("the game is busy").
+        if (!m_pauseHeld.load(std::memory_order_acquire))
+            m_runtime.syncIopToHostClock(); // the IOP stays current while the pause waits: nothing to catch up later
         const int64_t nowNs = steadyNs(std::chrono::steady_clock::now());
         std::string why;
         const bool quiet = stateQuiet(&why);
@@ -2101,6 +2105,11 @@ void EeScheduler::processPendingEvents()
             }
             m_pauseHeld.store(false, std::memory_order_release);
             m_pauseHeldBusy = false;
+            // DW5XL-DEBUG issue 009 v4.7: when the game goes on (the first fields after it are logged with this time).
+            g_pauseResumedNs = steadyNs(std::chrono::steady_clock::now());
+            g_fieldsAfterResume = 0;
+            std::fprintf(stderr, "[pause] resumed at field %llu\n",
+                         static_cast<unsigned long long>(m_vsyncTick.load(std::memory_order_acquire)));
         }
     }
     if (!m_hostPaused.load(std::memory_order_acquire))
@@ -2278,6 +2287,16 @@ void EeScheduler::processDueDeadlines()
                     if (on && lateUs > 3000) {
                         const auto gapUs = g_prevDeadlineService == std::chrono::steady_clock::time_point{} ? -1 : std::chrono::duration_cast<std::chrono::microseconds>(g_lastDeadlineService - g_prevDeadlineService).count();
                         std::fprintf(stderr, "[late-vblank] tick=%llu late=%lldus serviceGap=%lldus thread=%u\n", (unsigned long long)(m_vsyncTick + 1u), (long long)lateUs, (long long)gapUs, m_currentThreadId);
+                    }
+                    // DW5XL-DEBUG issue 009 v4.7: the first fields after a host pause ends (time since the resume).
+                    if (g_pauseResumedNs != 0 && g_fieldsAfterResume < 4)
+                    {
+                        std::fprintf(stderr, "[pause] field %llu: %.1f ms after the resume (late %.1f ms)\n",
+                                     static_cast<unsigned long long>(m_vsyncTick + 1u),
+                                     static_cast<double>(steadyNs(std::chrono::steady_clock::now()) - g_pauseResumedNs) / 1e6,
+                                     static_cast<double>(lateUs) / 1e3);
+                        if (++g_fieldsAfterResume == 4)
+                            g_pauseResumedNs = 0;
                     }
                 }
                 // Keep host fields on a fixed cadence so small wake-up lateness
@@ -2576,10 +2595,9 @@ void EeScheduler::waitForEvent()
         auto until = std::chrono::steady_clock::time_point(std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::nanoseconds(m_pauseWaitSinceNs.load(std::memory_order_acquire) +
                                      (stateAsked ? kPauseStateWaitNs : kPauseQuietWaitNs))));
-        const bool iopBusy = m_runtime.iopBusy();
-        if (iopBusy)
-            until = std::min(until, std::chrono::steady_clock::now() + eeCyclesToHostDuration(kIopRpcSliceEeCycles));
-        if (!m_eventCv.wait_until(lock, until, woken) && iopBusy)
+        // The IOP (and its sound) keeps running to the PC clock in its steps meanwhile, busy or not.
+        until = std::min(until, std::chrono::steady_clock::now() + eeCyclesToHostDuration(kIopRpcSliceEeCycles));
+        if (!m_eventCv.wait_until(lock, until, woken))
         {
             lock.unlock();
             m_runtime.syncIopToHostClock();

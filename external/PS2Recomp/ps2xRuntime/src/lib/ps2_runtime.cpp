@@ -1623,17 +1623,26 @@ void PS2Runtime::setHostPaused(bool paused)
         if (paused == m_hostPauseAsked)
             return;
         m_hostPauseAsked = paused;
-        // Issue 009 v4.7: the IOP clock stops when the EE holds (onHostPauseHeld), not here: until then the IOP
-        // finishes what is in progress with the EE (a request in flight is not a quiet point).
-        if (!paused && m_hostPauseStartNs != 0u)
+        // Issue 009 v4.7: the IOP clock and the sound stop when the EE holds (onHostPauseHeld), not here: until then
+        // the IOP finishes what is in progress with the EE (a request in flight is not a quiet point), and its sound
+        // plays on, so nothing piles up to come out late or in a burst after the resume. Both go on here.
+        if (!paused)
         {
-            m_hostPausedTotalNs += now - m_hostPauseStartNs;
-            m_hostPauseStartNs = 0u;
+            if (m_hostPauseStartNs != 0u)
+            {
+                m_hostPausedTotalNs += now - m_hostPauseStartNs;
+                m_hostPauseStartNs = 0u;
+            }
+            m_audioBackend.setPcmPaused(false);
+            m_lastHostResumeNs.store(static_cast<int64_t>(now), std::memory_order_release); // DW5XL-DEBUG 009 v4.7
         }
     }
     if (m_eeScheduler)
         m_eeScheduler->setHostPaused(paused);
-    m_audioBackend.setPcmPaused(paused);
+    // DW5XL-DEBUG issue 009 v4.7: the sound queued at the pause and at the resume (frames at 48 kHz): sound added to the
+    // queue while paused plays later than the picture after the resume.
+    std::fprintf(stderr, "[pause] %s: %u sound frames queued (%.1f ms)\n", paused ? "asked" : "resumed",
+                 m_audioBackend.pcmStats().queuedFrames, m_audioBackend.pcmStats().queuedFrames / 48.0);
 }
 
 void PS2Runtime::onHostPauseHeld()
@@ -1642,7 +1651,10 @@ void PS2Runtime::onHostPauseHeld()
         std::chrono::steady_clock::now().time_since_epoch()).count());
     std::lock_guard<std::mutex> lock(m_hostPauseMutex);
     if (m_hostPauseAsked && m_hostPauseStartNs == 0u)
+    {
         m_hostPauseStartNs = now;
+        m_audioBackend.setPcmPaused(true); // with the IOP clock (under the same lock as the resume)
+    }
 }
 
 void PS2Runtime::onHostPauseReleased()
@@ -1654,6 +1666,7 @@ void PS2Runtime::onHostPauseReleased()
     {
         m_hostPausedTotalNs += now - m_hostPauseStartNs;
         m_hostPauseStartNs = 0u;
+        m_audioBackend.setPcmPaused(false);
     }
 }
 
@@ -3804,9 +3817,31 @@ void PS2Runtime::run()
                 shownLoads = loads;
                 lastShownField = ps2x::presentation::kNoField;
             }
+            const auto waitStart = std::chrono::steady_clock::now();
             paced = m_eeScheduler->waitForPresentationField(lastShownField);
             if (paced.fresh)
                 lastShownField = paced.field;
+            // DW5XL-DEBUG issue 009 v4.7: the first window frames after a host pause ends (owner: "the picture takes a
+            // moment to start again").
+            if (const int64_t resumedNs = m_lastHostResumeNs.load(std::memory_order_acquire); resumedNs != 0)
+            {
+                static int64_t s_loggedFor = 0;
+                static int s_frames = 0;
+                if (s_loggedFor != resumedNs)
+                {
+                    s_loggedFor = resumedNs;
+                    s_frames = 0;
+                }
+                if (s_frames < 12)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    std::fprintf(stderr, "[pause] window frame %d: %.1f ms after the menu closed, field %llu, new picture %s, waited %.1f ms\n",
+                                 s_frames, static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count() - resumedNs) / 1e6,
+                                 static_cast<unsigned long long>(paced.field), paced.fresh ? "yes" : "no",
+                                 std::chrono::duration<double, std::milli>(now - waitStart).count());
+                    ++s_frames;
+                }
+            }
         }
         m_audioBackend.updatePcmStream();
         devHarness.step(m_eeScheduler->currentVSyncTick());

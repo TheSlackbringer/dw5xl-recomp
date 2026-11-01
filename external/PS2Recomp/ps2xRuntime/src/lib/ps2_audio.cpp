@@ -161,7 +161,8 @@ struct PS2AudioBackend::Impl
     PcmRing<262144> capture;
     PcmRing<262144> sourceCapture;
     std::atomic<bool> running{false}, captureEnabled{false}, sourceCaptureEnabled{false};
-    bool playbackStarted = false; // UI thread only.
+    std::atomic<bool> playbackStarted{false}; // set by the UI thread; read by setPcmPaused from any thread
+    std::atomic<bool> pcmPauseWanted{false};  // issue 009 v4.7: a host pause holds (kept for a stream started later)
     std::atomic<uint64_t> submittedFrames{0}, consumedFrames{0}, outputFrames{0};
     std::atomic<uint64_t> underrunFrames{0}, droppedFrames{0}, nonzeroSamples{0};
     std::atomic<uint64_t> captureDroppedFrames{0}, sourceCaptureDroppedFrames{0};
@@ -319,9 +320,13 @@ PS2AudioBackend::PcmStats PS2AudioBackend::pcmStats() const
 
 void PS2AudioBackend::setPcmPaused(bool paused)
 {
+    // Issue 009 v4.7: any thread (the scheduler stops the sound when a pause holds, with the IOP clock). raylib's
+    // Pause/ResumeAudioStream only set the buffer's flag under the audio device lock. A stream not started yet takes
+    // the wish when updatePcmStream starts it.
 #if !defined(PLATFORM_VITA)
     auto &state = *m_impl;
-    if (!state.playbackStarted || !IsAudioStreamValid(state.pcmStream))
+    state.pcmPauseWanted.store(paused, std::memory_order_release);
+    if (!state.playbackStarted.load(std::memory_order_acquire) || !IsAudioStreamValid(state.pcmStream))
         return;
     if (paused)
         PauseAudioStream(state.pcmStream);
@@ -342,7 +347,9 @@ void PS2AudioBackend::updatePcmStream()
         // Queue genuine samples before starting the fixed-rate device stream.
         // This reserve absorbs short GS stalls without replay or pitch changes.
         PlayAudioStream(state.pcmStream);
-        state.playbackStarted = true;
+        if (state.pcmPauseWanted.load(std::memory_order_acquire))
+            PauseAudioStream(state.pcmStream);
+        state.playbackStarted.store(true, std::memory_order_release);
     }
 #endif
     auto flushCapture = [](auto &ring, std::FILE *file, uint64_t &bytes,

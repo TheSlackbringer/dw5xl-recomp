@@ -653,6 +653,7 @@ private:
     mutable std::mutex m_hostPauseMutex;
     uint64_t m_hostPauseStartNs = 0, m_hostPausedTotalNs = 0;   // guarded by m_hostPauseMutex
     bool m_hostPauseAsked = false;   // guarded by m_hostPauseMutex; the IOP clock stops only once the EE holds (009 v4.7)
+    std::atomic<int64_t> m_lastHostResumeNs{0}; // DW5XL-DEBUG issue 009 v4.7: the last end of a host pause (window frames after it)
     DebugUiCallback m_debugUiInitCallback = nullptr;
     DebugUiCallback m_debugUiDrawCallback = nullptr;
     DebugUiCallback m_debugUiShutdownCallback = nullptr;
