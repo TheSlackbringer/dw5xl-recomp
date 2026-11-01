@@ -3735,6 +3735,7 @@ void PS2Runtime::run()
     uint64_t tick = 0;
     const int hostFpsOverride = configuredHostTargetFps();
     uint64_t lastShownField = ps2x::presentation::kNoField; // issue 023 fix 2: the field the last frame showed
+    uint64_t shownLoads = stateLoadCount();                  // issue 027: states loaded when lastShownField was set
     ps2x_dev::Harness devHarness;
     devHarness.runtime = this;
     devHarness.init();
@@ -3744,6 +3745,13 @@ void PS2Runtime::run()
         EeScheduler::PresentationField paced{};
         if (fieldPaced)
         {
+            // Issue 027: a state load sets the field number back; the loaded game's fields are new to the window
+            // (otherwise it would wait until the game passed the field it showed before the load).
+            if (const uint64_t loads = stateLoadCount(); loads != shownLoads)
+            {
+                shownLoads = loads;
+                lastShownField = ps2x::presentation::kNoField;
+            }
             paced = m_eeScheduler->waitForPresentationField(lastShownField);
             if (paced.fresh)
                 lastShownField = paced.field;
