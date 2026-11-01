@@ -1523,6 +1523,67 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
     m_iopSubsystem->runEeCycles(eeCycles);
 }
 
+// Issue 027 v4: the states folder, and a picture of the game saved with each state asked from the window.
+std::filesystem::path PS2Runtime::stateDirectory()
+{
+    const char *dir = std::getenv("PS2X_STATE_DIR");
+    return dir && *dir ? std::filesystem::path(dir) : getIoPaths().elfDirectory / "states";
+}
+
+void PS2Runtime::requestStateWithPicture(bool save, const std::string &path, const std::string &backup)
+{
+    const std::string &target = save ? path : backup;
+    const uint32_t w = ps2x_dev::s_lastFrameW, h = ps2x_dev::s_lastFrameH;
+    if (!target.empty() && w != 0u && h != 0u && !ps2x_dev::s_lastFrame.empty())
+    {
+        // the last game picture (no overlays), each output pixel the average of the pixels it covers
+        constexpr uint32_t kW = 256u, kH = 224u;
+        const size_t stride = ps2x_dev::s_lastFrame.size() / std::max<size_t>(1u, ps2x_dev::s_lastFrameRows);
+        std::vector<uint8_t> px(size_t(kW) * kH * 4u);
+        for (uint32_t y = 0; y < kH; ++y)
+            for (uint32_t x = 0; x < kW; ++x)
+            {
+                const uint32_t x0 = x * w / kW, x1 = std::max(x0 + 1u, (x + 1u) * w / kW);
+                const uint32_t y0 = y * h / kH, y1 = std::max(y0 + 1u, (y + 1u) * h / kH);
+                uint32_t sum[3] = {}, n = 0;
+                for (uint32_t sy = y0; sy < y1; ++sy)
+                    for (uint32_t sx = x0; sx < x1; ++sx, ++n)
+                        for (int c = 0; c < 3; ++c)
+                            sum[c] += ps2x_dev::s_lastFrame[size_t(sy) * stride + size_t(sx) * 4u + size_t(c)];
+                for (int c = 0; c < 3; ++c)
+                    px[(size_t(y) * kW + x) * 4u + size_t(c)] = uint8_t(sum[c] / std::max(n, 1u));
+                px[(size_t(y) * kW + x) * 4u + 3u] = 255u;
+            }
+        std::erase_if(m_statePictures, [&](const auto &p) { return p.first == target; });
+        m_statePictures.emplace_back(target, std::move(px));
+    }
+    eeScheduler().requestState(save ? EeScheduler::StateRequestKind::Save : EeScheduler::StateRequestKind::Load, path, backup);
+}
+
+void PS2Runtime::writeSavedStatePictures()
+{
+    std::vector<std::string> saved;
+    {
+        std::lock_guard lock(m_savedStatesMutex);
+        saved.swap(m_savedStates);
+    }
+    for (const std::string &path : saved)
+    {
+        const std::filesystem::path png = std::filesystem::path(path).replace_extension(".png");
+        const auto it = std::find_if(m_statePictures.begin(), m_statePictures.end(), [&](const auto &p) { return p.first == path; });
+        if (it == m_statePictures.end())
+        {
+            std::error_code ec;   // saved without a picture (a test switch): no older picture next to it
+            std::filesystem::remove(png, ec);
+            continue;
+        }
+        Image img{it->second.data(), 256, 224, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+        if (!ExportImage(img, png.string().c_str()))
+            std::fprintf(stderr, "[state] could not write the picture %s\n", png.string().c_str());
+        m_statePictures.erase(it);
+    }
+}
+
 void PS2Runtime::setHostPaused(bool paused)
 {
     const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -3804,25 +3865,21 @@ void PS2Runtime::run()
             saveIniValue("aa_samples", s_aaChoice);
         }
         // Issue 027 v3: F5 saves the game to the quick slot; F9 loads it, keeping the running game in before-load.state
-        // first; Shift+F9 goes back to that. The scheduler carries them out at its next quiet point. The folder is
-        // states/ next to the game's executable (PS2X_STATE_DIR for tests, so they never touch the player's states).
+        // first; Shift+F9 goes back to that. The scheduler carries them out at its next quiet point, in the states
+        // folder (stateDirectory). Issue 027 v4: each saved state gets a picture of the game (the states menu).
         {
-            static const std::filesystem::path s_stateDir = []
-            {
-                const char *dir = std::getenv("PS2X_STATE_DIR");
-                return dir && *dir ? std::filesystem::path(dir) : getIoPaths().elfDirectory / "states";
-            }();
+            static const std::filesystem::path s_stateDir = stateDirectory();
             const uint64_t tick = eeScheduler().currentVSyncTick();
             const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
             const bool loadKey = IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::LoadState));
             const std::string quick = (s_stateDir / "quick.state").string(), backup = (s_stateDir / "before-load.state").string();
-            using Kind = EeScheduler::StateRequestKind;
             if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::SaveState)) || ps2_host_input::scriptedKeyPress("F5", tick))
-                eeScheduler().requestState(Kind::Save, quick);
+                requestStateWithPicture(true, quick);
             else if ((loadKey && shift) || ps2_host_input::scriptedKeyPress("SHIFT+F9", tick))
-                eeScheduler().requestState(Kind::Load, backup);
+                eeScheduler().requestState(EeScheduler::StateRequestKind::Load, backup);
             else if (loadKey || ps2_host_input::scriptedKeyPress("F9", tick))
-                eeScheduler().requestState(Kind::Load, quick, backup);
+                requestStateWithPicture(false, quick, backup);
+            writeSavedStatePictures();
         }
 
         // F2 overlay numbers (issue 014), about once a second. VSync = guest fields per second, timed by the fields'
@@ -3913,8 +3970,9 @@ void PS2Runtime::run()
             DrawRectangle(8, y, MeasureText(buildText, kFontSize) + 16, kFontSize + 10, Fade(BLACK, 0.75f));
             DrawText(buildText, 16, y + 5, kFontSize, WHITE);
         }
-        // Issue 027 v3: the result of F5 / F9 for a few seconds, centred at the bottom of the window.
-        if (const std::string message = stateMessage(); !message.empty() && !IsWindowHidden())
+        // Issue 027 v3: the result of F5 / F9 for a few seconds, centred at the bottom of the window. While a host screen
+        // pauses the game (027 v4: the states menu), that screen shows it in its own help line.
+        if (const std::string message = stateMessage(); !message.empty() && !IsWindowHidden() && !eeScheduler().hostPaused())
         {
             constexpr int kFontSize = 22;
             const int textW = MeasureText(message.c_str(), kFontSize);

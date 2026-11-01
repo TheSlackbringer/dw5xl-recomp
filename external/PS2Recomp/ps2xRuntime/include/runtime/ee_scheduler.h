@@ -285,8 +285,11 @@ public:
     void requestStop();
     // Issue 023 3S: a host screen pauses the game: the executor holds at its next dispatcher-level event check
     // until resumed (use PS2Runtime::setHostPaused, which also stops the IOP clock and the audio output).
+    // Issue 027 v4: it holds at the next quiet point (no field passes on the way), so the paused game can be saved;
+    // save and load requests are carried out while it holds. pauseHeld: the executor has stopped there.
     void setHostPaused(bool paused);
     bool hostPaused() const { return m_hostPaused.load(std::memory_order_acquire); }
+    bool pauseHeld() const { return m_pauseHeld.load(std::memory_order_acquire); }
     // CRT mode 2=NTSC, 3=PAL. Unsupported modes retain the previous cadence.
     void setCrtMode(uint32_t mode) noexcept;
     [[nodiscard]] bool palVideoMode() const noexcept;
@@ -477,6 +480,8 @@ private:
     std::atomic<bool> m_guestExecuting{false};
     std::atomic<bool> m_stopRequested{false};
     std::atomic<bool> m_hostPaused{false};
+    std::atomic<bool> m_pauseHeld{false};
+    std::atomic<uint64_t> m_pauseAskedField{0};   // the field the pause was asked at (for the [pause] log line)
     std::atomic<bool> m_checkpointPending{false};
     uint32_t m_debugPublishCountdown = 0u;
 
@@ -510,7 +515,7 @@ private:
     uint64_t m_snapshotSequence = 0;
 
     // DW5XL (issue 027): the pending save/load request (any thread sets it; run() carries it out at a quiet point).
-    bool serviceStateRequest(); // true when a state was loaded
+    bool serviceStateRequest(bool *handled = nullptr); // true when a state was loaded; handled: a request was carried out
     std::mutex m_stateRequestMutex;
     std::atomic<bool> m_stateRequestPending{false};
     StateRequestKind m_stateRequestKind = StateRequestKind::None;

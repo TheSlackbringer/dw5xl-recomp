@@ -154,6 +154,12 @@ namespace ps2_host_input
         gState.verdite = true;
     }
 
+    bool scripted()
+    {
+        initScript();
+        return gScripted;
+    }
+
     bool scriptedKeyPress(const char *name, uint64_t vsyncTick)
     {
         initScript();

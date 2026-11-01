@@ -448,8 +448,18 @@ public:
     // Issue 027 v3: a short message about a save or load, shown in the window for a few seconds (any thread).
     void showStateMessage(std::string text);
     std::string stateMessage() const; // empty once it has been shown long enough
+    uint64_t stateMessageCount() const;      // messages so far (027 v4: the states menu waits for its request's)
+    std::string lastStateMessage() const;    // the latest message, however old
     // States loaded so far: a load jumps the field number, so rate counters (PS2X_STATS, the F2 numbers) restart.
     uint64_t stateLoadCount() const { return m_stateLoads.load(std::memory_order_acquire); }
+    // Issue 027 v4: the player's states folder: states/ next to the game's executable (PS2X_STATE_DIR in tests, so
+    // they never touch the player's states).
+    static std::filesystem::path stateDirectory();
+    // Window thread: a save (or a load with a backup) asked from the window, with a small picture (256x224) of the
+    // game as it is now; the picture is written next to the state it belongs to (<name>.png) once that is saved.
+    void requestStateWithPicture(bool save, const std::string &path, const std::string &backup = {});
+    // Window thread, every frame: writes the pictures of the states saved since the last call.
+    void writeSavedStatePictures();
     // Components outside the runtime (the app's overlays, IPU decoder, pad bridge, ...) add their state here; they
     // are saved and loaded in registration order, each under its own section tag.
     using StateHook = std::function<void(ps2x::StateArchive &)>;
@@ -620,9 +630,13 @@ private:
     std::string m_windowShotRequest;
     std::atomic<bool> m_showFps{false};
     std::atomic<uint64_t> m_stateLoads{0};
+    std::mutex m_savedStatesMutex;
+    std::vector<std::string> m_savedStates;                                       // saved by the executor
+    std::vector<std::pair<std::string, std::vector<uint8_t>>> m_statePictures;    // window thread: path, picture
     mutable std::mutex m_stateMessageMutex;
     std::string m_stateMessage;
     std::chrono::steady_clock::time_point m_stateMessageTime{};
+    uint64_t m_stateMessages = 0;                  // guarded by m_stateMessageMutex
     std::function<bool()> m_spu2KeyOnWanted;
     Spu2KeyOnObserver m_spu2KeyOnObserver;
     mutable std::mutex m_hostPauseMutex;

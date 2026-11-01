@@ -60,7 +60,15 @@ Gamepads work too. Holding the gamepad's **Back** (Select) button for ¾ of a se
 
 ### PC SETTINGS
 
-**PC SETTINGS** is in the game's Options menu (where the PS2's SCREEN ADJUST was), in the game's own style. You can also open it at any time with **Esc** or by holding **Back**: the game pauses until you close it with Esc, Triangle or Back.
+**PC SETTINGS** is in the game's Options menu (where the PS2's SCREEN ADJUST was), in the game's own style. It is also in the in-play menu (below).
+
+### In-play menu
+
+**Esc** or holding **Back** opens the in-play menu at any time: **RESUME**, **SAVE STATE**, **LOAD STATE** and **PC SETTINGS**. The game pauses until you close it with Esc, Triangle or Back (from a list, Back returns to the menu).
+
+- **SAVE STATE** saves the game exactly as it is, while it stays paused, to **QUICK** (the F5 slot) or **SLOT 1–5**. Each slot shows when it was made and a picture of that moment; replacing a used slot asks for a second Cross.
+- **LOAD STATE** goes back to a saved moment and closes the menu. **UNDO LAST LOAD** goes back to where you were before the last load (like Shift+F9).
+- A state made before your last in-game save is marked with **!**: loading it brings back the older save the game had then (see below).
 
 | Setting | Values |
 | --- | --- |
@@ -87,7 +95,7 @@ Up/Down picks a setting, Left/Right changes it, and Cross on DEFAULT resets them
 | **Shift+F9** | Undo the last load: goes back to where you were before pressing F9. |
 | **F10** | Discs window: see the installed discs, add or repair the DW5 disc, check the files. |
 
-Save states are kept in the `states` folder next to the game files and keep working after updates; a state is only refused when an update changed what a state holds.
+Save states (the quick slot, SLOT 1–5, and the state before the last load, each with its picture) are kept in the `states` folder next to the game files and keep working after updates; a state is only refused when an update changed what a state holds.
 
 Save states and memory-card saves are separate: a state does not change your memory card. When you load a state made before your last in-game save, the game shows the save it had at that moment; the newer save is still on the card and the game reads it the next time it starts. Saving in the game after such a load replaces the newer save.
 

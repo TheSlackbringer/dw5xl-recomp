@@ -40,4 +40,7 @@ namespace ps2_host_input
     // Issue 027 v3: true once for each host-input script event called `name` (F5, F9, SHIFT+F9) whose field has come:
     // a script presses the save-state keys as a player would.
     bool scriptedKeyPress(const char *name, uint64_t vsyncTick);
+    // True when a host-input script (PS2X_HOST_INPUT) drives the run: the real keyboard and pads are not read, by the
+    // game and (issue 027 v4) by the host screens either.
+    bool scripted();
 }
