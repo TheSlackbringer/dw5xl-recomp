@@ -1620,11 +1620,12 @@ void PS2Runtime::setHostPaused(bool paused)
         std::chrono::steady_clock::now().time_since_epoch()).count());
     {
         std::lock_guard<std::mutex> lock(m_hostPauseMutex);
-        if (paused == (m_hostPauseStartNs != 0u))
+        if (paused == m_hostPauseAsked)
             return;
-        if (paused)
-            m_hostPauseStartNs = now;
-        else
+        m_hostPauseAsked = paused;
+        // Issue 009 v4.7: the IOP clock stops when the EE holds (onHostPauseHeld), not here: until then the IOP
+        // finishes what is in progress with the EE (a request in flight is not a quiet point).
+        if (!paused && m_hostPauseStartNs != 0u)
         {
             m_hostPausedTotalNs += now - m_hostPauseStartNs;
             m_hostPauseStartNs = 0u;
@@ -1633,6 +1634,15 @@ void PS2Runtime::setHostPaused(bool paused)
     if (m_eeScheduler)
         m_eeScheduler->setHostPaused(paused);
     m_audioBackend.setPcmPaused(paused);
+}
+
+void PS2Runtime::onHostPauseHeld()
+{
+    const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    std::lock_guard<std::mutex> lock(m_hostPauseMutex);
+    if (m_hostPauseAsked && m_hostPauseStartNs == 0u)
+        m_hostPauseStartNs = now;
 }
 
 uint64_t PS2Runtime::hostPausedNanoseconds(uint64_t steadyNowNs) const

@@ -5,7 +5,10 @@
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <thread>
 
 namespace ps2_syscalls
 {
@@ -210,6 +213,51 @@ namespace ps2_syscalls
             {
                 runtime->eeScheduler().completeExternalWait(kSifRpcWaitType, token, KE_OK);
             }
+        }
+
+        // DW5XL-DEBUG issue 009 v4.7: PS2X_PAUSE_AT_RPC=<sid hex>:<rpc hex>[:<n>] asks a host pause the moment the nth
+        // such request starts (so it is in flight), a save while paused (PS2X_PAUSE_AT_RPC_SAVE=<file>), and the end
+        // of the pause after PS2X_PAUSE_AT_RPC_MS (default 2000). Used by issue_009_pause_rpc.py.
+        void debugPauseAtRpc(PS2Runtime *runtime, uint32_t sid, uint32_t rpcNum)
+        {
+            struct Target
+            {
+                bool on = false;
+                uint32_t sid = 0u, rpc = 0u, nth = 1u, holdMs = 2000u;
+            };
+            static const Target target = []
+            {
+                Target t;
+                const char *value = std::getenv("PS2X_PAUSE_AT_RPC");
+                if (!value || !*value)
+                    return t;
+                char *end = nullptr;
+                t.sid = static_cast<uint32_t>(std::strtoul(value, &end, 16));
+                if (!end || *end != ':')
+                    return t;
+                t.rpc = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+                if (end && *end == ':')
+                    t.nth = std::max(1u, static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 10)));
+                if (const char *ms = std::getenv("PS2X_PAUSE_AT_RPC_MS"); ms && *ms)
+                    t.holdMs = static_cast<uint32_t>(std::strtoul(ms, nullptr, 10));
+                t.on = true;
+                return t;
+            }();
+            static uint32_t seen = 0u;
+            if (!target.on || sid != target.sid || rpcNum != target.rpc || ++seen != target.nth)
+                return;
+            // Called right after startRpc gave the request a token: it is running in its IOP thread now.
+            std::fprintf(stderr, "[pause-test] pause asked at request sid=0x%x rpc=0x%x #%u (in flight)\n", sid, rpcNum, seen);
+            runtime->setHostPaused(true);
+            if (const char *save = std::getenv("PS2X_PAUSE_AT_RPC_SAVE"); save && *save)
+                runtime->eeScheduler().requestState(EeScheduler::StateRequestKind::Save, save);
+            std::thread([runtime, holdMs = target.holdMs]()
+                        {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
+                            std::fprintf(stderr, "[pause-test] pause ends after %u ms\n", holdMs);
+                            runtime->setHostPaused(false);
+                        })
+                .detach();
         }
 
     } // namespace
@@ -652,6 +700,8 @@ namespace ps2_syscalls
             if ((mode & kSifRpcModeNowait) != 0u || !runtime->eeScheduler().insideInvocation())
             {
                 asyncToken = PS2IopTransport::startRpc(runtime, rdram, ctx, request);
+                if (asyncToken != 0u)
+                    debugPauseAtRpc(runtime, sid, rpcNum); // DW5XL-DEBUG issue 009 v4.7
             }
             if (asyncToken != 0u)
             {

@@ -488,6 +488,7 @@ private:
     std::atomic<bool> m_hostPaused{false};
     std::atomic<bool> m_pauseHeld{false};
     std::atomic<uint64_t> m_pauseAskedField{0};   // the field the pause was asked at (for the [pause] log line)
+    std::atomic<int64_t> m_pauseAskedNs{0};       // issue 009 v4.7: when it was asked (steady clock; ask-to-hold time)
     std::atomic<bool> m_checkpointPending{false};
     uint32_t m_debugPublishCountdown = 0u;
 

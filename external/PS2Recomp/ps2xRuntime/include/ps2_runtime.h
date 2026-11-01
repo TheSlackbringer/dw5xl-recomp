@@ -515,6 +515,7 @@ public:
 
     // Issue 023 3S: where the game picture was last drawn in the window (x, y, width, height in window pixels).
     // Issue 023 3S: pauses the whole guest for a host screen (window thread): EE held, IOP clock and audio stopped.
+    // Issue 009 v4.7: audio stops at once; the IOP clock when the EE holds (at a quiet point).
     void setHostPaused(bool paused);
     // Issue 023 3S: SPU2 key-ons with their samples while wanted() is true (set once, before the game runs; both are
     // called on the game's thread).
@@ -592,6 +593,7 @@ private:
     [[nodiscard]] uint64_t startIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
     [[nodiscard]] bool iopRpcInFlight() const noexcept;
     [[nodiscard]] bool iopBusy() const noexcept; // issue 009 v4.5: a request in flight or a runnable IOP thread
+    void onHostPauseHeld(); // issue 009 v4.7 (executor): the EE holds a host pause; the IOP clock stops now
     void syncIopToHostClock() noexcept;
     void onIopRpcCompleted(uint64_t token);
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
@@ -649,6 +651,7 @@ private:
     Spu2KeyOnObserver m_spu2KeyOnObserver;
     mutable std::mutex m_hostPauseMutex;
     uint64_t m_hostPauseStartNs = 0, m_hostPausedTotalNs = 0;   // guarded by m_hostPauseMutex
+    bool m_hostPauseAsked = false;   // guarded by m_hostPauseMutex; the IOP clock stops only once the EE holds (009 v4.7)
     DebugUiCallback m_debugUiInitCallback = nullptr;
     DebugUiCallback m_debugUiDrawCallback = nullptr;
     DebugUiCallback m_debugUiShutdownCallback = nullptr;

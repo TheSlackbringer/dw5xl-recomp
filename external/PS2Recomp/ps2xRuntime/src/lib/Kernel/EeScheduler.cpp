@@ -408,7 +408,12 @@ void EeScheduler::run()
         }
         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
 
-        if (checkpointDue(kGuestDispatchCycles))
+        // Issue 009 v4.7: while a host pause waits for its quiet point, the game finishes what is in progress. The
+        // checkpoint the pause keeps pending brings guest code back here at its next check (to try the hold), but must
+        // not keep it from running at all.
+        const bool pauseWaiting = m_hostPaused.load(std::memory_order_acquire) && !m_pauseHeld.load(std::memory_order_acquire);
+        if (pauseWaiting ? (accountCycles(kGuestDispatchCycles), m_stopRequested.load(std::memory_order_acquire))
+                         : checkpointDue(kGuestDispatchCycles))
         {
             continue;
         }
@@ -546,6 +551,12 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         m_stopRequested.load(std::memory_order_acquire))
     {
         return true;
+    }
+    // Issue 009 v4.7: during a host pause the field and timer deadlines are not served (processPendingEvents), so an
+    // overdue one must not stop the guest code that finishes what is in progress before the hold.
+    if (m_hostPaused.load(std::memory_order_acquire))
+    {
+        return false;
     }
 
     const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
@@ -2031,12 +2042,19 @@ void EeScheduler::processPendingEvents()
         // Issue 027 v4: held only at a quiet point, so the paused game can be saved as it is. Until then the game
         // finishes what is in progress (interrupt handlers, queued events) but no field deadline is served, so no
         // field passes. A save or load request wakes the hold: the dispatcher loop carries it out at once.
+        // Issue 009 v4.7: the IOP runs on until the hold too (a request in flight is not quiet); its clock stops here.
         if (stateQuiet())
         {
             if (!m_pauseHeld.exchange(true, std::memory_order_acq_rel))
-                std::fprintf(stderr, "[pause] held at field %llu (asked at field %llu)\n",
+            {
+                m_runtime.onHostPauseHeld();
+                const auto askedNs = m_pauseAskedNs.load(std::memory_order_acquire);
+                const auto nowNs = std::chrono::steady_clock::now().time_since_epoch().count();
+                std::fprintf(stderr, "[pause] held at field %llu (asked at field %llu) after %.1f ms\n",
                              static_cast<unsigned long long>(m_vsyncTick.load(std::memory_order_acquire)),
-                             static_cast<unsigned long long>(m_pauseAskedField.load(std::memory_order_acquire)));
+                             static_cast<unsigned long long>(m_pauseAskedField.load(std::memory_order_acquire)),
+                             static_cast<double>(nowNs - askedNs) / 1e6);
+            }
             std::unique_lock lock(m_eventMutex);
             m_eventCv.wait(lock, [this]()
                            { return !m_hostPaused.load(std::memory_order_acquire) ||
@@ -2091,7 +2109,10 @@ void EeScheduler::setHostPaused(bool paused)
     {
         std::lock_guard lock(m_eventMutex);
         if (paused && !m_hostPaused.load(std::memory_order_acquire))
+        {
             m_pauseAskedField.store(m_vsyncTick.load(std::memory_order_acquire), std::memory_order_release);
+            m_pauseAskedNs.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
+        }
         m_hostPaused.store(paused, std::memory_order_release);
         m_checkpointPending.store(true, std::memory_order_release);   // running guest code returns to the dispatcher
     }
@@ -2506,6 +2527,26 @@ void EeScheduler::waitForEvent()
     {
         return;
     }
+    if (m_hostPaused.load(std::memory_order_acquire))
+    {
+        // Issue 009 v4.7: a host pause waits for its quiet point and every EE thread waits (e.g. for an IOP request).
+        // Deadlines are suspended, and EE time does not advance here; the IOP runs on to the PC clock in its steps
+        // while it has work, until an event (its completion), the end of the pause or a stop.
+        const auto woken = [this]()
+        { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire) ||
+                 !m_hostPaused.load(std::memory_order_acquire); };
+        if (!m_runtime.iopBusy())
+        {
+            m_eventCv.wait(lock, woken);
+            return;
+        }
+        if (!m_eventCv.wait_for(lock, eeCyclesToHostDuration(kIopRpcSliceEeCycles), woken))
+        {
+            lock.unlock();
+            m_runtime.syncIopToHostClock();
+        }
+        return;
+    }
     const uint64_t timerCycles = m_runtime.memory().cyclesUntilNextEeTimerInterrupt();
     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
     if (m_deadlines.empty() && !hasTimerDeadline)
@@ -2702,7 +2743,15 @@ bool EeScheduler::stateQuiet(std::string *reason) const
     for (const auto &[id, thread] : m_threads)
     {
         if (!thread.invocations.empty())
-            return fail("thread " + std::to_string(id) + " is inside an interrupt, alarm or callback");
+        {
+            // Issue 009 v4.7: which one (kind, guest pc, wait) — so a pause that does not hold can be explained.
+            const GuestInvocation &inner = thread.invocations.back();
+            char detail[96];
+            std::snprintf(detail, sizeof(detail), " (%zu deep, innermost kind %u at pc 0x%x; thread status %u, wait %u)",
+                          thread.invocations.size(), static_cast<unsigned>(inner.kind), inner.context.pc,
+                          static_cast<unsigned>(thread.status), static_cast<unsigned>(thread.wait.reason));
+            return fail("thread " + std::to_string(id) + " is inside an interrupt, alarm or callback" + detail);
+        }
         if (thread.resumeCompletion)
             return fail("thread " + std::to_string(id) + " has a resume completion");
         if (thread.wait.completion)
