@@ -2,8 +2,9 @@
 # Build the Linux *builder* AppImage offline with the existing Steam Runtime SDK.
 # No game files or generated game code are needed. Nothing is installed on the host.
 # Required local inputs: the builder image (issue 041; pinned in tools/release/linux-builder-image, it holds the
-# compiler and the approved libc++ packages), dependency source checkouts, the FFmpeg source tarball, and
-# linuxdeploy/appimagetool (see issue 011 notes).
+# compiler, the approved libc++ packages and, since issue 027 M11, the FFmpeg source tarball and
+# linuxdeploy/appimagetool in /inputs) and dependency source checkouts. DW5XL_FFMPEG_SOURCE and DW5XL_APPIMAGE_TOOLS
+# give other copies of those two (used when they exist).
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 test_args=()
@@ -19,13 +20,18 @@ git_common=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)
 jobs=${DW5XL_BUILD_JOBS:-2}
 mkdir -p "$sdk_work"
 sdk_work=$(realpath "$sdk_work")
+inputs=()   # local copies of the FFmpeg source and the AppImage tools if they exist; otherwise the image's /inputs
+if [ -e "$ffmpeg" ]; then inputs+=(-v "$ffmpeg:/ffmpeg.tar.xz:ro"); fi
+if [ -d "$image_tools" ]; then inputs+=(-v "$image_tools:/image-tools:ro"); fi
 podman run --rm --pull=never --network=none --cpus="$jobs" \
     -v "$repo:/src" -v "$sdk_work:/sdk" \
-    -v "$deps:/deps:ro" -v "$recomp_deps:/recomp-deps:ro" -v "$ffmpeg:/ffmpeg.tar.xz:ro" \
-    -v "$image_tools:/image-tools:ro" -e CMAKE_BUILD_PARALLEL_LEVEL="$jobs" \
+    -v "$deps:/deps:ro" -v "$recomp_deps:/recomp-deps:ro" "${inputs[@]}" \
+    -e CMAKE_BUILD_PARALLEL_LEVEL="$jobs" \
     -v "$git_common:$git_common:ro" \
     -e TEST_PACKAGE="${test_args[*]}" "$image" bash -euo pipefail -c '
 python3 /usr/local/bin/write_libcxx_manifest.py --check /approved-debs
+ffmpeg=/ffmpeg.tar.xz; [ -e "$ffmpeg" ] || ffmpeg=/inputs/ffmpeg-7.1.tar.xz
+image_tools=/image-tools; [ -d "$image_tools" ] || image_tools=/inputs/appimage-tools
 rm -rf /sdk/cxx
 mkdir -p /sdk/cxx
 for package in /approved-debs/*.deb; do dpkg-deb -x "$package" /sdk/cxx; done
@@ -33,7 +39,7 @@ python3 /src/tools/release/export_linux_sdk.py --output /sdk/clang --cxx /sdk/cx
 export PATH=/sdk/clang/bin:$PATH CC=/sdk/clang/bin/clang CXX=/sdk/clang/bin/clang++
 export LD_LIBRARY_PATH=/sdk/clang/lib:/sdk/ffmpeg/lib
 if [ ! -f /sdk/ffmpeg/include/libavcodec/avcodec.h ]; then
-    /src/tools/release/build_ffmpeg.sh linux /ffmpeg.tar.xz /sdk/ffmpeg > /sdk/ffmpeg-build.log 2>&1
+    /src/tools/release/build_ffmpeg.sh linux "$ffmpeg" /sdk/ffmpeg > /sdk/ffmpeg-build.log 2>&1
 fi
 common=(-G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=/src/tools/linux/clang.cmake
         -DDW5XL_LINUX_TOOLCHAIN_ROOT=/sdk/clang -DPS2X_ENABLE_SCCACHE=OFF -DFETCHCONTENT_FULLY_DISCONNECTED=ON)
@@ -57,7 +63,7 @@ cmake --build /src/build-recomp-linux-builder --target ps2_recomp > /sdk/recompi
 export DW5XL_PACKAGE_DEP_ROOT=/deps
 python3 /src/tools/release/make_release.py linux --build /src/app/build-linux-builder \
     --recomp-build /src/build-recomp-linux-builder --linux-sdk /sdk/clang --ffmpeg-root /sdk/ffmpeg \
-    --appimage-tools /image-tools ${TEST_PACKAGE:+--test} > /sdk/package.log 2>&1
+    --appimage-tools "$image_tools" ${TEST_PACKAGE:+--test} > /sdk/package.log 2>&1
 tail -5 /sdk/setup-tests.log
 tail -3 /sdk/package.log
 '

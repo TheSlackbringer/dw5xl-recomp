@@ -16,21 +16,20 @@ require a compiler, Git or Python on the player's system.
 
 ## Build the package
 
-CI prepares the source dependencies and checked tool archives, then runs the
-same offline builder used locally. The Linux AppImage and Windows ZIP are
+CI prepares the source dependencies, then runs the same offline builder used
+locally; the pinned tools and archives come from the builder images, so a
+release run downloads nothing from other sites (issue 027 M11). The Linux AppImage and Windows ZIP are
 uploaded to the same numbered draft only after all required jobs pass.
 Publishing remains an owner action.
 
 Local prerequisites are Podman, Python and the existing dependency sources.
 Pull the builder image once: `podman pull "$(cat tools/release/linux-builder-image)"`.
 The release build itself runs with networking disabled and never installs host
-packages. Supply these already downloaded inputs:
+packages. Supply these inputs:
 
 ```sh
 export DW5XL_DEP_ROOT=/path/to/app/deps
 export DW5XL_RECOMP_DEPS=/path/to/recompiler/build/_deps
-export DW5XL_FFMPEG_SOURCE=/path/to/ffmpeg-7.1.tar.xz
-export DW5XL_APPIMAGE_TOOLS=/path/to/appimage-tools
 export DW5XL_LINUX_SDK_WORK=/path/to/linux-sdk-work
 export DW5XL_BUILD_JOBS=2
 bash tools/release/build_linux.sh
@@ -40,8 +39,18 @@ bash tools/release/build_linux.sh
 `rlimgui-src` source checkouts. `DW5XL_RECOMP_DEPS` holds the five dependency
 checkouts populated by configuring PS2Recomp. No game data is used.
 
-`linux-tools.json` pins the AppImage tools and FFmpeg source. CI checks size and
-SHA-256 before use. Local builds never fetch missing inputs automatically.
+`linux-tools.json` pins the AppImage tools and FFmpeg source. They are fetched
+and checked (size, SHA-256) once, when the builder image is built, and kept in
+its `/inputs`; the release build uses those copies. `DW5XL_FFMPEG_SOURCE` and
+`DW5XL_APPIMAGE_TOOLS` point to other copies, used when they exist. Local builds
+never fetch missing inputs automatically.
+
+The Windows package is built the same way in its own image
+(`tools/release/windows.Containerfile`: archlinux pinned by digest, the
+cross-compiler and every pinned Windows input from `windows-tools.json`),
+published as `ghcr.io/theslackbringer/dw5xl-release-windows` and pinned in
+`tools/release/windows-builder-image` and the windows-build job of
+`.github/workflows/build.yml`.
 
 ## Builder image
 
@@ -55,9 +64,20 @@ builds it and publishes it to `ghcr.io/theslackbringer/dw5xl-release-linux`;
 local release builds use. The release build checks the `.deb` files against the
 manifest before using them, and makes no request to apt.llvm.org.
 
-To update the compiler or libc++: run the `builder-image` workflow (Actions,
-"Run workflow"), check the libc++ version in its summary, and commit the printed
-image line into `tools/release/linux-builder-image`. `DW5XL_LINUX_IMAGE`
+The Linux image is built on top of the approved toolchain image named in
+`tools/release/linux-toolchain-image` (by digest): only the pinned inputs are
+added, and the compiler and libc++ stay exactly as approved (apt.llvm.org keeps
+no old snapshots, so a rebuild from the SDK would bring a newer one).
+
+To update a pinned input: change the pin list, run the `builder-image` workflow
+(Actions, "Run workflow"; it also runs when those files change on `main` or a
+`ci/` branch), check its summary, and commit the printed image lines into
+`tools/release/linux-builder-image` and, for Windows,
+`tools/release/windows-builder-image` and build.yml. To update the compiler or
+libc++: write `toolchain` into `tools/release/linux-toolchain-image` (the image is
+then built from the SDK with today's apt.llvm.org snapshot), run the workflow,
+check the libc++ version in its summary, and pin the result in both
+`linux-builder-image` and `linux-toolchain-image`. `DW5XL_LINUX_IMAGE`
 overrides the image for a local test, e.g. one built from the Containerfile.
 
 The script builds the launcher and recompiler, runs the setup tests, scans the
