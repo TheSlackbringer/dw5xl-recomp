@@ -16,6 +16,7 @@ on:
       - tools/release/write_libcxx_manifest.py
       - tools/release/fetch_inputs.py
       - tools/release/linux-tools.json
+      - tools/release/linux-toolchain-image
       - tools/release/windows-tools.json
       - .github/workflows/builder-image.yml
 
@@ -29,7 +30,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Build the image
-        run: docker build --pull -t dw5xl-release-linux -f tools/release/linux.Containerfile tools/release
+        # the approved toolchain (tools/release/linux-toolchain-image), or `toolchain` there to install a new one
+        run: >
+          docker build --pull --build-arg TOOLCHAIN="$(cat tools/release/linux-toolchain-image)"
+          -t dw5xl-release-linux -f tools/release/linux.Containerfile tools/release
       - name: Check the approved libc++ packages and the pinned inputs (no network)
         run: |
           docker run --rm --network=none dw5xl-release-linux \

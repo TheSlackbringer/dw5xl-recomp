@@ -25,6 +25,10 @@ class BuilderImages(unittest.TestCase):
         for name in ('linux-builder-image', 'windows-builder-image'):
             self.assertRegex((HERE / name).read_text().strip(), DIGEST, name)
 
+    def test_linux_toolchain_is_an_approved_image_or_a_rebuild(self):
+        toolchain = (HERE / 'linux-toolchain-image').read_text().strip()
+        self.assertTrue(toolchain == 'toolchain' or DIGEST.match(toolchain), toolchain)
+
     def test_windows_job_runs_in_the_pinned_image(self):
         image = re.search(r'^\s+image:\s*(\S+)\s*$', job_text('windows-build'), re.M)
         self.assertIsNotNone(image, 'windows-build has no container image')

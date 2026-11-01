@@ -4,10 +4,16 @@
 # same apt.llvm.org snapshot that the package ships (with manifest.json: name, version, size, SHA-256).
 # Issue 027 M11: also the release build's other pinned inputs in /inputs (the FFmpeg source, linuxdeploy,
 # appimagetool from linux-tools.json, size and SHA-256 checked here), so a release build downloads nothing.
+# The toolchain comes from TOOLCHAIN: an approved image (tools/release/linux-toolchain-image, by digest; the inputs
+# are added on top and the compiler and libc++ stay exactly as approved: apt.llvm.org keeps no old snapshots), or
+# `toolchain`, the stage below, which installs today's apt.llvm.org snapshot (only to update the toolchain).
 # Built rarely by .github/workflows/builder-image.yml and published to ghcr.io; CI and local release builds use
 # the image pinned by digest in tools/release/linux-builder-image (see LINUX.md). Building it locally:
-#   podman build -t dw5xl-release-linux -f tools/release/linux.Containerfile tools/release
-FROM registry.gitlab.steamos.cloud/steamrt/sniper/sdk@sha256:9ae8083ee9ae6298361a62f289e62f0a2b0779d23fc8c276304157f0c06010c5
+#   podman build --build-arg TOOLCHAIN="$(cat tools/release/linux-toolchain-image)" -t dw5xl-release-linux \
+#     -f tools/release/linux.Containerfile tools/release
+ARG TOOLCHAIN=toolchain
+
+FROM registry.gitlab.steamos.cloud/steamrt/sniper/sdk@sha256:9ae8083ee9ae6298361a62f289e62f0a2b0779d23fc8c276304157f0c06010c5 AS toolchain
 
 LABEL org.opencontainers.image.source=https://github.com/TheSlackbringer/dw5xl-recomp
 LABEL org.opencontainers.image.description="DW5XL Linux release builder: Steam Runtime 3 sniper SDK, clang 23, approved libc++ packages, pinned build inputs"
@@ -27,5 +33,7 @@ RUN curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /etc/apt/trusted.gp
 
 ENV CC=clang-23 CXX=clang++-23
 
+FROM ${TOOLCHAIN}
+LABEL org.opencontainers.image.description="DW5XL Linux release builder: Steam Runtime 3 sniper SDK, clang 23, approved libc++ packages, pinned build inputs"
 COPY fetch_inputs.py linux-tools.json /usr/local/share/dw5xl/
 RUN python3 /usr/local/share/dw5xl/fetch_inputs.py /usr/local/share/dw5xl/linux-tools.json /inputs
