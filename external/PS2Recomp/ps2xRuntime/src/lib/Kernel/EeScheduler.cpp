@@ -49,6 +49,10 @@ namespace
     // Issue 009 v4.4/v4.5 (design 1a): while the IOP has work (a request or a runnable thread), the scheduler's waits end after this many EE
     // cycles so the IOP catches up in its own steps (ps2xIOP's host-clock poll) between the fields.
     constexpr uint64_t kIopRpcSliceEeCycles = ps2x::iop::kIopHostClockPollEeCycles;
+    // Issue 009 v4.7: how long a host pause lets the game finish what is in progress before it holds anyway, and how
+    // long a save or load asked during a busy hold may run on to reach a quiet point (PC time).
+    constexpr int64_t kPauseQuietWaitNs = 100'000'000;
+    constexpr int64_t kPauseStateWaitNs = 500'000'000;
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
 
@@ -411,9 +415,14 @@ void EeScheduler::run()
         // Issue 009 v4.7: while a host pause waits for its quiet point, the game finishes what is in progress. The
         // checkpoint the pause keeps pending brings guest code back here at its next check (to try the hold), but must
         // not keep it from running at all.
+        // No EE time is added here meanwhile (no field passes, so the game's clock must not run ahead of the IOP and
+        // the picture); the IOP is moved on to the PC clock while it has work.
         const bool pauseWaiting = m_hostPaused.load(std::memory_order_acquire) && !m_pauseHeld.load(std::memory_order_acquire);
-        if (pauseWaiting ? (accountCycles(kGuestDispatchCycles), m_stopRequested.load(std::memory_order_acquire))
-                         : checkpointDue(kGuestDispatchCycles))
+        if (pauseWaiting && m_runtime.iopBusy())
+        {
+            m_runtime.syncIopToHostClock();
+        }
+        if (pauseWaiting ? m_stopRequested.load(std::memory_order_acquire) : checkpointDue(kGuestDispatchCycles))
         {
             continue;
         }
@@ -2043,18 +2052,34 @@ void EeScheduler::processPendingEvents()
         // finishes what is in progress (interrupt handlers, queued events) but no field deadline is served, so no
         // field passes. A save or load request wakes the hold: the dispatcher loop carries it out at once.
         // Issue 009 v4.7: the IOP runs on until the hold too (a request in flight is not quiet); its clock stops here.
-        if (stateQuiet())
+        // The wait is bounded (owner: "it should work like the rest and have the best UX"): a game that stays busy (a
+        // movie streams all the time) is held anyway after kPauseQuietWaitNs, so EE, IOP clock and sound still stop
+        // together. Such a "busy" hold cannot be saved as it is: a save or load asked then lets the game run on (no
+        // field passes) for up to kPauseStateWaitNs to reach a quiet point, else it is refused ("the game is busy").
+        const int64_t nowNs = steadyNs(std::chrono::steady_clock::now());
+        std::string why;
+        const bool quiet = stateQuiet(&why);
+        if (!m_pauseHeld.load(std::memory_order_acquire))
         {
-            if (!m_pauseHeld.exchange(true, std::memory_order_acq_rel))
+            const bool stateAsked = m_stateRequestPending.load(std::memory_order_acquire);
+            const int64_t waited = nowNs - m_pauseWaitSinceNs.load(std::memory_order_acquire);
+            const bool busy = !quiet && waited >= (stateAsked ? kPauseStateWaitNs : kPauseQuietWaitNs);
+            if (busy && stateAsked)
+                refuseStateRequest("the game is busy");
+            if (quiet || busy)
             {
+                m_pauseHeld.store(true, std::memory_order_release);
+                m_pauseHeldBusy = busy;
                 m_runtime.onHostPauseHeld();
-                const auto askedNs = m_pauseAskedNs.load(std::memory_order_acquire);
-                const auto nowNs = std::chrono::steady_clock::now().time_since_epoch().count();
-                std::fprintf(stderr, "[pause] held at field %llu (asked at field %llu) after %.1f ms\n",
+                std::fprintf(stderr, "[pause] held at field %llu (asked at field %llu) after %.1f ms%s%s%s\n",
                              static_cast<unsigned long long>(m_vsyncTick.load(std::memory_order_acquire)),
                              static_cast<unsigned long long>(m_pauseAskedField.load(std::memory_order_acquire)),
-                             static_cast<double>(nowNs - askedNs) / 1e6);
+                             static_cast<double>(nowNs - m_pauseAskedNs.load(std::memory_order_acquire)) / 1e6,
+                             busy ? " (busy: " : "", busy ? why.c_str() : "", busy ? ")" : "");
             }
+        }
+        if (m_pauseHeld.load(std::memory_order_acquire))
+        {
             std::unique_lock lock(m_eventMutex);
             m_eventCv.wait(lock, [this]()
                            { return !m_hostPaused.load(std::memory_order_acquire) ||
@@ -2062,10 +2087,20 @@ void EeScheduler::processPendingEvents()
                                     m_stateRequestPending.load(std::memory_order_acquire); });
             if (m_hostPaused.load(std::memory_order_acquire) && !m_stopRequested.load(std::memory_order_acquire))
             {
+                if (m_pauseHeldBusy && m_stateRequestPending.load(std::memory_order_acquire))
+                {
+                    // A save or load during a busy hold: run on to a quiet point first (bounded, see above).
+                    m_pauseHeld.store(false, std::memory_order_release);
+                    m_pauseHeldBusy = false;
+                    m_runtime.onHostPauseReleased();
+                    m_pauseWaitSinceNs.store(steadyNs(std::chrono::steady_clock::now()), std::memory_order_release);
+                    std::fprintf(stderr, "[pause] a save or load while the game is busy: running on to a quiet point\n");
+                }
                 m_checkpointPending.store(true, std::memory_order_release);
                 return;
             }
             m_pauseHeld.store(false, std::memory_order_release);
+            m_pauseHeldBusy = false;
         }
     }
     if (!m_hostPaused.load(std::memory_order_acquire))
@@ -2111,7 +2146,8 @@ void EeScheduler::setHostPaused(bool paused)
         if (paused && !m_hostPaused.load(std::memory_order_acquire))
         {
             m_pauseAskedField.store(m_vsyncTick.load(std::memory_order_acquire), std::memory_order_release);
-            m_pauseAskedNs.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
+            m_pauseAskedNs.store(steadyNs(std::chrono::steady_clock::now()), std::memory_order_release);
+            m_pauseWaitSinceNs.store(steadyNs(std::chrono::steady_clock::now()), std::memory_order_release);
         }
         m_hostPaused.store(paused, std::memory_order_release);
         m_checkpointPending.store(true, std::memory_order_release);   // running guest code returns to the dispatcher
@@ -2531,16 +2567,19 @@ void EeScheduler::waitForEvent()
     {
         // Issue 009 v4.7: a host pause waits for its quiet point and every EE thread waits (e.g. for an IOP request).
         // Deadlines are suspended, and EE time does not advance here; the IOP runs on to the PC clock in its steps
-        // while it has work, until an event (its completion), the end of the pause or a stop.
+        // while it has work, until an event (its completion), the end of the pause, a stop, or the end of the bounded
+        // wait (processPendingEvents then holds the busy game).
         const auto woken = [this]()
         { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire) ||
                  !m_hostPaused.load(std::memory_order_acquire); };
-        if (!m_runtime.iopBusy())
-        {
-            m_eventCv.wait(lock, woken);
-            return;
-        }
-        if (!m_eventCv.wait_for(lock, eeCyclesToHostDuration(kIopRpcSliceEeCycles), woken))
+        const bool stateAsked = m_stateRequestPending.load(std::memory_order_acquire);
+        auto until = std::chrono::steady_clock::time_point(std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::nanoseconds(m_pauseWaitSinceNs.load(std::memory_order_acquire) +
+                                     (stateAsked ? kPauseStateWaitNs : kPauseQuietWaitNs))));
+        const bool iopBusy = m_runtime.iopBusy();
+        if (iopBusy)
+            until = std::min(until, std::chrono::steady_clock::now() + eeCyclesToHostDuration(kIopRpcSliceEeCycles));
+        if (!m_eventCv.wait_until(lock, until, woken) && iopBusy)
         {
             lock.unlock();
             m_runtime.syncIopToHostClock();
@@ -2735,6 +2774,16 @@ bool EeScheduler::stateQuiet(std::string *reason) const
             *reason = std::move(why);
         return false;
     };
+    // DW5XL-DEBUG issue 009 v4.7: PS2X_PAUSE_TEST_BUSY_MS=<n> makes the game count as busy for the first n ms of each
+    // wait of a host pause for its quiet point (tests of the bounded wait: issue_009_pause_busy.py).
+    static const int64_t s_testBusyNs = []
+    {
+        const char *value = std::getenv("PS2X_PAUSE_TEST_BUSY_MS");
+        return value && *value ? std::strtoll(value, nullptr, 10) * 1'000'000 : int64_t{0};
+    }();
+    if (s_testBusyNs > 0 && m_hostPaused.load(std::memory_order_acquire) && !m_pauseHeld.load(std::memory_order_acquire) &&
+        steadyNs(std::chrono::steady_clock::now()) - m_pauseWaitSinceNs.load(std::memory_order_acquire) < s_testBusyNs)
+        return fail("busy (test switch PS2X_PAUSE_TEST_BUSY_MS)");
     if (!m_events.empty())
         return fail("events are queued");
     for (const GuestInvocation &invocation : m_pendingInvocations)
@@ -2762,6 +2811,20 @@ bool EeScheduler::stateQuiet(std::string *reason) const
     if (m_runtime.iopRpcInFlight())
         return fail("an IOP request is in flight"); // issue 009 v4.4: its EE completion is not in the state
     return true;
+}
+
+void EeScheduler::refuseStateRequest(const char *why)
+{
+    StateRequestKind kind;
+    {
+        std::lock_guard lock(m_stateRequestMutex);
+        kind = m_stateRequestKind;
+        m_stateRequestKind = StateRequestKind::None;
+        m_stateRequestPending.store(false, std::memory_order_release);
+    }
+    const bool save = kind == StateRequestKind::Save;
+    std::fprintf(stderr, "[state] %s refused: %s\n", save ? "save" : "load", why);
+    m_runtime.showStateMessage(std::string(save ? "Can't save now: " : "Can't load now: ") + why);
 }
 
 bool EeScheduler::serviceStateRequest(bool *handled)

@@ -594,6 +594,7 @@ private:
     [[nodiscard]] bool iopRpcInFlight() const noexcept;
     [[nodiscard]] bool iopBusy() const noexcept; // issue 009 v4.5: a request in flight or a runnable IOP thread
     void onHostPauseHeld(); // issue 009 v4.7 (executor): the EE holds a host pause; the IOP clock stops now
+    void onHostPauseReleased(); // issue 009 v4.7 (executor): a busy hold runs on for a save/load; the IOP clock goes on
     void syncIopToHostClock() noexcept;
     void onIopRpcCompleted(uint64_t token);
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);

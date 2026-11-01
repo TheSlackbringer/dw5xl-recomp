@@ -1645,6 +1645,18 @@ void PS2Runtime::onHostPauseHeld()
         m_hostPauseStartNs = now;
 }
 
+void PS2Runtime::onHostPauseReleased()
+{
+    const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    std::lock_guard<std::mutex> lock(m_hostPauseMutex);
+    if (m_hostPauseStartNs != 0u)
+    {
+        m_hostPausedTotalNs += now - m_hostPauseStartNs;
+        m_hostPauseStartNs = 0u;
+    }
+}
+
 uint64_t PS2Runtime::hostPausedNanoseconds(uint64_t steadyNowNs) const
 {
     std::lock_guard<std::mutex> lock(m_hostPauseMutex);

@@ -489,6 +489,8 @@ private:
     std::atomic<bool> m_pauseHeld{false};
     std::atomic<uint64_t> m_pauseAskedField{0};   // the field the pause was asked at (for the [pause] log line)
     std::atomic<int64_t> m_pauseAskedNs{0};       // issue 009 v4.7: when it was asked (steady clock; ask-to-hold time)
+    std::atomic<int64_t> m_pauseWaitSinceNs{0};   // issue 009 v4.7: start of the bounded wait for a quiet point
+    bool m_pauseHeldBusy = false;                 // issue 009 v4.7 (executor): held, but not at a quiet point
     std::atomic<bool> m_checkpointPending{false};
     uint32_t m_debugPublishCountdown = 0u;
 
@@ -525,6 +527,7 @@ private:
 
     // DW5XL (issue 027): the pending save/load request (any thread sets it; run() carries it out at a quiet point).
     bool serviceStateRequest(bool *handled = nullptr); // true when a state was loaded; handled: a request was carried out
+    void refuseStateRequest(const char *why); // issue 009 v4.7: drops the pending request with a "Can't …" message
     std::mutex m_stateRequestMutex;
     std::atomic<bool> m_stateRequestPending{false};
     StateRequestKind m_stateRequestKind = StateRequestKind::None;
