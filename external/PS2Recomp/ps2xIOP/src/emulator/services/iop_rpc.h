@@ -2,9 +2,11 @@
 #include "ps2x/state_archive.h"
 
 #include "ps2x/iop/iop_types.h"
+#include "../core/iop_cpu.h" // issue 009 v4.4: a saved RPC thread state
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <unordered_map>
 
 namespace ps2x::iop
@@ -58,7 +60,43 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool hasServer(uint32_t sid) const noexcept;
         [[nodiscard]] size_t serverCount() const noexcept { return m_servers.size(); }
 
+        // Issue 009 v4.4 (design 1a): an EE request run by the module's own RPC thread, in IOP time, instead of at once
+        // on the EE host thread (handleRpc). The send data goes into the server buffer at once (as the SIF transfer
+        // does); the request waits for the thread that runs that server's sceSifRpcLoop, which runs the server
+        // function at its own priority on its own stack. Returns a token, or 0 when that is not possible (no such
+        // server, or no thread loops on its queue: the caller runs it with handleRpc). The end is reported through
+        // IopHost::rpcCompleted(token) after the reply has been copied to the EE receive buffer.
+        [[nodiscard]] uint64_t startRpc(const RpcRequest &request);
+        // The IOP thread `threadId` reached kRpcServerReturnSentinel: finishes its request, puts it back to sleep in
+        // its loop and starts its next queued request.
+        void onServerReturned(int threadId);
+        [[nodiscard]] bool rpcInFlight() const noexcept { return m_inFlight != 0u; }
+
     private:
+        struct QueuedRpc
+        {
+            uint64_t token = 0;
+            uint32_t sid = 0;
+            uint32_t function = 0;
+            uint32_t sendSize = 0;
+            uint32_t receiveAddress = 0;
+            uint32_t receiveSize = 0;
+        };
+        struct LoopThread
+        {
+            std::deque<QueuedRpc> queue;
+            bool active = false;
+            QueuedRpc current{};
+            IopCpuState saved{}; // the thread asleep in sceSifRpcLoop, restored after each request
+        };
+        void copySendData(const RpcRequest &request, uint32_t serverBuffer);
+        void copyReply(uint32_t returnPointer, uint32_t serverBuffer, uint32_t receiveAddress, uint32_t receiveSize);
+        void startNext(int threadId);
+        std::unordered_map<uint32_t, int> m_queueThreads; // queue (qd) -> the thread running sceSifRpcLoop on it
+        std::unordered_map<int, LoopThread> m_loops;
+        uint64_t m_nextToken = 0;
+        size_t m_inFlight = 0;
+
         struct RpcServer
         {
             uint32_t sid = 0;

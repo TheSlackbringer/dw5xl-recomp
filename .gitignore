@@ -27,6 +27,7 @@ __pycache__/
 # Game-derived generated code and frame dumps: never commit
 /recomp/*/vu1/
 /recomp/*/vu0/
+/recomp/*/iop/
 /final.png
 /frame_*.png
 /dist/

@@ -4,6 +4,7 @@
 #include "setup_cache.h"
 #include "setup_layout.h"
 #include "vu1lift/vu1_translator.h"
+#include "ioplift/iop_generate.h"
 
 #include <algorithm>
 #include <chrono>
@@ -191,6 +192,26 @@ SetupSteps defaultSetupSteps()
                 if(!publishCachedOutputs(record,key,folder,error)) return false;
                 publish.finish();
             }
+            stage.finish();
+        }
+        // Issue 009 v4.5: the disc's IOP modules as C++ (well under a second, so no cache; files that did not change
+        // are left alone by the synchronization).
+        {
+            ps2recomp::timing::Stage stage(c.timing(),"iop",c.timingParent());
+            c.progress(0.95,"iop: translating the IOP modules");
+            std::map<std::string,std::string> files;
+            if(!dw5xl::ioplift::generateIopModules(elf.parent_path()/"MODULES",files,error,
+                                                   [&](const std::string &line){c.log("iop: "+line);})) return false;
+            const auto folder=o.effectiveDataDir()/"recomp/dw5xl/iop";
+            const auto scratch=o.effectiveDataDir()/"build-setup"/"iop";
+            fs::remove_all(scratch);fs::create_directories(scratch);
+            for(const auto &[name,bytes]:files)
+            {
+                if(c.cancelled()) {error="cancelled";return false;}
+                if(!atomicWrite(scratch/name,bytes,error)) return false;
+            }
+            if(!syncDirectory(scratch,folder,error,false,[&](uint64_t,uint64_t){return !c.cancelled();})) return false;
+            fs::remove_all(scratch);
             stage.finish();
         }
         return true;

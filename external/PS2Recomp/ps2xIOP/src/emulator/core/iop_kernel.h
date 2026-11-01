@@ -72,6 +72,22 @@ namespace ps2x::iop::detail
         void terminateThreadsInRange(uint32_t base, uint32_t size);
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+        // Issue 009 v4.5: an IOP thread could run now (Ready, Running, or a delay that has ended).
+        [[nodiscard]] bool hasRunnableThread(uint64_t currentCycle) const noexcept
+        {
+            for (const IopThread *thread : m_threadList)
+                if (thread->state == IopThreadState::Ready || thread->state == IopThreadState::Running ||
+                    (thread->state == IopThreadState::Delay && thread->wakeCycle <= currentCycle))
+                    return true;
+            return false;
+        }
+        // Issue 009 v4.4 (design 1a): the RPC bridge runs EE requests in the module's own RPC thread.
+        [[nodiscard]] int currentThreadId() const noexcept { return m_currentThread ? m_currentThread->id : 0; }
+        [[nodiscard]] IopThread *findThread(int id) noexcept
+        {
+            const auto it = m_threads.find(id);
+            return it == m_threads.end() ? nullptr : &it->second;
+        }
 
         // Runs other IOP threads for one scheduling slice on behalf of guest code executing outside
         // any IOP thread (an RPC server function called by the host). Returns whether any IOP thread

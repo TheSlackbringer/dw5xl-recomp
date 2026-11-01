@@ -111,6 +111,17 @@ if(EXISTS "${DW5XL_VU0_LIFTED_SRC}")
 else()
     message(STATUS "No lifted VU0 code (run tools/regen.sh); VU0 microprograms will be interpreted")
 endif()
+# Issue 009 v4.5: the game's IOP modules translated to C++ (dw5xl_ioplift, run by tools/regen.sh) into the ignored
+# recomp/dw5xl/iop/ folder. Game-derived: never committed. Without it, IOP code runs in the interpreter.
+# The glob is re-checked on every build, so the folder appearing after configure is picked up too.
+set(DW5XL_IOP_NATIVE_DIR "${DW5XL_RECOMP_ROOT}/dw5xl/iop")
+file(GLOB DW5XL_IOP_NATIVE_SOURCES CONFIGURE_DEPENDS "${DW5XL_IOP_NATIVE_DIR}/*.cpp")
+if(DW5XL_IOP_NATIVE_SOURCES)
+    target_sources(dw5xl PRIVATE ${DW5XL_IOP_NATIVE_SOURCES})
+    set_source_files_properties(${DW5XL_IOP_NATIVE_SOURCES} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
+else()
+    message(STATUS "No translated IOP modules (run tools/regen.sh); IOP code will be interpreted")
+endif()
 # Generated code uses SSE4.1/AVX intrinsics (PS2Recomp only enables them in its own directory).
 target_compile_options(dw5xl PRIVATE ${DW5XL_ARCH_FLAGS} ${DW5XL_STRICT_FP_FLAGS})
 
@@ -199,17 +210,27 @@ add_custom_command(OUTPUT "${DW5XL_SETUP_GENERATED}/vu_producer.h"
     DEPENDS dw5xl_vu_generator $<TARGET_OBJECTS:dw5xl_vu_generator> "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vu_producer.cmake"
     VERBATIM)
 add_custom_target(dw5xl_vu_identity DEPENDS "${DW5XL_SETUP_GENERATED}/vu_producer.h")
+# Issue 009 v4.5: the IOP module translator (used by dw5xl_ioplift and the setup pipeline).
+add_library(dw5xl_iop_translator OBJECT setup/ioplift/iop_translator.cpp setup/ioplift/iop_generate.cpp)
+target_include_directories(dw5xl_iop_translator PUBLIC setup/ioplift "${PS2RECOMP_DIR}/ps2xIOP/include"
+    PRIVATE "${PS2RECOMP_DIR}/ps2xIOP/src")
+target_link_libraries(dw5xl_iop_translator PRIVATE ps2_iop)
 add_library(dw5xl_setup_core STATIC setup/iso9660.cpp setup/disc_setup.cpp setup/run_process.cpp setup/codegen.cpp
     setup/build_game.cpp setup/install_state.cpp setup/setup_layout.cpp setup/setup_pipeline.cpp setup/setup_cache.cpp
-    $<TARGET_OBJECTS:dw5xl_vu_generator>)
+    $<TARGET_OBJECTS:dw5xl_vu_generator> $<TARGET_OBJECTS:dw5xl_iop_translator>)
 add_dependencies(dw5xl_setup_core dw5xl_vu_identity)
 target_include_directories(dw5xl_setup_core PRIVATE "${DW5XL_SETUP_GENERATED}")
 target_include_directories(dw5xl_setup_core PUBLIC setup)
-target_link_libraries(dw5xl_setup_core PUBLIC ffmpeg Threads::Threads)
+target_link_libraries(dw5xl_setup_core PUBLIC ffmpeg Threads::Threads ps2_iop)
 # VU1/VU0 translator, the only one (issue 025 Step 6): dw5xl_vu1lift [--vu0] <SLES_538.60> <output.cpp>;
 # dw5xl_vu1lift --find-range <image> <pc> <name> [disc files] prints the vu1_inputs.h entries for a new program.
 add_executable(dw5xl_vu1lift setup/vu1lift/vu1lift_main.cpp)
 target_link_libraries(dw5xl_vu1lift PRIVATE dw5xl_setup_core)
+# Issue 009 v4.5: IOP module translator: dw5xl_ioplift <MODULES folder> <output folder> (game-derived output);
+# dw5xl_ioplift --raw <code.bin> <base hex> <name> <output folder> for the translator test.
+add_executable(dw5xl_ioplift setup/ioplift/ioplift_main.cpp $<TARGET_OBJECTS:dw5xl_iop_translator>)
+target_include_directories(dw5xl_ioplift PRIVATE setup/ioplift "${PS2RECOMP_DIR}/ps2xIOP/include")
+target_link_libraries(dw5xl_ioplift PRIVATE ps2_iop)
 # The wizard's window (raylib + imgui) and no-window run, shared by dw5xl_setup and the game (installed mode).
 add_library(dw5xl_setup_ui STATIC setup/wizard_ui.cpp setup/file_dialog.cpp)
 # raylib before dw5xl_setup_core: the core pulls in user32 (via FFmpeg), whose CloseWindow must not win over raylib's.
@@ -413,6 +434,19 @@ if(DW5XL_BUILD_TESTS)
     target_include_directories(dw5xl_deferred_log_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
     add_test(NAME deferred_log COMMAND dw5xl_deferred_log_test)
     set_tests_properties(deferred_log PROPERTIES TIMEOUT 20)
+    # Issue 009 v4.5: the IOP translator against the interpreter, on our own test program (translated at build time).
+    add_executable(dw5xl_ioplift_testgen tests/ioplift_testgen.cpp)
+    set(DW5XL_IOPLIFT_TEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/ioplift-test")
+    add_custom_command(OUTPUT "${DW5XL_IOPLIFT_TEST_DIR}/iop_IOPTEST.cpp"
+        COMMAND $<TARGET_FILE:dw5xl_ioplift_testgen> "${DW5XL_IOPLIFT_TEST_DIR}/program.bin"
+        COMMAND $<TARGET_FILE:dw5xl_ioplift> --raw "${DW5XL_IOPLIFT_TEST_DIR}/program.bin" 80000 IOPTEST "${DW5XL_IOPLIFT_TEST_DIR}"
+        DEPENDS dw5xl_ioplift_testgen dw5xl_ioplift "${CMAKE_CURRENT_SOURCE_DIR}/tests/ioplift_test_program.h"
+        VERBATIM)
+    add_executable(dw5xl_ioplift_test tests/ioplift_test.cpp "${DW5XL_IOPLIFT_TEST_DIR}/iop_IOPTEST.cpp")
+    target_include_directories(dw5xl_ioplift_test PRIVATE tests "${PS2RECOMP_DIR}/ps2xIOP/src" "${PS2RECOMP_DIR}/ps2xIOP/include")
+    target_link_libraries(dw5xl_ioplift_test PRIVATE ps2_iop)
+    add_test(NAME ioplift COMMAND dw5xl_ioplift_test)
+    set_tests_properties(ioplift PROPERTIES TIMEOUT 120)
     # ThreadSanitizer variant: the queue, PS2Memory, VIF1 parser and GIF arbiter
     # are recompiled instrumented; their archive copies are then never pulled in.
     option(DW5XL_TSAN_TESTS "Build the ThreadSanitizer variant of the VU1 async queue test" ON)

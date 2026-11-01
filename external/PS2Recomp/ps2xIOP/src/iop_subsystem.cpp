@@ -213,6 +213,26 @@ namespace ps2x::iop
         return hle->handleRpc(request);
     }
 
+    uint64_t IopSubsystem::startRpc(const RpcRequest &request)
+    {
+        return m_impl->emulator.hasRpcServer(request.sid) ? m_impl->emulator.startRpc(request) : 0u;
+    }
+
+    bool IopSubsystem::busy() const noexcept
+    {
+        return m_impl->emulator.busy();
+    }
+
+    bool IopSubsystem::rpcInFlight() const noexcept
+    {
+        return m_impl->emulator.rpcInFlight();
+    }
+
+    void IopSubsystem::runToHostClock() noexcept
+    {
+        m_impl->emulator.runToHostClock();
+    }
+
     void IopSubsystem::onSifTransfer(const SifTransfer &transfer)
     {
         for (auto &service : m_impl->coreServices)

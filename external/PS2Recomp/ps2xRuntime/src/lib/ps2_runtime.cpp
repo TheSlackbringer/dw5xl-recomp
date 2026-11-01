@@ -1512,6 +1512,36 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
     return m_iopSubsystem->handleRpc(request);
 }
 
+uint64_t PS2Runtime::startIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
+{
+    auto scope = m_iopHost->enterCall(ctx, rdram);
+    request.callToken = scope.token();
+    return m_iopSubsystem->startRpc(request);
+}
+
+bool PS2Runtime::iopBusy() const noexcept
+{
+    return m_iopSubsystem->busy();
+}
+
+bool PS2Runtime::iopRpcInFlight() const noexcept
+{
+    return m_iopSubsystem->rpcInFlight();
+}
+
+void PS2Runtime::syncIopToHostClock() noexcept
+{
+    m_iopSubsystem->runToHostClock();
+}
+
+void PS2Runtime::onIopRpcCompleted(uint64_t token)
+{
+    // Called on the executor while the IOP runs (EE cycle accounting); the EE side finishes the call at its next
+    // event service, outside guest code.
+    if (m_eeScheduler)
+        m_eeScheduler->postEvent(EeEvent{EeEventType::IopRpcComplete, 0u, token});
+}
+
 void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
 {
     auto scope = m_iopHost->enterCall(nullptr, rdram);

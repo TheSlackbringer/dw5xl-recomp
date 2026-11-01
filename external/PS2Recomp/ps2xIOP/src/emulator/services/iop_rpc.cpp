@@ -5,6 +5,7 @@
 #include "../core/iop_kernel.h"
 #include "../core/iop_memory.h"
 #include "ps2x/iop/iop_host.h"
+#include "../iop_emulator_const.h" // kRpcServerReturnSentinel
 
 #include <algorithm>
 #include <array>
@@ -23,6 +24,10 @@ namespace ps2x::iop::detail
     {
         m_servers.clear();
         m_nextDmaId = 1u;
+        m_queueThreads.clear();
+        m_loops.clear();
+        m_nextToken = 0u;
+        m_inFlight = 0u;
         // SIFMAN is initialised by the IOP kernel at boot, before any game IRX starts, so
         // sceSifCheckInit must report true (KOEISND.IRX in DW5/DW5XL bails out otherwise).
         m_sifInitialized = true;
@@ -244,6 +249,9 @@ namespace ps2x::iop::detail
             setV0(0);
             return true;
         case 22: // RpcLoop
+            // Issue 009 v4.4 (design 1a): this thread runs the requests of queue a0 (startRpc wakes it for each).
+            if (const int thread = m_kernel.currentThreadId())
+                m_queueThreads[cpu.gpr[4]] = thread;
             m_kernel.sleepCurrent(cpu);
             setV0(0);
             return true;
@@ -284,36 +292,15 @@ namespace ps2x::iop::detail
             return result;
 
         RpcServer &server = serverIt->second;
-        if (request.send.size != 0u && server.buffer != 0u)
-        {
-            const uint32_t copySize = std::min<uint32_t>(request.send.size, IopMemory::RamSize - std::min(server.buffer, IopMemory::RamSize));
-            if (copySize != 0u)
-            {
-                std::vector<uint8_t> payload(copySize);
-                if (m_host.readGuest(request.send.address, payload.data(), payload.size()))
-                    (void)m_memory.writeRam(server.buffer, payload.data(), payload.size());
-            }
-        }
+        copySendData(request, server.buffer);
 
-        uint32_t returnPointer = executor.executeGuestFunction(server.function,
-                                                               request.function,
-                                                               server.buffer,
-                                                               request.send.size,
-                                                               0u,
-                                                               server.gp);
-        if (returnPointer == 0u)
-            returnPointer = server.buffer;
-        if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
-        {
-            const uint32_t physical = IopMemory::physicalAddress(returnPointer);
-            if (physical < IopMemory::RamSize)
-            {
-                const uint32_t copySize = std::min<uint32_t>(request.receive.size, IopMemory::RamSize - physical);
-                (void)m_host.writeGuest(request.receive.address, m_memory.ram().data() + physical, copySize);
-                if (copySize < request.receive.size)
-                    (void)m_host.zeroGuest(request.receive.address + copySize, request.receive.size - copySize);
-            }
-        }
+        const uint32_t returnPointer = executor.executeGuestFunction(server.function,
+                                                                     request.function,
+                                                                     server.buffer,
+                                                                     request.send.size,
+                                                                     0u,
+                                                                     server.gp);
+        copyReply(returnPointer, server.buffer, request.receive.address, request.receive.size);
 
         result.handled = true;
         result.resultAddress = request.receive.address;
@@ -321,6 +308,111 @@ namespace ps2x::iop::detail
         result.signalNowaitCompletion = true;
         result.signalCompletion = true;
         return result;
+    }
+
+    void IopRpcBridge::copySendData(const RpcRequest &request, uint32_t serverBuffer)
+    {
+        if (request.send.size == 0u || serverBuffer == 0u)
+            return;
+        const uint32_t copySize = std::min<uint32_t>(request.send.size, IopMemory::RamSize - std::min(serverBuffer, IopMemory::RamSize));
+        if (copySize != 0u)
+        {
+            std::vector<uint8_t> payload(copySize);
+            if (m_host.readGuest(request.send.address, payload.data(), payload.size()))
+                (void)m_memory.writeRam(serverBuffer, payload.data(), payload.size());
+        }
+    }
+
+    void IopRpcBridge::copyReply(uint32_t returnPointer, uint32_t serverBuffer, uint32_t receiveAddress, uint32_t receiveSize)
+    {
+        if (returnPointer == 0u)
+            returnPointer = serverBuffer;
+        if (receiveAddress == 0u || receiveSize == 0u || returnPointer == 0u)
+            return;
+        const uint32_t physical = IopMemory::physicalAddress(returnPointer);
+        if (physical >= IopMemory::RamSize)
+            return;
+        const uint32_t copySize = std::min<uint32_t>(receiveSize, IopMemory::RamSize - physical);
+        (void)m_host.writeGuest(receiveAddress, m_memory.ram().data() + physical, copySize);
+        if (copySize < receiveSize)
+            (void)m_host.zeroGuest(receiveAddress + copySize, receiveSize - copySize);
+    }
+
+    uint64_t IopRpcBridge::startRpc(const RpcRequest &request)
+    {
+        const auto serverIt = m_servers.find(request.sid);
+        if (serverIt == m_servers.end() || serverIt->second.function == 0u)
+            return 0u;
+        const auto loop = m_queueThreads.find(serverIt->second.queue);
+        if (loop == m_queueThreads.end())
+            return 0u;
+        const IopThread *thread = m_kernel.findThread(loop->second);
+        const auto state = m_loops.find(loop->second);
+        const bool busy = state != m_loops.end() && state->second.active;
+        if (!thread || (!busy && thread->state != IopThreadState::Sleep))
+            return 0u; // not waiting in its loop: nothing would start the request
+
+        copySendData(request, serverIt->second.buffer);
+        QueuedRpc queued{};
+        queued.token = ++m_nextToken;
+        queued.sid = request.sid;
+        queued.function = request.function;
+        queued.sendSize = request.send.size;
+        queued.receiveAddress = request.receive.address;
+        queued.receiveSize = request.receive.size;
+        m_loops[loop->second].queue.push_back(queued);
+        ++m_inFlight;
+        startNext(loop->second);
+        return queued.token;
+    }
+
+    void IopRpcBridge::startNext(int threadId)
+    {
+        LoopThread &loop = m_loops[threadId];
+        IopThread *thread = m_kernel.findThread(threadId);
+        if (loop.active || loop.queue.empty() || !thread || thread->state != IopThreadState::Sleep)
+            return;
+        loop.current = loop.queue.front();
+        loop.queue.pop_front();
+        loop.active = true;
+        const auto server = m_servers.find(loop.current.sid);
+        loop.saved = thread->cpu;
+        IopCpuState &cpu = thread->cpu;
+        // As sceSifRpcLoop does: the server function called from the loop, on the thread's stack below its frame.
+        cpu.pc = server != m_servers.end() ? server->second.function : kRpcServerReturnSentinel;
+        cpu.branchPending = false;
+        cpu.pendingLoad = false;
+        cpu.gpr[4] = loop.current.function;
+        cpu.gpr[5] = server != m_servers.end() ? server->second.buffer : 0u;
+        cpu.gpr[6] = loop.current.sendSize;
+        cpu.gpr[7] = 0u;
+        if (server != m_servers.end())
+            cpu.gpr[28] = server->second.gp;
+        cpu.gpr[29] = (loop.saved.gpr[29] - 64u) & ~15u;
+        cpu.gpr[31] = kRpcServerReturnSentinel;
+        cpu.stopped = false;
+        cpu.yielded = false;
+        thread->state = IopThreadState::Ready;
+    }
+
+    void IopRpcBridge::onServerReturned(int threadId)
+    {
+        const auto loopIt = m_loops.find(threadId);
+        IopThread *thread = m_kernel.findThread(threadId);
+        if (loopIt == m_loops.end() || !loopIt->second.active || !thread)
+            return;
+        LoopThread &loop = loopIt->second;
+        const auto server = m_servers.find(loop.current.sid);
+        copyReply(thread->cpu.gpr[2], server != m_servers.end() ? server->second.buffer : 0u, loop.current.receiveAddress,
+                  loop.current.receiveSize);
+        thread->cpu = loop.saved; // back asleep in sceSifRpcLoop
+        thread->cpu.yielded = true;
+        thread->state = IopThreadState::Sleep;
+        loop.active = false;
+        const uint64_t token = loop.current.token;
+        --m_inFlight;
+        m_host.rpcCompleted(token);
+        startNext(threadId);
     }
 
     void IopRpcBridge::onSifTransfer(const SifTransfer &transfer)
@@ -358,6 +450,7 @@ namespace ps2x::iop::detail
     {
         a.tag("IRPC");
         a.podMap(m_servers);
+        a.podMap(m_queueThreads); // issue 009 v4.4; requests in flight: none at a quiet point
         a.value(m_nextDmaId);
         a.value(m_sifInitialized);
     }

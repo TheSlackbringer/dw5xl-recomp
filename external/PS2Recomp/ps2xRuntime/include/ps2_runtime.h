@@ -577,12 +577,20 @@ private:
     [[nodiscard]] bool canBindIopRpc(uint32_t sid) const noexcept;
     [[nodiscard]] bool hasEmulatedIopRpcServer(uint32_t sid) const noexcept;
     [[nodiscard]] ps2x::iop::RpcResult handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
+    // Issue 009 v4.4 (design 1a): the request run by the emulated module's RPC thread in IOP time; 0 = not possible
+    // (use handleIopRpc). Its end reaches the EE scheduler as an IopRpcComplete event.
+    [[nodiscard]] uint64_t startIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
+    [[nodiscard]] bool iopRpcInFlight() const noexcept;
+    [[nodiscard]] bool iopBusy() const noexcept; // issue 009 v4.5: a request in flight or a runnable IOP thread
+    void syncIopToHostClock() noexcept;
+    void onIopRpcCompleted(uint64_t token);
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
     void advanceIopEeCycles(uint64_t eeCycles) noexcept;
     void resetIop();
 
     friend class PS2IopTransport;
     friend class EeScheduler;
+    friend class PS2IopHostAdapter; // onIopRpcCompleted (issue 009 v4.4)
 
 private:
     PS2Memory m_memory;

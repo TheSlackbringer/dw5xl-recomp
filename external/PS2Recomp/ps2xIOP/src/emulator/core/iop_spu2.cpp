@@ -858,6 +858,13 @@ namespace ps2x::iop::detail
         for (uint64_t frame = 0; frame < frames + total / CyclesPerFrame; ++frame)
             m_impl->frame();
     }
+    uint64_t IopSpu2::cyclesUntilIrqCheck() const
+    {
+        for (unsigned core = 0; core != 2; ++core)
+            if (m_impl->reg(core, Attr) & 0x40)
+                return CyclesPerFrame - m_impl->remainder;
+        return UINT64_MAX;
+    }
     void IopSpu2::flushPcm() { m_impl->flush(); }
     void IopSpu2::setPcmCallback(std::function<void(std::span<const int16_t>)> callback) { m_impl->pcmCallback = std::move(callback); }
     void IopSpu2::setIrqCallback(std::function<void()> callback) { m_impl->irqCallback = std::move(callback); }

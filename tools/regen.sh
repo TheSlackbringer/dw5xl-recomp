@@ -64,4 +64,7 @@ if [[ "$selection" == main || "$selection" == all ]]; then
     "$lifter" --sharded "$root/game/dw5xl/SLES_538.60" "$root/recomp/dw5xl/vu1"
     # Issue 025: the VU0 microprograms (VCALLMS) from the same executable, into recomp/dw5xl/vu0/.
     "$lifter" --vu0 "$root/game/dw5xl/SLES_538.60" "$root/recomp/dw5xl/vu0/dw5xl_vu0_lifted.cpp"
+    # Issue 009 v4.5: the disc's IOP modules into recomp/dw5xl/iop/ (build it first: --target dw5xl_ioplift; a new
+    # folder needs a CMake re-configure before the game build picks it up).
+    "${DW5XL_IOPLIFT:-$root/app/build/dw5xl_ioplift}" "$root/game/dw5xl/MODULES" "$root/recomp/dw5xl/iop"
 fi

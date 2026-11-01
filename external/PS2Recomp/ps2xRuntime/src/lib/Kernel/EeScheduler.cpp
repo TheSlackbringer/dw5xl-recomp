@@ -1,6 +1,7 @@
 #include <atomic>
 #include <cstdio>
 #include "runtime/ee_scheduler.h"
+#include "ps2x/iop/iop_subsystem.h" // kIopHostClockPollEeCycles (issue 009 v4.4)
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
@@ -45,6 +46,9 @@ namespace
         return std::chrono::nanoseconds(pal ? 20000000 : 16683333);
     }
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
+    // Issue 009 v4.4/v4.5 (design 1a): while the IOP has work (a request or a runnable thread), the scheduler's waits end after this many EE
+    // cycles so the IOP catches up in its own steps (ps2xIOP's host-clock poll) between the fields.
+    constexpr uint64_t kIopRpcSliceEeCycles = ps2x::iop::kIopHostClockPollEeCycles;
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
 
@@ -1353,6 +1357,12 @@ bool EeScheduler::hasInvocation(GuestInvocationKind kind, uint64_t tag) const
                        });
 }
 
+bool EeScheduler::insideInvocation() const
+{
+    const GuestThread *owner = currentThread();
+    return owner && !owner->invocations.empty();
+}
+
 uint32_t EeScheduler::invocationStackTop()
 {
     assertExecutor();
@@ -2124,13 +2134,24 @@ void EeScheduler::processDueDeadlines()
 
             if (now < pacingDeadline)
             {
-                m_eventCv.wait_until(lock, pacingDeadline, [this]()
+                // Issue 009 v4.4/v4.5 (design 1a): while the IOP has work, wait in its host-clock steps and
+                // let it catch up between them, so its work does not land in one piece after the wait.
+                const bool iopBusy = m_runtime.iopBusy();
+                const auto waitUntil = iopBusy ? std::min(pacingDeadline, now + eeCyclesToHostDuration(kIopRpcSliceEeCycles))
+                                               : pacingDeadline;
+                m_eventCv.wait_until(lock, waitUntil, [this]()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire); });
                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
                 {
                     updateNextDeadline();
                     return;
+                }
+                if (iopBusy && std::chrono::steady_clock::now() < pacingDeadline)
+                {
+                    lock.unlock();
+                    m_runtime.syncIopToHostClock();
+                    continue;
                 }
             }
 
@@ -2367,6 +2388,10 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::Dmac:
         break;
+    case EeEventType::IopRpcComplete: // issue 009 v4.4 (design 1a)
+        if (m_iopRpcCompletion)
+            m_iopRpcCompletion(event.value);
+        break;
     case EeEventType::Alarm:
     {
         auto it = m_alarms.find(static_cast<int>(event.id));
@@ -2493,6 +2518,17 @@ void EeScheduler::waitForEvent()
         }
     }
 
+    // Issue 009 v4.4/v4.5 (design 1a): while the IOP has work (in IOP time, on this thread) it advances in
+    // the IOP's own host-clock steps instead of in one catch-up after the wait, so the next field is not delayed.
+    if (m_runtime.iopBusy())
+    {
+        const auto sliceDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(kIopRpcSliceEeCycles);
+        if (sliceDeadline < hostDeadline)
+        {
+            deadlineCycle = m_eeCycle + kIopRpcSliceEeCycles;
+            hostDeadline = sliceDeadline;
+        }
+    }
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire); });
@@ -2651,6 +2687,8 @@ bool EeScheduler::stateQuiet(std::string *reason) const
     }
     if (m_insideInterrupt)
         return fail("inside an interrupt");
+    if (m_runtime.iopRpcInFlight())
+        return fail("an IOP request is in flight"); // issue 009 v4.4: its EE completion is not in the state
     return true;
 }
 

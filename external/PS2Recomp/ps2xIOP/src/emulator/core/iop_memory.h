@@ -7,6 +7,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include "iop_spu2.h"
 
@@ -82,6 +83,51 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
 
+        // Issue 009 v4.5: native IOP code (ps2x/iop/iop_native.h) works on IOP RAM directly. The code map has one bit
+        // per 32-bit word of RAM translated into native code; any RAM write over such a word is noted (taken by the
+        // emulator, which then drops the module whose code changed).
+        [[nodiscard]] uint8_t *ramData() noexcept { return m_ram.data(); }
+        [[nodiscard]] uint8_t *ownedData() noexcept { return m_owned.data(); }
+        [[nodiscard]] const uint32_t *nativeCodeWords() const noexcept { return m_nativeCodeWords.data(); }
+        void markNativeCode(uint32_t address, uint32_t size, bool native) noexcept;
+        void clearNativeCode() noexcept;
+        [[nodiscard]] bool takeNativeCodeWrite() noexcept
+        {
+            const bool written = m_nativeCodeWritten;
+            m_nativeCodeWritten = false;
+            return written;
+        }
+        // Check mode (PS2X_IOP_LIFT_VERIFY): every RAM write's (address, size) while a log is set.
+        void setWriteLog(std::vector<std::pair<uint32_t, uint32_t>> *log) noexcept { m_writeLog = log; }
+        [[nodiscard]] std::vector<std::pair<uint32_t, uint32_t>> *writeLog() const noexcept { return m_writeLog; }
+        // Check mode: while a replay is set, accesses outside IOP RAM (hardware, scratchpad) take the recorded values
+        // of the native run and touch nothing; any difference from the record is noted.
+        struct HwAccess
+        {
+            uint32_t address;
+            uint32_t size;
+            uint32_t value;
+            bool write;
+            uint64_t cycle; // the IOP cycle of the access
+        };
+        struct HwReplay
+        {
+            const std::vector<HwAccess> *records = nullptr;
+            const uint64_t *cycle = nullptr; // the emulator's IOP cycle count during the replay
+            size_t next = 0u;
+            bool mismatch = false;
+        };
+        void setHwReplay(HwReplay *replay) noexcept { m_hwReplay = replay; }
+        // Check mode: while set, every RAM write (and every change of the written-byte map) first saves the bytes and
+        // flags it replaces, so a kernel call's effects can be undone and re-applied.
+        struct RamUndo
+        {
+            uint32_t address;
+            std::vector<uint8_t> data, owned;
+        };
+        void setRamUndo(std::vector<RamUndo> *undo) noexcept { m_ramUndo = undo; }
+        [[nodiscard]] std::vector<RamUndo> *ramUndo() const noexcept { return m_ramUndo; }
+
     private:
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
@@ -89,6 +135,19 @@ namespace ps2x::iop::detail
 
         std::vector<uint8_t> m_ram;
         std::vector<uint8_t> m_owned;
+        std::vector<uint32_t> m_nativeCodeWords = std::vector<uint32_t>(RamSize / 128u); // issue 009 v4.5
+        bool m_nativeCodeWritten = false;
+        std::vector<std::pair<uint32_t, uint32_t>> *m_writeLog = nullptr;
+        HwReplay *m_hwReplay = nullptr;
+        std::vector<RamUndo> *m_ramUndo = nullptr;
+        void noteRamWrite(uint32_t phys, size_t size)
+        {
+            if (m_ramUndo && size != 0u && phys < RamSize && size <= RamSize - phys)
+                m_ramUndo->push_back({phys, std::vector<uint8_t>(m_ram.begin() + phys, m_ram.begin() + phys + size),
+                                      std::vector<uint8_t>(m_owned.begin() + phys, m_owned.begin() + phys + size)});
+        }
+        [[nodiscard]] uint32_t replayRead(uint32_t address, uint32_t size) const noexcept;
+        void replayWrite(uint32_t address, uint32_t size, uint32_t value) noexcept;
         std::vector<uint8_t> m_scratch;
         std::unordered_map<uint32_t, uint32_t> m_hardware;
         std::vector<Allocation> m_allocations;
