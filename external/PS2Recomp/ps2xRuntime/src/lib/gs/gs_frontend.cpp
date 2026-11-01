@@ -814,7 +814,7 @@ void GS::latchHostPresentationFrame(uint64_t waitForField, uint64_t maxField)
     }
 
     bool updated = false;
-    if (m_fieldScanouts.load(std::memory_order_acquire))
+    if (m_fieldScanouts.load(std::memory_order_acquire) && !m_presentAfterLoad.exchange(false, std::memory_order_acq_rel))
     {
         // Issue 023: the fields are read on the GS side at the end of each field; the window only collects them.
         if (waitForField != UINT64_MAX)

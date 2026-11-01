@@ -21,9 +21,11 @@
 #include "runtime/ps2_settings.h"
 #include "ps2x/iop/spu2_sound.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,6 +33,7 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -136,6 +139,41 @@ bool patchListWord(uint8_t *ram, uint32_t container)
     return true;
 }
 
+// Core column runs of a title (its solid letters, left to right).
+std::vector<std::pair<int, int>> coreRuns(const MImage &img)
+{
+    std::vector<std::pair<int, int>> out; bool in = false; int start = 0;
+    for (int x = 0; x <= img.w; ++x) {
+        bool core = false;
+        for (int y = 0; x < img.w && y < img.h && !core; ++y) core = img.at(x, y)[3] >= kCore;
+        if (core && !in) { in = true; start = x; }
+        if (!core && in) { in = false; out.push_back({start, x}); }
+    }
+    return out;
+}
+
+// Issue 027 v4: the solid letters of a title of `count` letters. Some letters' cores touch (SAVE / LOAD's A and V,
+// SETTINGS' two T): specks are dropped, then the widest run is split at its thinnest column (in its middle 40 %)
+// until there are as many runs as letters.
+std::vector<std::pair<int, int>> letterRuns(const MImage &img, size_t count)
+{
+    std::vector<int> core(size_t(img.w), 0);
+    for (int x = 0; x < img.w; ++x) for (int y = 0; y < img.h; ++y) core[size_t(x)] += img.at(x, y)[3] >= kCore;
+    std::vector<std::pair<int, int>> runs;
+    for (const auto &r : coreRuns(img)) if (r.second - r.first >= 3) runs.push_back(r);
+    while (!runs.empty() && runs.size() < count) {
+        const auto widest = std::max_element(runs.begin(), runs.end(),
+                                             [](const auto &a, const auto &b) { return a.second - a.first < b.second - b.first; });
+        const int a = widest->first, b = widest->second, lo = a + (b - a) * 3 / 10, hi = a + (b - a) * 7 / 10;
+        if (hi <= lo) break;
+        int cut = lo;
+        for (int x = lo; x < hi; ++x) if (core[size_t(x)] < core[size_t(cut)]) cut = x;
+        *widest = {a, cut};
+        runs.insert(widest + 1, {cut + 1, b});
+    }
+    return runs;
+}
+
 // "PC SETTINGS" title into the SCREEN ADJUST title picture (sub-file 7): solid letters from the OPTIONS (3),
 // CONTROLS (5) and SETTINGS (4) titles, the game's glow regenerated, fitted to the picture's palette.
 bool patchTitle(uint8_t *ram, uint32_t container)
@@ -148,18 +186,7 @@ bool patchTitle(uint8_t *ram, uint32_t container)
     if (!t3 || !t4 || !t5 || !t7 || t7->w != 280 || t7->h != 40 || t7->imageType != 5) return false;
     const MImage options = decodeTim2(ptr(ram, a[0]), n[0], *t3), settings = decodeTim2(ptr(ram, a[1]), n[1], *t4),
                 controls = decodeTim2(ptr(ram, a[2]), n[2], *t5);
-    // core column runs of a title (solid letters)
-    auto runs = [](const MImage &img) {
-        std::vector<std::pair<int, int>> out; bool in = false; int start = 0;
-        for (int x = 0; x <= img.w; ++x) {
-            bool core = false;
-            for (int y = 0; x < img.w && y < img.h && !core; ++y) core = img.at(x, y)[3] >= kCore;
-            if (core && !in) { in = true; start = x; }
-            if (!core && in) { in = false; out.push_back({start, x}); }
-        }
-        return out;
-    };
-    const auto ro = runs(options), rc = runs(controls), rs = runs(settings);
+    const auto ro = coreRuns(options), rc = coreRuns(controls), rs = coreRuns(settings);
     if (ro.size() < 2 || rc.empty() || rs.empty()) return false;
     const MImage P = crop(cores(options), ro[1].first, 0, ro[1].second - ro[1].first, 40);
     const MImage C = crop(cores(controls), rc[0].first, 0, rc[0].second - rc[0].first, 40);
@@ -175,6 +202,97 @@ bool patchTitle(uint8_t *ram, uint32_t container)
     if (q.size() != size_t(280) * 40) return false;
     std::memcpy(ptr(ram, a[3]) + t7->pixels, q.data(), q.size());
     return true;
+}
+
+// Issue 027 v4: a title of the title font (MENU, SAVE STATE, LOAD STATE): solid letters cut from the Options screens'
+// titles (sub-files 3-10, letterRuns), 2 columns apart and 15 between words as in PC SETTINGS, the game's glow
+// regenerated around them.
+MImage titleWord(uint8_t *ram, uint32_t container, const char *text)
+{
+    static const std::array<std::pair<uint32_t, const char *>, 8> kTitles{{{3, "OPTIONS"}, {4, "SETTINGS"},
+        {5, "CONTROLS"}, {6, "SOUND"}, {7, "SCREENADJUST"}, {8, "SAVE/LOAD"}, {9, "MOVIES"}, {10, "OPENING"}}};
+    std::vector<std::pair<char, MImage>> letters;
+    MImage settings;
+    for (const auto &[file, word] : kTitles) {
+        uint32_t a, n; std::vector<Tim2Picture> pics;
+        if (!subFile(ram, container, file, a, n)) return {};
+        const Tim2Picture *t = tim(ram, a, n, pics);
+        if (!t) return {};
+        const MImage img = decodeTim2(ptr(ram, a), n, *t);
+        if (file == 4) settings = img;
+        const auto runs = letterRuns(img, std::strlen(word));
+        if (runs.size() != std::strlen(word)) continue;
+        const MImage solid = cores(img);
+        for (size_t i = 0; i < runs.size(); ++i)
+            letters.push_back({word[i], crop(solid, runs[i].first, 0, runs[i].second - runs[i].first, 40)});
+    }
+    std::vector<std::pair<const MImage *, int>> placed;
+    int pen = 8;
+    for (const char *c = text; *c; ++c) {
+        if (*c == ' ') { pen += 13; continue; }
+        const auto it = std::find_if(letters.begin(), letters.end(), [&](const auto &l) { return l.first == *c; });
+        if (it == letters.end() || !settings.w) return {};
+        placed.push_back({&it->second, pen});
+        pen += it->second.w + 2;
+    }
+    MImage word(pen + 8, 40);
+    for (const auto &[letter, x0] : placed)
+        for (int y = 0; y < 40; ++y) std::memcpy(word.at(x0, y), letter->at(0, y), size_t(letter->w) * 4);
+    return applyGlow(word, learnGlow(settings));
+}
+
+// Issue 027 v4: the K of the label font, which English discs do not have (their Q is in the SOUND TEST track
+// names). Three strokes of our own - a stem and two arms at about 45 degrees, placed like the K of the German disc's
+// label font, which was the model - shaded the way this font shades its strokes: the fill by coverage (8x8 samples
+// per pixel), then a dark rim and a soft shadow by distance from the fill. palette: the label strip's 16 colours
+// (1-5 shadow, 6 rim, 7-15 fill).
+Letter drawnK(const uint8_t *palette)
+{
+    constexpr int W = 19, H = 24, S = 8;
+    struct Stroke { float x0, y0, x1, y1, half; };
+    constexpr Stroke kStrokes[3] = {{4.0f, 3.0f, 4.0f, 23.0f, 1.55f}, {14.4f, 4.0f, 3.9f, 14.5f, 1.25f},
+                                    {5.9f, 12.0f, 14.9f, 21.6f, 1.25f}};
+    auto inside = [&](float x, float y) {
+        if (y < 5.0f || y >= 21.0f) return false;     // fill rows 5-20, as every label letter
+        for (const Stroke &st : kStrokes) {
+            const float vx = st.x1 - st.x0, vy = st.y1 - st.y0;
+            const float t = std::clamp(((x - st.x0) * vx + (y - st.y0) * vy) / (vx * vx + vy * vy), 0.0f, 1.0f);
+            if (std::hypot(x - (st.x0 + t * vx), y - (st.y0 + t * vy)) <= st.half) return true;
+        }
+        return false;
+    };
+    std::array<uint8_t, W * H> idx{};
+    std::vector<std::pair<int, int>> fill;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            int hits = 0;
+            for (int sy = 0; sy < S; ++sy)
+                for (int sx = 0; sx < S; ++sx) hits += inside(x + (sx + 0.5f) / S, y + (sy + 0.5f) / S);
+            const float cover = float(hits) / (S * S);
+            if (cover < 0.3f) continue;
+            idx[size_t(y) * W + x] = cover >= 0.92f ? 15 : cover >= 0.8f ? 14 : cover >= 0.65f ? 11 : cover >= 0.5f ? 9 : 8;
+            fill.push_back({x, y});
+        }
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            if (idx[size_t(y) * W + x]) continue;
+            float d = 1e9f;
+            for (const auto &[fx, fy] : fill) d = std::min(d, std::hypot(float(fx - x), float(fy - y)));
+            idx[size_t(y) * W + x] = d <= 1.0f ? 6 : d <= 1.5f ? 4 : d <= 2.3f ? 2 : d <= 2.9f ? 1 : 0;
+        }
+    Letter k;
+    k.img = MImage(W, H);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const uint8_t *c = palette + size_t(idx[size_t(y) * W + x]) * 4;
+            uint8_t *o = k.img.at(x, y);
+            o[0] = c[0]; o[1] = c[1]; o[2] = c[2]; o[3] = uint8_t(std::min(255, c[3] * 2));
+        }
+    k.fill0 = W; k.fill1 = -1;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x)
+            if (isFill(k.img.at(x, y))) { k.fill0 = std::min(k.fill0, x); k.fill1 = std::max(k.fill1, x); }
+    return k;
 }
 
 std::vector<uint8_t> readFile(const std::filesystem::path &p, uint64_t offset = 0, uint64_t size = 0)
@@ -514,6 +632,8 @@ bool input(Input in)
 Snapshot snapshot() { std::lock_guard<std::mutex> lock(g_mutex); return g_state; }
 void setValues(const Values &v) { std::lock_guard<std::mutex> lock(g_mutex); g_state.values = v; g_state.needsInit = false; ++g_state.version; }
 void clearChanged() { std::lock_guard<std::mutex> lock(g_mutex); g_state.changed = false; }
+// Issue 027 v4: PC SETTINGS opened from the in-play MENU starts at its first row, with the current settings.
+void restartRows() { std::lock_guard<std::mutex> lock(g_mutex); g_state.row = 0; g_state.needsInit = true; ++g_state.version; }
 }
 
 // --- the doors during play (window thread) -------------------------------------------------------------------------
@@ -567,7 +687,32 @@ void playMenuSound(int id)
     PlaySound(p.sound);
 }
 
-void openInPlay()
+// --- issue 027 v4: the in-play MENU and the state lists (window thread) ---------------------------------------------
+// Esc or Back held opens the MENU: RESUME, SAVE STATE, LOAD STATE, PC SETTINGS. The lists hold QUICK (F5's slot),
+// SLOT 1-5 and, in LOAD STATE, UNDO LAST LOAD (the game before the last load). A save is carried out while the game
+// stays paused (the scheduler holds at a quiet point and serves it there); a load closes the menu once it is done.
+enum class Screen { Menu, Settings, SaveList, LoadList };
+constexpr int kMenuRows = 4, kSlots = 6, kUndoRow = 6;
+const char *kMenuLabels[kMenuRows] = {"RESUME", "SAVE STATE", "LOAD STATE", "PC SETTINGS"};
+const char *kMenuHelp[kMenuRows] = {"Back to the game.", "Saves the game as it is now. It stays paused.",
+                                    "Goes back to a saved moment.", "Graphics and display settings."};
+const char *kScreenNames[4] = {"MENU", "PC SETTINGS", "SAVE STATE", "LOAD STATE"};
+struct SlotInfo { bool used = false; std::filesystem::file_time_type written{}; std::time_t time = 0; bool olderThanCard = false; Texture2D picture{}; };
+struct MenuState {
+    Screen screen = Screen::Menu;
+    int menuRow = 0, listRow = 0;
+    bool confirm = false;                             // a used slot: the next Cross replaces it
+    std::string saving;                               // a save asked from the list, until its file is written
+    std::filesystem::file_time_type savingBefore{};
+    std::string picture;                              // a saved state whose picture is still to be read
+    bool loading = false;                             // a load asked from the list: the menu closes once it is done
+    uint64_t loadsBefore = 0, messagesBefore = 0;
+    std::array<SlotInfo, kSlots + 1> slots;           // the last: UNDO LAST LOAD
+    std::filesystem::file_time_type cardWritten = std::filesystem::file_time_type::min();   // the card's newest file
+    std::time_t cardTime = 0;
+} g_menu;
+
+void openInPlay(bool byBackHeld)
 {
     if (!dw5xl::pcsettings::switchMode(Mode::Closed, Mode::InPlay)) return;
     ps2_host_input::setGameInputBlocked(true);
@@ -579,6 +724,9 @@ void openInPlay()
     std::fprintf(stderr, "[dw5xl:pc-settings] opened during play at field %llu (overlay %s%s): game paused, %s\n",
                  static_cast<unsigned long long>(field), module && module->identity ? module->identity : "none",
                  battleMenu ? ", a menu" : "", g_overBattle ? "darkened" : "menu background");
+    g_menu.screen = Screen::Menu; g_menu.menuRow = 0; g_menu.confirm = g_menu.loading = false; g_menu.saving.clear();
+    std::fprintf(stderr, "[dw5xl:menu] open MENU at field %llu (%s)\n", static_cast<unsigned long long>(field),
+                 byBackHeld ? "Back held" : "Esc");
 }
 void closeInPlay()
 {
@@ -587,6 +735,100 @@ void closeInPlay()
     ps2_host_input::setGameInputBlocked(false);   // buttons still held stay hidden from the game until released
     std::fprintf(stderr, "[dw5xl:pc-settings] closed at field %llu: game resumed\n",
                  static_cast<unsigned long long>(g_runtime->eeScheduler().currentVSyncTick()));
+    g_menu.screen = Screen::Menu; g_menu.confirm = g_menu.loading = false; g_menu.saving.clear();
+}
+
+std::string slotName(int row) { return row == 0 ? "QUICK" : row == kUndoRow ? "UNDO" : "SLOT " + std::to_string(row); }
+std::filesystem::path slotPath(int row)
+{
+    return PS2Runtime::stateDirectory() /
+           (row == 0 ? "quick.state" : row == kUndoRow ? "before-load.state" : "slot" + std::to_string(row) + ".state");
+}
+std::time_t wallTime(std::filesystem::file_time_type t)
+{
+    return std::chrono::system_clock::to_time_t(std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        t - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now()));
+}
+std::string timeText(std::time_t t, const char *format)
+{
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char text[40] = {};
+    std::strftime(text, sizeof(text), format, &tm);
+    return text;
+}
+// The slots as they are on disk with their pictures, and which were made before the memory card's newest file.
+void refreshSlots(bool log)
+{
+    MenuState &M = g_menu;
+    M.cardWritten = std::filesystem::file_time_type::min();   // (the file clock's zero may lie in the future)
+    std::error_code ec;
+    for (auto it = std::filesystem::recursive_directory_iterator(PS2Runtime::getIoPaths().mcRoot, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec))
+        if (it->is_regular_file(ec)) M.cardWritten = std::max(M.cardWritten, it->last_write_time(ec));
+    M.cardTime = M.cardWritten == std::filesystem::file_time_type::min() ? 0 : wallTime(M.cardWritten);
+    for (int r = 0; r <= kSlots; ++r) {
+        SlotInfo &slot = M.slots[size_t(r)];
+        if (slot.picture.id) { UnloadTexture(slot.picture); slot.picture = {}; }
+        slot.written = std::filesystem::last_write_time(slotPath(r), ec);
+        slot.used = !ec;
+        slot.time = slot.used ? wallTime(slot.written) : 0;
+        slot.olderThanCard = slot.used && M.cardTime && slot.written < M.cardWritten;
+        std::filesystem::path png = slotPath(r);
+        png.replace_extension(".png");
+        if (slot.used && std::filesystem::exists(png, ec)) {
+            slot.picture = LoadTexture(png.string().c_str());
+            SetTextureFilter(slot.picture, TEXTURE_FILTER_BILINEAR);
+            SetTextureWrap(slot.picture, TEXTURE_WRAP_CLAMP);
+        }
+    }
+    if (!log) return;
+    const bool load = M.screen == Screen::LoadList;
+    std::string line;
+    for (int r = 0; r < (load ? kSlots + 1 : kSlots); ++r) {
+        const SlotInfo &slot = M.slots[size_t(r)];
+        line += (r ? ", " : "") + slotName(r) + "=" + (slot.used ? timeText(slot.time, "%H:%M:%S") : "empty") +
+                (load && slot.olderThanCard ? " older-than-card" : "");
+    }
+    std::fprintf(stderr, "[dw5xl:menu] list %s: %s (memory card written %s)\n", load ? "LOAD STATE" : "SAVE STATE",
+                 line.c_str(), M.cardTime ? timeText(M.cardTime, "%H:%M:%S").c_str() : "never");
+}
+void showScreen(Screen screen)
+{
+    MenuState &M = g_menu;
+    M.screen = screen; M.listRow = 0; M.confirm = false;
+    std::fprintf(stderr, "[dw5xl:menu] screen %s\n", kScreenNames[int(screen)]);
+    if (screen == Screen::Settings) dw5xl::pcsettings::restartRows();
+    if (screen == Screen::SaveList || screen == Screen::LoadList) refreshSlots(true);
+}
+// Every frame while the screen is open: a save asked from the list is written (its row shows it, then its picture),
+// a load is done (the menu closes) or was refused (its message shows, the menu stays).
+void inPlayProgress()
+{
+    MenuState &M = g_menu;
+    const bool refused = g_runtime->stateMessageCount() != M.messagesBefore &&
+                         g_runtime->lastStateMessage().rfind("Can't", 0) == 0;
+    std::error_code ec;
+    if (!M.saving.empty()) {
+        const auto written = std::filesystem::last_write_time(M.saving, ec);
+        if (!ec && written != M.savingBefore) { M.picture = M.saving; M.saving.clear(); refreshSlots(true); }
+        else if (refused) M.saving.clear();
+    }
+    if (!M.picture.empty()) {                         // the window loop writes the picture once the state is saved
+        std::filesystem::path png = M.picture;
+        png.replace_extension(".png");
+        const auto pictureWritten = std::filesystem::last_write_time(png, ec);
+        if (!ec && pictureWritten >= std::filesystem::last_write_time(M.picture, ec) && !ec) { M.picture.clear(); refreshSlots(false); }
+    }
+    if (M.loading) {
+        if (g_runtime->stateLoadCount() != M.loadsBefore) { M.loading = false; closeInPlay(); }
+        else if (refused || (g_runtime->stateMessageCount() != M.messagesBefore &&
+                             g_runtime->lastStateMessage().rfind("No saved", 0) == 0)) M.loading = false;
+    }
 }
 
 // DW5XL-DEBUG issue 023 3S: PS2X_PCSETTINGS_SCRIPT="<field>:esc,<frames>:<step>,..." drives the doors and the screen
@@ -627,6 +869,7 @@ struct Presses { bool up = false, down = false, left = false, right = false, cro
 Presses readPresses()
 {
     Presses p;
+    if (ps2_host_input::scripted()) return p;         // a scripted run: only the screen's own script steps
     auto key = [](int k) { return IsKeyPressed(k) || IsKeyPressedRepeat(k); };
     p.up = key(KEY_UP) || key(KEY_W); p.down = key(KEY_DOWN) || key(KEY_S);
     p.left = key(KEY_LEFT) || key(KEY_A); p.right = key(KEY_RIGHT) || key(KEY_D);
@@ -649,6 +892,69 @@ Presses readPresses()
     }
     return p;
 }
+
+// Issue 027 v4: one frame of input on the in-play screen. back: Esc, Back held, or Back (Triangle / V).
+// The game's menu sounds: 0 cursor, 1 value changed, 3 confirm, 4 back.
+void inPlayInput(const Presses &p, bool back)
+{
+    using dw5xl::pcsettings::input;
+    MenuState &M = g_menu;
+    if (dw5xl::pcsettings::trace() && (p.up || p.down || p.left || p.right || p.cross || back))
+        std::fprintf(stderr, "[dw5xl:menu] input%s%s%s%s%s%s on %s (menu row %d, list row %d%s)\n", p.up ? " up" : "",
+                     p.down ? " down" : "", p.left ? " left" : "", p.right ? " right" : "", p.cross ? " cross" : "",
+                     back ? " back" : "", kScreenNames[int(M.screen)], M.menuRow, M.listRow, M.loading ? ", loading" : "");
+    if (M.loading) return;                            // the menu closes once the load is done
+    if (M.screen == Screen::Menu) {
+        if (back) { playMenuSound(4); closeInPlay(); }
+        else if (p.up || p.down) { M.menuRow = (M.menuRow + (p.down ? 1 : kMenuRows - 1)) % kMenuRows; playMenuSound(0); }
+        else if (p.cross) {
+            playMenuSound(3);
+            if (M.menuRow == 0) { std::fprintf(stderr, "[dw5xl:menu] RESUME\n"); closeInPlay(); }
+            else showScreen(M.menuRow == 1 ? Screen::SaveList : M.menuRow == 2 ? Screen::LoadList : Screen::Settings);
+        }
+        return;
+    }
+    if (M.screen == Screen::Settings) {
+        if (back) { playMenuSound(4); showScreen(Screen::Menu); }
+        else if (p.up) { if (input(Input::Up)) playMenuSound(0); }
+        else if (p.down) { if (input(Input::Down)) playMenuSound(0); }
+        else if (p.left) { if (input(Input::Left)) playMenuSound(1); }
+        else if (p.right) { if (input(Input::Right)) playMenuSound(1); }
+        else if (p.cross && dw5xl::pcsettings::snapshot().row == dw5xl::pcsettings::kDefaultRow) { input(Input::Default); playMenuSound(3); }
+        return;
+    }
+    const bool save = M.screen == Screen::SaveList;
+    const int rows = save ? kSlots : kSlots + 1;
+    if (M.confirm && !p.cross && (back || p.up || p.down || p.left || p.right)) {
+        M.confirm = false; playMenuSound(4);
+        std::fprintf(stderr, "[dw5xl:menu] replace cancelled\n");
+        return;
+    }
+    if (back) { playMenuSound(4); showScreen(Screen::Menu); return; }
+    if (p.up || p.down) { M.listRow = (M.listRow + (p.down ? 1 : rows - 1)) % rows; playMenuSound(0); return; }
+    if (!p.cross || !M.saving.empty()) return;
+    const int row = M.listRow;
+    const std::string path = slotPath(row).string();
+    M.messagesBefore = g_runtime->stateMessageCount();
+    if (save) {
+        if (M.slots[size_t(row)].used && !M.confirm) {
+            M.confirm = true; playMenuSound(1);
+            std::fprintf(stderr, "[dw5xl:menu] %s is used: Cross again to replace it\n", slotName(row).c_str());
+            return;
+        }
+        M.confirm = false;
+        std::error_code ec;
+        M.savingBefore = std::filesystem::last_write_time(path, ec);
+        M.saving = path;
+        g_runtime->requestStateWithPicture(true, path);
+        playMenuSound(3);
+    } else if (M.slots[size_t(row)].used) {
+        M.loading = true; M.loadsBefore = g_runtime->stateLoadCount();
+        if (row == kUndoRow) g_runtime->eeScheduler().requestState(EeScheduler::StateRequestKind::Load, path);
+        else g_runtime->requestStateWithPicture(false, path, slotPath(kUndoRow).string());
+        playMenuSound(3);
+    }
+}
 }
 
 namespace dw5xl::pcsettings {
@@ -658,7 +964,7 @@ bool frame(bool allowOpen)
     const std::string script = scriptAction();
     std::string shot;
     if (script.rfind("shot=", 0) == 0) shot = script.substr(5);
-    const bool esc = IsKeyPressed(KEY_ESCAPE) || script == "esc";
+    const bool esc = (IsKeyPressed(KEY_ESCAPE) && !ps2_host_input::scripted()) || script == "esc";
     const bool held = g_backHeld.exchange(false, std::memory_order_acq_rel) || script == "hold";
     const Mode mode = snapshot().mode;
     Presses p;
@@ -668,20 +974,12 @@ bool frame(bool allowOpen)
         p.cross |= script == "cross"; p.back |= script == "back";
     } else if (mode == Mode::Options)                 // the game's routine does not use Cross
         p.cross = IsKeyPressed(KEY_X) || IsKeyPressed(KEY_SPACE) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
-    if (mode == Mode::Closed && (esc || held) && allowOpen) openInPlay();
+    if (mode == Mode::Closed && (esc || held) && allowOpen) openInPlay(held && !esc);
     else if (mode == Mode::Options && esc) ps2_host_input::tapGameButtons(kPadTriangle);   // the game's Back
-    else if (mode == Mode::InPlay) {
-        // the game's menu sounds: 0 cursor, 1 value changed, 3 confirm, 4 back
-        if (esc || held || p.back) { playMenuSound(4); closeInPlay(); }
-        else if (p.up) { if (input(Input::Up)) playMenuSound(0); }
-        else if (p.down) { if (input(Input::Down)) playMenuSound(0); }
-        else if (p.left) { if (input(Input::Left)) playMenuSound(1); }
-        else if (p.right) { if (input(Input::Right)) playMenuSound(1); }
-    }
-    // Cross on DEFAULT. In the Options menu it taps Start, the routine's own reset, so the game sounds it too.
+    else if (mode == Mode::InPlay) { inPlayProgress(); inPlayInput(p, esc || held || p.back); }
+    // Cross on DEFAULT in the Options menu taps Start, the routine's own reset, so the game sounds it too.
     const Snapshot s = snapshot();
-    if (s.mode == Mode::InPlay && s.row == kDefaultRow && p.cross) { input(Input::Default); playMenuSound(3); }
-    else if (s.mode == Mode::Options && s.row == kDefaultRow && p.cross) ps2_host_input::tapGameButtons(kPadStart);
+    if (s.mode == Mode::Options && s.row == kDefaultRow && p.cross) ps2_host_input::tapGameButtons(kPadStart);
     if (!shot.empty()) g_runtime->requestWindowShot(shot);
     return snapshot().mode != Mode::Closed;
 }
@@ -716,6 +1014,9 @@ struct Assets {
     uint8_t line[4] = {};                             // separator colour (already tinted as the game draws it)
     Tex title, icon[3], barText[3];                   // in play: the screen title and the bar (Select, Change, Back)
     Tex sky, ground, emblem;                          // in play outside battle: the Options menu's background
+    Tex titleMenu, titleSave, titleLoad, menuLabel[kMenuRows], quick, slot, empty, undo;   // issue 027 v4
+    MImage digits;                                    // the number font (boot pictures), for text made later
+    std::vector<uint8_t> exe;                         // the executable: its small font, for text made later
 } g_assets;
 
 Tex upload(const MImage &img)
@@ -724,12 +1025,47 @@ Tex upload(const MImage &img)
     ::Image ri{const_cast<uint8_t *>(img.rgba.data()), img.w, img.h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
     t.t = LoadTextureFromImage(ri);
     SetTextureFilter(t.t, TEXTURE_FILTER_BILINEAR);
+    SetTextureWrap(t.t, TEXTURE_WRAP_CLAMP);          // filtering at an edge must not reach the opposite edge (027 v4:
+                                                      // a dark line at the ground picture's top in big windows)
     return t;
 }
 MImage tinted(MImage img, const float k[3]) { for (size_t i = 0; i < img.rgba.size(); i += 4) for (int c = 0; c < 3; ++c) img.rgba[i + c] = uint8_t(std::min(255.0f, img.rgba[i + c] * k[c])); return img; }
+// Text in the number font: 16x16 cells, 8 per row from ' ' (digits, A-Z, ':' and more).
+MImage numberImage(const MImage &digits, const std::string &text)
+{
+    MImage out(int(text.size()) * 16, 16);
+    for (size_t i = 0; i < text.size(); ++i) {
+        const int c = text[i] - 32; const MImage cell = crop(digits, (c % 8) * 16, (c / 8) * 16, 16, 16);
+        for (int y = 0; y < 16; ++y) std::memcpy(out.at(int(i) * 16, y), cell.at(0, y), 16 * 4);
+    }
+    return out;
+}
+
+// Text in the executable's small font (the help lines; glyphs from '!' at 0x216230, palette 0x215F90).
+MImage smallImage(const std::vector<uint8_t> &exe, const std::string &text)
+{
+    std::vector<MImage> glyphs; std::vector<int> pens; int pen = 0;
+    for (const char ch : text) {
+        if (ch == ' ' || ch < 33 || ch > 126) { pen += 7; continue; }        // 5 game pixels at 0.75 per texel
+        const MImage g = decodeGlyph(exe.data() + 0x216230 + size_t(ch - 33) * 160, exe.data() + 0x215F90);
+        int x0 = 16, x1 = -1;
+        for (int y = 0; y < 20; ++y) for (int x = 0; x < 16; ++x) if (g.at(x, y)[3] > 40) { x0 = std::min(x0, x); x1 = std::max(x1, x); }
+        if (x1 < x0) { pen += 7; continue; }
+        glyphs.push_back(crop(g, x0, 0, x1 - x0 + 1, 20)); pens.push_back(pen); pen += x1 - x0 + 1 + 2;
+    }
+    MImage line(std::max(pen, 1), 20);
+    for (size_t i = 0; i < glyphs.size(); ++i)
+        for (int y = 0; y < 20; ++y) for (int x = 0; x < glyphs[i].w; ++x) {
+            const uint8_t *src = glyphs[i].at(x, y); uint8_t *dst = line.at(pens[i] + x, y);
+            if (src[3] > dst[3]) std::memcpy(dst, src, 4);
+        }
+    return line;
+}
+
 void buildAssets()
 {
     Assets &A = g_assets; A.tried = true;
+    auto fail = [](const char *what) { std::fprintf(stderr, "[dw5xl:pc-settings] screen pictures not built: %s\n", what); };
     // the Options menu file (LINKDATA entry 41, LZP2) and the boot pictures (entry 0, not packed), from the disc
     const auto dir = PS2Runtime::getIoPaths().elfDirectory;
     std::vector<LinkEntry> idx;
@@ -750,6 +1086,39 @@ void buildAssets()
         size_t k = 0;
         for (const char *p = text; *p && k < split.size(); ++p) if (*p != ' ') letters.push_back({*p, split[k++]});
     }
+    // Issue 027 v4: Q from the SOUND TEST track names (sub-file 28, row 2: THE CONQUEROR), its shades mapped onto the
+    // label strip's (shadow entries by alpha, the others by brightness); K drawn (drawnK).
+    const uint8_t *labelPalette = ptr(ram, a12) + t12->clut;
+    uint32_t a28, n28; std::vector<Tim2Picture> s28;
+    if (!subFile(ram, container, 28, a28, n28)) return fail("no track names (sub-file 28)");
+    const Tim2Picture *t28 = tim(ram, a28, n28, s28);
+    if (!t28 || t28->imageType != 4 || t28->w < 208 || t28->h < 72 || t28->clutSize < 64) return fail("track names picture");
+    const uint8_t *trackPalette = ptr(ram, a28) + t28->clut;
+    auto lum = [](const uint8_t *c) { return (c[0] + c[1] + c[2]) / 3; };
+    uint8_t remap[16] = {};
+    for (int i = 1; i < 16; ++i) {
+        const uint8_t *c = trackPalette + i * 4;
+        const bool shadow = c[3] < 120;
+        int best = shadow ? 1 : 6;
+        for (int j = best; j < (shadow ? 6 : 16); ++j) {
+            const uint8_t *l = labelPalette + j * 4, *b = labelPalette + best * 4;
+            if (shadow ? std::abs(l[3] - c[3]) < std::abs(b[3] - c[3]) : std::abs(lum(l) - lum(c)) < std::abs(lum(b) - lum(c))) best = j;
+        }
+        remap[i] = uint8_t(best);
+    }
+    const std::vector<uint8_t> trackIdx = tim2Indices(ptr(ram, a28), n28, *t28);
+    if (trackIdx.size() < size_t(t28->w) * 72) return fail("track names pixels");
+    MImage conqueror(t28->w, 24);
+    for (int y = 0; y < 24; ++y)
+        for (int x = 0; x < t28->w; ++x) {
+            const uint8_t *c = labelPalette + size_t(remap[trackIdx[size_t(y + 48) * t28->w + x] & 15]) * 4;
+            uint8_t *o = conqueror.at(x, y);
+            o[0] = c[0]; o[1] = c[1]; o[2] = c[2]; o[3] = uint8_t(std::min(255, c[3] * 2));
+        }
+    const auto conquerorLetters = splitLetters(conqueror, 12);      // T H E C O N Q U E R O R
+    if (conquerorLetters.size() != 12) return fail("the letters of THE CONQUEROR");
+    letters.push_back({'Q', conquerorLetters[6]});
+    letters.push_back({'K', drawnK(labelPalette)});
     auto word = [&](const char *text) {
         std::vector<const Letter *> ls;
         for (const char *p = text; *p; ++p) {
@@ -762,6 +1131,11 @@ void buildAssets()
         return buildWord(ls, 9, 2, 4);
     };
     for (int i = 0; i < 5; ++i) { const MImage w = word(kLabels[i]); if (!w.w) return; A.label[i] = upload(w); }
+    // Issue 027 v4: the MENU's rows and the state lists' words
+    for (int i = 0; i < kMenuRows; ++i) { const MImage w = word(kMenuLabels[i]); if (!w.w) return fail(kMenuLabels[i]); A.menuLabel[i] = upload(w); }
+    const char *listWords[4] = {"QUICK", "SLOT", "EMPTY", "UNDO LAST LOAD"};
+    Tex *listTex[4] = {&A.quick, &A.slot, &A.empty, &A.undo};
+    for (int i = 0; i < 4; ++i) { const MImage w = word(listWords[i]); if (!w.w) return fail(listWords[i]); *listTex[i] = upload(w); }
     A.labelDefault = upload(crop(strip, 0, 9 * 24, 208, 24));
     // ON / OFF in the value strip's two palettes; which palette is yellow decides "current"
     const MImage v0 = decodeTim2(ptr(ram, a13), n13, *t13, 0), v1 = decodeTim2(ptr(ram, a13), n13, *t13, 1);
@@ -788,15 +1162,8 @@ void buildAssets()
     const auto boot = readFile(dir / "LINKDATA.BIN", idx[0].offset(), idx[0].size);
     const auto bootPics = findTim2(boot.data(), boot.size());
     if (bootPics.empty() || bootPics[0].w != 512 || bootPics[0].h != 512) return;
-    const MImage digits = decodeTim2(boot.data(), boot.size(), bootPics[0], 0);
-    auto numberText = [&](const std::string &text) {                 // 16x16 cells, 8 per row from ' '
-        MImage out(int(text.size()) * 16, 16);
-        for (size_t i = 0; i < text.size(); ++i) {
-            const int c = text[i] - 32; const MImage cell = crop(digits, (c % 8) * 16, (c / 8) * 16, 16, 16);
-            for (int y = 0; y < 16; ++y) std::memcpy(out.at(int(i) * 16, y), cell.at(0, y), 16 * 4);
-        }
-        return out;
-    };
+    A.digits = decodeTim2(boot.data(), boot.size(), bootPics[0], 0);
+    auto numberText = [&](const std::string &text) { return numberImage(A.digits, text); };
     const char *res[3] = {"640X512", "1280X1024", "2560X2048"}, *aa[5] = {"OFF", "2X", "4X", "8X", "16X"};
     for (int v = 0; v < 3; ++v) { const MImage n = numberText(res[v]); A.number[0][v][0] = upload(n); A.number[0][v][1] = upload(tinted(n, k)); }
     for (int v = 1; v < 5; ++v) { const MImage n = numberText(aa[v]); A.number[1][v][0] = upload(n); A.number[1][v][1] = upload(tinted(n, k)); }
@@ -808,6 +1175,11 @@ void buildAssets()
     const int iconPalette[3] = {44, 43, 40}, iconX[3] = {332, 312, 252};          // Select, Change, Back (20x20)
     for (int i = 0; i < 3; ++i)
         A.icon[i] = upload(crop(decodeTim2(boot.data(), boot.size(), bootPics[0], iconPalette[i]), iconX[i], 336, 20, 20));
+    // Issue 027 v4: the MENU, SAVE STATE and LOAD STATE titles (before patchTitle changes the SCREEN ADJUST title)
+    const MImage titleMenu = titleWord(ram, container, "MENU"), titleSave = titleWord(ram, container, "SAVE STATE"),
+                 titleLoad = titleWord(ram, container, "LOAD STATE");
+    if (!titleMenu.w || !titleSave.w || !titleLoad.w) return fail("the MENU / SAVE STATE / LOAD STATE titles");
+    A.titleMenu = upload(titleMenu); A.titleSave = upload(titleSave); A.titleLoad = upload(titleLoad);
     // the title: "PC SETTINGS" built as in the Options menu (patchTitle), from this copy of the menu file
     uint32_t a7, n7; std::vector<Tim2Picture> s7;
     if (!patchTitle(ram, container) || !subFile(ram, container, 7, a7, n7)) return;
@@ -839,30 +1211,14 @@ void buildAssets()
     A.ground = upload(decodeTim2(ram + a2, n2, *t2));
     A.emblem = upload(crop(decodeTim2(boot.data(), boot.size(), bootPics[0], 69), 96, 224, 104, 72));
     // the help lines in the small font of the executable (glyphs from '!' at 0x216230, palette 0x215F90)
-    const auto exe = readFile(PS2Runtime::getIoPaths().elfPath);
-    if (exe.size() < 0x216230 + 95 * 160) return;
-    auto smallText = [&](const char *text) {
-        std::vector<MImage> glyphs; std::vector<int> pens; int pen = 0;
-        for (const char *p = text; *p; ++p) {
-            if (*p == ' ' || *p < 33 || *p > 126) { pen += 7; continue; }        // 5 game pixels at 0.75 per texel
-            const MImage g = decodeGlyph(exe.data() + 0x216230 + size_t(*p - 33) * 160, exe.data() + 0x215F90);
-            int x0 = 16, x1 = -1;
-            for (int y = 0; y < 20; ++y) for (int x = 0; x < 16; ++x) if (g.at(x, y)[3] > 40) { x0 = std::min(x0, x); x1 = std::max(x1, x); }
-            if (x1 < x0) { pen += 7; continue; }
-            glyphs.push_back(crop(g, x0, 0, x1 - x0 + 1, 20)); pens.push_back(pen); pen += x1 - x0 + 1 + 2;
-        }
-        MImage line(std::max(pen, 1), 20);
-        for (size_t i = 0; i < glyphs.size(); ++i)
-            for (int y = 0; y < 20; ++y) for (int x = 0; x < glyphs[i].w; ++x) {
-                const uint8_t *src = glyphs[i].at(x, y); uint8_t *dst = line.at(pens[i] + x, y);
-                if (src[3] > dst[3]) std::memcpy(dst, src, 4);
-            }
-        return line;
-    };
+    A.exe = readFile(PS2Runtime::getIoPaths().elfPath);
+    if (A.exe.size() < 0x216230 + 95 * 160) return;
+    auto smallText = [&](const char *text) { return smallImage(A.exe, text); };
     for (int r = 0; r < kRows; ++r) A.help[r] = upload(smallText(kHelp[r]));
     const char *bar[3] = {"Select", "Change", "Back"};
     for (int i = 0; i < 3; ++i) A.barText[i] = upload(smallText(bar[i]));
     A.ok = true;
+    std::fprintf(stderr, "[dw5xl:pc-settings] screen pictures built\n");
 }
 
 // game picture coordinates (512 x 448) -> window
@@ -878,6 +1234,129 @@ void separator(ImDrawList *dl, const Map &m, float gy, float fullEnd, float fade
     const ImU32 on = IM_COL32(c[0], c[1], c[2], std::min(255, c[3] * 2)), off = IM_COL32(c[0], c[1], c[2], 0);
     dl->AddRectFilled(m.at(0, gy), m.at(fullEnd, gy + 3), on);
     dl->AddRectFilledMultiColor(m.at(fullEnd, gy), m.at(fadeEnd, gy + 3), on, off, off, on);
+}
+
+// Issue 027 v4: text made while the screen is open (times, help lines), uploaded once per text.
+const Tex &smallTex(const std::string &text)
+{
+    static std::map<std::string, Tex> cache;
+    auto it = cache.find(text);
+    if (it == cache.end()) it = cache.emplace(text, upload(smallImage(g_assets.exe, text))).first;
+    return it->second;
+}
+const Tex &numberTex(const std::string &text)
+{
+    static std::map<std::string, Tex> cache;
+    auto it = cache.find(text);
+    if (it == cache.end()) it = cache.emplace(text, upload(numberImage(g_assets.digits, text))).first;
+    return it->second;
+}
+// The help text above the button bar, wrapped at word boundaries to the picture's width (464 game pixels; the small
+// font is drawn at 0.75 per texel); a save or load message replaces it while it shows.
+void helpLines(ImDrawList *dl, const Map &m, std::string text)
+{
+    if (std::string message = g_runtime->stateMessage(); !message.empty()) text = std::move(message);
+    static std::map<std::string, std::vector<std::string>> wrapped;
+    auto it = wrapped.find(text);
+    if (it == wrapped.end()) {
+        std::vector<std::string> lines;
+        std::string line;
+        size_t at = 0;
+        while (at < text.size()) {
+            const size_t space = std::min(text.find(' ', at), text.size());
+            const std::string word = text.substr(at, space - at);
+            const std::string longer = line.empty() ? word : line + " " + word;
+            if (!line.empty() && float(smallImage(g_assets.exe, longer).w) * 0.75f > 464.0f) { lines.push_back(line); line = word; }
+            else line = longer;
+            at = space + 1;
+        }
+        if (!line.empty()) lines.push_back(line);
+        it = wrapped.emplace(text, std::move(lines)).first;
+    }
+    const auto &lines = it->second;
+    const float top = lines.size() <= 2 ? 372.0f - 10.0f * float(lines.size() - 1) : 405.0f - 20.0f * float(lines.size());
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const Tex &t = smallTex(lines[i]);
+        image(dl, m, t, 24, top + 20.0f * float(i), float(t.w) * 0.75f, 20);
+    }
+}
+const ImU32 kDim = IM_COL32(160, 160, 160, 255);
+// The selected row's glow: as PC SETTINGS draws it, but at least as wide as the row's label (owner 2026-11-01: on
+// UNDO LAST LOAD it covered only part of the row).
+void rowGlow(ImDrawList *dl, const Map &m, float y, const Tex &label)
+{
+    image(dl, m, g_assets.glow, 0, y - 2, std::max(144.0f, 24 - 4 + float(label.w) + 24), 32, IM_COL32(255, 208, 96, 128));
+}
+
+// The MENU: RESUME, SAVE STATE, LOAD STATE, PC SETTINGS, in the rows of the PC SETTINGS screen.
+void drawMenu(ImDrawList *dl, const Map &m)
+{
+    const Assets &A = g_assets; const MenuState &M = g_menu;
+    rowGlow(dl, m, 100.0f + 34.0f * M.menuRow, A.menuLabel[M.menuRow]);
+    for (int r = 0; r < kMenuRows; ++r) {
+        const float y = 100.0f + 34.0f * r;
+        image(dl, m, A.menuLabel[r], 24 - 4, y, float(A.menuLabel[r].w), 28, r == M.menuRow ? IM_COL32_WHITE : kDim);
+        separator(dl, m, y + 27, 448, 496);
+    }
+    helpLines(dl, m, kMenuHelp[M.menuRow]);
+}
+
+// SAVE STATE / LOAD STATE: QUICK, SLOT 1-5 (and UNDO LAST LOAD) with the time each was made; the selected slot's
+// picture, date and time on the right; a mark on states made before the memory card's newest save.
+void drawList(ImDrawList *dl, const Map &m)
+{
+    const Assets &A = g_assets; const MenuState &M = g_menu;
+    const bool load = M.screen == Screen::LoadList;
+    auto rowY = [](int r) { return r == kUndoRow ? 312.0f : 100.0f + 34.0f * float(r); };
+    rowGlow(dl, m, rowY(M.listRow), M.listRow == 0 ? A.quick : M.listRow == kUndoRow ? A.undo : A.slot);
+    for (int r = 0; r < (load ? kSlots + 1 : kSlots); ++r) {
+        const float y = rowY(r);
+        const SlotInfo &slot = M.slots[size_t(r)];
+        const ImU32 tint = r == M.listRow ? IM_COL32_WHITE : kDim;
+        const Tex &label = r == 0 ? A.quick : r == kUndoRow ? A.undo : A.slot;
+        image(dl, m, label, 24 - 4, y, float(label.w), 28, tint);
+        if (r > 0 && r < kUndoRow) {                  // the slot's number in the number font, as the values
+            const Tex &n = numberTex(std::to_string(r));
+            image(dl, m, n, 24 - 4 + float(label.w) + 2, y + 4, 12.0f * float(n.w) / 16.0f, 20, tint);
+        }
+        const float valueX = r == kUndoRow ? 24 + float(label.w) + 4 : 150;
+        if (slot.used) {
+            const Tex &t = numberTex(timeText(slot.time, "%H:%M"));
+            const float w = 10.0f * float(t.w) / 16.0f;
+            image(dl, m, t, valueX, y + 4, w, 20, tint);
+            if (load && slot.olderThanCard) {
+                const Tex &mark = numberTex("!");
+                image(dl, m, mark, valueX + w + 2, y + 4, 10.0f * float(mark.w) / 16.0f, 20, IM_COL32(255, 200, 80, 255));
+            }
+        } else {
+            image(dl, m, A.empty, valueX - 4, y, float(A.empty.w), 28, IM_COL32(110, 110, 110, 255));
+        }
+        separator(dl, m, y + 27, 270, 290);
+    }
+    const SlotInfo &sel = M.slots[size_t(M.listRow)];
+    dl->AddRectFilled(m.at(300, 96), m.at(500, 271), IM_COL32(0, 0, 0, 170));
+    if (sel.used && sel.picture.id)
+        dl->AddImage(ImTextureID(sel.picture.id), m.at(302, 98), m.at(498, 269));
+    else if (sel.used) {                              // a state from before pictures were saved with states
+        const Tex &none = smallTex("No picture");
+        image(dl, m, none, 400 - float(none.w) * 0.375f, 174, float(none.w) * 0.75f, 20, kDim);
+    }
+    if (sel.used) {
+        const Tex &d = smallTex(timeText(sel.time, "%d %b %Y, %H:%M:%S"));
+        image(dl, m, d, 302, 276, float(d.w) * 0.75f, 20);
+    }
+    if (M.confirm)
+        helpLines(dl, m, slotName(M.listRow) + " holds a state from " + timeText(sel.time, "%H:%M") + ". Cross again to replace it.");
+    else if (!load)
+        helpLines(dl, m, "Saves the game as it is now. It stays paused.");
+    else if (!sel.used)
+        helpLines(dl, m, "This slot is empty.");
+    else if (sel.olderThanCard)
+        helpLines(dl, m, "Made before your card save (" + timeText(M.cardTime, "%H:%M") +
+                             "): loads the older save. Saving in the game would replace the newer one.");
+    else
+        helpLines(dl, m, M.listRow == kUndoRow ? "Goes back to where you were before the last load."
+                                               : "Loads this state: the game goes on from there.");
 }
 
 void applyChanges(const dw5xl::pcsettings::Snapshot &s)
@@ -932,7 +1411,10 @@ void drawOverlay()
             image(dl, m, A.ground, 0, 140, 512, 308);
             image(dl, m, A.emblem, 0, 0, 104, 84);
         }
-        image(dl, m, A.title, 16, 20, 280, 46);
+        const Screen screen = g_menu.screen;           // issue 027 v4: the MENU and the state lists
+        const Tex &title = screen == Screen::Menu ? A.titleMenu : screen == Screen::SaveList ? A.titleSave
+                         : screen == Screen::LoadList ? A.titleLoad : A.title;
+        image(dl, m, title, 16, 20, float(title.w), 46);
         separator(dl, m, 57, 512, 512);
         // the bar: a dark band between two light lines, fading in from the left (measured on the SETTINGS screen)
         auto band = [&](float y0, float y1, ImU32 on) {
@@ -944,10 +1426,15 @@ void drawOverlay()
         band(409, 432, IM_COL32(35, 33, 32, 255));
         band(432, 434, IM_COL32(124, 115, 99, 255));
         const float iconX[3] = {299, 367, 442};
+        const char *action = screen == Screen::Menu ? "Open" : screen == Screen::SaveList ? "Save"
+                           : screen == Screen::LoadList ? "Load" : nullptr;
         for (int i = 0; i < 3; ++i) {
+            const Tex &text = i == 1 && action ? smallTex(action) : A.barText[i];
             image(dl, m, A.icon[i], iconX[i], 410, 12, 20);
-            image(dl, m, A.barText[i], iconX[i] + 13, 410, float(A.barText[i].w) * 0.75f, 20);
+            image(dl, m, text, iconX[i] + 13, 410, float(text.w) * 0.75f, 20);
         }
+        if (screen == Screen::Menu) { drawMenu(dl, m); return; }
+        if (screen != Screen::Settings) { drawList(dl, m); return; }
     }
     const int screenRow[kRows] = {0, 1, 2, 3, 4, 6};
     const float rowY = 100.0f + 34.0f * screenRow[s.row];
@@ -978,7 +1465,8 @@ void drawOverlay()
             }
         }
     }
-    image(dl, m, A.help[s.row], 24, 372, float(A.help[s.row].w) * 0.75f, 20);
+    if (s.mode == Mode::InPlay && !g_runtime->stateMessage().empty()) helpLines(dl, m, "");
+    else image(dl, m, A.help[s.row], 24, 372, float(A.help[s.row].w) * 0.75f, 20);
 }
 }
 

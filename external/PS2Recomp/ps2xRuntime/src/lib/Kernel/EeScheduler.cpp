@@ -275,10 +275,12 @@ void EeScheduler::run()
         }
 
         // DW5XL (issue 027): a save/load request is carried out here, at the first quiet point. After a load the
-        // scheduler's state is the saved one: start the loop over.
+        // scheduler's state is the saved one: start the loop over. Issue 027 v4: a request carried out while a host
+        // screen pauses the game goes straight back to the pause, so nothing runs in between.
         if (m_stateRequestPending.load(std::memory_order_acquire) || m_stateSaveAtTick != 0u || m_stateLoadAtTick != 0u)
         {
-            if (serviceStateRequest())
+            bool handled = false;
+            if (serviceStateRequest(&handled) || (handled && m_hostPaused.load(std::memory_order_acquire)))
             {
                 continue;
             }
@@ -2026,12 +2028,30 @@ void EeScheduler::processPendingEvents()
     {
         // Issue 023 3S: held here, at the dispatcher level (no guest frames on the host stack), until the host
         // screen closes. Nothing advances meanwhile: no EE cycles, timers or IOP time; overdue fields re-anchor.
-        std::unique_lock lock(m_eventMutex);
-        m_eventCv.wait(lock, [this]()
-                       { return !m_hostPaused.load(std::memory_order_acquire) ||
-                                m_stopRequested.load(std::memory_order_acquire); });
+        // Issue 027 v4: held only at a quiet point, so the paused game can be saved as it is. Until then the game
+        // finishes what is in progress (interrupt handlers, queued events) but no field deadline is served, so no
+        // field passes. A save or load request wakes the hold: the dispatcher loop carries it out at once.
+        if (stateQuiet())
+        {
+            if (!m_pauseHeld.exchange(true, std::memory_order_acq_rel))
+                std::fprintf(stderr, "[pause] held at field %llu (asked at field %llu)\n",
+                             static_cast<unsigned long long>(m_vsyncTick.load(std::memory_order_acquire)),
+                             static_cast<unsigned long long>(m_pauseAskedField.load(std::memory_order_acquire)));
+            std::unique_lock lock(m_eventMutex);
+            m_eventCv.wait(lock, [this]()
+                           { return !m_hostPaused.load(std::memory_order_acquire) ||
+                                    m_stopRequested.load(std::memory_order_acquire) ||
+                                    m_stateRequestPending.load(std::memory_order_acquire); });
+            if (m_hostPaused.load(std::memory_order_acquire) && !m_stopRequested.load(std::memory_order_acquire))
+            {
+                m_checkpointPending.store(true, std::memory_order_release);
+                return;
+            }
+            m_pauseHeld.store(false, std::memory_order_release);
+        }
     }
-    processDueDeadlines();
+    if (!m_hostPaused.load(std::memory_order_acquire))
+        processDueDeadlines();
     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
     m_pendingEeTimerInterrupts = 0u;
     for (uint32_t timer = 0u; timer < 4u; ++timer)
@@ -2055,7 +2075,8 @@ void EeScheduler::processPendingEvents()
         std::lock_guard lock(m_eventMutex);
         const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
         const bool cycleEventDue = nextEventCycle != 0u && m_eeCycle >= nextEventCycle;
-        const bool pendingWork = !m_events.empty() || cycleEventDue || m_stopRequested.load(std::memory_order_acquire);
+        const bool pendingWork = !m_events.empty() || cycleEventDue || m_stopRequested.load(std::memory_order_acquire) ||
+                                 m_hostPaused.load(std::memory_order_acquire);   // paused: back here at the next check
         m_checkpointPending.store(pendingWork, std::memory_order_release);
     }
     applyPendingPreemption();
@@ -2069,6 +2090,8 @@ void EeScheduler::setHostPaused(bool paused)
 {
     {
         std::lock_guard lock(m_eventMutex);
+        if (paused && !m_hostPaused.load(std::memory_order_acquire))
+            m_pauseAskedField.store(m_vsyncTick.load(std::memory_order_acquire), std::memory_order_release);
         m_hostPaused.store(paused, std::memory_order_release);
         m_checkpointPending.store(true, std::memory_order_release);   // running guest code returns to the dispatcher
     }
@@ -2692,7 +2715,7 @@ bool EeScheduler::stateQuiet(std::string *reason) const
     return true;
 }
 
-bool EeScheduler::serviceStateRequest()
+bool EeScheduler::serviceStateRequest(bool *handled)
 {
     const uint64_t tick = m_vsyncTick.load(std::memory_order_acquire);
     if (m_stateSaveAtTick != 0u && tick >= m_stateSaveAtTick)
@@ -2742,6 +2765,8 @@ bool EeScheduler::serviceStateRequest()
         }
         return false;
     }
+    if (handled)
+        *handled = true;
     return ok && kind == StateRequestKind::Load;
 }
 

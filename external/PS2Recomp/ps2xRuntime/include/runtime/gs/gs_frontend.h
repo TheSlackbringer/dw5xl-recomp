@@ -316,6 +316,9 @@ private:
     bool m_hasLastFieldRead = false;
     // Output scale/AA change, reset or a loaded save state: the next field is read even without a GS write.
     std::atomic<bool> m_forceFieldRead{true};
+    // Issue 027 v4: a state load dropped the presented picture; the window's next latch reads the loaded display once
+    // instead of waiting for the game's next field (the window had no picture for that frame).
+    std::atomic<bool> m_presentAfterLoad{false};
     uint64_t m_nativeImageUploadCount = 0;
     uint64_t m_nativePackedGIFPacketCount = 0;
 
