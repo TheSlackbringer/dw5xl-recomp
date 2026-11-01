@@ -103,22 +103,8 @@ jobs:
           for dep in raylib imgui rlimgui; do
             mv "app/build-ci/_deps/$dep-src" "app/deps/$dep-src"
           done
-      - name: Download checked builder inputs (CI only; the player build is offline)
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import hashlib, json, urllib.request
-          root = Path('/tmp/linux-builder-tools')
-          inputs = json.loads(Path('tools/release/linux-tools.json').read_text())
-          for item in inputs:
-              path = root / item['filename']
-              path.parent.mkdir(parents=True, exist_ok=True)
-              urllib.request.urlretrieve(item['url'], path)
-              if path.stat().st_size != item['size'] or hashlib.sha256(path.read_bytes()).hexdigest() != item['sha256']:
-                  raise SystemExit(f'input size or checksum mismatch: {path}')
-              if path.suffix == '.AppImage':
-                  path.chmod(0o755)
-          PY
+      # Issue 027 M11: the image also holds the FFmpeg source and the AppImage tools in /inputs, checked against
+      # tools/release/linux-tools.json when it was built; this job downloads no build input itself.
       - name: Pull the pinned builder image (issue 041; compiler and libc++ inside, no apt.llvm.org)
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -133,8 +119,6 @@ jobs:
         env:
           DW5XL_LINUX_SDK_WORK: ${{ runner.temp }}/linux-sdk
           DW5XL_RECOMP_DEPS: ${{ github.workspace }}/build-recomp/_deps
-          DW5XL_FFMPEG_SOURCE: /tmp/linux-builder-tools/ffmpeg-7.1.tar.xz
-          DW5XL_APPIMAGE_TOOLS: /tmp/linux-builder-tools/appimage-tools
           DW5XL_BUILD_JOBS: '2'
         run: bash tools/release/build_linux.sh
       - uses: actions/upload-artifact@v7

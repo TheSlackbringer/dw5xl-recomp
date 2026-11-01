@@ -35,7 +35,7 @@ class BuilderImages(unittest.TestCase):
         self.assertEqual(image.group(1), (HERE / 'windows-builder-image').read_text().strip())
 
     def test_release_jobs_download_nothing(self):
-        for job in ('windows-build',):   # linux-package: once its inputs come from its image (027 M11, owner's choice)
+        for job in ('windows-build', 'linux-package'):
             text = job_text(job)
             for tool in ('curl ', 'wget ', 'urlretrieve', 'urllib', 'pacman '):
                 self.assertNotIn(tool, text, job)
