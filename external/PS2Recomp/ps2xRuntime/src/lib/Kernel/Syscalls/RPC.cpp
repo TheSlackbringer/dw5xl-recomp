@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <string>
 #include <thread>
+#include <vector>
 
 namespace ps2_syscalls
 {
@@ -215,15 +217,18 @@ namespace ps2_syscalls
             }
         }
 
-        // DW5XL-DEBUG issue 009 v4.7: PS2X_PAUSE_AT_RPC=<sid hex>:<rpc hex>[:<n>] asks a host pause the moment the nth
-        // such request starts (so it is in flight), a save while paused (PS2X_PAUSE_AT_RPC_SAVE=<file>), and the end
-        // of the pause after PS2X_PAUSE_AT_RPC_MS (default 2000). Used by issue_009_pause_rpc.py.
+        // DW5XL-DEBUG issue 009 v4.7: PS2X_PAUSE_AT_RPC=<sid hex|*>:<rpc hex|*>[:<n>[,<n>…]] asks a host pause the
+        // moment the nth such request starts (so it is in flight; counted from field PS2X_PAUSE_AT_RPC_FROM, default
+        // 0), a save while paused (PS2X_PAUSE_AT_RPC_SAVE=<file>), and the end of the pause after PS2X_PAUSE_AT_RPC_MS
+        // (default 2000). Used by issue_009_pause_rpc.py and issue_009_pause_resume.py.
         void debugPauseAtRpc(PS2Runtime *runtime, uint32_t sid, uint32_t rpcNum)
         {
             struct Target
             {
-                bool on = false;
-                uint32_t sid = 0u, rpc = 0u, nth = 1u, holdMs = 2000u;
+                bool on = false, anySid = false, anyRpc = false;
+                uint32_t sid = 0u, rpc = 0u, holdMs = 2000u;
+                uint64_t fromField = 0u;
+                std::vector<uint32_t> nth{1u};
             };
             static const Target target = []
             {
@@ -231,20 +236,42 @@ namespace ps2_syscalls
                 const char *value = std::getenv("PS2X_PAUSE_AT_RPC");
                 if (!value || !*value)
                     return t;
-                char *end = nullptr;
-                t.sid = static_cast<uint32_t>(std::strtoul(value, &end, 16));
-                if (!end || *end != ':')
+                const std::string spec = value;
+                const size_t first = spec.find(':');
+                if (first == std::string::npos)
                     return t;
-                t.rpc = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
-                if (end && *end == ':')
-                    t.nth = std::max(1u, static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 10)));
+                const size_t second = spec.find(':', first + 1);
+                const std::string sidText = spec.substr(0, first);
+                const std::string rpcText = spec.substr(first + 1, second == std::string::npos ? std::string::npos : second - first - 1);
+                t.anySid = sidText == "*";
+                t.anyRpc = rpcText == "*";
+                t.sid = static_cast<uint32_t>(std::strtoul(sidText.c_str(), nullptr, 16));
+                t.rpc = static_cast<uint32_t>(std::strtoul(rpcText.c_str(), nullptr, 16));
+                if (second != std::string::npos)
+                {
+                    t.nth.clear();
+                    const std::string list = spec.substr(second + 1);
+                    for (size_t pos = 0; pos < list.size();)
+                    {
+                        const size_t comma = list.find(',', pos);
+                        t.nth.push_back(std::max(1u, static_cast<uint32_t>(std::strtoul(list.substr(pos, comma - pos).c_str(), nullptr, 10))));
+                        if (comma == std::string::npos)
+                            break;
+                        pos = comma + 1;
+                    }
+                }
                 if (const char *ms = std::getenv("PS2X_PAUSE_AT_RPC_MS"); ms && *ms)
                     t.holdMs = static_cast<uint32_t>(std::strtoul(ms, nullptr, 10));
+                if (const char *from = std::getenv("PS2X_PAUSE_AT_RPC_FROM"); from && *from)
+                    t.fromField = std::strtoull(from, nullptr, 10);
                 t.on = true;
                 return t;
             }();
             static uint32_t seen = 0u;
-            if (!target.on || sid != target.sid || rpcNum != target.rpc || ++seen != target.nth)
+            if (!target.on || (!target.anySid && sid != target.sid) || (!target.anyRpc && rpcNum != target.rpc) ||
+                runtime->eeScheduler().currentVSyncTick() < target.fromField)
+                return;
+            if (std::find(target.nth.begin(), target.nth.end(), ++seen) == target.nth.end())
                 return;
             // Called right after startRpc gave the request a token: it is running in its IOP thread now.
             std::fprintf(stderr, "[pause-test] pause asked at request sid=0x%x rpc=0x%x #%u (in flight)\n", sid, rpcNum, seen);

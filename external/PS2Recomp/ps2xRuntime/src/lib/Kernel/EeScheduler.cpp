@@ -49,9 +49,10 @@ namespace
     // Issue 009 v4.4/v4.5 (design 1a): while the IOP has work (a request or a runnable thread), the scheduler's waits end after this many EE
     // cycles so the IOP catches up in its own steps (ps2xIOP's host-clock poll) between the fields.
     constexpr uint64_t kIopRpcSliceEeCycles = ps2x::iop::kIopHostClockPollEeCycles;
-    // Issue 009 v4.7: how long a host pause lets the game finish what is in progress before it holds anyway, and how
-    // long a save or load asked during a busy hold may run on to reach a quiet point (PC time).
-    constexpr int64_t kPauseQuietWaitNs = 100'000'000;
+    // Issue 009 v4.7: a host pause holds at once (owner, 2026-11-01: a run-on before the hold let the movie's decoder go
+    // on without fields, and the picture was slow to start again after the menu). Only a save or load asked during a
+    // hold that is not at a quiet point runs on to reach one, for at most this long (PC time).
+    constexpr int64_t kPauseQuietWaitNs = 0;
     constexpr int64_t kPauseStateWaitNs = 500'000'000;
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
@@ -2050,14 +2051,12 @@ void EeScheduler::processPendingEvents()
     {
         // Issue 023 3S: held here, at the dispatcher level (no guest frames on the host stack), until the host
         // screen closes. Nothing advances meanwhile: no EE cycles, timers or IOP time; overdue fields re-anchor.
-        // Issue 027 v4: held only at a quiet point, so the paused game can be saved as it is. Until then the game
-        // finishes what is in progress (interrupt handlers, queued events) but no field deadline is served, so no
-        // field passes. A save or load request wakes the hold: the dispatcher loop carries it out at once.
-        // Issue 009 v4.7: the IOP runs on until the hold too (a request in flight is not quiet); its clock stops here.
-        // The wait is bounded (owner: "it should work like the rest and have the best UX"): a game that stays busy (a
-        // movie streams all the time) is held anyway after kPauseQuietWaitNs, so EE, IOP clock and sound still stop
-        // together. Such a "busy" hold cannot be saved as it is: a save or load asked then lets the game run on (no
-        // field passes) for up to kPauseStateWaitNs to reach a quiet point, else it is refused ("the game is busy").
+        // Issue 027 v4 held only at a quiet point, so the paused game could be saved as it is. Issue 009 v4.7 (owner:
+        // "it should work like the rest and have the best UX"): the pause holds at once (kPauseQuietWaitNs = 0), and EE
+        // time, IOP clock and sound stop together here. A hold that is not at a quiet point ("busy": a movie streams
+        // all the time, a request is in flight) cannot be saved as it is: a save or load asked then lets the game run
+        // on (no field passes, the IOP and its sound go on) for up to kPauseStateWaitNs to reach a quiet point, then
+        // holds again; else the request is refused ("the game is busy"). A save or load request wakes the hold.
         if (!m_pauseHeld.load(std::memory_order_acquire))
             m_runtime.syncIopToHostClock(); // the IOP stays current while the pause waits: nothing to catch up later
         const int64_t nowNs = steadyNs(std::chrono::steady_clock::now());

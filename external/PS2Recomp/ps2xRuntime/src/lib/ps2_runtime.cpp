@@ -3827,19 +3827,36 @@ void PS2Runtime::run()
             {
                 static int64_t s_loggedFor = 0;
                 static int s_frames = 0;
+                static uint64_t s_generation = 0, s_pictures = 0;
+                static bool s_done = false;
                 if (s_loggedFor != resumedNs)
                 {
                     s_loggedFor = resumedNs;
                     s_frames = 0;
+                    s_generation = gs().hostPresentationGeneration();
+                    s_pictures = 0;
+                    s_done = false;
                 }
-                if (s_frames < 12)
+                if (!s_done)
                 {
                     const auto now = std::chrono::steady_clock::now();
-                    std::fprintf(stderr, "[pause] window frame %d: %.1f ms after the menu closed, field %llu, new picture %s, waited %.1f ms\n",
-                                 s_frames, static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count() - resumedNs) / 1e6,
-                                 static_cast<unsigned long long>(paced.field), paced.fresh ? "yes" : "no",
-                                 std::chrono::duration<double, std::milli>(now - waitStart).count());
+                    const double sinceMs = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count() - resumedNs) / 1e6;
+                    if (const uint64_t generation = gs().hostPresentationGeneration(); generation != s_generation)
+                    {
+                        s_generation = generation;
+                        ++s_pictures;
+                    }
+                    if (s_frames < 3)
+                        std::fprintf(stderr, "[pause] window frame %d: %.1f ms after the menu closed, field %llu, new field %s, waited %.1f ms\n",
+                                     s_frames, sinceMs, static_cast<unsigned long long>(paced.field), paced.fresh ? "yes" : "no",
+                                     std::chrono::duration<double, std::milli>(now - waitStart).count());
                     ++s_frames;
+                    if (sinceMs >= 1000.0)
+                    {
+                        std::fprintf(stderr, "[pause] first second after the resume: %llu new pictures in %d window frames\n",
+                                     static_cast<unsigned long long>(s_pictures), s_frames);
+                        s_done = true;
+                    }
                 }
             }
         }
