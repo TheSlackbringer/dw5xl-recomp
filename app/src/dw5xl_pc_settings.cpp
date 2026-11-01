@@ -783,6 +783,7 @@ void refreshSlots(bool log)
         if (slot.used && std::filesystem::exists(png, ec)) {
             slot.picture = LoadTexture(png.string().c_str());
             SetTextureFilter(slot.picture, TEXTURE_FILTER_BILINEAR);
+            SetTextureWrap(slot.picture, TEXTURE_WRAP_CLAMP);
         }
     }
     if (!log) return;
@@ -1024,6 +1025,8 @@ Tex upload(const MImage &img)
     ::Image ri{const_cast<uint8_t *>(img.rgba.data()), img.w, img.h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
     t.t = LoadTextureFromImage(ri);
     SetTextureFilter(t.t, TEXTURE_FILTER_BILINEAR);
+    SetTextureWrap(t.t, TEXTURE_WRAP_CLAMP);          // filtering at an edge must not reach the opposite edge (027 v4:
+                                                      // a dark line at the ground picture's top in big windows)
     return t;
 }
 MImage tinted(MImage img, const float k[3]) { for (size_t i = 0; i < img.rgba.size(); i += 4) for (int c = 0; c < 3; ++c) img.rgba[i + c] = uint8_t(std::min(255.0f, img.rgba[i + c] * k[c])); return img; }
@@ -1248,14 +1251,34 @@ const Tex &numberTex(const std::string &text)
     if (it == cache.end()) it = cache.emplace(text, upload(numberImage(g_assets.digits, text))).first;
     return it->second;
 }
-void helpLines(ImDrawList *dl, const Map &m, std::string first, std::string second = {})
+// The help text above the button bar, wrapped at word boundaries to the picture's width (464 game pixels; the small
+// font is drawn at 0.75 per texel); a save or load message replaces it while it shows.
+void helpLines(ImDrawList *dl, const Map &m, std::string text)
 {
-    if (std::string message = g_runtime->stateMessage(); !message.empty()) { first = std::move(message); second.clear(); }
-    const Tex &a = smallTex(first);
-    image(dl, m, a, 24, second.empty() ? 372 : 362, float(a.w) * 0.75f, 20);
-    if (second.empty()) return;
-    const Tex &b = smallTex(second);
-    image(dl, m, b, 24, 382, float(b.w) * 0.75f, 20);
+    if (std::string message = g_runtime->stateMessage(); !message.empty()) text = std::move(message);
+    static std::map<std::string, std::vector<std::string>> wrapped;
+    auto it = wrapped.find(text);
+    if (it == wrapped.end()) {
+        std::vector<std::string> lines;
+        std::string line;
+        size_t at = 0;
+        while (at < text.size()) {
+            const size_t space = std::min(text.find(' ', at), text.size());
+            const std::string word = text.substr(at, space - at);
+            const std::string longer = line.empty() ? word : line + " " + word;
+            if (!line.empty() && float(smallImage(g_assets.exe, longer).w) * 0.75f > 464.0f) { lines.push_back(line); line = word; }
+            else line = longer;
+            at = space + 1;
+        }
+        if (!line.empty()) lines.push_back(line);
+        it = wrapped.emplace(text, std::move(lines)).first;
+    }
+    const auto &lines = it->second;
+    const float top = lines.size() <= 2 ? 372.0f - 10.0f * float(lines.size() - 1) : 405.0f - 20.0f * float(lines.size());
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const Tex &t = smallTex(lines[i]);
+        image(dl, m, t, 24, top + 20.0f * float(i), float(t.w) * 0.75f, 20);
+    }
 }
 const ImU32 kDim = IM_COL32(160, 160, 160, 255);
 
@@ -1308,6 +1331,10 @@ void drawList(ImDrawList *dl, const Map &m)
     dl->AddRectFilled(m.at(300, 96), m.at(500, 271), IM_COL32(0, 0, 0, 170));
     if (sel.used && sel.picture.id)
         dl->AddImage(ImTextureID(sel.picture.id), m.at(302, 98), m.at(498, 269));
+    else if (sel.used) {                              // a state from before pictures were saved with states
+        const Tex &none = smallTex("No picture");
+        image(dl, m, none, 400 - float(none.w) * 0.375f, 174, float(none.w) * 0.75f, 20, kDim);
+    }
     if (sel.used) {
         const Tex &d = smallTex(timeText(sel.time, "%d %b %Y, %H:%M:%S"));
         image(dl, m, d, 302, 276, float(d.w) * 0.75f, 20);
@@ -1319,8 +1346,8 @@ void drawList(ImDrawList *dl, const Map &m)
     else if (!sel.used)
         helpLines(dl, m, "This slot is empty.");
     else if (sel.olderThanCard)
-        helpLines(dl, m, "Made before your memory-card save at " + timeText(M.cardTime, "%H:%M") + ": after loading, the game",
-                  "has the older save, and saving in the game then replaces the newer one.");
+        helpLines(dl, m, "Made before your card save (" + timeText(M.cardTime, "%H:%M") +
+                             "): loads the older save. Saving in the game would replace the newer one.");
     else
         helpLines(dl, m, M.listRow == kUndoRow ? "Goes back to where you were before the last load."
                                                : "Loads this state: the game goes on from there.");
@@ -1432,7 +1459,7 @@ void drawOverlay()
             }
         }
     }
-    if (s.mode == Mode::InPlay && !g_runtime->stateMessage().empty()) helpLines(dl, m, {});
+    if (s.mode == Mode::InPlay && !g_runtime->stateMessage().empty()) helpLines(dl, m, "");
     else image(dl, m, A.help[s.row], 24, 372, float(A.help[s.row].w) * 0.75f, 20);
 }
 }

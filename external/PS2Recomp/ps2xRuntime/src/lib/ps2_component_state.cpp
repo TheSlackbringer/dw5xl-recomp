@@ -134,6 +134,8 @@ void GS::serializeState(ps2x::StateArchive &a)
     if (!m_backend)
         throw ps2x::StateError("no GS renderer");
     m_backend->SerializeState(a);
+    if (a.loading()) // issue 027 v4: the window shows the loaded display at once (latchHostPresentationFrame)
+        m_presentAfterLoad.store(true, std::memory_order_release);
 }
 
 void VU1Interpreter::serializeState(ps2x::StateArchive &a)
