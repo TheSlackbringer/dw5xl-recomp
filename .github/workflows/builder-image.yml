@@ -1,7 +1,9 @@
-# Builds the Linux release builder image (issue 041: Steam Runtime 3 sniper SDK, clang 23 and the approved libc++
-# packages of one apt.llvm.org snapshot) and publishes it to ghcr.io. Runs rarely: on demand, or when its inputs
-# change. Using a new image is a separate, reviewed commit that writes the printed digest into
-# tools/release/linux-builder-image; the release job never builds or changes the image itself.
+# Builds the release builder images and publishes them to ghcr.io (issue 041: Linux, Steam Runtime 3 sniper SDK, clang
+# 23 and the approved libc++ packages of one apt.llvm.org snapshot; issue 027 M11: both images also hold every pinned
+# build input, and the Windows image is the windows-build job's environment). Runs rarely: on demand, or when an
+# image's inputs change. Using a new image is a separate, reviewed commit that writes the printed digest into
+# tools/release/linux-builder-image (Linux) or tools/release/windows-builder-image and the windows-build job's
+# container in build.yml (Windows); the release jobs never build or change an image themselves.
 name: builder-image
 
 on:
@@ -10,7 +12,11 @@ on:
     branches: [main, 'ci/**']
     paths:
       - tools/release/linux.Containerfile
+      - tools/release/windows.Containerfile
       - tools/release/write_libcxx_manifest.py
+      - tools/release/fetch_inputs.py
+      - tools/release/linux-tools.json
+      - tools/release/windows-tools.json
       - .github/workflows/builder-image.yml
 
 permissions:
@@ -24,10 +30,12 @@ jobs:
       - uses: actions/checkout@v7
       - name: Build the image
         run: docker build --pull -t dw5xl-release-linux -f tools/release/linux.Containerfile tools/release
-      - name: Check the approved libc++ packages
+      - name: Check the approved libc++ packages and the pinned inputs (no network)
         run: |
           docker run --rm --network=none dw5xl-release-linux \
             python3 /usr/local/bin/write_libcxx_manifest.py --check /approved-debs
+          docker run --rm --network=none dw5xl-release-linux python3 /usr/local/share/dw5xl/fetch_inputs.py \
+            --check /usr/local/share/dw5xl/linux-tools.json /inputs
       - name: Publish
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -46,6 +54,38 @@ jobs:
             echo 'Approved libc++ packages:'
             echo '```json'
             docker run --rm --network=none "$image:$tag" cat /approved-debs/manifest.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$ref"
+
+  windows:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the image
+        run: docker build --pull -t dw5xl-release-windows -f tools/release/windows.Containerfile tools/release
+      - name: Check the pinned inputs and the tools (no network)
+        run: |
+          docker run --rm --network=none dw5xl-release-windows python3 /usr/local/share/dw5xl/fetch_inputs.py \
+            --check /usr/local/share/dw5xl/windows-tools.json /inputs
+          docker run --rm --network=none dw5xl-release-windows sh -c \
+            '/opt/llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-clang --version | head -1 &&
+             cmake --version | head -1 && ninja --version && python3 --version'
+      - name: Publish
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/dw5xl-release-windows"
+          tag="$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}"
+          docker tag dw5xl-release-windows "$image:$tag"
+          docker push "$image:$tag"
+          ref=$(docker inspect --format '{{index .RepoDigests 0}}' "$image:$tag")
+          {
+            echo "Published \`$image:$tag\`. To use it, write this line into \`tools/release/windows-builder-image\`"
+            echo 'and into the windows-build job (container) in `.github/workflows/build.yml`:'
+            echo '```'
+            echo "$ref"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           echo "$ref"

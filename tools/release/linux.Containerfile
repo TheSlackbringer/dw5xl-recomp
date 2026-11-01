@@ -2,13 +2,15 @@
 # glibc 2.31), so the game runs on the Steam Deck and practically every current distribution, plus clang 23 from
 # apt.llvm.org (the same compiler major version as development) and, in /approved-debs, the libc++ packages of the
 # same apt.llvm.org snapshot that the package ships (with manifest.json: name, version, size, SHA-256).
+# Issue 027 M11: also the release build's other pinned inputs in /inputs (the FFmpeg source, linuxdeploy,
+# appimagetool from linux-tools.json, size and SHA-256 checked here), so a release build downloads nothing.
 # Built rarely by .github/workflows/builder-image.yml and published to ghcr.io; CI and local release builds use
 # the image pinned by digest in tools/release/linux-builder-image (see LINUX.md). Building it locally:
 #   podman build -t dw5xl-release-linux -f tools/release/linux.Containerfile tools/release
 FROM registry.gitlab.steamos.cloud/steamrt/sniper/sdk@sha256:9ae8083ee9ae6298361a62f289e62f0a2b0779d23fc8c276304157f0c06010c5
 
 LABEL org.opencontainers.image.source=https://github.com/TheSlackbringer/dw5xl-recomp
-LABEL org.opencontainers.image.description="DW5XL Linux release builder: Steam Runtime 3 sniper SDK, clang 23, approved libc++ packages"
+LABEL org.opencontainers.image.description="DW5XL Linux release builder: Steam Runtime 3 sniper SDK, clang 23, approved libc++ packages, pinned build inputs"
 LABEL org.opencontainers.image.licenses="Steam Runtime: Debian packages under their own licenses; LLVM: Apache-2.0 WITH LLVM-exception"
 
 COPY write_libcxx_manifest.py /usr/local/bin/write_libcxx_manifest.py
@@ -24,3 +26,6 @@ RUN curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /etc/apt/trusted.gp
  && rm -rf /var/lib/apt/lists/*
 
 ENV CC=clang-23 CXX=clang++-23
+
+COPY fetch_inputs.py linux-tools.json /usr/local/share/dw5xl/
+RUN python3 /usr/local/share/dw5xl/fetch_inputs.py /usr/local/share/dw5xl/linux-tools.json /inputs
