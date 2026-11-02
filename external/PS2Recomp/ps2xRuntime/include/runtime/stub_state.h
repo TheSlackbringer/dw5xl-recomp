@@ -13,6 +13,11 @@ namespace ps2x
     void serializeStubStates(StateArchive &archive, uint8_t *rdram, uint64_t vsyncTick);
     uint8_t *stateGuestRdram();
     uint64_t stateVsyncTick();
+    // Issue 027 v6: a stub whose save section can refuse also registers the same check here, so a save or load is
+    // refused before anything is written. The check returns the reason, or nullptr when a state can be taken now.
+    using StubStateBlockerFn = const char *(*)(uint64_t vsyncTick);
+    bool registerStubStateBlocker(const char *name, StubStateBlockerFn fn);
+    const char *stubStateBlocker(uint64_t vsyncTick); // the first reason, or nullptr
 }
 
 // The translation unit's own file (a unity batch counts as one), for names that are unique per copy of a header.

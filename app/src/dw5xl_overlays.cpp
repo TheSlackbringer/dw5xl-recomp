@@ -213,8 +213,13 @@ void installOverlays(PS2Runtime& runtime) {
         std::fprintf(stderr,"[dw5xl:disc] declined: disc-check entries unavailable\n");return;
     }
     // DW5XL (issue 027): no state in the middle of a Load Original disc check (its session spans EE yields).
+    // Issue 027 v6: the same check is asked before a save or load starts, so nothing is written first.
+    static const auto discCheckBlocker=[]()->const char*{
+        return discCheckSession.runtime ? "a Load Original disc check is running" : nullptr;
+    };
+    runtime.registerStateBlocker(discCheckBlocker);
     runtime.registerStateHook("DISC",[](ps2x::StateArchive& a){
-        if(a.saving() && discCheckSession.runtime) throw ps2x::StateError("a Load Original disc check is running");
+        if(a.saving()) if(const char* why=discCheckBlocker()) throw ps2x::StateError(why);
         if(a.loading()) discCheckSession.clear();
     });
     supportedOverlays[2].module=&adaptedOvl02.descriptor;

@@ -467,6 +467,11 @@ public:
     // are saved and loaded in registration order, each under its own section tag.
     using StateHook = std::function<void(ps2x::StateArchive &)>;
     void registerStateHook(std::string name, StateHook hook);
+    // Issue 027 v6: a component whose state hook can refuse a save registers the same check here (the reason, or
+    // nullptr), so a save or load is refused before anything is written. stateBlocker() asks the stubs and these.
+    using StateBlocker = std::function<const char *()>;
+    void registerStateBlocker(StateBlocker blocker);
+    [[nodiscard]] std::string stateBlocker() const;
 
     EeScheduler &eeScheduler();
     const EeScheduler &eeScheduler() const;
@@ -681,6 +686,7 @@ private:
     std::vector<LoadedModule> m_loadedModules;
     void serializeState(ps2x::StateArchive &archive); // DW5XL (issue 027)
     std::vector<std::pair<std::string, StateHook>> m_stateHooks;
+    std::vector<StateBlocker> m_stateBlockers;
     uint8_t *m_boundRdram = nullptr;
     uint8_t *m_boundGSVram = nullptr;
 };
