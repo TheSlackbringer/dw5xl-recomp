@@ -285,8 +285,28 @@ void EeScheduler::run()
         if (m_stateRequestPending.load(std::memory_order_acquire) || m_stateSaveAtTick != 0u || m_stateLoadAtTick != 0u)
         {
             bool handled = false;
-            if (serviceStateRequest(&handled) || (handled && m_hostPaused.load(std::memory_order_acquire)))
+            const bool pausedBefore = m_hostPaused.load(std::memory_order_acquire);
+            const bool loaded = serviceStateRequest(&handled);
+            if (loaded || (handled && m_hostPaused.load(std::memory_order_acquire)))
             {
+                // DW5XL-DEBUG issue 009 v4.10: PS2X_PAUSE_TEST_LOAD_CLOSE=1 waits here, after a load carried out during a
+                // host pause, until the host screen has closed, so the close always comes before the executor is back at
+                // the hold (the order that left the pause set; tests: issue_009_pause_after_load.py).
+                static const bool s_testLoadClose = []
+                {
+                    const char *value = std::getenv("PS2X_PAUSE_TEST_LOAD_CLOSE");
+                    return value && *value && *value != '0';
+                }();
+                if (loaded && s_testLoadClose && pausedBefore)
+                {
+                    const bool waited = m_hostPaused.load(std::memory_order_acquire);
+                    std::unique_lock lock(m_eventMutex);
+                    m_eventCv.wait(lock, [this]
+                                   { return !m_hostPaused.load(std::memory_order_acquire) ||
+                                            m_stopRequested.load(std::memory_order_acquire); });
+                    std::fprintf(stderr, "[pause] test: the screen closed before the executor went on after the load "
+                                         "(%s; PS2X_PAUSE_TEST_LOAD_CLOSE)\n", waited ? "waited for it" : "already closed");
+                }
                 continue;
             }
         }
@@ -2048,6 +2068,16 @@ void EeScheduler::applyPendingPreemption()
 void EeScheduler::processPendingEvents()
 {
     assertExecutor();
+    // The end of a hold (issue 009 v4.10: also when the host screen closed while the executor was away from it).
+    const auto endHostPauseHold = [this]()
+    {
+        m_pauseHeld.store(false, std::memory_order_release);
+        // DW5XL-DEBUG issue 009 v4.7: when the game goes on (the first fields after it are logged with this time).
+        g_pauseResumedNs = steadyNs(std::chrono::steady_clock::now());
+        g_fieldsAfterResume = 0;
+        std::fprintf(stderr, "[pause] resumed at field %llu\n",
+                     static_cast<unsigned long long>(m_vsyncTick.load(std::memory_order_acquire)));
+    };
     if (m_hostPaused.load(std::memory_order_acquire))
     {
         // Issue 023 3S: held here, at the dispatcher level (no guest frames on the host stack), until the host
@@ -2146,13 +2176,15 @@ void EeScheduler::processPendingEvents()
                 m_checkpointPending.store(true, std::memory_order_release);
                 return;
             }
-            m_pauseHeld.store(false, std::memory_order_release);
-            // DW5XL-DEBUG issue 009 v4.7: when the game goes on (the first fields after it are logged with this time).
-            g_pauseResumedNs = steadyNs(std::chrono::steady_clock::now());
-            g_fieldsAfterResume = 0;
-            std::fprintf(stderr, "[pause] resumed at field %llu\n",
-                         static_cast<unsigned long long>(m_vsyncTick.load(std::memory_order_acquire)));
+            endHostPauseHold();
         }
+    }
+    else if (m_pauseHeld.load(std::memory_order_acquire))
+    {
+        // Issue 009 v4.10: a load picked during the hold is carried out in run() with the hold still set, and the host
+        // screen closes when it is done. When it closed before the executor came back here, the hold ends now; else the
+        // next pause would skip the stopping point and onHostPauseHeld() (the IOP clock and the sound would not stop).
+        endHostPauseHold();
     }
     if (!m_hostPaused.load(std::memory_order_acquire))
         processDueDeadlines();
