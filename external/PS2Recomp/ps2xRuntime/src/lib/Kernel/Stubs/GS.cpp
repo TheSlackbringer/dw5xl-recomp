@@ -1276,9 +1276,37 @@ namespace ps2_stubs
 
         if (mode == 0)
         {
+            // DW5XL-DEBUG issue 050: PS2X_GS_SYNC_TRACE=1 (with PS2X_VU1_ASYNC_TRACE=1) counts every mode-0 sync, pending
+            // work or not, and the fields with one; printed as each [vu1-async] window closes, so both cover the same
+            // syncs: the independent count issue_050_fps_counter.py checks the device queue's Explicit counter against.
+            static const bool s_syncTrace = []
+            {
+                const char *value = std::getenv("PS2X_GS_SYNC_TRACE");
+                return value && *value && *value != '0';
+            }();
+            static uint32_t s_syncCalls = 0u, s_syncFields = 0u;
+            static uint64_t s_syncLastField = ~0ull, s_syncWindows = 0u;
+            if (s_syncTrace)
+            {
+                const uint64_t field = runtime->eeScheduler().currentVSyncTick();
+                ++s_syncCalls;
+                if (field != s_syncLastField)
+                {
+                    ++s_syncFields;
+                    s_syncLastField = field;
+                }
+            }
             if (ps2x::device::isAsync(mem))
             {
                 ps2x::device::drainAll(mem, ps2x::device::DrainReason::Explicit);
+            }
+            if (s_syncTrace && ps2x::device::traceWindowCount() != s_syncWindows)
+            {
+                s_syncWindows = ps2x::device::traceWindowCount();
+                std::fprintf(stderr, "[gs-sync] field=%llu calls=%u fields=%u\n",
+                             static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), s_syncCalls,
+                             s_syncFields);
+                s_syncCalls = s_syncFields = 0u;
             }
             else
             {
