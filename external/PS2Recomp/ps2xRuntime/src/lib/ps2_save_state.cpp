@@ -267,17 +267,23 @@ std::string PS2Runtime::stateMessage() const
     return std::chrono::steady_clock::now() - m_stateMessageTime < std::chrono::seconds(3) ? m_stateMessage : std::string();
 }
 
+void PS2Runtime::drainDeviceWork()
+{
+    ps2x::device::drainAll(m_memory, ps2x::device::DrainReason::Explicit);
+    m_gifArbiter.drain();
+    m_gifArbiter.waitIdle();
+}
+
 bool PS2Runtime::performStateRequest(bool save, const std::string &path, bool &retry, const std::string &backup)
 {
     const auto started = std::chrono::steady_clock::now();
     retry = false;
     try
     {
-        // Nothing in flight: the VIF1/VU1/GIF device finishes what it was given and the renderer flushes. What that
-        // completes (DMA interrupts, events) is handled by the scheduler first: then this request comes back.
-        ps2x::device::drainAll(m_memory, ps2x::device::DrainReason::Explicit);
-        m_gifArbiter.drain();
-        m_gifArbiter.waitIdle();
+        // Nothing in flight: the scheduler's stopping point (issue 009 v4.8) has drained the device and the renderer
+        // already, so this drain finds nothing to do. Should it complete something after all (DMA interrupts,
+        // events), the scheduler handles that first: then this request comes back.
+        drainDeviceWork();
         if (!m_eeScheduler->stateQuiet())
         {
             retry = true;

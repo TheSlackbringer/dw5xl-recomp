@@ -445,6 +445,9 @@ public:
     // tries again at its next quiet point.
     // backup (a load only): the running game is saved there first, once the state has passed its checks.
     bool performStateRequest(bool save, const std::string &path, bool &retry, const std::string &backup = {});
+    // Issue 009 v4.8 (executor): the VIF1/VU1/GIF device finishes what it was given and the renderer flushes (the
+    // scheduler's stopping point and the state request).
+    void drainDeviceWork();
     // Issue 027 v3: a short message about a save or load, shown in the window for a few seconds (any thread).
     void showStateMessage(std::string text);
     std::string stateMessage() const; // empty once it has been shown long enough

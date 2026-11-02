@@ -490,7 +490,6 @@ private:
     std::atomic<uint64_t> m_pauseAskedField{0};   // the field the pause was asked at (for the [pause] log line)
     std::atomic<int64_t> m_pauseAskedNs{0};       // issue 009 v4.7: when it was asked (steady clock; ask-to-hold time)
     std::atomic<int64_t> m_pauseWaitSinceNs{0};   // issue 009 v4.7: start of the bounded wait for a quiet point
-    bool m_pauseHeldBusy = false;                 // issue 009 v4.7 (executor): held, but not at a quiet point
     std::atomic<bool> m_checkpointPending{false};
     uint32_t m_debugPublishCountdown = 0u;
 
@@ -528,8 +527,17 @@ private:
     // DW5XL (issue 027): the pending save/load request (any thread sets it; run() carries it out at a quiet point).
     bool serviceStateRequest(bool *handled = nullptr); // true when a state was loaded; handled: a request was carried out
     void refuseStateRequest(const char *why); // issue 009 v4.7: drops the pending request with a "Can't …" message
+    // Issue 009 v4.8: the one stopping point of the machine, used by the host pause and every save and load. Queued
+    // completions are handed over; once nothing else keeps the game from a quiet point, the device finishes what it
+    // was given, the renderer flushes, and what that completed is handed over too. True: a quiet point.
+    [[nodiscard]] bool reachStoppingPoint(std::string *reason = nullptr);
+    // Completions (the device worker's idle wake-up, an IOP request's end) only mark threads ready or finish a
+    // request's EE side: no game code runs and no field passes. Other queued events stay queued, in order.
+    size_t handOverCompletions(); // how many were handed over
+    [[nodiscard]] bool completionQueuedLocked() const; // m_eventMutex held
     std::mutex m_stateRequestMutex;
     std::atomic<bool> m_stateRequestPending{false};
+    std::atomic<int64_t> m_stateAskedNs{0}; // DW5XL-DEBUG issue 009 v4.8: when the pending request was asked (test switch)
     StateRequestKind m_stateRequestKind = StateRequestKind::None;
     std::string m_stateRequestPath;
     std::string m_stateRequestBackup;
