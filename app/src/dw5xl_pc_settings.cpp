@@ -833,11 +833,14 @@ void inPlayProgress()
 
 // DW5XL-DEBUG issue 023 3S: PS2X_PCSETTINGS_SCRIPT="<field>:esc,<frames>:<step>,..." drives the doors and the screen
 // in hidden runs (the guest field stops while paused, so later steps count window frames after the previous one).
+// Issue 027 v7: "@<field>:<step>" is due at that guest field (steps while the game runs), and window frames while a
+// save or load asked from the screen is in progress do not count (the screen takes no input then).
 // Steps: esc, hold (Back held), up, down, left, right, cross, back (Triangle), shot=<file.png>.
-struct ScriptStep { uint64_t wait = 0; std::string action; };
+struct ScriptStep { uint64_t wait = 0; std::string action; bool atField = false; };
 std::vector<ScriptStep> g_script;
 size_t g_scriptNext = 0;
 uint64_t g_scriptFrames = 0;
+bool g_scriptWaitLogged = false;
 void loadScript()
 {
     const char *v = std::getenv("PS2X_PCSETTINGS_SCRIPT");
@@ -846,8 +849,9 @@ void loadScript()
     for (size_t at = 0; at <= all.size();) {
         const size_t comma = std::min(all.find(',', at), all.size());
         const std::string step = all.substr(at, comma - at);
+        const bool atField = !step.empty() && step[0] == '@';
         if (const size_t colon = step.find(':'); colon != std::string::npos)
-            g_script.push_back({std::strtoull(step.c_str(), nullptr, 10), step.substr(colon + 1)});
+            g_script.push_back({std::strtoull(step.c_str() + (atField ? 1 : 0), nullptr, 10), step.substr(colon + 1), atField});
         at = comma + 1;
     }
 }
@@ -857,9 +861,16 @@ std::string scriptAction()
     static std::once_flag once; std::call_once(once, loadScript);
     if (g_scriptNext >= g_script.size()) return {};
     const ScriptStep &step = g_script[g_scriptNext];
-    const bool due = g_scriptNext == 0 ? g_runtime->eeScheduler().currentVSyncTick() >= step.wait : ++g_scriptFrames >= step.wait;
+    bool due;
+    if (g_scriptNext == 0 || step.atField) due = g_runtime->eeScheduler().currentVSyncTick() >= step.wait;
+    else if (dw5xl::pcsettings::snapshot().mode == Mode::InPlay && (g_menu.loading || !g_menu.saving.empty())) {
+        if (!g_scriptWaitLogged)
+            std::fprintf(stderr, "[pc-settings] script step %zu waits for the state request\n", g_scriptNext + 1);
+        g_scriptWaitLogged = true;
+        return {};
+    } else due = ++g_scriptFrames >= step.wait;
     if (!due) return {};
-    ++g_scriptNext; g_scriptFrames = 0;
+    ++g_scriptNext; g_scriptFrames = 0; g_scriptWaitLogged = false;
     std::fprintf(stderr, "[pc-settings] script step %zu: %s\n", g_scriptNext, step.action.c_str());
     return step.action;
 }
