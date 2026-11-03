@@ -1584,8 +1584,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         m_ioRegisters[channelBase + 0x10] = madr + gotQw * 16u;
                         m_ioRegisters[channelBase + 0x20] = qwc - gotQw;
                         static const bool readbackTrace = std::getenv("PS2X_READBACK_TRACE") != nullptr; // DW5XL-DEBUG
-                        if (readbackTrace)
-                            std::fprintf(stderr, "[vif1:readback] madr=0x%x qwc=%u gotBytes=%u\n", madr, qwc, got);
+                        if (readbackTrace) // tick: the game's field (issue 009 v4.4: events by field, not by log position)
+                            std::fprintf(stderr, "[vif1:readback] tick=%llu madr=0x%x qwc=%u gotBytes=%u\n",
+                                         static_cast<unsigned long long>(gs_regs.vsyncTick.load(std::memory_order_acquire)),
+                                         madr, qwc, got);
                         if (gotQw == qwc)
                         {
                             m_ioRegisters[channelBase + 0x00] &= ~0x100u;

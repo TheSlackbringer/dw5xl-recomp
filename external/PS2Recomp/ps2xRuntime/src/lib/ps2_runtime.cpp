@@ -1512,6 +1512,36 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
     return m_iopSubsystem->handleRpc(request);
 }
 
+uint64_t PS2Runtime::startIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
+{
+    auto scope = m_iopHost->enterCall(ctx, rdram);
+    request.callToken = scope.token();
+    return m_iopSubsystem->startRpc(request);
+}
+
+bool PS2Runtime::iopBusy() const noexcept
+{
+    return m_iopSubsystem->busy();
+}
+
+bool PS2Runtime::iopRpcInFlight() const noexcept
+{
+    return m_iopSubsystem->rpcInFlight();
+}
+
+void PS2Runtime::syncIopToHostClock() noexcept
+{
+    m_iopSubsystem->runToHostClock();
+}
+
+void PS2Runtime::onIopRpcCompleted(uint64_t token)
+{
+    // Called on the executor while the IOP runs (EE cycle accounting); the EE side finishes the call at its next
+    // event service, outside guest code.
+    if (m_eeScheduler)
+        m_eeScheduler->postEvent(EeEvent{EeEventType::IopRpcComplete, 0u, token});
+}
+
 void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
 {
     auto scope = m_iopHost->enterCall(nullptr, rdram);
@@ -1590,19 +1620,54 @@ void PS2Runtime::setHostPaused(bool paused)
         std::chrono::steady_clock::now().time_since_epoch()).count());
     {
         std::lock_guard<std::mutex> lock(m_hostPauseMutex);
-        if (paused == (m_hostPauseStartNs != 0u))
+        if (paused == m_hostPauseAsked)
             return;
-        if (paused)
-            m_hostPauseStartNs = now;
-        else
+        m_hostPauseAsked = paused;
+        // Issue 009 v4.7: the IOP clock and the sound stop when the EE holds (onHostPauseHeld), not here: until then
+        // the IOP finishes what is in progress with the EE (a request in flight is not a quiet point), and its sound
+        // plays on, so nothing piles up to come out late or in a burst after the resume. Both go on here.
+        if (!paused)
         {
-            m_hostPausedTotalNs += now - m_hostPauseStartNs;
-            m_hostPauseStartNs = 0u;
+            if (m_hostPauseStartNs != 0u)
+            {
+                m_hostPausedTotalNs += now - m_hostPauseStartNs;
+                m_hostPauseStartNs = 0u;
+            }
+            m_audioBackend.setPcmPaused(false);
+            m_lastHostResumeNs.store(static_cast<int64_t>(now), std::memory_order_release); // DW5XL-DEBUG 009 v4.7
         }
     }
     if (m_eeScheduler)
         m_eeScheduler->setHostPaused(paused);
-    m_audioBackend.setPcmPaused(paused);
+    // DW5XL-DEBUG issue 009 v4.7: the sound queued at the pause and at the resume (frames at 48 kHz): sound added to the
+    // queue while paused plays later than the picture after the resume.
+    std::fprintf(stderr, "[pause] %s: %u sound frames queued (%.1f ms)\n", paused ? "asked" : "resumed",
+                 m_audioBackend.pcmStats().queuedFrames, m_audioBackend.pcmStats().queuedFrames / 48.0);
+}
+
+void PS2Runtime::onHostPauseHeld()
+{
+    const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    std::lock_guard<std::mutex> lock(m_hostPauseMutex);
+    if (m_hostPauseAsked && m_hostPauseStartNs == 0u)
+    {
+        m_hostPauseStartNs = now;
+        m_audioBackend.setPcmPaused(true); // with the IOP clock (under the same lock as the resume)
+    }
+}
+
+void PS2Runtime::onHostPauseReleased()
+{
+    const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    std::lock_guard<std::mutex> lock(m_hostPauseMutex);
+    if (m_hostPauseStartNs != 0u)
+    {
+        m_hostPausedTotalNs += now - m_hostPauseStartNs;
+        m_hostPauseStartNs = 0u;
+        m_audioBackend.setPcmPaused(false);
+    }
 }
 
 uint64_t PS2Runtime::hostPausedNanoseconds(uint64_t steadyNowNs) const
@@ -3752,9 +3817,48 @@ void PS2Runtime::run()
                 shownLoads = loads;
                 lastShownField = ps2x::presentation::kNoField;
             }
+            const auto waitStart = std::chrono::steady_clock::now();
             paced = m_eeScheduler->waitForPresentationField(lastShownField);
             if (paced.fresh)
                 lastShownField = paced.field;
+            // DW5XL-DEBUG issue 009 v4.7: the first window frames after a host pause ends (owner: "the picture takes a
+            // moment to start again").
+            if (const int64_t resumedNs = m_lastHostResumeNs.load(std::memory_order_acquire); resumedNs != 0)
+            {
+                static int64_t s_loggedFor = 0;
+                static int s_frames = 0;
+                static uint64_t s_generation = 0, s_pictures = 0;
+                static bool s_done = false;
+                if (s_loggedFor != resumedNs)
+                {
+                    s_loggedFor = resumedNs;
+                    s_frames = 0;
+                    s_generation = gs().hostPresentationGeneration();
+                    s_pictures = 0;
+                    s_done = false;
+                }
+                if (!s_done)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    const double sinceMs = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count() - resumedNs) / 1e6;
+                    if (const uint64_t generation = gs().hostPresentationGeneration(); generation != s_generation)
+                    {
+                        s_generation = generation;
+                        ++s_pictures;
+                    }
+                    if (s_frames < 3)
+                        std::fprintf(stderr, "[pause] window frame %d: %.1f ms after the menu closed, field %llu, new field %s, waited %.1f ms\n",
+                                     s_frames, sinceMs, static_cast<unsigned long long>(paced.field), paced.fresh ? "yes" : "no",
+                                     std::chrono::duration<double, std::milli>(now - waitStart).count());
+                    ++s_frames;
+                    if (sinceMs >= 1000.0)
+                    {
+                        std::fprintf(stderr, "[pause] first second after the resume: %llu new pictures in %d window frames\n",
+                                     static_cast<unsigned long long>(s_pictures), s_frames);
+                        s_done = true;
+                    }
+                }
+            }
         }
         m_audioBackend.updatePcmStream();
         devHarness.step(m_eeScheduler->currentVSyncTick());

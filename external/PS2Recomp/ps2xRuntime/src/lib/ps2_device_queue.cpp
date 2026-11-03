@@ -77,6 +77,7 @@ namespace ps2x::device
         thread_local int t_executingDepth = 0;
         std::array<std::atomic<uint64_t>, static_cast<size_t>(ProfilePart::Count)> g_profileNs{};
         std::atomic<uint64_t> g_gameFrames{0};
+        std::atomic<uint64_t> g_traceWindows{0}; // DW5XL-DEBUG issue 050: [vu1-async] windows printed so far
         std::atomic<uint64_t> g_lastFrameField{~0ull};
 
         struct ExecutingScope
@@ -357,10 +358,16 @@ namespace ps2x::device
                 }
 
                 const uint64_t appliedNow = applied.load(std::memory_order_relaxed);
+                // Issue 050: an Explicit drain is the game's render sync. It counts (per-reason count, game frames) when
+                // device work was submitted since the previous one, whether or not that work is still pending: the
+                // dispatcher may already have applied what the worker finished. A sync with nothing new drew nothing.
+                const bool renderSync = reason == DrainReason::Explicit && target > lastExplicitTarget;
+                if (reason == DrainReason::Explicit)
+                    lastExplicitTarget = std::max(lastExplicitTarget, target);
+                bool blocked = false;
+                uint64_t waitNs = 0u, pendingBefore = 0u;
                 if (target > appliedNow)
                 {
-                    bool blocked = false;
-                    uint64_t waitNs = 0u;
                     if (completed.load(std::memory_order_acquire) < target)
                     {
                         blocked = true;
@@ -374,22 +381,24 @@ namespace ps2x::device
                         waitNs = nsSince(waitStart);
                         ps2prof::record(ps2prof::Event::DeviceWaitEnd, target, static_cast<uint16_t>(reason)); // DW5XL-DEBUG
                     }
-                    const uint64_t pendingBefore = submitted.load(std::memory_order_relaxed) - appliedNow;
+                    pendingBefore = submitted.load(std::memory_order_relaxed) - appliedNow;
                     applyCompleted();
                     statDrains.fetch_add(1u, std::memory_order_relaxed);
-                    if (reason == DrainReason::Explicit)
-                    {
-                        const uint64_t field = mem.gs().vsyncTick.load(std::memory_order_relaxed);
-                        if (g_lastFrameField.exchange(field, std::memory_order_relaxed) != field)
-                        {
-                            g_gameFrames.fetch_add(1u, std::memory_order_relaxed);
-                            ps2prof::record(ps2prof::Event::GameFrame, field); // DW5XL-DEBUG issue 025
-                        }
-                    }
                     if (blocked)
                     {
                         statBlockingDrains.fetch_add(1u, std::memory_order_relaxed);
                         statDrainWaitNs.fetch_add(waitNs, std::memory_order_relaxed);
+                    }
+                    if (cfg.trace && reason != DrainReason::Explicit)
+                        traceDrain(reason, blocked, waitNs, pendingBefore);
+                }
+                if (renderSync)
+                {
+                    const uint64_t field = mem.gs().vsyncTick.load(std::memory_order_relaxed);
+                    if (g_lastFrameField.exchange(field, std::memory_order_relaxed) != field)
+                    {
+                        g_gameFrames.fetch_add(1u, std::memory_order_relaxed);
+                        ps2prof::record(ps2prof::Event::GameFrame, field); // DW5XL-DEBUG issue 025
                     }
                     if (cfg.trace)
                         traceDrain(reason, blocked, waitNs, pendingBefore);
@@ -497,6 +506,7 @@ namespace ps2x::device
             }
 
             std::atomic<uint64_t> submitted{0};
+            uint64_t lastExplicitTarget = 0u; // issue 050 (owner thread): submitted at the previous Explicit drain
             std::atomic<uint64_t> completed{0};
             std::atomic<uint64_t> applied{0};
             std::atomic<uint64_t> lastGifSeq{0};
@@ -830,6 +840,7 @@ namespace ps2x::device
                 if (now - traceWindowStart < std::chrono::seconds(1))
                     return;
                 const auto windowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - traceWindowStart).count();
+                g_traceWindows.fetch_add(1u, std::memory_order_relaxed);
                 std::fprintf(stderr, "[vu1-async] windowMs=%lld submitted=%llu applied=%llu workerBusyNs=%llu workerIdleNs=%llu",
                              static_cast<long long>(windowMs),
                              static_cast<unsigned long long>(submitted.load(std::memory_order_relaxed) - traceSubmittedMark),
@@ -1122,6 +1133,11 @@ namespace ps2x::device
     uint64_t gameFrameCount() noexcept
     {
         return g_gameFrames.load(std::memory_order_relaxed);
+    }
+
+    uint64_t traceWindowCount() noexcept
+    {
+        return g_traceWindows.load(std::memory_order_relaxed);
     }
 
     bool profileEnabled() noexcept

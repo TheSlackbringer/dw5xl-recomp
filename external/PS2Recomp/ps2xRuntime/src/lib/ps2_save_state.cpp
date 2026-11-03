@@ -160,9 +160,47 @@ void ps2x::serializeStubStates(StateArchive &a, uint8_t *rdram, uint64_t vsyncTi
     g_stateVsyncTick = 0u;
 }
 
+namespace
+{
+    std::map<std::string, ps2x::StubStateBlockerFn> &stubStateBlockers()
+    {
+        static std::map<std::string, ps2x::StubStateBlockerFn> blockers;
+        return blockers;
+    }
+}
+
+bool ps2x::registerStubStateBlocker(const char *name, StubStateBlockerFn fn)
+{
+    stubStateBlockers().emplace(name, fn);
+    return true;
+}
+
+const char *ps2x::stubStateBlocker(uint64_t vsyncTick)
+{
+    for (const auto &[name, fn] : stubStateBlockers())
+        if (const char *why = fn(vsyncTick))
+            return why;
+    return nullptr;
+}
+
 void PS2Runtime::registerStateHook(std::string name, StateHook hook)
 {
     m_stateHooks.emplace_back(std::move(name), std::move(hook));
+}
+
+void PS2Runtime::registerStateBlocker(StateBlocker blocker)
+{
+    m_stateBlockers.push_back(std::move(blocker));
+}
+
+std::string PS2Runtime::stateBlocker() const
+{
+    if (const char *why = ps2x::stubStateBlocker(m_eeScheduler->currentVSyncTick()))
+        return why;
+    for (const StateBlocker &blocker : m_stateBlockers)
+        if (const char *why = blocker())
+            return why;
+    return {};
 }
 
 void PS2Runtime::serializeState(ps2x::StateArchive &a)
@@ -267,17 +305,27 @@ std::string PS2Runtime::stateMessage() const
     return std::chrono::steady_clock::now() - m_stateMessageTime < std::chrono::seconds(3) ? m_stateMessage : std::string();
 }
 
+void PS2Runtime::drainDeviceWork()
+{
+    ps2x::device::drainAll(m_memory, ps2x::device::DrainReason::Explicit);
+    m_gifArbiter.drain();
+    m_gifArbiter.waitIdle();
+}
+
 bool PS2Runtime::performStateRequest(bool save, const std::string &path, bool &retry, const std::string &backup)
 {
     const auto started = std::chrono::steady_clock::now();
     retry = false;
     try
     {
-        // Nothing in flight: the VIF1/VU1/GIF device finishes what it was given and the renderer flushes. What that
-        // completes (DMA interrupts, events) is handled by the scheduler first: then this request comes back.
-        ps2x::device::drainAll(m_memory, ps2x::device::DrainReason::Explicit);
-        m_gifArbiter.drain();
-        m_gifArbiter.waitIdle();
+        // Issue 027 v6: a part that cannot be saved now (a movie, the memory card, a disc check) says so before
+        // anything is drained, read or written; a load needs a copy of the running game too, so it is refused alike.
+        if (const std::string why = stateBlocker(); !why.empty())
+            throw ps2x::StateError(why);
+        // Nothing in flight: the scheduler's stopping point (issue 009 v4.8) has drained the device and the renderer
+        // already, so this drain finds nothing to do. Should it complete something after all (DMA interrupts,
+        // events), the scheduler handles that first: then this request comes back.
+        drainDeviceWork();
         if (!m_eeScheduler->stateQuiet())
         {
             retry = true;
@@ -381,7 +429,11 @@ bool PS2Runtime::performStateRequest(bool save, const std::string &path, bool &r
     }
     catch (const std::exception &e)
     {
-        std::cerr << "[state] " << (save ? "save" : "load") << " refused: " << e.what() << std::endl;
+        // Issue 027 v6: how long the request took before the "no" (a refusal should cost nothing).
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        char after[32];
+        std::snprintf(after, sizeof(after), " (after %.2f ms)", ms);
+        std::cerr << "[state] " << (save ? "save" : "load") << " refused: " << e.what() << after << std::endl;
         showStateMessage(refusalMessage(save, e.what()));
         return false;
     }

@@ -141,10 +141,14 @@ namespace ps2x::device
     bool workerShouldCancelVu1() noexcept;
 
     // Game frames: fields in which the game finished at least one frame (an
-    // explicit render-sync drain that had device work). Per second = the FPS a
+    // explicit render-sync drain with device work submitted since the previous
+    // one, pending or already applied: issue 050). Per second = the FPS a
     // screen shows; counts 3D frames (two syncs per frame), movie frames (one)
     // and never more than one per field (F2 FPS overlay, issue 014).
     uint64_t gameFrameCount() noexcept;
+    // DW5XL-DEBUG issue 050: [vu1-async] windows printed so far (PS2X_VU1_ASYNC_TRACE), so a count kept elsewhere
+    // (PS2X_GS_SYNC_TRACE) can close its windows at the same moments.
+    uint64_t traceWindowCount() noexcept;
 
     // PS2X_DEVICE_PROFILE=1 (with PS2X_VU1_ASYNC_TRACE=1): device-worker time per
     // part, printed with each [vu1-async] line. Parts nest: Transfer contains

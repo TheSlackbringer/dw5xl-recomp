@@ -1,6 +1,7 @@
 #include <atomic>
 #include <cstdio>
 #include "runtime/ee_scheduler.h"
+#include "ps2x/iop/iop_subsystem.h" // kIopHostClockPollEeCycles (issue 009 v4.4)
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
@@ -45,6 +46,14 @@ namespace
         return std::chrono::nanoseconds(pal ? 20000000 : 16683333);
     }
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
+    // Issue 009 v4.4/v4.5 (design 1a): while the IOP has work (a request or a runnable thread), the scheduler's waits end after this many EE
+    // cycles so the IOP catches up in its own steps (ps2xIOP's host-clock poll) between the fields.
+    constexpr uint64_t kIopRpcSliceEeCycles = ps2x::iop::kIopHostClockPollEeCycles;
+    // Issue 009 v4.7: a host pause holds at once (owner, 2026-11-01: a run-on before the hold let the movie's decoder go
+    // on without fields, and the picture was slow to start again after the menu). Only a save or load asked during a
+    // hold that is not at a quiet point runs on to reach one, for at most this long (PC time).
+    constexpr int64_t kPauseQuietWaitNs = 0;
+    constexpr int64_t kPauseStateWaitNs = 500'000'000;
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
 
@@ -276,8 +285,28 @@ void EeScheduler::run()
         if (m_stateRequestPending.load(std::memory_order_acquire) || m_stateSaveAtTick != 0u || m_stateLoadAtTick != 0u)
         {
             bool handled = false;
-            if (serviceStateRequest(&handled) || (handled && m_hostPaused.load(std::memory_order_acquire)))
+            const bool pausedBefore = m_hostPaused.load(std::memory_order_acquire);
+            const bool loaded = serviceStateRequest(&handled);
+            if (loaded || (handled && m_hostPaused.load(std::memory_order_acquire)))
             {
+                // DW5XL-DEBUG issue 009 v4.10: PS2X_PAUSE_TEST_LOAD_CLOSE=1 waits here, after a load carried out during a
+                // host pause, until the host screen has closed, so the close always comes before the executor is back at
+                // the hold (the order that left the pause set; tests: issue_009_pause_after_load.py).
+                static const bool s_testLoadClose = []
+                {
+                    const char *value = std::getenv("PS2X_PAUSE_TEST_LOAD_CLOSE");
+                    return value && *value && *value != '0';
+                }();
+                if (loaded && s_testLoadClose && pausedBefore)
+                {
+                    const bool waited = m_hostPaused.load(std::memory_order_acquire);
+                    std::unique_lock lock(m_eventMutex);
+                    m_eventCv.wait(lock, [this]
+                                   { return !m_hostPaused.load(std::memory_order_acquire) ||
+                                            m_stopRequested.load(std::memory_order_acquire); });
+                    std::fprintf(stderr, "[pause] test: the screen closed before the executor went on after the load "
+                                         "(%s; PS2X_PAUSE_TEST_LOAD_CLOSE)\n", waited ? "waited for it" : "already closed");
+                }
                 continue;
             }
         }
@@ -404,7 +433,17 @@ void EeScheduler::run()
         }
         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
 
-        if (checkpointDue(kGuestDispatchCycles))
+        // Issue 009 v4.7: while a host pause waits for its quiet point, the game finishes what is in progress. The
+        // checkpoint the pause keeps pending brings guest code back here at its next check (to try the hold), but must
+        // not keep it from running at all.
+        // No EE time is added here meanwhile (no field passes, so the game's clock must not run ahead of the IOP and
+        // the picture); the IOP is moved on to the PC clock while it has work.
+        const bool pauseWaiting = m_hostPaused.load(std::memory_order_acquire) && !m_pauseHeld.load(std::memory_order_acquire);
+        if (pauseWaiting)
+        {
+            m_runtime.syncIopToHostClock();
+        }
+        if (pauseWaiting ? m_stopRequested.load(std::memory_order_acquire) : checkpointDue(kGuestDispatchCycles))
         {
             continue;
         }
@@ -526,6 +565,9 @@ namespace
     // its estimated cycle count reaches the field. Written under m_eventMutex, read by the executor at checkpoints.
     std::atomic<int64_t> g_nextFieldHostDeadlineNs{0};
     uint32_t g_fieldClockPoll = 0u;
+    int64_t g_pauseResumedNs = 0;     // DW5XL-DEBUG issue 009 v4.7 (executor): the last resume, for the first fields after it
+    int g_fieldsAfterResume = 0;
+    int64_t g_pauseTestWakeAtNs = 0;  // DW5XL-DEBUG issue 009 v4.8 (executor): when this hold's test wake-up is due (0 = none)
     constexpr uint32_t kFieldClockPollInterval = 64u;
 
     int64_t steadyNs(std::chrono::steady_clock::time_point time) noexcept
@@ -542,6 +584,12 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         m_stopRequested.load(std::memory_order_acquire))
     {
         return true;
+    }
+    // Issue 009 v4.7: during a host pause the field and timer deadlines are not served (processPendingEvents), so an
+    // overdue one must not stop the guest code that finishes what is in progress before the hold.
+    if (m_hostPaused.load(std::memory_order_acquire))
+    {
+        return false;
     }
 
     const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
@@ -1355,6 +1403,12 @@ bool EeScheduler::hasInvocation(GuestInvocationKind kind, uint64_t tag) const
                        });
 }
 
+bool EeScheduler::insideInvocation() const
+{
+    const GuestThread *owner = currentThread();
+    return owner && !owner->invocations.empty();
+}
+
 uint32_t EeScheduler::invocationStackTop()
 {
     assertExecutor();
@@ -2014,31 +2068,123 @@ void EeScheduler::applyPendingPreemption()
 void EeScheduler::processPendingEvents()
 {
     assertExecutor();
+    // The end of a hold (issue 009 v4.10: also when the host screen closed while the executor was away from it).
+    const auto endHostPauseHold = [this]()
+    {
+        m_pauseHeld.store(false, std::memory_order_release);
+        // DW5XL-DEBUG issue 009 v4.7: when the game goes on (the first fields after it are logged with this time).
+        g_pauseResumedNs = steadyNs(std::chrono::steady_clock::now());
+        g_fieldsAfterResume = 0;
+        std::fprintf(stderr, "[pause] resumed at field %llu\n",
+                     static_cast<unsigned long long>(m_vsyncTick.load(std::memory_order_acquire)));
+    };
     if (m_hostPaused.load(std::memory_order_acquire))
     {
         // Issue 023 3S: held here, at the dispatcher level (no guest frames on the host stack), until the host
         // screen closes. Nothing advances meanwhile: no EE cycles, timers or IOP time; overdue fields re-anchor.
-        // Issue 027 v4: held only at a quiet point, so the paused game can be saved as it is. Until then the game
-        // finishes what is in progress (interrupt handlers, queued events) but no field deadline is served, so no
-        // field passes. A save or load request wakes the hold: the dispatcher loop carries it out at once.
-        if (stateQuiet())
+        // Issue 027 v4 held only at a quiet point, so the paused game could be saved as it is. Issue 009 v4.7 (owner:
+        // "it should work like the rest and have the best UX"): the pause holds at once (kPauseQuietWaitNs = 0), and EE
+        // time, IOP clock and sound stop together here. A hold that is not at a quiet point ("busy": a movie streams
+        // all the time, a request is in flight) cannot be saved as it is: a save or load asked then lets the game run
+        // on (no field passes, the IOP and its sound go on) for up to kPauseStateWaitNs to reach a quiet point, then
+        // holds again; else the request is refused ("the game is busy"). A save or load request wakes the hold.
+        // Issue 009 v4.8: the hold and every save and load use one stopping point (reachStoppingPoint); a completion
+        // that arrives while held is handed over at once, and a save or load during the hold is decided by the state
+        // when it comes.
+        // DW5XL-DEBUG issue 009 v4.8: PS2X_PAUSE_TEST_WAKE_MS=<n> queues a device idle wake-up n ms into every hold, as
+        // the device worker does when it goes idle after the hold (tests: issue_009_pause_hold_event.py).
+        static const int64_t s_testWakeNs = []
         {
-            if (!m_pauseHeld.exchange(true, std::memory_order_acq_rel))
-                std::fprintf(stderr, "[pause] held at field %llu (asked at field %llu)\n",
+            const char *value = std::getenv("PS2X_PAUSE_TEST_WAKE_MS");
+            return value && *value ? std::strtoll(value, nullptr, 10) * 1'000'000 : int64_t{0};
+        }();
+        if (!m_pauseHeld.load(std::memory_order_acquire))
+        {
+            m_runtime.syncIopToHostClock(); // the IOP stays current while the pause waits: nothing to catch up later
+            // Issue 009 v4.8 (step 1): the hold is reached at the stopping point (completions handed over, the device
+            // drained), so a hold that is quiet has nothing in flight.
+            std::string why;
+            const bool quiet = reachStoppingPoint(&why);
+            const int64_t nowNs = steadyNs(std::chrono::steady_clock::now());
+            const bool stateAsked = m_stateRequestPending.load(std::memory_order_acquire);
+            const int64_t waited = nowNs - m_pauseWaitSinceNs.load(std::memory_order_acquire);
+            const bool busy = !quiet && waited >= (stateAsked ? kPauseStateWaitNs : kPauseQuietWaitNs);
+            if (busy && stateAsked)
+                refuseStateRequest("the game is busy");
+            if (quiet || busy)
+            {
+                m_pauseHeld.store(true, std::memory_order_release);
+                g_pauseTestWakeAtNs = s_testWakeNs > 0 ? nowNs + s_testWakeNs : 0;
+                m_runtime.onHostPauseHeld();
+                std::fprintf(stderr, "[pause] held at field %llu (asked at field %llu) after %.1f ms%s%s%s\n",
                              static_cast<unsigned long long>(m_vsyncTick.load(std::memory_order_acquire)),
-                             static_cast<unsigned long long>(m_pauseAskedField.load(std::memory_order_acquire)));
-            std::unique_lock lock(m_eventMutex);
-            m_eventCv.wait(lock, [this]()
-                           { return !m_hostPaused.load(std::memory_order_acquire) ||
-                                    m_stopRequested.load(std::memory_order_acquire) ||
-                                    m_stateRequestPending.load(std::memory_order_acquire); });
+                             static_cast<unsigned long long>(m_pauseAskedField.load(std::memory_order_acquire)),
+                             static_cast<double>(nowNs - m_pauseAskedNs.load(std::memory_order_acquire)) / 1e6,
+                             busy ? " (busy: " : "", busy ? why.c_str() : "", busy ? ")" : "");
+            }
+        }
+        if (m_pauseHeld.load(std::memory_order_acquire))
+        {
+            {
+                std::unique_lock lock(m_eventMutex);
+                // Issue 009 v4.8 (step 2): a completion that arrives while held (the device worker's idle wake-up can
+                // come just after the drain) is handed over at once, so a quiet hold stays quiet.
+                const auto woken = [this]()
+                { return !m_hostPaused.load(std::memory_order_acquire) || m_stopRequested.load(std::memory_order_acquire) ||
+                         m_stateRequestPending.load(std::memory_order_acquire) || completionQueuedLocked(); };
+                for (;;)
+                {
+                    if (g_pauseTestWakeAtNs != 0 &&
+                        !m_eventCv.wait_until(lock, std::chrono::steady_clock::time_point(std::chrono::duration_cast<
+                                                        std::chrono::steady_clock::duration>(std::chrono::nanoseconds(g_pauseTestWakeAtNs))),
+                                              woken))
+                    {
+                        // DW5XL-DEBUG issue 009 v4.8: the test wake-up, queued as the device worker's workerIdle posts it.
+                        m_events.push_back(EeEvent{EeEventType::ExternalWake, ps2x::device::kDeviceIdleWaitType,
+                                                   ps2x::device::kDeviceIdleWaitToken});
+                        m_checkpointPending.store(true, std::memory_order_release);
+                        g_pauseTestWakeAtNs = 0;
+                        std::fprintf(stderr, "[pause] test wake-up queued at field %llu, %lld ms into the hold (PS2X_PAUSE_TEST_WAKE_MS)\n",
+                                     static_cast<unsigned long long>(m_vsyncTick.load(std::memory_order_acquire)),
+                                     static_cast<long long>(s_testWakeNs / 1'000'000));
+                    }
+                    m_eventCv.wait(lock, woken);
+                    if (!m_hostPaused.load(std::memory_order_acquire) || m_stopRequested.load(std::memory_order_acquire) ||
+                        m_stateRequestPending.load(std::memory_order_acquire))
+                        break;
+                    lock.unlock();
+                    const size_t handed = handOverCompletions();
+                    std::fprintf(stderr, "[pause] %zu completion(s) handed over during the hold at field %llu\n", handed,
+                                 static_cast<unsigned long long>(m_vsyncTick.load(std::memory_order_acquire)));
+                    lock.lock();
+                }
+            }
             if (m_hostPaused.load(std::memory_order_acquire) && !m_stopRequested.load(std::memory_order_acquire))
             {
+                // Issue 009 v4.8 (step 3): a save or load during the hold is decided by the state now, not by how the
+                // hold began. At the stopping point it is carried out at once (run(): serviceStateRequest); else the
+                // game runs on to a quiet point first (bounded, see above).
+                std::string why;
+                if (!reachStoppingPoint(&why))
+                {
+                    m_pauseHeld.store(false, std::memory_order_release);
+                    m_runtime.onHostPauseReleased();
+                    m_pauseWaitSinceNs.store(steadyNs(std::chrono::steady_clock::now()), std::memory_order_release);
+                    std::fprintf(stderr, "[pause] a save or load while the game is busy (%s): running on to a quiet point\n",
+                                 why.c_str());
+                }
                 m_checkpointPending.store(true, std::memory_order_release);
                 return;
             }
-            m_pauseHeld.store(false, std::memory_order_release);
+            endHostPauseHold();
         }
+    }
+    else if (m_pauseHeld.load(std::memory_order_acquire))
+    {
+        // Issue 009 v4.10: a load picked during the hold is carried out in run() with the hold still set, and the host
+        // screen closes when it is done. When it closed before the executor came back here, the hold ends now; else the
+        // next pause would skip the stopping point and onHostPauseHeld() (the IOP clock and the sound would not stop).
+        endHostPauseHold();
     }
     if (!m_hostPaused.load(std::memory_order_acquire))
         processDueDeadlines();
@@ -2081,7 +2227,11 @@ void EeScheduler::setHostPaused(bool paused)
     {
         std::lock_guard lock(m_eventMutex);
         if (paused && !m_hostPaused.load(std::memory_order_acquire))
+        {
             m_pauseAskedField.store(m_vsyncTick.load(std::memory_order_acquire), std::memory_order_release);
+            m_pauseAskedNs.store(steadyNs(std::chrono::steady_clock::now()), std::memory_order_release);
+            m_pauseWaitSinceNs.store(steadyNs(std::chrono::steady_clock::now()), std::memory_order_release);
+        }
         m_hostPaused.store(paused, std::memory_order_release);
         m_checkpointPending.store(true, std::memory_order_release);   // running guest code returns to the dispatcher
     }
@@ -2147,13 +2297,24 @@ void EeScheduler::processDueDeadlines()
 
             if (now < pacingDeadline)
             {
-                m_eventCv.wait_until(lock, pacingDeadline, [this]()
+                // Issue 009 v4.4/v4.5 (design 1a): while the IOP has work, wait in its host-clock steps and
+                // let it catch up between them, so its work does not land in one piece after the wait.
+                const bool iopBusy = m_runtime.iopBusy();
+                const auto waitUntil = iopBusy ? std::min(pacingDeadline, now + eeCyclesToHostDuration(kIopRpcSliceEeCycles))
+                                               : pacingDeadline;
+                m_eventCv.wait_until(lock, waitUntil, [this]()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire); });
                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
                 {
                     updateNextDeadline();
                     return;
+                }
+                if (iopBusy && std::chrono::steady_clock::now() < pacingDeadline)
+                {
+                    lock.unlock();
+                    m_runtime.syncIopToHostClock();
+                    continue;
                 }
             }
 
@@ -2200,6 +2361,16 @@ void EeScheduler::processDueDeadlines()
                     if (on && lateUs > 3000) {
                         const auto gapUs = g_prevDeadlineService == std::chrono::steady_clock::time_point{} ? -1 : std::chrono::duration_cast<std::chrono::microseconds>(g_lastDeadlineService - g_prevDeadlineService).count();
                         std::fprintf(stderr, "[late-vblank] tick=%llu late=%lldus serviceGap=%lldus thread=%u\n", (unsigned long long)(m_vsyncTick + 1u), (long long)lateUs, (long long)gapUs, m_currentThreadId);
+                    }
+                    // DW5XL-DEBUG issue 009 v4.7: the first fields after a host pause ends (time since the resume).
+                    if (g_pauseResumedNs != 0 && g_fieldsAfterResume < 4)
+                    {
+                        std::fprintf(stderr, "[pause] field %llu: %.1f ms after the resume (late %.1f ms)\n",
+                                     static_cast<unsigned long long>(m_vsyncTick + 1u),
+                                     static_cast<double>(steadyNs(std::chrono::steady_clock::now()) - g_pauseResumedNs) / 1e6,
+                                     static_cast<double>(lateUs) / 1e3);
+                        if (++g_fieldsAfterResume == 4)
+                            g_pauseResumedNs = 0;
                     }
                 }
                 // Keep host fields on a fixed cadence so small wake-up lateness
@@ -2390,6 +2561,10 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::Dmac:
         break;
+    case EeEventType::IopRpcComplete: // issue 009 v4.4 (design 1a)
+        if (m_iopRpcCompletion)
+            m_iopRpcCompletion(event.value);
+        break;
     case EeEventType::Alarm:
     {
         auto it = m_alarms.find(static_cast<int>(event.id));
@@ -2481,6 +2656,28 @@ void EeScheduler::waitForEvent()
     {
         return;
     }
+    if (m_hostPaused.load(std::memory_order_acquire))
+    {
+        // Issue 009 v4.7: a host pause waits for its quiet point and every EE thread waits (e.g. for an IOP request).
+        // Deadlines are suspended, and EE time does not advance here; the IOP runs on to the PC clock in its steps
+        // while it has work, until an event (its completion), the end of the pause, a stop, or the end of the bounded
+        // wait (processPendingEvents then holds the busy game).
+        const auto woken = [this]()
+        { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire) ||
+                 !m_hostPaused.load(std::memory_order_acquire); };
+        const bool stateAsked = m_stateRequestPending.load(std::memory_order_acquire);
+        auto until = std::chrono::steady_clock::time_point(std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::nanoseconds(m_pauseWaitSinceNs.load(std::memory_order_acquire) +
+                                     (stateAsked ? kPauseStateWaitNs : kPauseQuietWaitNs))));
+        // The IOP (and its sound) keeps running to the PC clock in its steps meanwhile, busy or not.
+        until = std::min(until, std::chrono::steady_clock::now() + eeCyclesToHostDuration(kIopRpcSliceEeCycles));
+        if (!m_eventCv.wait_until(lock, until, woken))
+        {
+            lock.unlock();
+            m_runtime.syncIopToHostClock();
+        }
+        return;
+    }
     const uint64_t timerCycles = m_runtime.memory().cyclesUntilNextEeTimerInterrupt();
     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
     if (m_deadlines.empty() && !hasTimerDeadline)
@@ -2516,6 +2713,17 @@ void EeScheduler::waitForEvent()
         }
     }
 
+    // Issue 009 v4.4/v4.5 (design 1a): while the IOP has work (in IOP time, on this thread) it advances in
+    // the IOP's own host-clock steps instead of in one catch-up after the wait, so the next field is not delayed.
+    if (m_runtime.iopBusy())
+    {
+        const auto sliceDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(kIopRpcSliceEeCycles);
+        if (sliceDeadline < hostDeadline)
+        {
+            deadlineCycle = m_eeCycle + kIopRpcSliceEeCycles;
+            hostDeadline = sliceDeadline;
+        }
+    }
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire); });
@@ -2644,6 +2852,7 @@ void EeScheduler::requestState(StateRequestKind kind, std::string path, std::str
         m_stateRequestKind = kind;
         m_stateRequestPath = std::move(path);
         m_stateRequestBackup = std::move(backup);
+        m_stateAskedNs.store(steadyNs(std::chrono::steady_clock::now()), std::memory_order_release);
         m_stateRequestPending.store(kind != StateRequestKind::None, std::memory_order_release);
     }
     std::lock_guard lock(m_eventMutex); // wake an idle executor so it reaches the top of run()
@@ -2658,6 +2867,24 @@ bool EeScheduler::stateQuiet(std::string *reason) const
             *reason = std::move(why);
         return false;
     };
+    // DW5XL-DEBUG issue 009 v4.7: PS2X_PAUSE_TEST_BUSY_MS=<n> makes the game count as busy for the first n ms of each
+    // wait of a host pause for its quiet point (tests of the bounded wait: issue_009_pause_busy.py). Issue 009 v4.8: a
+    // save or load asked while paused is decided by the state when it comes, so the switch also covers the first n ms
+    // after such a request.
+    static const int64_t s_testBusyNs = []
+    {
+        const char *value = std::getenv("PS2X_PAUSE_TEST_BUSY_MS");
+        return value && *value ? std::strtoll(value, nullptr, 10) * 1'000'000 : int64_t{0};
+    }();
+    if (s_testBusyNs > 0 && m_hostPaused.load(std::memory_order_acquire))
+    {
+        const int64_t nowNs = steadyNs(std::chrono::steady_clock::now());
+        if ((!m_pauseHeld.load(std::memory_order_acquire) &&
+             nowNs - m_pauseWaitSinceNs.load(std::memory_order_acquire) < s_testBusyNs) ||
+            (m_stateRequestPending.load(std::memory_order_acquire) &&
+             nowNs - m_stateAskedNs.load(std::memory_order_acquire) < s_testBusyNs))
+            return fail("busy (test switch PS2X_PAUSE_TEST_BUSY_MS)");
+    }
     if (!m_events.empty())
         return fail("events are queued");
     for (const GuestInvocation &invocation : m_pendingInvocations)
@@ -2666,7 +2893,15 @@ bool EeScheduler::stateQuiet(std::string *reason) const
     for (const auto &[id, thread] : m_threads)
     {
         if (!thread.invocations.empty())
-            return fail("thread " + std::to_string(id) + " is inside an interrupt, alarm or callback");
+        {
+            // Issue 009 v4.7: which one (kind, guest pc, wait) — so a pause that does not hold can be explained.
+            const GuestInvocation &inner = thread.invocations.back();
+            char detail[96];
+            std::snprintf(detail, sizeof(detail), " (%zu deep, innermost kind %u at pc 0x%x; thread status %u, wait %u)",
+                          thread.invocations.size(), static_cast<unsigned>(inner.kind), inner.context.pc,
+                          static_cast<unsigned>(thread.status), static_cast<unsigned>(thread.wait.reason));
+            return fail("thread " + std::to_string(id) + " is inside an interrupt, alarm or callback" + detail);
+        }
         if (thread.resumeCompletion)
             return fail("thread " + std::to_string(id) + " has a resume completion");
         if (thread.wait.completion)
@@ -2674,7 +2909,67 @@ bool EeScheduler::stateQuiet(std::string *reason) const
     }
     if (m_insideInterrupt)
         return fail("inside an interrupt");
+    if (m_runtime.iopRpcInFlight())
+        return fail("an IOP request is in flight"); // issue 009 v4.4: its EE completion is not in the state
     return true;
+}
+
+void EeScheduler::refuseStateRequest(const char *why)
+{
+    StateRequestKind kind;
+    {
+        std::lock_guard lock(m_stateRequestMutex);
+        kind = m_stateRequestKind;
+        m_stateRequestKind = StateRequestKind::None;
+        m_stateRequestPending.store(false, std::memory_order_release);
+    }
+    const bool save = kind == StateRequestKind::Save;
+    std::fprintf(stderr, "[state] %s refused: %s\n", save ? "save" : "load", why);
+    m_runtime.showStateMessage(std::string(save ? "Can't save now: " : "Can't load now: ") + why);
+}
+
+namespace
+{
+    // Issue 009 v4.8: events that only complete something (no game code, no field): the device worker's idle wake-up
+    // marks the thread waiting for the device ready; an IOP request's end finishes its EE side.
+    bool isCompletion(const EeEvent &event) noexcept
+    {
+        return event.type == EeEventType::ExternalWake || event.type == EeEventType::IopRpcComplete;
+    }
+}
+
+bool EeScheduler::completionQueuedLocked() const
+{
+    return std::any_of(m_events.begin(), m_events.end(), isCompletion);
+}
+
+size_t EeScheduler::handOverCompletions()
+{
+    assertExecutor();
+    std::deque<EeEvent> completions;
+    {
+        std::lock_guard lock(m_eventMutex);
+        if (!completionQueuedLocked())
+            return 0u;
+        std::deque<EeEvent> others;
+        for (const EeEvent &event : m_events)
+            (isCompletion(event) ? completions : others).push_back(event);
+        m_events.swap(others);
+    }
+    for (const EeEvent &event : completions)
+        processEvent(event);
+    return completions.size();
+}
+
+bool EeScheduler::reachStoppingPoint(std::string *reason)
+{
+    assertExecutor();
+    handOverCompletions();
+    if (!stateQuiet(reason))
+        return false; // game code has to run first: no drain while it does (a waiting save or load comes back often)
+    m_runtime.drainDeviceWork();
+    handOverCompletions(); // what the drain completed (the worker's idle wake-up may also come just after it)
+    return stateQuiet(reason);
 }
 
 bool EeScheduler::serviceStateRequest(bool *handled)
@@ -2694,7 +2989,7 @@ bool EeScheduler::serviceStateRequest(bool *handled)
         return false;
     static std::string s_lastRefusal;
     std::string reason;
-    if (!stateQuiet(&reason))
+    if (!reachStoppingPoint(&reason)) // issue 009 v4.8: the one stopping point, as for the pause
     {
         if (reason != s_lastRefusal) // say once per reason, not every iteration
             std::fprintf(stderr, "[state] waiting for a quiet point at tick %llu: %s\n",

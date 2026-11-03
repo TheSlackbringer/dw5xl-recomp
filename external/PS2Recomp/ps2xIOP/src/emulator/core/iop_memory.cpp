@@ -41,6 +41,7 @@ namespace ps2x::iop::detail
         m_interruptControl = 1;
         m_dmaStart.reset();
         m_spu2.reset();
+        clearNativeCode();
     }
 
     uint32_t IopMemory::physicalAddress(uint32_t address) noexcept
@@ -53,6 +54,8 @@ namespace ps2x::iop::detail
         const uint32_t phys = physicalAddress(address);
         if (phys < RamSize)
             return m_ram[phys];
+        if (m_hwReplay)
+            return static_cast<uint8_t>(replayRead(address, 1u));
         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
             return m_scratch[phys - ScratchBase];
         if (phys >= Spu2Base && phys < Spu2Base + 0x800u)
@@ -64,6 +67,8 @@ namespace ps2x::iop::detail
     uint16_t IopMemory::read16(uint32_t address) const
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_hwReplay && phys + 1u >= RamSize)
+            return static_cast<uint16_t>(replayRead(address, 2u));
         if ((phys & 1u) == 0u && phys >= Spu2Base && phys < Spu2Base + 0x800u)
             return m_spu2.read16(phys - Spu2Base);
         if (phys + 1u < RamSize)
@@ -84,6 +89,8 @@ namespace ps2x::iop::detail
             std::memcpy(&value, m_ram.data() + phys, sizeof(value));
             return value;
         }
+        if (m_hwReplay && (phys & 3u) == 0u)
+            return replayRead(address, 4u);
         if ((phys & 3u) == 0u && phys >= ScratchBase && phys + 3u < ScratchBase + ScratchSize)
         {
             uint32_t value;
@@ -104,8 +111,14 @@ namespace ps2x::iop::detail
         const uint32_t phys = physicalAddress(address);
         if (phys < RamSize)
         {
+            noteRamWrite(phys, sizeof(value));
             m_ram[phys] = value;
             markOwned(phys, sizeof(value));
+            return;
+        }
+        if (m_hwReplay)
+        {
+            replayWrite(address, 1u, value);
             return;
         }
         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
@@ -131,6 +144,11 @@ namespace ps2x::iop::detail
     void IopMemory::write16(uint32_t address, uint16_t value)
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_hwReplay && phys + 1u >= RamSize)
+        {
+            replayWrite(address, 2u, value);
+            return;
+        }
         if ((phys & 1u) == 0u && phys >= Spu2Base && phys < Spu2Base + 0x800u)
         {
             m_spu2.write16(phys - Spu2Base, value);
@@ -138,6 +156,7 @@ namespace ps2x::iop::detail
         }
         if (phys + 1u < RamSize)
         {
+            noteRamWrite(phys, sizeof(value));
             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
             markOwned(phys, sizeof(value));
             return;
@@ -151,8 +170,14 @@ namespace ps2x::iop::detail
         const uint32_t phys = physicalAddress(address);
         if ((phys & 3u) == 0u && phys + 3u < RamSize)
         {
+            noteRamWrite(phys, sizeof(value));
             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
             markOwned(phys, sizeof(value));
+            return;
+        }
+        if (m_hwReplay && (phys & 3u) == 0u)
+        {
+            replayWrite(address, 4u, value);
             return;
         }
         if ((phys & 3u) == 0u && phys >= ScratchBase && phys + 3u < ScratchBase + ScratchSize)
@@ -188,6 +213,7 @@ namespace ps2x::iop::detail
             return false;
         if (size != 0u)
         {
+            noteRamWrite(phys, size);
             std::memcpy(m_ram.data() + phys, source, size);
             markOwned(phys, size);
         }
@@ -201,6 +227,7 @@ namespace ps2x::iop::detail
             return false;
         if (size != 0u)
         {
+            noteRamWrite(phys, size);
             std::memset(m_ram.data() + phys, 0, size);
             markOwned(phys, size);
         }
@@ -222,6 +249,64 @@ namespace ps2x::iop::detail
         if (address > RamSize || size > RamSize - address)
             return;
         std::fill(m_owned.begin() + address, m_owned.begin() + address + size, uint8_t{1});
+        // Issue 009 v4.5: every RAM write passes here; one over translated code is noted.
+        if (m_writeLog && size != 0u)
+            m_writeLog->emplace_back(address, static_cast<uint32_t>(size));
+        if (size != 0u && !m_nativeCodeWritten)
+            for (uint32_t word = address >> 2u, last = static_cast<uint32_t>((address + size - 1u) >> 2u); word <= last; ++word)
+                if ((m_nativeCodeWords[word >> 5u] >> (word & 31u)) & 1u)
+                {
+                    m_nativeCodeWritten = true;
+                    break;
+                }
+    }
+
+    uint32_t IopMemory::replayRead(uint32_t address, uint32_t size) const noexcept
+    {
+        HwReplay &r = *m_hwReplay;
+        if (!r.records || r.next >= r.records->size())
+        {
+            r.mismatch = true;
+            return 0u;
+        }
+        const HwAccess &a = (*r.records)[r.next++];
+        if (a.write || a.address != address || a.size != size || (r.cycle && *r.cycle != a.cycle))
+            r.mismatch = true;
+        return a.value;
+    }
+
+    void IopMemory::replayWrite(uint32_t address, uint32_t size, uint32_t value) noexcept
+    {
+        HwReplay &r = *m_hwReplay;
+        if (!r.records || r.next >= r.records->size())
+        {
+            r.mismatch = true;
+            return;
+        }
+        const HwAccess &a = (*r.records)[r.next++];
+        if (!a.write || a.address != address || a.size != size || a.value != value || (r.cycle && *r.cycle != a.cycle))
+            r.mismatch = true;
+    }
+
+    void IopMemory::markNativeCode(uint32_t address, uint32_t size, bool native) noexcept
+    {
+        const uint32_t phys = physicalAddress(address);
+        if (phys >= RamSize || size == 0u)
+            return;
+        const uint32_t last = (std::min<uint32_t>(phys + size, RamSize) - 1u) >> 2u;
+        for (uint32_t word = phys >> 2u; word <= last; ++word)
+        {
+            if (native)
+                m_nativeCodeWords[word >> 5u] |= 1u << (word & 31u);
+            else
+                m_nativeCodeWords[word >> 5u] &= ~(1u << (word & 31u));
+        }
+    }
+
+    void IopMemory::clearNativeCode() noexcept
+    {
+        std::fill(m_nativeCodeWords.begin(), m_nativeCodeWords.end(), 0u);
+        m_nativeCodeWritten = false;
     }
 
     bool IopMemory::isHardwareAddress(uint32_t address) const
@@ -300,6 +385,8 @@ namespace ps2x::iop::detail
         // than reading past RAM into host memory; legal transfers wrap SPU RAM.
         const uint32_t availableWords = (RamSize - ramAddress) / 4u;
         const uint32_t copiedWords = static_cast<uint32_t>(std::min<uint64_t>(transferWords, availableWords));
+        if ((value & 1u) == 0u)
+            noteRamWrite(ramAddress, static_cast<size_t>(copiedWords) * 4u);
         m_spu2.dmaTransfer(secondCore ? 1u : 0u, (value & 1u) != 0u,
                            m_ram.data() + ramAddress, copiedWords);
         if ((value & 1u) == 0u)
@@ -348,6 +435,7 @@ namespace ps2x::iop::detail
                 if (address < block.address + block.size && block.address < address + size)
                     return 0u;
             m_allocations.push_back({address, size});
+            noteRamWrite(address, size);
             markOwned(address, size);
             return address;
         }
@@ -378,6 +466,7 @@ namespace ps2x::iop::detail
             return 0u;
         }
         m_allocations.push_back({candidate, size});
+        noteRamWrite(candidate, size);
         markOwned(candidate, size);
         m_heapCursor = std::max(m_heapCursor, candidate + size);
         return candidate;

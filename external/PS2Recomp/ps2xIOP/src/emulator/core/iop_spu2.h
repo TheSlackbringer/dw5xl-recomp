@@ -43,6 +43,9 @@ namespace ps2x::iop::detail
         void completeDma(unsigned core);
         void cancelDma(unsigned core);
         void advance(uint64_t iopCycles);
+        // Issue 009 v4.5: IOP cycles until the next sample, the only point at which advance() can raise the sound
+        // interrupt, while a core has it enabled; UINT64_MAX otherwise.
+        [[nodiscard]] uint64_t cyclesUntilIrqCheck() const;
         void flushPcm();
         void setPcmCallback(std::function<void(std::span<const int16_t>)> callback);
         void setIrqCallback(std::function<void()> callback);

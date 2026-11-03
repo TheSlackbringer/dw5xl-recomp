@@ -28,6 +28,16 @@ public:
                    : ps2x::iop::RpcResult{};
     }
 
+    // Issue 009 v4.4 (design 1a): 0 = run it with handleRpc.
+    [[nodiscard]] static uint64_t startRpc(
+        PS2Runtime *runtime,
+        uint8_t *rdram,
+        R5900Context *context,
+        ps2x::iop::RpcRequest request)
+    {
+        return runtime ? runtime->startIopRpc(rdram, context, std::move(request)) : 0u;
+    }
+
     [[nodiscard]] static bool canBindRpc(const PS2Runtime *runtime, uint32_t sid)
     {
         return !runtime || runtime->canBindIopRpc(sid);

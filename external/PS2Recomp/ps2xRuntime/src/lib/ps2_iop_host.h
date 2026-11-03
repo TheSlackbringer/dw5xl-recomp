@@ -52,6 +52,7 @@ public:
     bool writeIopMemory(uint32_t address, const void *source, size_t size) override;
     bool zeroIopMemory(uint32_t address, size_t size) override;
     bool normalizeIopAddress(uint32_t address, uint32_t &normalized) const override;
+    void rpcCompleted(uint64_t token) override; // issue 009 v4.4 (design 1a)
     uint32_t allocateIopHandle(ps2x::iop::IopHandleKind kind) override;
     uint32_t allocateGuest(uint32_t size, uint32_t alignment) override;
     void freeGuest(uint32_t address) override;

@@ -93,6 +93,12 @@ namespace ps2x::iop
             normalized = 0u;
             return false;
         }
+        // Issue 009 v4.4 (design 1a): an EE request started with IopSubsystem::startRpc has finished on the IOP; its
+        // reply is in the EE receive buffer.
+        virtual void rpcCompleted(uint64_t token)
+        {
+            (void)token;
+        }
         virtual uint32_t allocateIopHandle(IopHandleKind kind) = 0;
         virtual uint32_t allocateGuest(uint32_t size, uint32_t alignment) = 0;
         virtual void freeGuest(uint32_t address) = 0;

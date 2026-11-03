@@ -3214,6 +3214,21 @@ namespace
         return producerEnded && idle && !p.demuxTransaction && !p.retryPacket;
     }
 
+    // Issue 027 v6: the save section's refusal, also asked before a save or load starts (mpegStateBlocker).
+    const char *mpegStateBlockerLocked(const MpegStubState &m, uint64_t tick)
+    {
+        for (const auto &[addr, p] : m.playbackByMpeg)
+            if (playbackBusy(p) && !playbackAbandoned(m, p, tick))
+                return "a movie is playing";
+        return nullptr;
+    }
+
+    const char *mpegStateBlocker(uint64_t tick)
+    {
+        std::lock_guard lock(g_mpeg_stub_mutex);
+        return mpegStateBlockerLocked(g_mpeg_stub_state, tick);
+    }
+
     void serializeMpegStubState(ps2x::StateArchive &a)
     {
         std::lock_guard lock(g_mpeg_stub_mutex);
@@ -3226,9 +3241,8 @@ namespace
         // could notice only by asking that movie for more than its leftover frames.
         const uint64_t tick = ps2x::stateVsyncTick();
         if (a.saving())
-            for (const auto &[addr, p] : m.playbackByMpeg)
-                if (playbackBusy(p) && !playbackAbandoned(m, p, tick))
-                    throw ps2x::StateError("a movie is playing");
+            if (const char *why = mpegStateBlockerLocked(m, tick))
+                throw ps2x::StateError(why);
         a.value(m.initialized);
         a.value(m.nextCallbackHandle);
         a.value(m.cdStreamGeneration);
@@ -3311,5 +3325,6 @@ namespace
             g_nextDemuxToken.store(demux);
     }
     [[maybe_unused]] const bool g_mpegStubStateRegistered = ps2x::registerStubState("stub-mpeg", &serializeMpegStubState);
+    [[maybe_unused]] const bool g_mpegStubStateBlockerRegistered = ps2x::registerStubStateBlocker("stub-mpeg", &mpegStateBlocker);
 }
 }

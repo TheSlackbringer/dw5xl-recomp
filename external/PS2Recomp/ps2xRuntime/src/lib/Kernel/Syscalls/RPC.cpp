@@ -5,7 +5,12 @@
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <string>
+#include <thread>
+#include <vector>
 
 namespace ps2_syscalls
 {
@@ -186,6 +191,100 @@ namespace ps2_syscalls
                 return false;
             }
             return runtime->eeScheduler().signalSemaphore(static_cast<int>(semaId), true) >= 0;
+        }
+
+        // Issue 009 v4.4 (design 1a): EE requests an IOP thread runs, by token (executor only). An empty entry is a WAIT
+        // request: its waiting thread ends the call when it resumes; otherwise the entry ends the NOWAIT call.
+        constexpr uint32_t kSifRpcWaitType = 3u; // waitExternal type (MPEG uses 1 and 2)
+        std::unordered_map<uint64_t, std::function<void()>> g_iop_rpc_calls;
+
+        void finishIopRpc(PS2Runtime *runtime, uint64_t token)
+        {
+            const auto it = g_iop_rpc_calls.find(token);
+            if (it == g_iop_rpc_calls.end())
+            {
+                return;
+            }
+            std::function<void()> finish = std::move(it->second);
+            g_iop_rpc_calls.erase(it);
+            if (finish)
+            {
+                finish();
+            }
+            else
+            {
+                runtime->eeScheduler().completeExternalWait(kSifRpcWaitType, token, KE_OK);
+            }
+        }
+
+        // DW5XL-DEBUG issue 009 v4.7: PS2X_PAUSE_AT_RPC=<sid hex|*>:<rpc hex|*>[:<n>[,<n>…]] asks a host pause the
+        // moment the nth such request starts (so it is in flight; counted from field PS2X_PAUSE_AT_RPC_FROM, default
+        // 0), a save while paused (PS2X_PAUSE_AT_RPC_SAVE=<file>), and the end of the pause after PS2X_PAUSE_AT_RPC_MS
+        // (default 2000). Used by issue_009_pause_rpc.py and issue_009_pause_resume.py.
+        void debugPauseAtRpc(PS2Runtime *runtime, uint32_t sid, uint32_t rpcNum)
+        {
+            struct Target
+            {
+                bool on = false, anySid = false, anyRpc = false;
+                uint32_t sid = 0u, rpc = 0u, holdMs = 2000u;
+                uint64_t fromField = 0u;
+                std::vector<uint32_t> nth{1u};
+            };
+            static const Target target = []
+            {
+                Target t;
+                const char *value = std::getenv("PS2X_PAUSE_AT_RPC");
+                if (!value || !*value)
+                    return t;
+                const std::string spec = value;
+                const size_t first = spec.find(':');
+                if (first == std::string::npos)
+                    return t;
+                const size_t second = spec.find(':', first + 1);
+                const std::string sidText = spec.substr(0, first);
+                const std::string rpcText = spec.substr(first + 1, second == std::string::npos ? std::string::npos : second - first - 1);
+                t.anySid = sidText == "*";
+                t.anyRpc = rpcText == "*";
+                t.sid = static_cast<uint32_t>(std::strtoul(sidText.c_str(), nullptr, 16));
+                t.rpc = static_cast<uint32_t>(std::strtoul(rpcText.c_str(), nullptr, 16));
+                if (second != std::string::npos)
+                {
+                    t.nth.clear();
+                    const std::string list = spec.substr(second + 1);
+                    for (size_t pos = 0; pos < list.size();)
+                    {
+                        const size_t comma = list.find(',', pos);
+                        t.nth.push_back(std::max(1u, static_cast<uint32_t>(std::strtoul(list.substr(pos, comma - pos).c_str(), nullptr, 10))));
+                        if (comma == std::string::npos)
+                            break;
+                        pos = comma + 1;
+                    }
+                }
+                if (const char *ms = std::getenv("PS2X_PAUSE_AT_RPC_MS"); ms && *ms)
+                    t.holdMs = static_cast<uint32_t>(std::strtoul(ms, nullptr, 10));
+                if (const char *from = std::getenv("PS2X_PAUSE_AT_RPC_FROM"); from && *from)
+                    t.fromField = std::strtoull(from, nullptr, 10);
+                t.on = true;
+                return t;
+            }();
+            static uint32_t seen = 0u;
+            if (!target.on || (!target.anySid && sid != target.sid) || (!target.anyRpc && rpcNum != target.rpc) ||
+                runtime->eeScheduler().currentVSyncTick() < target.fromField)
+                return;
+            if (std::find(target.nth.begin(), target.nth.end(), ++seen) == target.nth.end())
+                return;
+            // Called right after startRpc gave the request a token: it is running in its IOP thread now.
+            std::fprintf(stderr, "[pause-test] pause asked at request sid=0x%x rpc=0x%x #%u (in flight)\n", sid, rpcNum, seen);
+            runtime->setHostPaused(true);
+            if (const char *save = std::getenv("PS2X_PAUSE_AT_RPC_SAVE"); save && *save)
+                runtime->eeScheduler().requestState(EeScheduler::StateRequestKind::Save, save);
+            std::thread([runtime, holdMs = target.holdMs]()
+                        {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
+                            std::fprintf(stderr, "[pause-test] pause ends after %u ms\n", holdMs);
+                            runtime->setHostPaused(false);
+                        })
+                .detach();
         }
 
     } // namespace
@@ -568,6 +667,10 @@ namespace ps2_syscalls
         {
             completionSemaphore = endParameter;
         }
+        // Issue 009 v4.4 (design 1a): nonzero when the module's own IOP thread runs the request; the call then ends at
+        // the IOP's completion instead of here.
+        uint64_t asyncToken = 0u;
+        std::function<void()> traceReply; // DW5XL-DEBUG: the reply traces, once the reply is there
 
         {
             ps2x::iop::RpcRequest request{};
@@ -620,42 +723,67 @@ namespace ps2_syscalls
                 }
                 std::fputc('\n', stderr);
             }
-            iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
-            if (dw5Ksnh)
+            // A WAIT call from a callback (interrupt-like) must not block its thread: it runs at once, as before.
+            if ((mode & kSifRpcModeNowait) != 0u || !runtime->eeScheduler().insideInvocation())
             {
-                uint32_t r[6] = {};
-                if (receiveBuffer && receiveSize >= 24u)
-                    std::memcpy(r, getMemPtr(rdram, receiveBuffer), sizeof(r));
-                std::fprintf(stderr, "[dw5xl:ksnh] rpc=0x%x req=%x %x %x %x reply=%x %x %x %x %x %x\n", rpcNum,
-                             dw5Pre[0], dw5Pre[1], dw5Pre[2], dw5Pre[3], r[0], r[1], r[2], r[3], r[4], r[5]);
+                asyncToken = PS2IopTransport::startRpc(runtime, rdram, ctx, request);
+                if (asyncToken != 0u)
+                    debugPauseAtRpc(runtime, sid, rpcNum); // DW5XL-DEBUG issue 009 v4.7
             }
-            // DW5XL-DEBUG (temporary): log each (sid, rpc) once, then whenever its reply word 0 changes.
+            if (asyncToken != 0u)
             {
-                static std::unordered_map<uint64_t, std::pair<uint32_t, uint64_t>> seen;
-                const uint32_t replyAddr = iopResult.resultAddress ? iopResult.resultAddress : receiveBuffer;
-                uint32_t reply0 = 0xDEADBEEFu;
-                if (replyAddr && receiveSize >= 4u)
-                    std::memcpy(&reply0, getMemPtr(rdram, replyAddr), 4);
-                uint32_t send0 = 0u, send1 = 0u, send2 = 0u;
-                if (sendBuf && sendSize >= 12u)
-                {
-                    const uint8_t *q = getMemPtr(rdram, sendBuf);
-                    std::memcpy(&send0, q, 4); std::memcpy(&send1, q + 4, 4); std::memcpy(&send2, q + 8, 4);
-                }
-                const uint64_t key = (static_cast<uint64_t>(sid) << 32) | rpcNum;
-                auto [it, inserted] = seen.try_emplace(key, std::make_pair(reply0, 0ull));
-                ++it->second.second;
-                static const bool ksngTrace = std::getenv("PS2X_KSNG_TRACE") != nullptr; // DW5XL-DEBUG (read once: issue 025)
-                if (inserted || it->second.first != reply0 || ((sid == 0x4B534E47u || sid == 0x4B534E48u) && ksngTrace))
-                {
-                    it->second.first = reply0;
-                    std::cerr << "[dw5xl:rpc] sid=0x" << std::hex << sid << " rpc=0x" << rpcNum << " #" << std::dec
-                              << it->second.second << " send=" << sendSize << " [" << std::hex << send0 << " " << send1
-                              << " " << send2 << "] reply0=0x" << reply0 << " handled=" << iopResult.handled
-                              << " endFn=0x" << endFunction << std::dec << std::endl;
-                }
+                // As handleRpc reports a request it ran; the IOP thread writes the reply to the receive buffer itself.
+                iopResult.handled = true;
+                iopResult.resultAddress = receiveBuffer;
+                iopResult.serverDispatchPolicy = ps2x::iop::ServerDispatchPolicy::Suppress;
+                iopResult.signalNowaitCompletion = true;
+                iopResult.signalCompletion = true;
             }
+            else
+            {
+                iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+            }
+            traceReply = [=]()
+            {
+                if (dw5Ksnh)
+                {
+                    uint32_t r[6] = {};
+                    if (receiveBuffer && receiveSize >= 24u)
+                        std::memcpy(r, getMemPtr(rdram, receiveBuffer), sizeof(r));
+                    std::fprintf(stderr, "[dw5xl:ksnh] rpc=0x%x req=%x %x %x %x reply=%x %x %x %x %x %x\n", rpcNum,
+                                 dw5Pre[0], dw5Pre[1], dw5Pre[2], dw5Pre[3], r[0], r[1], r[2], r[3], r[4], r[5]);
+                }
+                // DW5XL-DEBUG (temporary): log each (sid, rpc) once, then whenever its reply word 0 changes.
+                {
+                    static std::unordered_map<uint64_t, std::pair<uint32_t, uint64_t>> seen;
+                    const uint32_t replyAddr = iopResult.resultAddress ? iopResult.resultAddress : receiveBuffer;
+                    uint32_t reply0 = 0xDEADBEEFu;
+                    if (replyAddr && receiveSize >= 4u)
+                        std::memcpy(&reply0, getMemPtr(rdram, replyAddr), 4);
+                    uint32_t send0 = 0u, send1 = 0u, send2 = 0u;
+                    if (sendBuf && sendSize >= 12u)
+                    {
+                        const uint8_t *q = getMemPtr(rdram, sendBuf);
+                        std::memcpy(&send0, q, 4); std::memcpy(&send1, q + 4, 4); std::memcpy(&send2, q + 8, 4);
+                    }
+                    const uint64_t key = (static_cast<uint64_t>(sid) << 32) | rpcNum;
+                    auto [it, inserted] = seen.try_emplace(key, std::make_pair(reply0, 0ull));
+                    ++it->second.second;
+                    static const bool ksngTrace = std::getenv("PS2X_KSNG_TRACE") != nullptr; // DW5XL-DEBUG (read once: issue 025)
+                    if (inserted || it->second.first != reply0 || ((sid == 0x4B534E47u || sid == 0x4B534E48u) && ksngTrace))
+                    {
+                        it->second.first = reply0;
+                        std::cerr << "[dw5xl:rpc] sid=0x" << std::hex << sid << " rpc=0x" << rpcNum << " #" << std::dec
+                                  << it->second.second << " send=" << sendSize << " [" << std::hex << send0 << " " << send1
+                                  << " " << send2 << "] reply0=0x" << reply0 << " handled=" << iopResult.handled
+                                  << " endFn=0x" << endFunction << std::dec << std::endl;
+                    }
+                }
+            };
+        }
 
+        const auto signalCompletion = [=]()
+        {
             if (iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)
             {
@@ -665,6 +793,11 @@ namespace ps2_syscalls
             {
                 (void)signalRpcCompletionSema(runtime, completionSemaphore);
             }
+        };
+        if (asyncToken == 0u)
+        {
+            traceReply();
+            signalCompletion();
         }
 
         uint32_t guestFunction = iopResult.guestFunction;
@@ -684,7 +817,10 @@ namespace ps2_syscalls
         }
         const bool serverDispatched = guestFunction != 0u && runtime->hasFunction(guestFunction);
 
-        auto finishCall = [=](const R5900Context *guestResult, R5900Context &parent)
+        // queued (issue 009 v4.4): the end of a NOWAIT request an IOP thread ran, at an event service: `parent` is a copy
+        // of the caller's context and the end function runs as an interrupt-like invocation, as the SIF interrupt
+        // handler runs it on a PS2.
+        auto finishCall = [=](const R5900Context *guestResult, R5900Context &parent, bool queued)
         {
             bool handled = iopResult.handled;
             uint32_t resultPointer = iopResult.resultAddress;
@@ -784,12 +920,17 @@ namespace ps2_syscalls
             callback.context = parent;
             callback.context.pc = callbackFunction;
             SET_GPR_U32(&callback.context, 4, endParameter);
-            SET_GPR_U32(&callback.context, 29, runtime->eeScheduler().invocationStackTop());
+            SET_GPR_U32(&callback.context, 29, queued ? 0u : runtime->eeScheduler().invocationStackTop());
             SET_GPR_U32(&callback.context, 31, 0u);
             callback.onComplete = [completeClient](const R5900Context &, R5900Context &base)
             {
                 completeClient(base, true);
             };
+            if (queued)
+            {
+                runtime->eeScheduler().queueInvocation(std::move(callback));
+                return;
+            }
             runtime->eeScheduler().invokeCurrent(std::move(callback));
         };
 
@@ -807,11 +948,38 @@ namespace ps2_syscalls
             SET_GPR_U32(&invocation.context, 31, 0u);
             invocation.onComplete = [finishCall](const R5900Context &completed, R5900Context &parent)
             {
-                finishCall(&completed, parent);
+                finishCall(&completed, parent, false);
             };
             runtime->eeScheduler().invokeCurrent(std::move(invocation));
         }
-        finishCall(nullptr, *ctx);
+        if (asyncToken != 0u)
+        {
+            // Issue 009 v4.4 (design 1a): the IOP thread runs the request in IOP time. WAIT: this thread waits in game
+            // time (other EE threads and the field clock keep going) and ends the call when it resumes. NOWAIT: the
+            // call returns 0 now with the client still busy; the completion ends it.
+            EeScheduler &scheduler = runtime->eeScheduler();
+            scheduler.setIopRpcCompletionHandler([runtime](uint64_t token) { finishIopRpc(runtime, token); });
+            if ((mode & kSifRpcModeNowait) == 0u)
+            {
+                g_iop_rpc_calls[asyncToken] = {};
+                scheduler.waitExternal(EeWaitReason::External, kSifRpcWaitType, asyncToken,
+                                       [traceReply, signalCompletion, finishCall](R5900Context &resume)
+                                       {
+                                           traceReply();
+                                           signalCompletion();
+                                           finishCall(nullptr, resume, false);
+                                       });
+            }
+            g_iop_rpc_calls[asyncToken] = [traceReply, signalCompletion, finishCall, caller = *ctx]() mutable
+            {
+                traceReply();
+                signalCompletion();
+                finishCall(nullptr, caller, true);
+            };
+            setReturnS32(ctx, 0);
+            return;
+        }
+        finishCall(nullptr, *ctx, false);
     }
 
     void SifRegisterRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

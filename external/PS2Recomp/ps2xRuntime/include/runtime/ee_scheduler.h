@@ -242,6 +242,7 @@ enum class EeEventType : uint8_t
     Dmac,
     ExternalWake,
     Alarm,
+    IopRpcComplete, // issue 009 v4.4 (design 1a): value = the request's token
 };
 
 struct EeEvent
@@ -335,6 +336,8 @@ public:
     [[noreturn]] void invokeCurrent(GuestInvocation invocation);
     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
     [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
+    // Issue 009 v4.4: the current thread runs an invocation (interrupt, callback, alarm ...), where it must not block.
+    [[nodiscard]] bool insideInvocation() const;
     [[nodiscard]] uint32_t invocationStackTop();
 
     int addIrqHandler(bool dmac,
@@ -361,6 +364,9 @@ public:
         bool fresh = false;
     };
     PresentationField waitForPresentationField(uint64_t lastShown) const;
+    // Issue 009 v4.4 (design 1a): called at an event service (executor, outside guest code) with the token of an EE
+    // request whose IOP part has ended.
+    void setIopRpcCompletionHandler(std::function<void(uint64_t)> handler) { m_iopRpcCompletion = std::move(handler); }
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
@@ -482,6 +488,8 @@ private:
     std::atomic<bool> m_hostPaused{false};
     std::atomic<bool> m_pauseHeld{false};
     std::atomic<uint64_t> m_pauseAskedField{0};   // the field the pause was asked at (for the [pause] log line)
+    std::atomic<int64_t> m_pauseAskedNs{0};       // issue 009 v4.7: when it was asked (steady clock; ask-to-hold time)
+    std::atomic<int64_t> m_pauseWaitSinceNs{0};   // issue 009 v4.7: start of the bounded wait for a quiet point
     std::atomic<bool> m_checkpointPending{false};
     uint32_t m_debugPublishCountdown = 0u;
 
@@ -501,6 +509,8 @@ private:
     uint64_t m_scheduledEndField = 0;
     std::chrono::steady_clock::time_point m_scheduledEndTime{};
     bool m_scheduledEndKnown = false;
+    // Issue 009 v4.4 (design 1a): finishes an EE request whose IOP part has ended (RPC.cpp registers it).
+    std::function<void(uint64_t)> m_iopRpcCompletion;
     std::atomic<bool> m_palVideoMode{false};
     uint32_t m_vsyncFlagAddress = 0;
     uint32_t m_vsyncTickAddress = 0;
@@ -516,8 +526,18 @@ private:
 
     // DW5XL (issue 027): the pending save/load request (any thread sets it; run() carries it out at a quiet point).
     bool serviceStateRequest(bool *handled = nullptr); // true when a state was loaded; handled: a request was carried out
+    void refuseStateRequest(const char *why); // issue 009 v4.7: drops the pending request with a "Can't …" message
+    // Issue 009 v4.8: the one stopping point of the machine, used by the host pause and every save and load. Queued
+    // completions are handed over; once nothing else keeps the game from a quiet point, the device finishes what it
+    // was given, the renderer flushes, and what that completed is handed over too. True: a quiet point.
+    [[nodiscard]] bool reachStoppingPoint(std::string *reason = nullptr);
+    // Completions (the device worker's idle wake-up, an IOP request's end) only mark threads ready or finish a
+    // request's EE side: no game code runs and no field passes. Other queued events stay queued, in order.
+    size_t handOverCompletions(); // how many were handed over
+    [[nodiscard]] bool completionQueuedLocked() const; // m_eventMutex held
     std::mutex m_stateRequestMutex;
     std::atomic<bool> m_stateRequestPending{false};
+    std::atomic<int64_t> m_stateAskedNs{0}; // DW5XL-DEBUG issue 009 v4.8: when the pending request was asked (test switch)
     StateRequestKind m_stateRequestKind = StateRequestKind::None;
     std::string m_stateRequestPath;
     std::string m_stateRequestBackup;

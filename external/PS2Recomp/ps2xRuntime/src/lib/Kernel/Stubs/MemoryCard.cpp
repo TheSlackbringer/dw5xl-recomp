@@ -1548,12 +1548,25 @@ namespace ps2_stubs
 {
 namespace
 {
+    // Issue 027 v6: the save section's refusal, also asked before a save or load starts (memoryCardStateBlocker).
+    const char *memoryCardStateBlockerLocked()
+    {
+        return !g_mcFiles.empty() || g_mcCommandPending ? "a memory card file is open or a card command is pending" : nullptr;
+    }
+
+    const char *memoryCardStateBlocker(uint64_t)
+    {
+        std::lock_guard lock(g_mcStateMutex);
+        return memoryCardStateBlockerLocked();
+    }
+
     void serializeMemoryCardStubState(ps2x::StateArchive &a)
     {
         std::lock_guard lock(g_mcStateMutex);
         a.tag("SMCD");
-        if (a.saving() && (!g_mcFiles.empty() || g_mcCommandPending))
-            throw ps2x::StateError("a memory card file is open or a card command is pending");
+        if (a.saving())
+            if (const char *why = memoryCardStateBlockerLocked())
+                throw ps2x::StateError(why);
         a.value(g_mcNextFd);
         a.value(g_mcLastCmd);
         a.value(g_mcLastResult);
@@ -1567,5 +1580,6 @@ namespace
             g_mcCommandPending = false;
     }
     [[maybe_unused]] const bool g_mcStubStateRegistered = ps2x::registerStubState("stub-memcard", &serializeMemoryCardStubState);
+    [[maybe_unused]] const bool g_mcStubStateBlockerRegistered = ps2x::registerStubStateBlocker("stub-memcard", &memoryCardStateBlocker);
 }
 }

@@ -3,6 +3,8 @@
 
 constexpr uint32_t kThreadReturnSentinel = 0x1FFFFF00u;
 constexpr uint32_t kCallReturnSentinel = 0x1FFFFF04u;
+// Issue 009 v4.4 (design 1a): a module's RPC thread returns here from a server function it ran for the EE.
+constexpr uint32_t kRpcServerReturnSentinel = 0x1FFFFF08u;
 constexpr uint64_t kIopClockHz = 36'864'000ull;
 // NTSC field cadence (approximately 59.94 Hz).  VBlank imports are
 // scheduler waits, not no-op timing hints: returning immediately lets

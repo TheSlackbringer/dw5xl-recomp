@@ -445,6 +445,9 @@ public:
     // tries again at its next quiet point.
     // backup (a load only): the running game is saved there first, once the state has passed its checks.
     bool performStateRequest(bool save, const std::string &path, bool &retry, const std::string &backup = {});
+    // Issue 009 v4.8 (executor): the VIF1/VU1/GIF device finishes what it was given and the renderer flushes (the
+    // scheduler's stopping point and the state request).
+    void drainDeviceWork();
     // Issue 027 v3: a short message about a save or load, shown in the window for a few seconds (any thread).
     void showStateMessage(std::string text);
     std::string stateMessage() const; // empty once it has been shown long enough
@@ -464,6 +467,11 @@ public:
     // are saved and loaded in registration order, each under its own section tag.
     using StateHook = std::function<void(ps2x::StateArchive &)>;
     void registerStateHook(std::string name, StateHook hook);
+    // Issue 027 v6: a component whose state hook can refuse a save registers the same check here (the reason, or
+    // nullptr), so a save or load is refused before anything is written. stateBlocker() asks the stubs and these.
+    using StateBlocker = std::function<const char *()>;
+    void registerStateBlocker(StateBlocker blocker);
+    [[nodiscard]] std::string stateBlocker() const;
 
     EeScheduler &eeScheduler();
     const EeScheduler &eeScheduler() const;
@@ -515,6 +523,7 @@ public:
 
     // Issue 023 3S: where the game picture was last drawn in the window (x, y, width, height in window pixels).
     // Issue 023 3S: pauses the whole guest for a host screen (window thread): EE held, IOP clock and audio stopped.
+    // Issue 009 v4.7: audio stops at once; the IOP clock when the EE holds (at a quiet point).
     void setHostPaused(bool paused);
     // Issue 023 3S: SPU2 key-ons with their samples while wanted() is true (set once, before the game runs; both are
     // called on the game's thread).
@@ -587,12 +596,22 @@ private:
     [[nodiscard]] bool canBindIopRpc(uint32_t sid) const noexcept;
     [[nodiscard]] bool hasEmulatedIopRpcServer(uint32_t sid) const noexcept;
     [[nodiscard]] ps2x::iop::RpcResult handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
+    // Issue 009 v4.4 (design 1a): the request run by the emulated module's RPC thread in IOP time; 0 = not possible
+    // (use handleIopRpc). Its end reaches the EE scheduler as an IopRpcComplete event.
+    [[nodiscard]] uint64_t startIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
+    [[nodiscard]] bool iopRpcInFlight() const noexcept;
+    [[nodiscard]] bool iopBusy() const noexcept; // issue 009 v4.5: a request in flight or a runnable IOP thread
+    void onHostPauseHeld(); // issue 009 v4.7 (executor): the EE holds a host pause; the IOP clock stops now
+    void onHostPauseReleased(); // issue 009 v4.7 (executor): a busy hold runs on for a save/load; the IOP clock goes on
+    void syncIopToHostClock() noexcept;
+    void onIopRpcCompleted(uint64_t token);
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
     void advanceIopEeCycles(uint64_t eeCycles) noexcept;
     void resetIop();
 
     friend class PS2IopTransport;
     friend class EeScheduler;
+    friend class PS2IopHostAdapter; // onIopRpcCompleted (issue 009 v4.4)
 
 private:
     PS2Memory m_memory;
@@ -641,6 +660,8 @@ private:
     Spu2KeyOnObserver m_spu2KeyOnObserver;
     mutable std::mutex m_hostPauseMutex;
     uint64_t m_hostPauseStartNs = 0, m_hostPausedTotalNs = 0;   // guarded by m_hostPauseMutex
+    bool m_hostPauseAsked = false;   // guarded by m_hostPauseMutex; the IOP clock stops only once the EE holds (009 v4.7)
+    std::atomic<int64_t> m_lastHostResumeNs{0}; // DW5XL-DEBUG issue 009 v4.7: the last end of a host pause (window frames after it)
     DebugUiCallback m_debugUiInitCallback = nullptr;
     DebugUiCallback m_debugUiDrawCallback = nullptr;
     DebugUiCallback m_debugUiShutdownCallback = nullptr;
@@ -665,6 +686,7 @@ private:
     std::vector<LoadedModule> m_loadedModules;
     void serializeState(ps2x::StateArchive &archive); // DW5XL (issue 027)
     std::vector<std::pair<std::string, StateHook>> m_stateHooks;
+    std::vector<StateBlocker> m_stateBlockers;
     uint8_t *m_boundRdram = nullptr;
     uint8_t *m_boundGSVram = nullptr;
 };

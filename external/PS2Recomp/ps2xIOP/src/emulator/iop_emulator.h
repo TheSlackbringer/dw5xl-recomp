@@ -29,6 +29,13 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
         void runEeCycles(uint64_t eeCycles) noexcept;
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+        // Issue 009 v4.4 (design 1a): the request run by the module's RPC thread in IOP time (0 = not possible).
+        [[nodiscard]] uint64_t startRpc(const RpcRequest &request);
+        [[nodiscard]] bool rpcInFlight() const noexcept;
+        // Issue 009 v4.5: the IOP has work now (a request in flight or a runnable thread).
+        [[nodiscard]] bool busy() const noexcept;
+        // Runs the host-clocked IOP up to the wall clock now (issue 009 v4.4: in steps while the EE waits).
+        void runToHostClock() noexcept;
         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
         void onSifTransfer(const SifTransfer &transfer);
 
