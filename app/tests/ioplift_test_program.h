@@ -41,6 +41,9 @@ namespace ioplift_test
     inline uint32_t anyReg(Rng &r) { return r.below(32u); }
     inline uint32_t baseReg(Rng &r) { return 8u + r.below(8u); }
 
+    // Issue 054: at most one Rng call per function call's arguments (their order is the compiler's choice: gcc and
+    // clang differ), so the program is the same whichever compiler builds the generator or the test. The order is
+    // clang's (left to right), the program 009 v4.5 was proven with.
     inline std::vector<uint32_t> program()
     {
         std::vector<uint32_t> w;
@@ -74,13 +77,17 @@ namespace ioplift_test
             {
                 static constexpr uint32_t ops[] = {0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26};
                 const uint32_t off = (r.below(9u) < 8u ? (r.below(32u) * 4u) : r.below(128u)) - 64u; // mostly aligned
-                w.push_back(iType(ops[r.below(sizeof(ops) / sizeof(ops[0]))], baseReg(r), destReg(r), off));
+                const uint32_t op = ops[r.below(sizeof(ops) / sizeof(ops[0]))];
+                const uint32_t base = baseReg(r);
+                w.push_back(iType(op, base, destReg(r), off));
             }
             else if (kind < 80)
             {
                 static constexpr uint32_t ops[] = {0x28, 0x29, 0x2A, 0x2B, 0x2E};
                 const uint32_t off = (r.below(9u) < 8u ? (r.below(32u) * 4u) : r.below(128u)) - 64u;
-                w.push_back(iType(ops[r.below(sizeof(ops) / sizeof(ops[0]))], baseReg(r), anyReg(r), off));
+                const uint32_t op = ops[r.below(sizeof(ops) / sizeof(ops[0]))];
+                const uint32_t base = baseReg(r);
+                w.push_back(iType(op, base, anyReg(r), off));
             }
             else if (kind < 92)
             {
@@ -103,8 +110,13 @@ namespace ioplift_test
                 const uint32_t target = codeAddress(r.below(randomWords));
                 w.push_back(((2u + r.below(2u)) << 26u) | ((target >> 2u) & 0x03FFFFFFu)); // J/JAL
             }
+            else if (r.below(2u))
+                w.push_back(rType(20u + r.below(2u), 0, 0, 0, 0x08)); // JR
             else
-                w.push_back(r.below(2u) ? rType(20u + r.below(2u), 0, 0, 0, 0x08) : rType(20u + r.below(2u), 0, destReg(r), 0, 0x09));
+            {
+                const uint32_t target = 20u + r.below(2u);
+                w.push_back(rType(target, 0, destReg(r), 0, 0x09)); // JALR
+            }
         }
         // Hand-written edge cases (the random part's branches stay inside it).
         const uint32_t edges[] = {

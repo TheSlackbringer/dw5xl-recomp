@@ -437,10 +437,30 @@ if(DW5XL_BUILD_TESTS)
     # Issue 009 v4.5: the IOP translator against the interpreter, on our own test program (translated at build time).
     add_executable(dw5xl_ioplift_testgen tests/ioplift_testgen.cpp)
     set(DW5XL_IOPLIFT_TEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/ioplift-test")
+    # Issue 054: a build machine of another system (Windows built on Linux: CI's windows-build) cannot run the
+    # programs built here; it builds app/host_tools with its own compiler and runs those copies.
+    if(CMAKE_CROSSCOMPILING AND NOT CMAKE_HOST_SYSTEM_NAME STREQUAL CMAKE_SYSTEM_NAME)
+        include(ExternalProject)
+        set(DW5XL_HOST_TOOLS_DIR "${CMAKE_CURRENT_BINARY_DIR}/host-tools")
+        set(DW5XL_IOPLIFT_TESTGEN "${DW5XL_HOST_TOOLS_DIR}/dw5xl_ioplift_testgen${CMAKE_HOST_EXECUTABLE_SUFFIX}")
+        set(DW5XL_IOPLIFT "${DW5XL_HOST_TOOLS_DIR}/dw5xl_ioplift${CMAKE_HOST_EXECUTABLE_SUFFIX}")
+        ExternalProject_Add(dw5xl_host_tools
+            SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/host_tools"
+            BINARY_DIR "${DW5XL_HOST_TOOLS_DIR}"
+            CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release
+            BUILD_ALWAYS ON # rebuilt (usually a no-op) on every build, so source changes reach the host copies
+            INSTALL_COMMAND ""
+            BUILD_BYPRODUCTS "${DW5XL_IOPLIFT_TESTGEN}" "${DW5XL_IOPLIFT}")
+        set(DW5XL_IOPLIFT_TOOLS dw5xl_host_tools "${DW5XL_IOPLIFT_TESTGEN}" "${DW5XL_IOPLIFT}")
+    else()
+        set(DW5XL_IOPLIFT_TESTGEN $<TARGET_FILE:dw5xl_ioplift_testgen>)
+        set(DW5XL_IOPLIFT $<TARGET_FILE:dw5xl_ioplift>)
+        set(DW5XL_IOPLIFT_TOOLS dw5xl_ioplift_testgen dw5xl_ioplift)
+    endif()
     add_custom_command(OUTPUT "${DW5XL_IOPLIFT_TEST_DIR}/iop_IOPTEST.cpp"
-        COMMAND $<TARGET_FILE:dw5xl_ioplift_testgen> "${DW5XL_IOPLIFT_TEST_DIR}/program.bin"
-        COMMAND $<TARGET_FILE:dw5xl_ioplift> --raw "${DW5XL_IOPLIFT_TEST_DIR}/program.bin" 80000 IOPTEST "${DW5XL_IOPLIFT_TEST_DIR}"
-        DEPENDS dw5xl_ioplift_testgen dw5xl_ioplift "${CMAKE_CURRENT_SOURCE_DIR}/tests/ioplift_test_program.h"
+        COMMAND "${DW5XL_IOPLIFT_TESTGEN}" "${DW5XL_IOPLIFT_TEST_DIR}/program.bin"
+        COMMAND "${DW5XL_IOPLIFT}" --raw "${DW5XL_IOPLIFT_TEST_DIR}/program.bin" 80000 IOPTEST "${DW5XL_IOPLIFT_TEST_DIR}"
+        DEPENDS ${DW5XL_IOPLIFT_TOOLS} "${CMAKE_CURRENT_SOURCE_DIR}/tests/ioplift_test_program.h"
         VERBATIM)
     add_executable(dw5xl_ioplift_test tests/ioplift_test.cpp "${DW5XL_IOPLIFT_TEST_DIR}/iop_IOPTEST.cpp")
     target_include_directories(dw5xl_ioplift_test PRIVATE tests "${PS2RECOMP_DIR}/ps2xIOP/src" "${PS2RECOMP_DIR}/ps2xIOP/include")
