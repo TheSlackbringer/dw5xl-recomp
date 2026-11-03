@@ -7,6 +7,13 @@
 // installed mode only); this test has no window: the drive is always ready.
 bool dw5xlDiscNotReady(uint32_t) { return false; }
 void dw5xlDiscChecked(uint32_t) {}
+// Record the installed-mode observer boundary; the game/disc wrapper remains the code under test.
+int originalCompleted = 0;
+bool originalEarned = false;
+void dw5xlOriginalCheckCompleted(PS2Runtime*, int, uint32_t which, bool success) {
+ ++originalCompleted; originalEarned = which == 0 && success;
+}
+void dw5xlOriginalCheckReset() { originalEarned = false; }
 extern const uint32_t g_ps2RecompiledFunctionTableBase=0x1000;
 extern const uint32_t g_ps2RecompiledFunctionTableEnd=0x1004;
 extern const uint32_t g_ps2RecompiledFunctionTableSlotCount=1;
@@ -24,9 +31,11 @@ struct Scratch {
 }
 namespace {
 int delegateCalls=0;
+bool fixtureSuccess=false;
 void delegate(uint8_t*,R5900Context* ctx,PS2Runtime*) {++delegateCalls;finishDiscCall(ctx,77);}
 void guestDiscCheck(uint8_t* ram,R5900Context* ctx,PS2Runtime* runtime) {
  if(ctx->pc==kDiscCheck) {
+  if(fixtureSuccess)discCheckSession.validation=dw5xl::discs::Validation::valid;
   SET_GPR_U32(ctx,31,0x637F24);discStatus(ram,ctx,runtime);
   require(getRegU32(ctx,2)==1,"original first poll sees tray open");
   SET_GPR_U32(ctx,29,discCheckSession.stack-0x1b0);
@@ -38,7 +47,7 @@ void guestDiscCheck(uint8_t* ram,R5900Context* ctx,PS2Runtime* runtime) {
  require(getRegU32(ctx,2)==2,"original readiness state advances");
  SET_GPR_U32(ctx,29,discCheckSession.stack);
  SET_GPR_U32(ctx,31,discCheckSession.returnPc);
- finishDiscCall(ctx,0); // Authentic cancellation leaves original caller in charge.
+ finishDiscCall(ctx,fixtureSuccess?1:0); // Original result remains the caller's result.
 }
 const RecompiledModuleEntry checkRows[]={{kDiscCheck,guestDiscCheck},{0x637F08,guestDiscCheck}};
 }
@@ -84,6 +93,16 @@ int main(){try{
  require(getRegU32(&other,2)==77&&delegateCalls==1,"unrelated callers delegate during check");
  checkImportedDisc(unusedRam,&checkContext,&checkRuntime);
  require(!discCheckSession.runtime&&checkContext.pc==0x1234&&getRegU32(&checkContext,2)==0,"original cancellation clears scope and returns zero");
+ require(originalCompleted==1&&!originalEarned,"cancelled original check cannot earn a remembered record");
+ fixtureSuccess=true;
+ checkContext.pc=kDiscCheck;SET_GPR_U32(&checkContext,4,0);SET_GPR_U32(&checkContext,31,0x637B28);
+ checkImportedDisc(unusedRam,&checkContext,&checkRuntime);
+ require(originalCompleted==1,"yielded check does not publish success early");
+ checkImportedDisc(unusedRam,&checkContext,&checkRuntime);
+ require(originalCompleted==2&&originalEarned&&getRegU32(&checkContext,2)==1,"completed verified manual DW5 check publishes success");
+ checkContext.pc=kDiscCheck;SET_GPR_U32(&checkContext,4,0);SET_GPR_U32(&checkContext,31,0x1234);
+ checkImportedDisc(unusedRam,&checkContext,&checkRuntime);checkImportedDisc(unusedRam,&checkContext,&checkRuntime);
+ require(originalCompleted==3&&!originalEarned,"another caller cannot earn a remembered record");
  require(checkRuntime.activateCompiledModule("test00"),"activate noncheck overlay");
  SET_GPR_U32(&other,31,0x637F68);discReady(unusedRam,&other,&checkRuntime);
  require(getRegU32(&other,2)==77&&delegateCalls==2,"same PC in other overlay delegates");

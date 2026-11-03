@@ -3,6 +3,7 @@
 #include "runtime/state_archive.h"
 #include "game_overrides.h"
 #include "dw5xl_disc_validation.h"
+#include "dw5xl_load_original.h"
 #include "runtime/ee_scheduler.h"
 #include "ps2_runtime_macros.h"
 #include <string>
@@ -120,8 +121,12 @@ void checkImportedDisc(uint8_t* ram,R5900Context* ctx,PS2Runtime* runtime) {
     if(original==end || original->address!=entry) {runtime->requestStop();return;}
     original->function(ram,ctx,runtime);
     // Do not clear on a dispatcher yield: continuation entries are wrapped too.
-    if(ctx->pc==discCheckSession.returnPc && getRegU32(ctx,29)==discCheckSession.stack)
+    if(ctx->pc==discCheckSession.returnPc && getRegU32(ctx,29)==discCheckSession.stack) {
+        dw5xlOriginalCheckCompleted(runtime,discCheckSession.threadId,discCheckSession.which,
+            discCheckSession.returnPc==0x637B28u &&
+            discCheckSession.validation==dw5xl::discs::Validation::valid && getRegU32(ctx,2)!=0);
         discCheckSession.clear();
+    }
 }
 
 bool prepareDiscHooks(PS2Runtime& runtime) {
@@ -149,6 +154,7 @@ void queueLoad(uint8_t* ram,R5900Context* ctx,PS2Runtime* runtime) {
     // is wrapped; original continuation aliases do not rerun invalidation.
     if(dw5xl::overlays::invalidateForLoadDestination(*runtime,getRegU32(ctx,6),kOverlayBase)) {
         discCheckSession.clear();
+        dw5xlOriginalCheckReset();
         std::fprintf(stderr,"[dw5xl:overlay] invalidated before queued load; resource=0x%x generation=%llu\n",
                      getRegU32(ctx,5),static_cast<unsigned long long>(runtime->compiledModuleGeneration()));
     }
@@ -220,7 +226,7 @@ void installOverlays(PS2Runtime& runtime) {
     runtime.registerStateBlocker(discCheckBlocker);
     runtime.registerStateHook("DISC",[](ps2x::StateArchive& a){
         if(a.saving()) if(const char* why=discCheckBlocker()) throw ps2x::StateError(why);
-        if(a.loading()) discCheckSession.clear();
+        if(a.loading()) { discCheckSession.clear(); dw5xlOriginalCheckReset(); }
     });
     supportedOverlays[2].module=&adaptedOvl02.descriptor;
     for(const auto& image:supportedOverlays)

@@ -40,7 +40,7 @@ Download the latest release from the [Releases](https://github.com/TheSlackbring
 
 **First start:** choose your XL disc image (and optionally the DW5 one) and press **Start**. The disc is checked, and the game is translated and compiled for your PC — about 10 minutes, once. Every later start opens the game directly; a new release rebuilds once without asking for the disc again.
 
-**Load Original:** when the game asks for the Dynasty Warriors 5 disc, a window opens over the game: choose that disc image and press **Install**. You can also add or repair discs any time with **F10**.
+**Load Original:** add your Dynasty Warriors 5 disc during setup or through **F10**. Once verified, Musou and Free Mode are available automatically on future launches while the DW5 files remain installed. If you installed DW5 with an older release, use **Load Original** once or re-add the disc to remember it. When the game asks for a missing disc, choose its image in the window and press **Install** as before. F10 also lets you remove DW5; your saves, settings and DW5XL files are kept.
 
 Saves, settings and logs are kept in `%LOCALAPPDATA%\DW5XL` (Windows) or `~/.local/share/dw5xl` (Linux), so updating the release keeps them. If something goes wrong, please attach the files from its `logs` folder to an issue.
 
@@ -93,7 +93,7 @@ Up/Down picks a setting, Left/Right changes it, and Cross on DEFAULT resets them
 | **F8** | Show the build ID and game tick (for bug reports). |
 | **F9** | Load state: goes back to the moment of the last F5. |
 | **Shift+F9** | Undo the last load: goes back to where you were before pressing F9. |
-| **F10** | Discs window: see the installed discs, add or repair the DW5 disc, check the files. |
+| **F10** | Discs window: see installed discs, add, repair or remove DW5, check the files. |
 
 Save states (the quick slot, SLOT 1–5, and the state before the last load, each with its picture) are kept in the `states` folder next to the game files and keep working after updates; a state is only refused when an update changed what a state holds.
 

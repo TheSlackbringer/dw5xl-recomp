@@ -15,6 +15,8 @@
 #include "ps2_debug_panel.h"
 #include "wizard_ui.h"
 #include "dw5xl_pc_settings.h"
+#include "dw5xl_load_original.h"
+#include "load_original.h"
 
 #include "imgui.h"
 #include "raylib.h"
@@ -41,6 +43,7 @@ std::atomic<bool> g_closeWindow{false};   // the requested disc is installed: cl
 bool g_discsWindow = false;             // F10 (runtime/hotkeys.h)
 std::unique_ptr<DiscInstallPanel> g_panel;
 std::string g_checkResult;
+bool g_removeOriginal = false;
 
 fs::path bootElfName() { return fs::path(kCodegenProfiles[0].input).filename(); }
 
@@ -64,10 +67,20 @@ void logToFile(const fs::path &dataDir)
 // changed to the game files) when the game should boot; false with `exitCode` when the process should end.
 bool dw5xlInstalledBoot(int argc, char **argv, fs::path &elf, int &exitCode)
 {
-    const fs::path data = playerDataDir();
+    fs::path data = playerDataDir();
     if (data.empty())
     {
         std::fprintf(stderr, "[install] no player data folder (set DW5XL_DATA_DIR)\n");
+        exitCode = 1;
+        return false;
+    }
+    // Keep portable overrides anchored to the launch directory. Installed play
+    // changes cwd to the XL folder before the background check and F10 use it.
+    std::error_code pathError;
+    data = fs::absolute(data, pathError);
+    if (pathError)
+    {
+        std::fprintf(stderr, "[install] cannot resolve the player data folder: %s\n", pathError.message().c_str());
         exitCode = 1;
         return false;
     }
@@ -152,6 +165,7 @@ bool dw5xlInstalledBoot(int argc, char **argv, fs::path &elf, int &exitCode)
     }
     std::fprintf(stderr, "[install] playing from %s\n", utf8(fs::current_path()).c_str());
     g_dataDir = data;
+    dw5xlStartOriginalCheck(data);
     elf = fs::path(".") / bootElfName();
     return true;
 }
@@ -260,6 +274,22 @@ void drawOverlay()
                     if (g_checkResult.empty())
                         g_checkResult = "All installed files are there with the right sizes.";
                 }
+                if (ImGui::Button("Remove DW5..."))
+                    g_removeOriginal = true;
+                if (g_removeOriginal)
+                {
+                    ImGui::TextWrapped("Remove the installed DW5 disc files? Saves, settings and DW5XL are kept. "
+                                       "Close the game afterwards; add the DW5 disc again to restore these modes.");
+                    if (ImGui::Button("Remove DW5 files"))
+                    {
+                        std::string error;
+                        g_checkResult = removeOriginal(g_dataDir, error) ? "DW5 removed. Close the game before playing again." : error;
+                        g_removeOriginal = false;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Keep DW5"))
+                        g_removeOriginal = false;
+                }
                 if (!g_checkResult.empty())
                     ImGui::TextWrapped("%s", g_checkResult.c_str());
             }
@@ -281,6 +311,7 @@ void drawOverlay()
         g_discsWindow = false;
         g_panel.reset();
         g_checkResult.clear();
+        g_removeOriginal = false;
     }
 }
 } // namespace

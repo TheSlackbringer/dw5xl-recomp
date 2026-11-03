@@ -1,6 +1,7 @@
 #include "setup_pipeline.h"
 #include "codegen.h"
 #include "install_state.h"
+#include "load_original.h"
 #include "setup_cache.h"
 #include "setup_layout.h"
 #include "vu1lift/vu1_translator.h"
@@ -473,6 +474,13 @@ void SetupRun::runSteps()
         before += last;
         ctx.log(std::string("copied ") + image.disc->name + " to game/" + image.disc->folder);
         if (!writeInstallMarker(data, *image.disc, error))
+        {
+            fail(error);
+            return;
+        }
+        // All supported entry points (wizard, Insert-disc, F10 and --add-disc)
+        // share this verified extraction. Mere file presence never earns a record.
+        if (image.disc->files.data() == kSupportedDiscs[1].files.data() && !rememberOriginal(data, error))
         {
             fail(error);
             return;
