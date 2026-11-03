@@ -19,6 +19,9 @@ import subprocess
 import zsync_file
 
 NOTES_DIR = Path(__file__).with_name('notes')
+CHANGELOG_HEADING = '<h2>Changelog</h2>'  # the end of notes/template.html; the owner writes below it
+CHANGELOG_PLACEHOLDER = '<!-- Write the changelog here before publishing; CI keeps it when it updates the draft. -->'
+CI_COMMENT = '<!-- CI:'
 SERIES = 'v0.1.0-beta'
 RETIRED_SERIES = ('v0.1.0-alpha',)  # an unpublished draft of these becomes the next draft of SERIES
 # Package file names per platform: prefix + version + suffix (issue 044: the AppImage names the project, not Linux),
@@ -121,14 +124,26 @@ def package_for_version(source, version):
     return (target, checksum) if zsync is None else (target, checksum, zsync_file.rename(zsync, target))
 
 
-def release_body(version, commit, run_id, subject, platforms):
+def release_body(version, commit, run_id, subject, platforms, current=None):
+    """A version's own notes file, else the owner's release template (notes/template.html, ending in the Changelog
+    heading) with the changelog the owner wrote into the draft, kept across updates. CI's details are an HTML
+    comment, so the page looks like the published releases."""
+    first_line = subject.splitlines()[0] if subject else ''
     metadata = (f'Built by GitHub Actions from {commit} (run {run_id}) after every test job passed.\n\n'
                 f'{platforms} builder packages: launcher, compiler, sources and tools. '
                 'The first start builds the game from your own disc.\n\n'
-                f'Latest commit: {subject.splitlines()[0] if subject else ""}\n\n'
+                f'Latest commit: {first_line}\n\n'
                 'Draft packages are updated by CI until the owner publishes this version.')
     notes = NOTES_DIR / f'{version}.md'
-    return notes.read_text().rstrip() + '\n\n---\n\n' + metadata if notes.is_file() else metadata
+    if notes.is_file():
+        return notes.read_text().rstrip() + '\n\n---\n\n' + metadata
+    template = (NOTES_DIR / 'template.html').read_text().rstrip('\n') + '\n'
+    changelog = CHANGELOG_PLACEHOLDER
+    if current and CHANGELOG_HEADING in current:
+        changelog = current.split(CHANGELOG_HEADING, 1)[1].split(CI_COMMENT, 1)[0].strip('\n') or changelog
+    details = (f'built by GitHub Actions from {commit} (run {run_id}) after every test job passed; latest commit: '
+               f'{first_line}. CI updates the packages until the owner publishes this version.').replace('--', '-')
+    return f'{template}{changelog}\n\n{CI_COMMENT} {details} -->\n'
 
 
 def update_draft(github, source, commit, run_id, subject, series=SERIES):
@@ -142,7 +157,7 @@ def update_draft(github, source, commit, run_id, subject, series=SERIES):
             'tag_name': version,
             'target_commitish': commit,
             'name': f'DW5XL {version}',
-            'body': release_body(version, commit, run_id, subject, platforms),
+            'body': release_body(version, commit, run_id, subject, platforms, release and release.get('body')),
         }
         try:
             if release is None:

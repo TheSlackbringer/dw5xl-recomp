@@ -6,7 +6,8 @@ import tempfile
 import unittest
 
 from test_zsync_file import write_zsync
-from update_draft import GitHub, PublishedDuringUpdate, package_for_version, select_release, update_draft
+from update_draft import (CHANGELOG_PLACEHOLDER, NOTES_DIR, GitHub, PublishedDuringUpdate, package_for_version,
+                          select_release, update_draft)
 import zsync_file
 
 
@@ -217,6 +218,36 @@ class DraftLifecycleTest(unittest.TestCase):
         github.create({'tag_name': 'v0.1.0-beta.6'})
         payload = {'tag_name': 'v0.1.0-beta.6', 'draft': True, 'prerelease': False}
         self.assertEqual(calls, [('releases', {'method': 'POST', 'payload': payload})])
+
+    def test_draft_uses_the_owner_template_with_ci_details_hidden(self):
+        github = FakeGitHub([])
+        self.update(github)
+        body = github.state[0]['body']
+        self.assertTrue(body.startswith((NOTES_DIR / 'template.html').read_text().rstrip('\n') + '\n'))
+        self.assertIn('<h2>Changelog</h2>\n' + CHANGELOG_PLACEHOLDER + '\n\n<!-- CI:', body)
+        self.assertRegex(body, r'<!-- CI: built by GitHub Actions from 123abcd \(run 42\) after every test job passed; '
+                               r'latest commit: Release fix\. [^\n]*-->\n\Z')
+        self.assertNotIn('second line', body)
+
+    def test_owner_changelog_survives_the_next_update(self):
+        github = FakeGitHub([])
+        self.update(github)
+        github.state[0]['body'] = github.state[0]['body'].replace(CHANGELOG_PLACEHOLDER, 'Fix package naming\n</br>\nF5')
+        renamed = Path(self.scratch.name) / 'DW5XL-v0.1.0-beta.1-windows-x64.zip'
+        update_draft(github, renamed, '456cdef', '43', 'Next fix')
+        body = github.state[0]['body']
+        self.assertIn('<h2>Changelog</h2>\nFix package naming\n</br>\nF5\n\n<!-- CI: built by GitHub Actions from 456cdef', body)
+        self.assertEqual((body.count('<!-- CI:'), body.count('<h2>Changelog</h2>')), (1, 1))
+        self.assertNotIn(CHANGELOG_PLACEHOLDER, body)
+
+    def test_old_ci_body_becomes_the_template(self):
+        old = {**release('v0.1.0-beta.8', True), 'body': 'Built by GitHub Actions from abc (run 1).\n\nLatest commit: x'}
+        github = FakeGitHub([old])
+        self.update(github)
+        body = github.state[0]['body']
+        self.assertTrue(body.startswith('<h1>Dynasty Warriors 5: Xtreme Legends'))
+        self.assertIn(CHANGELOG_PLACEHOLDER, body)
+        self.assertNotIn('Latest commit:', body)
 
     def test_old_linux_package_name_is_refused(self):
         old = Path(self.scratch.name) / 'DW5XL-123abcd-linux-x86_64.AppImage'

@@ -1,0 +1,37 @@
+<h1>Dynasty Warriors 5: Xtreme Legends — Native PC Port</h1>
+<p>This port uses static recompilation (MIPS R5900 → C++) and Vulkan rendering. The download contains no disc files, translated game code or compiled game. Everything needed from the game is extracted and built locally from your own disc image.</p>
+<h2>What you need</h2>
+<ul>
+<li><strong>Dynasty Warriors 5 Xtreme Legends</strong>, PAL <strong>SLES-53860</strong>, as an ISO.</li>
+<li>Optional: <strong>Dynasty Warriors 5</strong>, PAL <strong>SLES-53339</strong>, for Load Original.</li>
+<li>An x86-64 CPU with AVX2 and a Vulkan-compatible graphics card with current drivers.</li>
+<li>Windows 10 (1903 or newer) / Windows 11, or Linux with glibc 2.31 or newer.</li>
+</ul>
+<p>No separate compiler, Git or Python installation is required. The first build works offline.</p>
+<h2>Linux: AppImage</h2>
+<ol>
+<li>Download <strong><code>DW5XL.AppImage</code></strong>.</li>
+<li>Mark it executable in your file manager, then open it.</li>
+<li>Select your XL ISO, optionally select the DW5 ISO, and click <strong>Start</strong>.</li>
+<li>Let setup verify the disc, translate the code and compile the game. Allow several minutes; the time depends on your CPU. The game starts when setup finishes.</li>
+</ol>
+<p>Open the same AppImage again to play. Linux updates reuse unchanged build files where possible; your saves and settings stay in the player data folder.</p>
+<h2>Windows: ZIP</h2>
+<ol>
+<li>Download <strong><code>DW5XL.windows-x64.zip</code></strong> and extract it to a short path such as <code>C:\Games\DW5XL</code>.</li>
+<li>Keep the extracted files together and launch <strong><code>DW5XL.exe</code></strong>. If SmartScreen warns about the unsigned program, choose <strong>More info → Run anyway</strong>.</li>
+<li>Select your XL ISO, optionally select the DW5 ISO, and click <strong>Start</strong>. The first start builds the game locally; later starts launch it directly.</li>
+</ol>
+<p>For <strong>Load Original</strong>, add your DW5 ISO during setup or through the <strong>F10</strong> Discs window.</p>
+
+<h2>Game data and saves</h2>
+<ul>
+<li><strong>Windows:</strong> <code>%LOCALAPPDATA%\DW5XL\</code></li>
+<li><strong>Linux:</strong> <code>$XDG_DATA_HOME/dw5xl/</code>, normally <code>~/.local/share/dw5xl/</code></li>
+</ul>
+<p>Within that folder, the compiled game is in <code>build/</code> and memory-card saves are in <code>game/dw5xl/mc0/</code>. Game files, settings and logs also stay there, separately from the downloaded ZIP or AppImage. Keep this data folder when updating to retain your progress.</p>
+<h2>Source and licenses</h2>
+<p><a href="https://github.com/TheSlackbringer/dw5xl-recomp">Source code</a> is available under GPL-3.0. Third-party license notices are included with the bundled tools and libraries.</p>
+<p>This is an unofficial, non-commercial fan project, unaffiliated with Koei Tecmo Games or Sony Interactive Entertainment.</p>
+<hr>
+<h2>Changelog</h2>
