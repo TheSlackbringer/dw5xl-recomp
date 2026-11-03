@@ -19,16 +19,18 @@ bool firstMenu = true;
 
 void reader(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
 {
-    if (firstMenu && getRegU32(ctx, 31) == kMenuReturn) {
+    const bool menu = getRegU32(ctx, 31) == kMenuReturn;
+    // Every menu read: loading a save state can put the flag back to 0.
+    if (menu && readiness.allowed()) {
+        // The original setter is immediate (JR RA; SW A0,-0x7974(GP)).
+        // Run it with a private register context; the real caller sees only its ordinary reader result.
+        auto setterContext = *ctx;
+        SET_GPR_U64(&setterContext, 4, 1);
+        setterContext.pc = kSetter;
+        originalSetter(ram, &setterContext, runtime);
+    }
+    if (firstMenu && menu) {
         firstMenu = false;
-        if (readiness.allowed()) {
-            // The original setter is immediate (JR RA; SW A0,-0x7974(GP)).
-            // Run it with a private register context; the real caller sees only its ordinary reader result.
-            auto setterContext = *ctx;
-            SET_GPR_U64(&setterContext, 4, 1);
-            setterContext.pc = kSetter;
-            originalSetter(ram, &setterContext, runtime);
-        }
         const char *installed = readiness.installed == InstallState::Installed ? "installed" :
                                 readiness.installed == InstallState::Incomplete ? "incomplete" : "missing";
         const char *checked = readiness.check == OriginalCheck::valid ? "valid" :
