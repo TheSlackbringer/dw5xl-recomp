@@ -3,6 +3,7 @@
 // the pump must return at once; afterwards every byte arrives, in order; after drain() writes go straight through.
 #include "runtime/ps2_stdio_pump.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +19,7 @@
 #define T_WRITE _write
 #define T_CLOSE _close
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #define T_PIPE(fds) pipe(fds)
 #define T_DUP dup
@@ -161,6 +163,45 @@ int main()
         T_CLOSE(err);
         T_CLOSE(a[0]);
         T_CLOSE(b[0]);
+    }
+
+    // Issue 053: a small pump pipe. A PC whose account is over the kernel's per-user pipe limit gives a new pipe only
+    // 8 KB and refuses a bigger one, so the pump must hold the backlog itself. A 4 KB pump pipe in front of an unread
+    // 4 KB destination: 40 KB of writes return at once, then every byte arrives in order. (Before 053 the writes
+    // blocked; the case then reports FAIL after 2 s instead of hanging, and reads the destination to let them finish.)
+    {
+        int small[2];
+        if (T_PIPE(small) != 0)
+        {
+            std::printf("FAIL cannot create the small destination pipe\n");
+            return 1;
+        }
+#if defined(F_SETPIPE_SZ)
+        fcntl(small[1], F_SETPIPE_SZ, 4096); // Windows: T_PIPE already makes it 4 KB
+#endif
+        const int writer = T_DUP(small[1]);
+        T_CLOSE(small[1]);
+        check(ps2x::stdio_pump::installFd(writer, 4096), "pump installed with a 4 KB pipe");
+        std::atomic<bool> done{false};
+        double ms = 0.0;
+        std::thread writes([&] {
+            const auto start = std::chrono::steady_clock::now();
+            for (size_t at = 0; at < expected.size(); at += 100)
+                T_WRITE(writer, expected.data() + at, 100);
+            ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            done = true;
+        });
+        for (int waited = 0; waited < 2000 && !done; waited += 10)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const bool returned = done;
+        std::printf("      small pipe: 400 writes %s (%.2f ms)\n", returned ? "returned" : "still blocked after 2 s", ms);
+        check(returned && ms < 200.0, "small pipe: writes return while the destination is not being read");
+        const std::string got = readExactly(small[0], expected.size());
+        writes.join();
+        check(got == expected, "small pipe: every byte arrives, in order");
+        ps2x::stdio_pump::drain();
+        T_CLOSE(writer);
+        T_CLOSE(small[0]);
     }
 
     std::printf("%s\n", g_failures ? "stdio_pump: FAIL" : "stdio_pump: PASS");

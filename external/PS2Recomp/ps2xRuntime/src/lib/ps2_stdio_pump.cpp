@@ -129,16 +129,53 @@ namespace ps2x::stdio_pump
             }
         }
 
+        // Issue 053: the backlog waits in the pump's memory, not in the pipe. A PC whose account is over the kernel's
+        // per-user pipe limit gives the pipe only 8 KB and refuses F_SETPIPE_SZ, and a lagging destination must still
+        // not stall the program's writes. This thread only empties the pipe into the queue; a second one writes the
+        // queue to the destination, in order. Bounded: past kBacklogBytes the reader waits, as a full pipe did.
+        constexpr size_t kBacklogBytes = size_t{64} << 20;
+
         void copyLoop(int pipeRead, int destination)
         {
+            std::mutex mutex;
+            std::condition_variable changed;
+            std::deque<std::string> chunks;
+            size_t queued = 0;
+            bool ended = false;
+            std::thread writer([&] {
+                std::unique_lock<std::mutex> lock(mutex);
+                for (;;)
+                {
+                    changed.wait(lock, [&] { return !chunks.empty() || ended; });
+                    if (chunks.empty())
+                        return; // every write end closed and everything written: drained
+                    std::string chunk = std::move(chunks.front());
+                    chunks.pop_front();
+                    lock.unlock();
+                    writeAll(destination, chunk.data(), chunk.size());
+                    lock.lock();
+                    queued -= chunk.size();
+                    changed.notify_all();
+                }
+            });
             char buffer[16384];
             for (;;)
             {
                 const auto n = PUMP_READ(pipeRead, buffer, sizeof(buffer));
                 if (n <= 0)
-                    return; // every write end closed: drained
-                writeAll(destination, buffer, static_cast<size_t>(n));
+                    break; // every write end closed
+                std::unique_lock<std::mutex> lock(mutex);
+                changed.wait(lock, [&] { return queued == 0 || queued + static_cast<size_t>(n) <= kBacklogBytes; });
+                chunks.emplace_back(buffer, static_cast<size_t>(n));
+                queued += static_cast<size_t>(n);
+                changed.notify_all();
             }
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                ended = true;
+            }
+            changed.notify_all();
+            writer.join();
         }
 
 #if defined(_WIN32)
