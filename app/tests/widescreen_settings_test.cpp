@@ -1,11 +1,17 @@
 // Issue 047: the aspect and FOV keys of dw5xl.ini, in a private settings file.
 #include "dw5xl_widescreen.h"
+#include "ps2_runtime.h"
 
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <random>
 #include <string>
+
+extern const uint32_t g_ps2RecompiledFunctionTableBase = 0x1000;
+extern const uint32_t g_ps2RecompiledFunctionTableEnd = 0x1004;
+extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = 1;
+PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[] = {nullptr};
 
 using namespace dw5xl::widescreen;
 namespace {
