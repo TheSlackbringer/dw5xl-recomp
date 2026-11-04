@@ -12,6 +12,8 @@ fi
 # The renderer patches must apply in order on the pinned paraLLEl-GS revision (BUILDING.md),
 # exactly as a fresh checkout applies them: git apply vendor/parallel-gs-patches/*.patch.
 pgs_repo=app/deps/parallel-gs
+# In a linked worktree git gives hooks GIT_DIR and GIT_INDEX_FILE, which would point these at the wrong repository.
+pgs_git() { env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE git "$@"; }
 if git diff --cached --name-only | grep -q '^vendor/parallel-gs-patches/'; then
     # The pinned revision lives in one place: BUILDING.md's checkout command.
     pgs_rev=$(git show :BUILDING.md | sed -n 's#^git -C app/deps/parallel-gs checkout \([0-9a-f]\{40\}\)$#\1#p' | head -1)
@@ -19,16 +21,16 @@ if git diff --cached --name-only | grep -q '^vendor/parallel-gs-patches/'; then
         echo "Commit blocked: BUILDING.md has no 'git -C app/deps/parallel-gs checkout <revision>' line." >&2
         exit 1
     fi
-    if ! git -C "$pgs_repo" cat-file -e "$pgs_rev^{commit}" 2>/dev/null; then
+    if ! pgs_git -C "$pgs_repo" cat-file -e "$pgs_rev^{commit}" 2>/dev/null; then
         echo "Commit blocked: cannot check vendor/parallel-gs-patches ($pgs_repo at $pgs_rev is missing)." >&2
         exit 1
     fi
     tmp=$(mktemp -d)
     trap 'rm -rf -- "$tmp"' EXIT
-    git -C "$pgs_repo" archive "$pgs_rev" | tar -x -C "$tmp"
+    pgs_git -C "$pgs_repo" archive "$pgs_rev" | tar -x -C "$tmp"
     # The staged version of every patch in the series, in file name order.
     for path in $(git ls-files --cached 'vendor/parallel-gs-patches/*.patch' | sort); do
-        if ! git show ":$path" | (cd "$tmp" && git apply --whitespace=nowarn -); then
+        if ! git show ":$path" | (cd "$tmp" && pgs_git apply --whitespace=nowarn -); then
             echo "Commit blocked: $path does not apply after the patches before it (on $pgs_rev)." >&2
             echo "Export each patch against the previous patches, not against upstream." >&2
             exit 1

@@ -435,6 +435,21 @@ namespace
 // Buttons: UP DOWN LEFT RIGHT START SELECT CROSS CIRCLE SQUARE TRIANGLE
 //          L1 R1 L2 R2 L3 R3
 // ---------------------------------------------------------------------------
+// DW5XL issue 047: the game picture's shape in the window, width / height; 0 = its own display size.
+static std::atomic<float> s_pictureShape{0.0f};
+// DW5XL issue 047: PC SETTINGS' SHARPEN, contrast-adaptive sharpening of the picture as the window draws it (above 1x).
+static std::atomic<bool> s_presentSharpen{false};
+static const char *const kPresentSharpenShader = R"(#version 330
+in vec2 fragTexCoord; in vec4 fragColor; out vec4 finalColor; uniform sampler2D texture0; uniform vec2 texel;
+void main() {
+  vec3 c = texture(texture0, fragTexCoord).rgb;
+  vec3 n = texture(texture0, fragTexCoord + vec2(0.0, -texel.y)).rgb, e = texture(texture0, fragTexCoord + vec2(texel.x, 0.0)).rgb;
+  vec3 w = texture(texture0, fragTexCoord + vec2(-texel.x, 0.0)).rgb, u = texture(texture0, fragTexCoord + vec2(0.0, texel.y)).rgb;
+  vec3 lo = min(c, min(n, min(e, min(w, u)))), hi = max(c, max(n, max(e, max(w, u))));
+  vec3 a = clamp(min(lo, 1.0 - hi) / max(hi, vec3(0.001)), 0.0, 1.0); vec3 k = -sqrt(a) * 0.2;
+  finalColor = vec4(clamp((c + (n + e + w + u) * k) / (1.0 + 4.0 * k), 0.0, 1.0), 1.0);
+})";
+
 namespace ps2x_dev
 {
     std::atomic<uint32_t> g_padPressedMask{0u}; // read by ps2_pad.cpp
@@ -506,7 +521,21 @@ namespace ps2x_dev
         img.height = static_cast<int>(s_lastFrameH);
         img.mipmaps = 1;
         img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-        const bool ok = ExportImage(img, path.c_str());
+        // DW5XL issue 047: a dump shows a wide picture's shape in the window. A 4:3 window keeps the stored picture,
+        // so frame comparisons with earlier builds still work.
+        const float shape = s_pictureShape.load(std::memory_order_relaxed);
+        bool ok = false;
+        if (shape > 1.5f)
+        {
+            Image wide = ImageCopy(img);
+            ImageResize(&wide, static_cast<int>(std::lround(static_cast<float>(img.height) * shape)), img.height);
+            ok = ExportImage(wide, path.c_str());
+            UnloadImage(wide);
+        }
+        else
+        {
+            ok = ExportImage(img, path.c_str());
+        }
         std::cerr << "[dev] shot " << path << (ok ? " ok" : " FAILED") << std::endl;
         return ok;
     }
@@ -3137,6 +3166,14 @@ void PS2Runtime::freeGuestBlockLocked(uint32_t guestAddr)
     coalesceGuestHeapLocked();
 }
 
+void PS2Runtime::setPresentSharpen(bool on) { s_presentSharpen.store(on, std::memory_order_relaxed); }
+bool PS2Runtime::presentSharpen() const { return s_presentSharpen.load(std::memory_order_relaxed); }
+
+void PS2Runtime::setPictureShape(float widthOverHeight)
+{
+    s_pictureShape.store(widthOverHeight, std::memory_order_relaxed);
+}
+
 void PS2Runtime::configureGuestHeap(uint32_t guestBase, uint32_t guestLimit)
 {
     std::lock_guard<std::mutex> lock(m_guestHeapMutex);
@@ -3906,8 +3943,9 @@ void PS2Runtime::run()
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         // Letterbox by the logical display size, not the stored image size.
-        const float aspectWidth = static_cast<float>(std::max<uint32_t>(1u, displayWidth));
         const float aspectHeight = static_cast<float>(std::max<uint32_t>(1u, displayHeight));
+        const float pictureShape = s_pictureShape.load(std::memory_order_relaxed);   // DW5XL issue 047
+        const float aspectWidth = pictureShape > 0.0f ? aspectHeight * pictureShape : static_cast<float>(std::max<uint32_t>(1u, displayWidth));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
         const float scale = std::min(screenWidth / aspectWidth, screenHeight / aspectHeight);
@@ -3932,7 +3970,19 @@ void PS2Runtime::run()
                 std::memcpy(s_lastRect, rect, sizeof(rect));
             }
         }
+        // DW5XL issue 047: above 1x the picture is scaled smoothly; nearest would repeat whole rows. 1x stays as it was.
+        SetTextureFilter(frameTex, m_gs.getResolutionScale() > 1u ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+        const bool sharpen = s_presentSharpen.load(std::memory_order_relaxed) && m_gs.getResolutionScale() > 1u;
+        static Shader s_sharpenShader{};
+        if (sharpen)
+        {
+            if (!s_sharpenShader.id) s_sharpenShader = LoadShaderFromMemory(nullptr, kPresentSharpenShader);
+            const float texel[2] = {1.0f / static_cast<float>(frameTex.width), 1.0f / static_cast<float>(frameTex.height)};
+            SetShaderValue(s_sharpenShader, GetShaderLocation(s_sharpenShader, "texel"), texel, SHADER_UNIFORM_VEC2);
+            BeginShaderMode(s_sharpenShader);
+        }
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        if (sharpen) EndShaderMode();
         m_pictureRect[0] = dstRect.x; m_pictureRect[1] = dstRect.y;   // issue 023 3S: for overlays over the picture
         m_pictureRect[2] = dstRect.width; m_pictureRect[3] = dstRect.height;
         ps2_host_input::drawMouseCaptureIndicator(dstRect.x, dstRect.y, dstRect.width, dstRect.height);

@@ -72,14 +72,20 @@ Gamepads work too. Holding the gamepad's **Back** (Select) button for ¾ of a se
 
 | Setting | Values |
 | --- | --- |
-| VSYNC | On / Off |
-| RESOLUTION | 640×512 (1×), 1280×1024 (2×), 2560×2048 (4×) |
+| **GRAPHICS** | |
+| RENDER SCALE | 1×, 2×, 4×: how much detail the game draws |
 | ANTI-ALIASING | Off, 2×, 4×, 8×, 16× |
+| SHARPEN | On / Off (above 1×): crisper edges, with some grain |
+| FIELD OF VIEW | 80–130 %. How far you see in battle. |
+| DEFAULT | Restores this page's settings |
+| **DISPLAY** | |
 | DISPLAY | Window / Fullscreen |
+| ASPECT RATIO | 4:3, 16:9, 21:9. The shape of the whole game; in battle, wide shapes show more. |
+| VSYNC | On / Off |
 | SHOW FPS | On / Off |
-| DEFAULT | Restores the default settings |
+| DEFAULT | Restores this page's settings |
 
-Up/Down picks a setting, Left/Right changes it, and Cross on DEFAULT resets them all. Changes apply right away and are remembered.
+Cross opens a page, Back returns from it. Up/Down picks a setting, Left/Right changes it, and Cross on DEFAULT resets that page. Changes apply right away and are remembered.
 
 ### Function keys
 

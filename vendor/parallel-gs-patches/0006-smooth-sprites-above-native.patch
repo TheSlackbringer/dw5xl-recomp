@@ -1,0 +1,51 @@
+Draw pictures at the output scale when asked (set_smooth_sprites)
+
+paraLLEl-GS keeps every sprite on the native pixel grid (raster and attributes snapped), so at higher
+output scales text and other 2D stay at PS2 resolution while 3D sharpens. An option draws textured
+sprites that do not read the frame they draw to at the output scale. Those that do (DW5XL's depth
+resets and full-screen copies) stay snapped: unsnapped depth resets leave seams across the terrain.
+Off by default; the runtime turns it on above 1x, so 1x stays identical (DW5XL issue 047).
+
+Applies on top of 0001 to 0005.
+
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -2697,8 +2697,15 @@ void GSInterface::drawing_kick_append()
+ 	{
+ 		prim_attr.state |= 1u << STATE_BIT_PARALLELOGRAM;
+ 		prim_attr.state |= 1u << STATE_BIT_SPRITE;
+-		prim_attr.state |= 1u << STATE_BIT_SNAP_RASTER;
+-		prim_attr.state |= 1u << STATE_BIT_SNAP_ATTRIBUTE;
++		// Sprites normally stay on the native pixel grid. With smooth sprites, pictures are drawn at the output scale:
++		// textured sprites that do not read the frame they draw to (depth resets and full-screen copies do).
++		const bool picture = registers.prim.desc.TME != 0 &&
++		                     uint32_t(ctx.tex0.desc.TBP0) != ctx.frame.desc.FBP * PGS_BLOCKS_PER_PAGE;
++		if (!smooth_sprites || !picture)
++		{
++			prim_attr.state |= 1u << STATE_BIT_SNAP_RASTER;
++			prim_attr.state |= 1u << STATE_BIT_SNAP_ATTRIBUTE;
++		}
+ 		prim_attr.state &= ~(1u << STATE_BIT_MULTISAMPLE);
+ 	}
+ 	else if (is_line)
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -271,6 +271,8 @@ public:
+ 	void reset_context_state();
+ 
+ 	void set_super_sampling_rate(SuperSampling super_sampling, bool ordered_grid, bool super_sampled_textures);
++	// Draw pictures at the output scale instead of the native pixel grid (DW5XL issue 047).
++	void set_smooth_sprites(bool enable) { smooth_sprites = enable; }
+ 	void set_debug_mode(const DebugMode &mode);
+ 	void set_hacks(const Hacks &hacks);
+ 
+@@ -632,6 +634,7 @@ private:
+ 	uint32_t sampling_rate_x_log2 = 0;
+ 	uint32_t sampling_rate_y_log2 = 0;
+ 	bool super_sampled_textures = false;
++	bool smooth_sprites = false;
+ 
+ 	void reset_context_state_registers();
+ 

@@ -541,6 +541,11 @@ public:
     uint64_t hostPausedNanoseconds(uint64_t steadyNowNs) const;   // total paused time up to now (IOP clock)
     // DW5XL-DEBUG issue 023 3S (window thread): save the whole window, overlays included, at the end of this frame.
     void requestWindowShot(const std::string &path) { m_windowShotRequest = path; }
+    // DW5XL issue 047: the game picture's shape in the window, width / height; 0 = the picture's own display size.
+    void setPictureShape(float widthOverHeight);
+    // DW5XL issue 047: sharpen the picture as the window draws it, above 1x.
+    void setPresentSharpen(bool on);
+    bool presentSharpen() const;
     void pictureRect(float &x, float &y, float &w, float &h) const { x = m_pictureRect[0]; y = m_pictureRect[1]; w = m_pictureRect[2]; h = m_pictureRect[3]; }
     inline GS &gs() { return m_gs; }
     inline const GS &gs() const { return m_gs; }

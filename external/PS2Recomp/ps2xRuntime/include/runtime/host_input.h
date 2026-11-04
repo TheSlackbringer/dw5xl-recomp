@@ -37,6 +37,8 @@ namespace ps2_host_input
     void setBackHoldAction(double seconds, void (*action)());
     // Window thread: a short press of these PS2 pad buttons (pad bit mask) reaches the game, as a key tap would.
     void tapGameButtons(uint16_t mask);
+    // The game does not see these buttons until they are let go (a host screen used the press).
+    void hideGameButtonsUntilRelease(uint16_t mask);
     // Issue 027 v3: true once for each host-input script event called `name` (F5, F9, SHIFT+F9) whose field has come:
     // a script presses the save-state keys as a player would.
     bool scriptedKeyPress(const char *name, uint64_t vsyncTick);

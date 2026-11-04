@@ -73,7 +73,7 @@ def folder_card_superblock():
     return bytes(sb)
 
 
-def make_config(out, mc_folder=None, mc_file=None):
+def make_config(out, mc_folder=None, mc_file=None, settings=()):
     home = os.path.join(out, 'pcsx2home')
     cfg = os.path.join(home, 'PCSX2')
     os.makedirs(os.path.join(cfg, 'inis'), exist_ok=True)
@@ -93,6 +93,8 @@ def make_config(out, mc_folder=None, mc_file=None):
     for button, key in PAD_KEYS.items():
         ini = set_key(ini, 'Pad1', button, key)
     ini = set_key(ini, 'Hotkeys', 'Screenshot', 'Keyboard/F8')
+    for section, key, value in settings:
+        ini = set_key(ini, section, key, value)
     if mc_file:
         # Slot 1: a copy of a PCSX2 card file (.ps2); slot 2 off.
         shutil.copyfile(mc_file, os.path.join(cfg, 'memcards', 'Mcd001.ps2'))
@@ -134,6 +136,8 @@ def main():
     ap.add_argument('--mc-file', default=None, help='a PCSX2 card file (.ps2) whose copy is slot 1')
     ap.add_argument('--xshots', action='store_true',
                     help='also capture the whole private display every interval (PCSX2\'s own menus are not in its screenshots)')
+    ap.add_argument('--set', action='append', default=[], metavar='SECTION:KEY=VALUE',
+                    help='a setting for the throwaway config, e.g. EmuCore/GS:AspectRatio=16:9 (repeatable)')
     args = ap.parse_args()
 
     iso = args.iso or next(iter(glob.glob(os.path.join(REPO, 'discs', 'dw5xl', '*.iso'))), None)
@@ -141,7 +145,12 @@ def main():
         sys.exit('no disc image (pass --iso)')
     out = os.path.abspath(args.out)
     os.makedirs(out, exist_ok=True)
-    home = make_config(out, args.mc_folder, args.mc_file)
+    settings = []
+    for item in args.set:
+        section, rest = item.split(':', 1)
+        key, value = rest.split('=', 1)
+        settings.append((section, key, value))
+    home = make_config(out, args.mc_folder, args.mc_file, settings)
     keys = []
     for item in filter(None, args.keys.split(',')):
         parts = item.split(':')

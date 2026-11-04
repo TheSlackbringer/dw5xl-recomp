@@ -38,7 +38,8 @@ import sys
 import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GAME_DIR = os.path.join(REPO, 'game', 'dw5xl')
+GAME_DIR = os.environ.get('DW5XL_TEST_GAME_DIR') or os.path.join(REPO, 'game', 'dw5xl')
+BINARY = os.environ.get('DW5XL_TEST_BINARY') or os.path.join(REPO, 'app', 'build', 'dw5xl')
 EXIT_TICK = 14000
 BATTLE_FROM = 4000
 
@@ -81,7 +82,7 @@ def run_once(name, args, out):
     env.update(kv.split('=', 1) for kv in args.env)
     if args.audio == 'null':
         env['PULSE_SINK'] = 'dw5xl_codex_tests'
-    game = [os.path.join(REPO, 'app', 'build', 'dw5xl'), './SLES_538.60']
+    game = [BINARY, './SLES_538.60']
     if args.mode == 'hidden':
         env['PS2X_HIDDEN'] = '1'
         cmd = game

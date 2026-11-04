@@ -14,6 +14,7 @@
 #include "dw5xl_menu_assets.h"
 #include "ipu_idec.h"
 #include "dw5xl_pc_settings.h"
+#include "dw5xl_widescreen.h"
 #include "imgui.h"
 #include "raylib.h"
 #include "runtime/ee_scheduler.h"
@@ -586,7 +587,7 @@ namespace {
 std::mutex g_mutex;
 Snapshot g_state;                                  // guarded by g_mutex
 std::atomic<bool> g_open{false};                   // the Options menu's screen is open
-constexpr int kValueCount[kRows] = {2, 3, 5, 2, 2, 0};
+constexpr int kValueCount[kRows] = {2, 3, 5, 2, 2, 3, kFovValues, 2, 0};
 }
 // DW5XL-DEBUG issue 023 3S: PS2X_PCSETTINGS_TRACE=1 logs opening, closing and every navigation input.
 bool trace() { static const bool on = [] { const char *v = std::getenv("PS2X_PCSETTINGS_TRACE"); return v && *v == '1'; }(); return on; }
@@ -598,7 +599,7 @@ bool switchMode(Mode from, Mode to)
     if (g_state.mode != from) return false;
     if (trace()) std::fprintf(stderr, "[pc-settings] %s %s\n", to == Mode::Closed ? "close" : "open",
                               (to == Mode::InPlay || from == Mode::InPlay) ? "in-play" : "options");
-    if (to != Mode::Closed) { g_state.row = 0; g_state.needsInit = true; }
+    if (to != Mode::Closed) { g_state.page = PageMenu; g_state.row = 0; g_state.needsInit = true; }
     g_state.mode = to;
     ++g_state.version;
     return true;
@@ -615,25 +616,38 @@ bool input(Input in)
     std::lock_guard<std::mutex> lock(g_mutex);
     Snapshot &s = g_state;
     const Snapshot before = s;
-    int *value[kRows] = {&s.values.vsync, &s.values.resolution, &s.values.antiAliasing, &s.values.display, &s.values.showFps, nullptr};
+    int *value[kRows] = {&s.values.vsync, &s.values.resolution, &s.values.antiAliasing, &s.values.display, &s.values.showFps, &s.values.aspect, &s.values.fov, &s.values.sharpen, nullptr};
+    const int rows = s.page == PageMenu ? kMenuChoices : kPageRows;
+    int *current = s.page == PageMenu ? nullptr : value[kPages[s.page - 1][s.row]];
+    const int count = s.page == PageMenu ? 0 : kValueCount[kPages[s.page - 1][s.row]];
     switch (in) {
-    case Input::Up: do s.row = (s.row + kRows - 1) % kRows; while (kValueCount[s.row] == 0 && s.row != kDefaultRow); break;
-    case Input::Down: do s.row = (s.row + 1) % kRows; while (kValueCount[s.row] == 0 && s.row != kDefaultRow); break;
-    case Input::Left: if (value[s.row] && *value[s.row] > 0) --*value[s.row], s.changed = true; break;
-    case Input::Right: if (value[s.row] && *value[s.row] + 1 < kValueCount[s.row]) ++*value[s.row], s.changed = true; break;
-    case Input::Default: s.values = Values{}; s.changed = true; break;
+    case Input::Up: s.row = (s.row + rows - 1) % rows; break;
+    case Input::Down: s.row = (s.row + 1) % rows; break;
+    case Input::Left: if (current && *current > 0) --*current, s.changed = true; break;
+    case Input::Right: if (current && *current + 1 < count) ++*current, s.changed = true; break;
+    case Input::Default:                                // only the page being looked at
+        if (s.page != PageMenu) {
+            const Values defaults;
+            for (const Row row : kPages[s.page - 1])
+                if (value[row]) *value[row] = row == RowVsync ? defaults.vsync : row == RowScale ? defaults.resolution : row == RowAntiAliasing ? defaults.antiAliasing
+                    : row == RowDisplay ? defaults.display : row == RowShowFps ? defaults.showFps : row == RowAspect ? defaults.aspect : row == RowFov ? defaults.fov : defaults.sharpen;
+            s.changed = true;
+        }
+        break;
+    case Input::Enter: if (s.page == PageMenu) { s.page = s.row + 1; s.row = 0; } break;
+    case Input::Leave: if (s.page != PageMenu) { s.row = s.page - 1; s.page = PageMenu; } break;
     }
     ++s.version;
     if (trace())
         std::fprintf(stderr, "[pc-settings] input %d -> row %d values vsync=%d res=%d aa=%d display=%d fps=%d\n", int(in), s.row,
                      s.values.vsync, s.values.resolution, s.values.antiAliasing, s.values.display, s.values.showFps);
-    return s.row != before.row || s.changed != before.changed || std::memcmp(&s.values, &before.values, sizeof(Values)) != 0;
+    return s.row != before.row || s.page != before.page || s.changed != before.changed || std::memcmp(&s.values, &before.values, sizeof(Values)) != 0;
 }
 Snapshot snapshot() { std::lock_guard<std::mutex> lock(g_mutex); return g_state; }
 void setValues(const Values &v) { std::lock_guard<std::mutex> lock(g_mutex); g_state.values = v; g_state.needsInit = false; ++g_state.version; }
 void clearChanged() { std::lock_guard<std::mutex> lock(g_mutex); g_state.changed = false; }
 // Issue 027 v4: PC SETTINGS opened from the in-play MENU starts at its first row, with the current settings.
-void restartRows() { std::lock_guard<std::mutex> lock(g_mutex); g_state.row = 0; g_state.needsInit = true; ++g_state.version; }
+void restartRows() { std::lock_guard<std::mutex> lock(g_mutex); g_state.page = PageMenu; g_state.row = 0; g_state.needsInit = true; ++g_state.version; }
 }
 
 // --- the doors during play (window thread) -------------------------------------------------------------------------
@@ -926,12 +940,17 @@ void inPlayInput(const Presses &p, bool back)
         return;
     }
     if (M.screen == Screen::Settings) {
-        if (back) { playMenuSound(4); showScreen(Screen::Menu); }
+        const dw5xl::pcsettings::Snapshot page = dw5xl::pcsettings::snapshot();
+        if (back) {
+            playMenuSound(4);
+            if (page.page != dw5xl::pcsettings::PageMenu) input(Input::Leave); else showScreen(Screen::Menu);
+        }
         else if (p.up) { if (input(Input::Up)) playMenuSound(0); }
         else if (p.down) { if (input(Input::Down)) playMenuSound(0); }
         else if (p.left) { if (input(Input::Left)) playMenuSound(1); }
         else if (p.right) { if (input(Input::Right)) playMenuSound(1); }
-        else if (p.cross && dw5xl::pcsettings::snapshot().row == dw5xl::pcsettings::kDefaultRow) { input(Input::Default); playMenuSound(3); }
+        else if (p.cross && page.page == dw5xl::pcsettings::PageMenu) { input(Input::Enter); playMenuSound(3); }
+        else if (p.cross && dw5xl::pcsettings::kPages[page.page - 1][page.row] == dw5xl::pcsettings::RowDefault) { input(Input::Default); playMenuSound(3); }
         return;
     }
     const bool save = M.screen == Screen::SaveList;
@@ -983,14 +1002,23 @@ bool frame(bool allowOpen)
         p = readPresses();
         p.up |= script == "up"; p.down |= script == "down"; p.left |= script == "left"; p.right |= script == "right";
         p.cross |= script == "cross"; p.back |= script == "back";
-    } else if (mode == Mode::Options)                 // the game's routine does not use Cross
-        p.cross = IsKeyPressed(KEY_X) || IsKeyPressed(KEY_SPACE) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
+    } else if (mode == Mode::Options) {               // the game's routine does not use Cross; its Back leaves the screen
+        p.cross = IsKeyPressed(KEY_X) || IsKeyPressed(KEY_SPACE) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN) || script == "cross";
+        p.back = readPresses().back || script == "back";
+    }
     if (mode == Mode::Closed && (esc || held) && allowOpen) openInPlay(held && !esc);
+    else if (mode == Mode::Options && snapshot().page != PageMenu) {
+        // On a page, Back returns to the PC SETTINGS menu: the game must not see it, or it leaves the screen.
+        ps2_host_input::hideGameButtonsUntilRelease(kPadTriangle);
+        if (esc || p.back) { input(Input::Leave); playMenuSound(4); }
+    }
+    else if (mode == Mode::Options && p.cross) { input(Input::Enter); playMenuSound(3); p.cross = false; }
     else if (mode == Mode::Options && esc) ps2_host_input::tapGameButtons(kPadTriangle);   // the game's Back
     else if (mode == Mode::InPlay) { inPlayProgress(); inPlayInput(p, esc || held || p.back); }
     // Cross on DEFAULT in the Options menu taps Start, the routine's own reset, so the game sounds it too.
     const Snapshot s = snapshot();
-    if (s.mode == Mode::Options && s.row == kDefaultRow && p.cross) ps2_host_input::tapGameButtons(kPadStart);
+    if (s.mode == Mode::Options && s.page != PageMenu && kPages[s.page - 1][s.row] == RowDefault && p.cross)
+        ps2_host_input::tapGameButtons(kPadStart);
     if (!shot.empty()) g_runtime->requestWindowShot(shot);
     return snapshot().mode != Mode::Closed;
 }
@@ -1001,7 +1029,6 @@ namespace {
 using namespace dw5xl::menu;
 using MImage = dw5xl::menu::Image;
 using dw5xl::pcsettings::kRows;
-using dw5xl::pcsettings::kDefaultRow;
 
 // The menu font's words in the word strip (sub-file 12): row -> text, for finding letters.
 const std::array<std::pair<int, const char *>, 30> kWords{{{0, "SETTINGS"}, {1, "CONTROLS"}, {2, "SOUND"}, {3, "SCREEN ADJUST"},
@@ -1009,16 +1036,20 @@ const std::array<std::pair<int, const char *>, 30> kWords{{{0, "SETTINGS"}, {1, 
     {12, "VIBRATION"}, {13, "BOW CONTROL"}, {14, "SETUP"}, {15, "SYSTEM"}, {16, "BGM VOLUME"}, {17, "SE VOLUME"},
     {18, "SOUND TEST"}, {19, "SAVE"}, {20, "LOAD"}, {22, "ENDING - WEI"}, {23, "ENDING - WU"}, {24, "ENDING - SHU"},
     {25, "ENDING - OTHER"}, {26, "OTHER"}, {27, "OPENING EDIT"}, {28, "VARIATIONS"}, {29, "REPEAT"}, {30, "PLAY"}, {31, "MAP EVENT"}}};
-const char *kLabels[5] = {"VSYNC", "RESOLUTION", "ANTI-ALIASING", "DISPLAY", "SHOW FPS"};
-const char *kHelp[kRows] = {"Waits for each display refresh: no tearing.", "Internal resolution of the picture.",
+const char *kLabels[8] = {"VSYNC", "RENDER SCALE", "ANTI-ALIASING", "DISPLAY", "SHOW FPS", "ASPECT RATIO", "FIELD OF VIEW", "SHARPEN"};
+const char *kPageLabels[2] = {"GRAPHICS", "DISPLAY"};
+const char *kPageHelp[2] = {"How the picture is drawn.", "How the picture is shown on your screen."};
+const char *kHelp[kRows] = {"Waits for each display refresh: no tearing.", "How much detail the game draws.",
                             "Smooths the edges of the picture.", "Plays in a window or fullscreen.",
-                            "Shows the frame rate in the top left corner (also F2).", "Restores the default settings."};
+                            "Shows the frame rate in the top left corner (also F2).",
+                            "The shape of the whole game. Choose your screen's shape; in battle you see more.", "How far you see in battle.", "Crisper edges, above 1X. Adds some grain.", "Restores this page's settings."};
 constexpr uint32_t kScales[3] = {1, 2, 4}, kSamples[5] = {1, 2, 4, 8, 16};
 
 struct Tex { Texture2D t{}; int w = 0, h = 0; };      // w, h: the picture's size in its source texels
 struct Assets {
     bool tried = false, ok = false;
-    Tex label[5], labelDefault, onOff[2][2];          // onOff[ON/OFF][white/yellow]
+    Tex label[8], pageLabel[2], pageHelp[2], labelDefault, onOff[2][2];          // onOff[ON/OFF][white/yellow]
+    Tex aspect[dw5xl::widescreen::kAspects][2], fov[dw5xl::pcsettings::kFovValues];   // aspect: white / yellow
     Tex word[2][2];                                   // WINDOW / FULLSCREEN, white / yellow
     Tex number[2][5][2];                              // [resolution / anti-aliasing][value][white / yellow]
     Tex glow, help[kRows];
@@ -1141,13 +1172,13 @@ void buildAssets()
         }
         return buildWord(ls, 9, 2, 4);
     };
-    for (int i = 0; i < 5; ++i) { const MImage w = word(kLabels[i]); if (!w.w) return; A.label[i] = upload(w); }
+    for (int i = 0; i < 8; ++i) { const MImage w = word(kLabels[i]); if (!w.w) return fail(kLabels[i]); A.label[i] = upload(w); }
+    for (int i = 0; i < 2; ++i) { const MImage w = word(kPageLabels[i]); if (!w.w) return fail(kPageLabels[i]); A.pageLabel[i] = upload(w); }
     // Issue 027 v4: the MENU's rows and the state lists' words
     for (int i = 0; i < kMenuRows; ++i) { const MImage w = word(kMenuLabels[i]); if (!w.w) return fail(kMenuLabels[i]); A.menuLabel[i] = upload(w); }
     const char *listWords[4] = {"QUICK", "SLOT", "EMPTY", "UNDO LAST LOAD"};
     Tex *listTex[4] = {&A.quick, &A.slot, &A.empty, &A.undo};
     for (int i = 0; i < 4; ++i) { const MImage w = word(listWords[i]); if (!w.w) return fail(listWords[i]); *listTex[i] = upload(w); }
-    A.labelDefault = upload(crop(strip, 0, 9 * 24, 208, 24));
     // ON / OFF in the value strip's two palettes; which palette is yellow decides "current"
     const MImage v0 = decodeTim2(ptr(ram, a13), n13, *t13, 0), v1 = decodeTim2(ptr(ram, a13), n13, *t13, 1);
     auto yellowness = [](const MImage &img) { long s = 0; for (size_t i = 0; i < img.rgba.size(); i += 4) if (img.rgba[i + 3] > 200) s += img.rgba[i] - img.rgba[i + 2]; return s; };
@@ -1158,6 +1189,7 @@ void buildAssets()
         for (int y = 0; y < cell.h; ++y) for (int x = 0; x < cell.w; ++x) if (cell.at(x, y)[3] > 10) { x0 = std::min(x0, x); x1 = std::max(x1, x); }
         return x1 < x0 ? cell : crop(cell, x0, 0, x1 - x0 + 1, cell.h);
     };
+    A.labelDefault = upload(inked(crop(strip, 0, 9 * 24, 208, 24)));   // its ink starts where the other labels' ink starts
     for (int v = 0; v < 2; ++v) {
         A.onOff[v][0] = upload(inked(crop(white, 0, v * 24, 80, 24)));
         A.onOff[v][1] = upload(inked(crop(yellow, 0, v * 24, 80, 24)));
@@ -1175,9 +1207,12 @@ void buildAssets()
     if (bootPics.empty() || bootPics[0].w != 512 || bootPics[0].h != 512) return;
     A.digits = decodeTim2(boot.data(), boot.size(), bootPics[0], 0);
     auto numberText = [&](const std::string &text) { return numberImage(A.digits, text); };
-    const char *res[3] = {"640X512", "1280X1024", "2560X2048"}, *aa[5] = {"OFF", "2X", "4X", "8X", "16X"};
+    const char *res[3] = {"1X", "2X", "4X"}, *aa[5] = {"OFF", "2X", "4X", "8X", "16X"};
     for (int v = 0; v < 3; ++v) { const MImage n = numberText(res[v]); A.number[0][v][0] = upload(n); A.number[0][v][1] = upload(tinted(n, k)); }
     for (int v = 1; v < 5; ++v) { const MImage n = numberText(aa[v]); A.number[1][v][0] = upload(n); A.number[1][v][1] = upload(tinted(n, k)); }
+    const char *aspects[dw5xl::widescreen::kAspects] = {"4:3", "16:9", "21:9"};
+    for (int v = 0; v < dw5xl::widescreen::kAspects; ++v) { const MImage n = numberText(aspects[v]); A.aspect[v][0] = upload(n); A.aspect[v][1] = upload(tinted(n, k)); }
+    for (int v = 0; v < dw5xl::pcsettings::kFovValues; ++v) A.fov[v] = upload(tinted(numberText(std::to_string(80 + v * 5) + "%"), k));
     const MImage lines = decodeTim2(boot.data(), boot.size(), bootPics[0], 5);
     std::memcpy(A.line, lines.at(194, 305), 4);
     A.line[0] = uint8_t(A.line[0] * 112 / 128); A.line[1] = uint8_t(A.line[1] * 112 / 128); A.line[2] = uint8_t(A.line[2] * 112 / 128);
@@ -1226,6 +1261,7 @@ void buildAssets()
     if (A.exe.size() < 0x216230 + 95 * 160) return;
     auto smallText = [&](const char *text) { return smallImage(A.exe, text); };
     for (int r = 0; r < kRows; ++r) A.help[r] = upload(smallText(kHelp[r]));
+    for (int i = 0; i < 2; ++i) A.pageHelp[i] = upload(smallText(kPageHelp[i]));
     const char *bar[3] = {"Select", "Change", "Back"};
     for (int i = 0; i < 3; ++i) A.barText[i] = upload(smallText(bar[i]));
     A.ok = true;
@@ -1384,13 +1420,34 @@ void applyChanges(const dw5xl::pcsettings::Snapshot &s)
     ps2x::settings::saveText("display", full ? "fullscreen" : "window");
     g_runtime->setShowFps(s.values.showFps == 0);
     ps2x::settings::saveText("show_fps", s.values.showFps == 0 ? "on" : "off");
+    g_runtime->setPresentSharpen(s.values.sharpen == 0);
+    ps2x::settings::saveText("sharpen", s.values.sharpen == 0 ? "on" : "off");
+    if (dw5xl::widescreen::aspect() != s.values.aspect) dw5xl::widescreen::setAspect(dw5xl::widescreen::Aspect(s.values.aspect));
+    if (dw5xl::widescreen::fov() != 80 + s.values.fov * 5) dw5xl::widescreen::setFov(80 + s.values.fov * 5);
     clearChanged();
 }
 }
 
 namespace dw5xl::pcsettings {
+// Issue 047: a window keeps the chosen shape, so the picture fills it. Fullscreen shows it as large as the screen allows.
+void sizeWindowForAspect()
+{
+    static int sizedFor = -1;
+    const bool full = IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE);
+    const int key = full ? -2 : int(dw5xl::widescreen::aspect());
+    if (key == sizedFor) return;
+    sizedFor = key;
+    if (full || IsWindowHidden()) return;
+    const float shape = dw5xl::widescreen::shape();
+    const int most = GetMonitorWidth(GetCurrentMonitor());
+    int height = GetScreenHeight(), width = int(float(height) * shape + 0.5f);
+    if (most > 0 && width > most) { width = most; height = int(float(width) / shape + 0.5f); }
+    SetWindowSize(width, height);
+}
+
 void drawOverlay()
 {
+    sizeWindowForAspect();
     Snapshot s = snapshot();
     if (s.mode == Mode::Closed || !g_runtime) return;
     if (s.needsInit) {
@@ -1401,6 +1458,9 @@ void drawOverlay()
         v.antiAliasing = samples >= 16 ? 4 : samples >= 8 ? 3 : samples >= 4 ? 2 : samples >= 2 ? 1 : 0;
         v.display = IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE) ? 1 : 0;
         v.showFps = g_runtime->showFps() ? 0 : 1;
+        v.aspect = dw5xl::widescreen::aspect();
+        v.fov = (dw5xl::widescreen::fov() - 80) / 5;
+        v.sharpen = g_runtime->presentSharpen() ? 0 : 1;
         setValues(v);
         s = snapshot();
     }
@@ -1437,7 +1497,7 @@ void drawOverlay()
         band(409, 432, IM_COL32(35, 33, 32, 255));
         band(432, 434, IM_COL32(124, 115, 99, 255));
         const float iconX[3] = {299, 367, 442};
-        const char *action = screen == Screen::Menu ? "Open" : screen == Screen::SaveList ? "Save"
+        const char *action = screen == Screen::Menu || s.page == PageMenu ? "Open" : screen == Screen::SaveList ? "Save"
                            : screen == Screen::LoadList ? "Load" : nullptr;
         for (int i = 0; i < 3; ++i) {
             const Tex &text = i == 1 && action ? smallTex(action) : A.barText[i];
@@ -1447,37 +1507,62 @@ void drawOverlay()
         if (screen == Screen::Menu) { drawMenu(dl, m); return; }
         if (screen != Screen::Settings) { drawList(dl, m); return; }
     }
-    const int screenRow[kRows] = {0, 1, 2, 3, 4, 6};
-    const float rowY = 100.0f + 34.0f * screenRow[s.row];
-    image(dl, m, A.glow, 0, rowY - 2, 144, 32, IM_COL32(255, 208, 96, 128));
+    const auto help = [&](const Tex &line) {
+        if (s.mode == Mode::InPlay && !g_runtime->stateMessage().empty()) helpLines(dl, m, "");
+        else image(dl, m, line, 24, 372, float(line.w) * 0.75f, 20);
+    };
+    if (s.page == PageMenu) {                          // PC SETTINGS: GRAPHICS, DISPLAY
+        rowGlow(dl, m, 100.0f + 34.0f * s.row, A.pageLabel[s.row]);
+        for (int r = 0; r < kMenuChoices; ++r) {
+            const float y = 100.0f + 34.0f * r;
+            image(dl, m, A.pageLabel[r], 24 - 4, y, float(A.pageLabel[r].w), 28, r == s.row ? IM_COL32_WHITE : IM_COL32(160, 160, 160, 255));
+            separator(dl, m, y + 27, 448, 496);
+        }
+        help(A.pageHelp[s.row]);
+        return;
+    }
+    const Tex &pageName = A.pageLabel[s.page - 1];     // which page, at the title's right
+    image(dl, m, pageName, 490.0f - float(pageName.w), 26, float(pageName.w), 28);
+    const auto &rows = kPages[s.page - 1];
+    const auto screenRow = [](int r) { return r == kPageRows - 1 ? r + 1 : r; };   // an empty row before DEFAULT
+    image(dl, m, A.glow, 0, 100.0f + 34.0f * screenRow(s.row) - 2, 144, 32, IM_COL32(255, 208, 96, 128));
     int labelW = 0; for (const Tex &t : A.label) labelW = std::max(labelW, t.w);
     const float valueX = std::max(184.0f, 24.0f - 4.0f + float(labelW) + 14.0f);
-    const int values[5] = {s.values.vsync, s.values.resolution, s.values.antiAliasing, s.values.display, s.values.showFps};
-    for (int r = 0; r < kRows; ++r) {
-        const float y = 100.0f + 34.0f * screenRow[r];
-        const ImU32 labelTint = r == s.row ? IM_COL32_WHITE : IM_COL32(160, 160, 160, 255);
-        if (r == kDefaultRow) { image(dl, m, A.labelDefault, 24, y, 208, 28, labelTint); separator(dl, m, y + 27, 136, 184); continue; }
+    const int values[8] = {s.values.vsync, s.values.resolution, s.values.antiAliasing, s.values.display, s.values.showFps, s.values.aspect, s.values.fov, s.values.sharpen};
+    for (int i = 0; i < kPageRows; ++i) {
+        const Row r = rows[i];
+        const float y = 100.0f + 34.0f * screenRow(i);
+        const ImU32 labelTint = i == s.row ? IM_COL32_WHITE : IM_COL32(160, 160, 160, 255);
+        if (r == RowDefault) { image(dl, m, A.labelDefault, 24, y, float(A.labelDefault.w), 28, labelTint); separator(dl, m, y + 27, 136, 184); continue; }
         image(dl, m, A.label[r], 24 - 4, y, float(A.label[r].w), 28, labelTint);
         separator(dl, m, y + 27, 448, 496);
         float x = valueX;
-        const int count = r == 1 ? 3 : r == 2 ? 5 : 2;
+        if (r == RowFov) {                                             // one value at a time
+            const Tex &t = A.fov[values[r]];
+            image(dl, m, t, x, y + 4, 12.0f * float(t.w) / 16.0f, 20);
+            continue;
+        }
+        const int count = r == RowScale || r == RowAspect ? 3 : r == RowAntiAliasing ? 5 : 2;
         for (int v = 0; v < count; ++v) {
             const int cur = v == values[r] ? 1 : 0;
-            if (r == 0 || r == 4 || (r == 2 && v == 0)) {             // ON / OFF pictures (OFF also for anti-aliasing)
-                const Tex &t = A.onOff[r == 2 ? 1 : v][cur];
+            if (r == RowVsync || r == RowShowFps || r == RowSharpen || (r == RowAntiAliasing && v == 0)) {   // ON / OFF pictures (OFF also for anti-aliasing)
+                const Tex &t = A.onOff[r == RowAntiAliasing ? 1 : v][cur];
                 image(dl, m, t, x, y, float(t.w), 28); x += float(t.w) + 12;
-            } else if (r == 3) {
+            } else if (r == RowDisplay) {
                 const Tex &t = A.word[v][cur];
                 image(dl, m, t, x - 4, y, float(t.w), 28); x += float(t.w) - 8 + 12;   // built words carry a 4-texel margin
+            } else if (r == RowAspect) {
+                const Tex &t = A.aspect[v][cur];
+                const float w = 12.0f * float(t.w) / 16.0f;
+                image(dl, m, t, x, y + 4, w, 20); x += w + 12;
             } else {
-                const Tex &t = A.number[r == 1 ? 0 : 1][v][cur];
-                const float cw = r == 1 ? 10.0f : 12.0f, w = cw * float(t.w) / 16.0f;
+                const Tex &t = A.number[r == RowScale ? 0 : 1][v][cur];
+                const float w = 12.0f * float(t.w) / 16.0f;
                 image(dl, m, t, x, y + 4, w, 20); x += w + 12;
             }
         }
     }
-    if (s.mode == Mode::InPlay && !g_runtime->stateMessage().empty()) helpLines(dl, m, "");
-    else image(dl, m, A.help[s.row], 24, 372, float(A.help[s.row].w) * 0.75f, 20);
+    help(A.help[rows[s.row]]);
 }
 }
 

@@ -109,6 +109,7 @@ struct GSVulkanBackend::Impl
         scanoutState.reset();
         fieldWeaver.reset();
         gs.set_super_sampling_rate(static_cast<ParallelGS::SuperSampling>(samples), true, true);
+        gs.set_smooth_sprites(scale > 1u);   // DW5XL issue 047: 1x stays on the native grid
         aaSamples.store(samples, std::memory_order_relaxed);
         currentScale.store(scale, std::memory_order_relaxed);
         std::fprintf(stderr, "[gs:vulkan] Output=%ux AA=%ux (%u samples)\n", scale, samples / minSamplesFor(scale), samples);
@@ -150,6 +151,7 @@ struct GSVulkanBackend::Impl
 
         if (!gs.init(&device, opts))
             throw std::runtime_error("Vulkan device lacks paraLLEl-GS features");
+        gs.set_smooth_sprites(outputScale > 1u);   // DW5XL issue 047: 1x stays on the native grid
         scanout.Initialize(snapshot.data(), vramBytes);
         const auto &gpu = device.get_gpu_properties();
         if (gpu.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)

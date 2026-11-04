@@ -91,6 +91,7 @@ namespace
     bool gScripted = false;
     // Issue 023 3S: a host screen blocks the game's input; Back held runs the host action.
     std::atomic<bool> gInputBlocked{false};
+    std::atomic<uint16_t> gHideUntilRelease{0};
     uint16_t gHiddenUntilRelease = 0;
     void (*gBackHoldAction)() = nullptr;
     double gBackHoldSeconds = 0.75, gBackDownSince = -1.0;
@@ -177,6 +178,7 @@ namespace ps2_host_input
 
     void setGameInputBlocked(bool blocked) { gInputBlocked.store(blocked); }
     void setBackHoldAction(double seconds, void (*action)()) { gBackHoldSeconds = seconds; gBackHoldAction = action; }
+    void hideGameButtonsUntilRelease(uint16_t mask) { gHideUntilRelease.fetch_or(mask); }
     void tapGameButtons(uint16_t mask)
     {
         const double now = IsWindowReady() ? GetTime() : 0.0;
@@ -430,6 +432,12 @@ namespace ps2_host_input
             if (!gScripted && (kTapButtons & mask) && (rawPressed & mask) && !(gPreviousPressed & mask))
                 gTapUntil[bit] = now + 0.1;
             if (focused && now < gTapUntil[bit]) pressed |= mask;
+        }
+        const uint16_t hidden = gHideUntilRelease.load();
+        if (hidden)
+        {
+            gHideUntilRelease.fetch_and(static_cast<uint16_t>(~(hidden & ~pressed)));
+            pressed = static_cast<uint16_t>(pressed & ~hidden);
         }
         if (gInputBlocked) { gHiddenUntilRelease = pressed; pressed = 0; sticks = {128, 128, 128, 128}; gTapUntil.fill(0.0); }   // issue 023 3S
         else { gHiddenUntilRelease &= pressed; pressed &= static_cast<uint16_t>(~gHiddenUntilRelease); }
