@@ -3946,8 +3946,9 @@ void PS2Runtime::run()
         const float aspectHeight = static_cast<float>(std::max<uint32_t>(1u, displayHeight));
         const float pictureShape = s_pictureShape.load(std::memory_order_relaxed);   // DW5XL issue 047
         const float aspectWidth = pictureShape > 0.0f ? aspectHeight * pictureShape : static_cast<float>(std::max<uint32_t>(1u, displayWidth));
-        const float screenWidth = static_cast<float>(GetScreenWidth());
-        const float screenHeight = static_cast<float>(GetScreenHeight());
+        // DW5XL issue 047: the real window. GetScreenWidth() already holds a size asked for, which the window manager may refuse.
+        const float screenWidth = static_cast<float>(GetRenderWidth());
+        const float screenHeight = static_cast<float>(GetRenderHeight());
         const float scale = std::min(screenWidth / aspectWidth, screenHeight / aspectHeight);
         const float dstWidth = aspectWidth * scale;
         const float dstHeight = aspectHeight * scale;
@@ -4138,7 +4139,7 @@ void PS2Runtime::run()
         {
             constexpr int kFontSize = 22;
             const int textW = MeasureText(message.c_str(), kFontSize);
-            const int x = (GetScreenWidth() - textW) / 2, y = GetScreenHeight() - kFontSize - 40;
+            const int x = (GetRenderWidth() - textW) / 2, y = GetRenderHeight() - kFontSize - 40;
             DrawRectangle(x - 12, y - 7, textW + 24, kFontSize + 14, Fade(BLACK, 0.75f));
             DrawText(message.c_str(), x, y, kFontSize, WHITE);
         }

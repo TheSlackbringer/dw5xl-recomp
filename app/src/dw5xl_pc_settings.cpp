@@ -988,9 +988,12 @@ void inPlayInput(const Presses &p, bool back)
 }
 
 namespace dw5xl::pcsettings {
+void sizeWindowForAspect();
+
 bool frame(bool allowOpen)
 {
     if (!g_runtime) return false;
+    sizeWindowForAspect();
     const std::string script = scriptAction();
     std::string shot;
     if (script.rfind("shot=", 0) == 0) shot = script.substr(5);
@@ -1429,25 +1432,26 @@ void applyChanges(const dw5xl::pcsettings::Snapshot &s)
 }
 
 namespace dw5xl::pcsettings {
-// Issue 047: a window keeps the chosen shape, so the picture fills it. Fullscreen shows it as large as the screen allows.
+// Issue 047: a window keeps the chosen shape, so the picture fills it. Fullscreen and a maximized window show it as
+// large as they allow: the window manager decides their size, so it is not asked. Leaving them fits the window again,
+// at the height it last had as a normal window.
 void sizeWindowForAspect()
 {
-    static int sizedFor = -1;
-    const bool full = IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE);
-    const int key = full ? -2 : int(dw5xl::widescreen::aspect());
-    if (key == sizedFor) return;
+    static int sizedFor = -1, windowedHeight = 448;   // the height the window opens at
+    const bool full = IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE), maximized = IsWindowMaximized();
+    const int key = full ? -2 : maximized ? -3 : int(dw5xl::widescreen::aspect());
+    if (key == sizedFor) { if (key >= 0) windowedHeight = GetRenderHeight(); return; }
     sizedFor = key;
-    if (full || IsWindowHidden()) return;
+    if (full || maximized || IsWindowHidden()) return;
     const float shape = dw5xl::widescreen::shape();
     const int most = GetMonitorWidth(GetCurrentMonitor());
-    int height = GetScreenHeight(), width = int(float(height) * shape + 0.5f);
+    int height = windowedHeight, width = int(float(height) * shape + 0.5f);
     if (most > 0 && width > most) { width = most; height = int(float(width) / shape + 0.5f); }
     SetWindowSize(width, height);
 }
 
 void drawOverlay()
 {
-    sizeWindowForAspect();
     Snapshot s = snapshot();
     if (s.mode == Mode::Closed || !g_runtime) return;
     if (s.needsInit) {
