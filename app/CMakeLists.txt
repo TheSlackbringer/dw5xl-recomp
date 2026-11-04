@@ -59,6 +59,7 @@ add_executable(dw5xl
     src/ipu_idec.cpp
     src/dw5xl_overlays.cpp
     src/dw5xl_install.cpp
+    src/dw5xl_load_original.cpp
     src/dw5xl_pc_settings.cpp
     setup/wizard_console.cpp
 )
@@ -87,7 +88,7 @@ set_target_properties(dw5xl PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
 if(DW5XL_BATCHED)
     set_target_properties(dw5xl PROPERTIES UNITY_BUILD OFF)
 endif()
-set_source_files_properties(src/dw5xl_allocators.cpp src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp src/dw5xl_install.cpp src/dw5xl_pc_settings.cpp setup/wizard_console.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
+set_source_files_properties(src/dw5xl_allocators.cpp src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp src/dw5xl_install.cpp src/dw5xl_load_original.cpp src/dw5xl_pc_settings.cpp setup/wizard_console.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
 # Lifted VU1 microprograms are translated from the game's own microcode (dw5xl_vu1lift, run by the launcher or
 # tools/regen.sh) into the ignored recomp/dw5xl/vu1/ folder. Game-derived: never committed. Without it,
 # VU1 microcode runs in the interpreter.
@@ -216,7 +217,7 @@ target_include_directories(dw5xl_iop_translator PUBLIC setup/ioplift "${PS2RECOM
     PRIVATE "${PS2RECOMP_DIR}/ps2xIOP/src")
 target_link_libraries(dw5xl_iop_translator PRIVATE ps2_iop)
 add_library(dw5xl_setup_core STATIC setup/iso9660.cpp setup/disc_setup.cpp setup/run_process.cpp setup/codegen.cpp
-    setup/build_game.cpp setup/install_state.cpp setup/setup_layout.cpp setup/setup_pipeline.cpp setup/setup_cache.cpp
+    setup/build_game.cpp setup/install_state.cpp setup/load_original.cpp setup/setup_layout.cpp setup/setup_pipeline.cpp setup/setup_cache.cpp
     $<TARGET_OBJECTS:dw5xl_vu_generator> $<TARGET_OBJECTS:dw5xl_iop_translator>)
 add_dependencies(dw5xl_setup_core dw5xl_vu_identity)
 target_include_directories(dw5xl_setup_core PRIVATE "${DW5XL_SETUP_GENERATED}")
@@ -275,6 +276,9 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_setup_install_test tests/setup_install_test.cpp)
     target_link_libraries(dw5xl_setup_install_test PRIVATE dw5xl_setup_core)
     add_test(NAME setup_install COMMAND dw5xl_setup_install_test)
+    add_executable(dw5xl_load_original_test tests/load_original_test.cpp)
+    target_link_libraries(dw5xl_load_original_test PRIVATE dw5xl_setup_core)
+    add_test(NAME load_original COMMAND dw5xl_load_original_test)
     # Function-key layout (owner 2026-10-20), unique keys, README key table, handlers read the table.
     add_executable(dw5xl_hotkeys_test tests/hotkeys_test.cpp)
     target_link_libraries(dw5xl_hotkeys_test PRIVATE ps2_runtime)
@@ -358,7 +362,7 @@ if(DW5XL_BUILD_TESTS)
     target_link_libraries(dw5xl_vu0_macro_test PRIVATE ps2_runtime)
     target_compile_options(dw5xl_vu0_macro_test PRIVATE ${DW5XL_ARCH_FLAGS} ${DW5XL_STRICT_FP_FLAGS})
     add_test(NAME vu0_macro COMMAND dw5xl_vu0_macro_test)
-    if(DW5XL_BUILD_GAME) # these two compile generated game functions
+    if(DW5XL_BUILD_GAME) # these tests compile generated game functions
     dw5xl_generated_function("${DW5XL_GENERATED_DIR}" "FUN_00144c70_0x144c70.cpp" DW5XL_POLL_SEMA_SOURCE)
     dw5xl_generated_function("${DW5XL_GENERATED_DIR}" "FUN_00110c78_0x110c78.cpp" DW5XL_GS_HELPER_SOURCE)
     dw5xl_generated_function("${DW5XL_GENERATED_DIR}" "FUN_001111d8_0x1111d8.cpp" DW5XL_GS_HELPER2_SOURCE)
@@ -375,6 +379,14 @@ if(DW5XL_BUILD_TESTS)
     target_include_directories(dw5xl_original_gs_helper_test PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
     target_compile_options(dw5xl_original_gs_helper_test PRIVATE ${DW5XL_ARCH_FLAGS})
     add_test(NAME original_gs_helper COMMAND dw5xl_original_gs_helper_test)
+    dw5xl_generated_function("${DW5XL_GENERATED_DIR}" "main_ovl02_import_001ac6c0_0x1ac6c0.cpp" DW5XL_ORIGINAL_SETTER_SOURCE)
+    dw5xl_generated_function("${DW5XL_GENERATED_DIR}" "FUN_001ac6d0_0x1ac6d0.cpp" DW5XL_ORIGINAL_READER_SOURCE)
+    add_executable(dw5xl_original_load_original_test tests/original_load_original_test.cpp
+        "${DW5XL_ORIGINAL_SETTER_SOURCE}" "${DW5XL_ORIGINAL_READER_SOURCE}")
+    target_link_libraries(dw5xl_original_load_original_test PRIVATE ps2_runtime)
+    target_include_directories(dw5xl_original_load_original_test PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
+    target_compile_options(dw5xl_original_load_original_test PRIVATE ${DW5XL_ARCH_FLAGS})
+    add_test(NAME original_load_original COMMAND dw5xl_original_load_original_test)
     endif()
     add_executable(dw5xl_disc_validation_test tests/disc_validation_test.cpp)
     target_link_libraries(dw5xl_disc_validation_test PRIVATE ps2_runtime)

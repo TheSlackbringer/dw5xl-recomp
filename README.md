@@ -40,7 +40,7 @@ Download the latest release from the [Releases](https://github.com/TheSlackbring
 
 **First start:** choose your XL disc image (and optionally the DW5 one) and press **Start**. The disc is checked, and the game is translated and compiled for your PC — about 10 minutes, once. Every later start opens the game directly; a new release rebuilds once without asking for the disc again.
 
-**Load Original:** when the game asks for the Dynasty Warriors 5 disc, a window opens over the game: choose that disc image and press **Install**. You can also add or repair discs any time with **F10**.
+**Load Original:** when the game asks for the Dynasty Warriors 5 disc, a window opens over the game: choose that disc image and press **Install**. You can also add or repair discs any time with **F10**. Once your DW5 disc is installed, the game starts with Musou and Free Mode already unlocked.
 
 Saves, settings and logs are kept in `%LOCALAPPDATA%\DW5XL` (Windows) or `~/.local/share/dw5xl` (Linux), so updating the release keeps them. If something goes wrong, please attach the files from its `logs` folder to an issue.
 
