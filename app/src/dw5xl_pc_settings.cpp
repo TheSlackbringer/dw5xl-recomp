@@ -1434,20 +1434,24 @@ void applyChanges(const dw5xl::pcsettings::Snapshot &s)
 namespace dw5xl::pcsettings {
 // Issue 047: a window keeps the chosen shape, so the picture fills it. Fullscreen and a maximized window show it as
 // large as they allow: the window manager decides their size, so it is not asked. Leaving them fits the window again,
-// at the height it last had as a normal window.
+// at the height it last had as a normal window. A new shape on a normal window does not move it: a resize alone leaves
+// the place to the window manager, so the place is asked for as well.
 void sizeWindowForAspect()
 {
     static int sizedFor = -1, windowedHeight = 448;   // the height the window opens at
     const bool full = IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE), maximized = IsWindowMaximized();
     const int key = full ? -2 : maximized ? -3 : int(dw5xl::widescreen::aspect());
     if (key == sizedFor) { if (key >= 0) windowedHeight = GetRenderHeight(); return; }
+    const bool wasNormal = sizedFor >= 0;
     sizedFor = key;
     if (full || maximized || IsWindowHidden()) return;
     const float shape = dw5xl::widescreen::shape();
     const int most = GetMonitorWidth(GetCurrentMonitor());
     int height = windowedHeight, width = int(float(height) * shape + 0.5f);
     if (most > 0 && width > most) { width = most; height = int(float(width) / shape + 0.5f); }
+    const Vector2 place = GetWindowPosition();
     SetWindowSize(width, height);
+    if (wasNormal) SetWindowPosition(int(place.x), int(place.y));
 }
 
 void drawOverlay()
