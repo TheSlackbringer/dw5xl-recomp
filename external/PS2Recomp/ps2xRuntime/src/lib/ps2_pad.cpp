@@ -1,5 +1,6 @@
 #include "runtime/ps2_pad.h"
 #include "runtime/host_input.h"
+#include "runtime/back_button.h"
 #include "ps2_host_backend.h"
 
 #include <algorithm>
@@ -94,8 +95,8 @@ namespace
     std::atomic<uint16_t> gHideUntilRelease{0};
     uint16_t gHiddenUntilRelease = 0;
     void (*gBackHoldAction)() = nullptr;
-    double gBackHoldSeconds = 0.75, gBackDownSince = -1.0;
-    bool gBackHoldFired = false;
+    double gBackHoldSeconds = 0.75;
+    ps2_host_input::BackButton gBackButton;
 
     void initScript()
     {
@@ -312,6 +313,7 @@ namespace ps2_host_input
         }
 
         int gamepad = -1;
+        bool padBack = false;
         if (focused && !gScripted)
         {
             for (int index = 0; index < 4; ++index)
@@ -330,20 +332,29 @@ namespace ps2_host_input
                 {GAMEPAD_BUTTON_LEFT_THUMB, PAD_L3}, {GAMEPAD_BUTTON_RIGHT_THUMB, PAD_R3}
             };
             for (const auto &button : buttons) bind(IsGamepadButtonDown(gamepad, button.first), button.second);
-            // Back: Select, or (issue 023 3S) held for a while the host action, a short press Select on release
-            const bool back = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_LEFT);
-            if (!gBackHoldAction) bind(back, PAD_SELECT);
-            else if (back) {
-                if (gBackDownSince < 0.0) gBackDownSince = now;
-                if (!gBackHoldFired && now - gBackDownSince >= gBackHoldSeconds) { gBackHoldFired = true; gBackHoldAction(); }
-            } else if (gBackDownSince >= 0.0) {
-                if (!gBackHoldFired) gTapUntil[0] = now + 0.1;            // PAD_SELECT is bit 0, a tap button
-                gBackDownSince = -1.0; gBackHoldFired = false;
-            }
+            padBack = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_LEFT);
             sticks[0] = stickByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X));
             sticks[1] = stickByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y));
             sticks[2] = stickByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X));
             sticks[3] = stickByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y));
+        }
+        else if (gScripted)   // issue 058: the pad's Back and Start in a script, through the same rule as a real pad
+        {
+            padBack = scriptedDown("PADBACK", vsyncTick);
+            bind(scriptedDown("PADSTART", vsyncTick), PAD_START);
+        }
+        if (gamepad >= 0 || gScripted)
+        {
+            // Back: Select, or (issue 023 3S, 058) the rule of back_button.h when holding it runs the host action
+            if (!gBackHoldAction) bind(padBack, PAD_SELECT);
+            else
+            {
+                const double backNow = gScripted ? double(vsyncTick) * 0.02 : now;   // a script counts PAL fields
+                const auto back = gBackButton.step(padBack, (pressed & PAD_START) != 0, backNow, gBackHoldSeconds);
+                bind(back.select, PAD_SELECT);
+                if (back.fire) gBackHoldAction();
+                if (back.tap) gTapUntil[0] = now + 0.1;                              // PAD_SELECT is bit 0, a tap button
+            }
         }
 
         std::array<bool, 3> mouse{};

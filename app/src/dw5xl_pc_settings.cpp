@@ -15,6 +15,7 @@
 #include "ipu_idec.h"
 #include "dw5xl_pc_settings.h"
 #include "dw5xl_widescreen.h"
+#include "dw5xl_main_menu.h"
 #include "imgui.h"
 #include "raylib.h"
 #include "runtime/ee_scheduler.h"
@@ -706,17 +707,22 @@ void playMenuSound(int id)
 // SLOT 1-5 and, in LOAD STATE, UNDO LAST LOAD (the game before the last load). A save is carried out while the game
 // stays paused (the scheduler holds at a quiet point and serves it there); a load closes the menu once it is done.
 enum class Screen { Menu, Settings, SaveList, LoadList };
-constexpr int kMenuRows = 4, kSlots = 6, kUndoRow = 6;
-const char *kMenuLabels[kMenuRows] = {"RESUME", "SAVE STATE", "LOAD STATE", "PC SETTINGS"};
+// Issue 058: MAIN MENU, the last row, through the game's own Select + Start reset: it works where the game asks for it.
+constexpr int kMenuRows = 5, kMainMenuRow = 4, kSlots = 6, kUndoRow = 6;
+const char *kMenuLabels[kMenuRows] = {"RESUME", "SAVE STATE", "LOAD STATE", "PC SETTINGS", "MAIN MENU"};
 const char *kMenuHelp[kMenuRows] = {"Back to the game.", "Saves the game as it is now. It stays paused.",
-                                    "Goes back to a saved moment.", "Graphics and display settings."};
+                                    "Goes back to a saved moment.", "Graphics and display settings.",
+                                    "Leaves for the game's main menu, as Select + Start held does."};
+const char *kMainMenuRefused = "Not here: the game can't return to its main menu from this screen.";
+const char *kMainMenuQuestion[2] = {"Return to the main menu?", "Progress since your last save will be lost."};
 const char *kScreenNames[4] = {"MENU", "PC SETTINGS", "SAVE STATE", "LOAD STATE"};
 struct SlotInfo { bool used = false; std::filesystem::file_time_type written{}; std::time_t time = 0; bool olderThanCard = false; Texture2D picture{}; };
 struct MenuState {
     Screen screen = Screen::Menu;
     int menuRow = 0, listRow = 0;
     bool confirm = false;                             // a used slot: the next Cross replaces it
-    std::string saving;                               // a save asked from the list, until its file is written
+    bool asking = false, askYes = false;              // issue 058: the MAIN MENU question, NO preselected
+    std::string saving;                             // a save asked from the list, until its file is written
     std::filesystem::file_time_type savingBefore{};
     std::string picture;                              // a saved state whose picture is still to be read
     bool loading = false;                             // a load asked from the list: the menu closes once it is done
@@ -738,7 +744,7 @@ void openInPlay(bool byBackHeld)
     std::fprintf(stderr, "[dw5xl:pc-settings] opened during play at field %llu (overlay %s%s): game paused, %s\n",
                  static_cast<unsigned long long>(field), module && module->identity ? module->identity : "none",
                  battleMenu ? ", a menu" : "", g_overBattle ? "darkened" : "menu background");
-    g_menu.screen = Screen::Menu; g_menu.menuRow = 0; g_menu.confirm = g_menu.loading = false; g_menu.saving.clear();
+    g_menu.screen = Screen::Menu; g_menu.menuRow = 0; g_menu.confirm = g_menu.loading = g_menu.asking = false; g_menu.saving.clear();
     std::fprintf(stderr, "[dw5xl:menu] open MENU at field %llu (%s)\n", static_cast<unsigned long long>(field),
                  byBackHeld ? "Back held" : "Esc");
 }
@@ -749,7 +755,7 @@ void closeInPlay()
     ps2_host_input::setGameInputBlocked(false);   // buttons still held stay hidden from the game until released
     std::fprintf(stderr, "[dw5xl:pc-settings] closed at field %llu: game resumed\n",
                  static_cast<unsigned long long>(g_runtime->eeScheduler().currentVSyncTick()));
-    g_menu.screen = Screen::Menu; g_menu.confirm = g_menu.loading = false; g_menu.saving.clear();
+    g_menu.screen = Screen::Menu; g_menu.confirm = g_menu.loading = g_menu.asking = false; g_menu.saving.clear();
 }
 
 std::string slotName(int row) { return row == 0 ? "QUICK" : row == kUndoRow ? "UNDO" : "SLOT " + std::to_string(row); }
@@ -929,9 +935,26 @@ void inPlayInput(const Presses &p, bool back)
                      p.down ? " down" : "", p.left ? " left" : "", p.right ? " right" : "", p.cross ? " cross" : "",
                      back ? " back" : "", kScreenNames[int(M.screen)], M.menuRow, M.listRow, M.loading ? ", loading" : "");
     if (M.loading) return;                            // the menu closes once the load is done
+    if (M.screen == Screen::Menu && M.asking) {       // issue 058: YES / NO, as the game's own questions
+        // NO and Back carry on with the game (spec v2, criterion 6)
+        if (back) { playMenuSound(4); std::fprintf(stderr, "[dw5xl:menu] MAIN MENU: back\n"); closeInPlay(); }
+        else if (p.left || p.right) { M.askYes = !M.askYes; playMenuSound(0); }
+        else if (p.cross && !M.askYes) { playMenuSound(4); std::fprintf(stderr, "[dw5xl:menu] MAIN MENU: NO\n"); closeInPlay(); }
+        else if (p.cross) {
+            playMenuSound(3);
+            std::fprintf(stderr, "[dw5xl:menu] MAIN MENU: YES\n");
+            dw5xl::mainmenu::requestReturn(*g_runtime);
+            closeInPlay();
+        }
+        return;
+    }
     if (M.screen == Screen::Menu) {
         if (back) { playMenuSound(4); closeInPlay(); }
         else if (p.up || p.down) { M.menuRow = (M.menuRow + (p.down ? 1 : kMenuRows - 1)) % kMenuRows; playMenuSound(0); }
+        else if (p.cross && M.menuRow == kMainMenuRow) {
+            if (!dw5xl::mainmenu::gameListens()) { playMenuSound(4); std::fprintf(stderr, "[dw5xl:menu] MAIN MENU: refused, the game does not ask here\n"); }
+            else { playMenuSound(3); M.asking = true; M.askYes = false; std::fprintf(stderr, "[dw5xl:menu] MAIN MENU: question\n"); }
+        }
         else if (p.cross) {
             playMenuSound(3);
             if (M.menuRow == 0) { std::fprintf(stderr, "[dw5xl:menu] RESUME\n"); closeInPlay(); }
@@ -1060,6 +1083,7 @@ struct Assets {
     Tex title, icon[3], barText[3];                   // in play: the screen title and the bar (Select, Change, Back)
     Tex sky, ground, emblem;                          // in play outside battle: the Options menu's background
     Tex titleMenu, titleSave, titleLoad, menuLabel[kMenuRows], quick, slot, empty, undo;   // issue 027 v4
+    Tex yesNo[2][2];                                  // issue 058: YES / NO, plain / the game's current-value yellow
     MImage digits;                                    // the number font (boot pictures), for text made later
     std::vector<uint8_t> exe;                         // the executable: its small font, for text made later
 } g_assets;
@@ -1204,6 +1228,8 @@ void buildAssets()
     float k[3]; for (int c = 0; c < 3; ++c) k[c] = float((ys[c] / std::max(yn, 1)) / std::max(1.0, ws[c] / std::max(wn, 1)));
     const char *words[2] = {"WINDOW", "FULLSCREEN"};
     for (int i = 0; i < 2; ++i) { const MImage w = word(words[i]); if (!w.w) return; A.word[i][0] = upload(w); A.word[i][1] = upload(tinted(w, k)); }
+    const char *answers[2] = {"YES", "NO"};
+    for (int i = 0; i < 2; ++i) { const MImage w = word(answers[i]); if (!w.w) return fail(answers[i]); A.yesNo[i][0] = upload(w); A.yesNo[i][1] = upload(tinted(w, k)); }
     // the number font, the separator line, the glow and the bar icons: the boot pictures
     const auto boot = readFile(dir / "LINKDATA.BIN", idx[0].offset(), idx[0].size);
     const auto bootPics = findTim2(boot.data(), boot.size());
@@ -1338,17 +1364,44 @@ void rowGlow(ImDrawList *dl, const Map &m, float y, const Tex &label)
     image(dl, m, g_assets.glow, 0, y - 2, std::max(144.0f, 24 - 4 + float(label.w) + 24), 32, IM_COL32(255, 208, 96, 128));
 }
 
-// The MENU: RESUME, SAVE STATE, LOAD STATE, PC SETTINGS, in the rows of the PC SETTINGS screen.
+const ImU32 kOff = IM_COL32(85, 85, 85, 255);         // a row that can't be used here
+
+// Issue 058: the MAIN MENU question in the look of the game's own (INTERIM SAVE's "Proceed?"): a light box with a
+// dark frame, dark text, YES and NO with the chosen one in the current-value yellow on the row glow; NO preselected.
+void drawQuestion(ImDrawList *dl, const Map &m)
+{
+    const Assets &A = g_assets; const MenuState &M = g_menu;
+    dl->AddRectFilled(m.at(72, 140), m.at(440, 262), IM_COL32(204, 196, 178, 250));
+    dl->AddRect(m.at(72, 140), m.at(440, 262), IM_COL32(96, 88, 74, 255), 0.0f, 0, 2.0f * m.sx);
+    dl->AddRect(m.at(76, 144), m.at(436, 258), IM_COL32(150, 140, 122, 255), 0.0f, 0, 1.0f * m.sx);
+    for (int i = 0; i < 2; ++i) {
+        const Tex &t = smallTex(kMainMenuQuestion[i]);
+        image(dl, m, t, 104, 160.0f + 20.0f * float(i), float(t.w) * 0.75f, 20, IM_COL32(48, 44, 38, 255));
+    }
+    const float x[2] = {180, 290}, y = 218;
+    for (int i = 0; i < 2; ++i) {
+        const bool chosen = (i == 0) == M.askYes;
+        const Tex &w = A.yesNo[i][chosen ? 1 : 0];
+        if (chosen) image(dl, m, A.glow, x[i] - 16, y - 2, float(w.w) + 32, 32, IM_COL32(255, 208, 96, 128));
+        image(dl, m, w, x[i], y, float(w.w), 28, chosen ? IM_COL32_WHITE : IM_COL32(70, 64, 56, 255));
+    }
+    helpLines(dl, m, "YES: to the main menu. NO or Back: carry on.");
+}
+
+// The MENU: RESUME, SAVE STATE, LOAD STATE, PC SETTINGS, MAIN MENU, in the rows of the PC SETTINGS screen.
 void drawMenu(ImDrawList *dl, const Map &m)
 {
     const Assets &A = g_assets; const MenuState &M = g_menu;
+    const bool listens = dw5xl::mainmenu::gameListens();   // issue 058: MAIN MENU is dimmed where the game does not ask
     rowGlow(dl, m, 100.0f + 34.0f * M.menuRow, A.menuLabel[M.menuRow]);
     for (int r = 0; r < kMenuRows; ++r) {
         const float y = 100.0f + 34.0f * r;
-        image(dl, m, A.menuLabel[r], 24 - 4, y, float(A.menuLabel[r].w), 28, r == M.menuRow ? IM_COL32_WHITE : kDim);
+        const ImU32 tint = r == kMainMenuRow && !listens ? kOff : r == M.menuRow ? IM_COL32_WHITE : kDim;
+        image(dl, m, A.menuLabel[r], 24 - 4, y, float(A.menuLabel[r].w), 28, tint);
         separator(dl, m, y + 27, 448, 496);
     }
-    helpLines(dl, m, kMenuHelp[M.menuRow]);
+    if (M.asking) { drawQuestion(dl, m); return; }
+    helpLines(dl, m, M.menuRow == kMainMenuRow && !listens ? kMainMenuRefused : kMenuHelp[M.menuRow]);
 }
 
 // SAVE STATE / LOAD STATE: QUICK, SLOT 1-5 (and UNDO LAST LOAD) with the time each was made; the selected slot's

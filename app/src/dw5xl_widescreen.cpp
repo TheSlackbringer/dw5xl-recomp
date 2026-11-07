@@ -226,6 +226,7 @@ void fades(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
 void pause(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
 {
     g_scene = g_hud = false;
+    if (g_trace) std::fprintf(stderr, "[widescreen] pause menu\n");   // DW5XL-DEBUG (issue 058's test)
     originalPause(ram, ctx, runtime);
 }
 

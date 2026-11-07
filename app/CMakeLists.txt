@@ -62,6 +62,7 @@ add_executable(dw5xl
     src/dw5xl_load_original.cpp
     src/dw5xl_widescreen.cpp
     src/dw5xl_pc_settings.cpp
+    src/dw5xl_main_menu.cpp
     setup/wizard_console.cpp
 )
 target_include_directories(dw5xl PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
@@ -89,7 +90,7 @@ set_target_properties(dw5xl PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
 if(DW5XL_BATCHED)
     set_target_properties(dw5xl PROPERTIES UNITY_BUILD OFF)
 endif()
-set_source_files_properties(src/dw5xl_allocators.cpp src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp src/dw5xl_install.cpp src/dw5xl_load_original.cpp src/dw5xl_widescreen.cpp src/dw5xl_pc_settings.cpp setup/wizard_console.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
+set_source_files_properties(src/dw5xl_allocators.cpp src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp src/dw5xl_install.cpp src/dw5xl_load_original.cpp src/dw5xl_widescreen.cpp src/dw5xl_pc_settings.cpp src/dw5xl_main_menu.cpp setup/wizard_console.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
 # Lifted VU1 microprograms are translated from the game's own microcode (dw5xl_vu1lift, run by the launcher or
 # tools/regen.sh) into the ignored recomp/dw5xl/vu1/ folder. Game-derived: never committed. Without it,
 # VU1 microcode runs in the interpreter.
@@ -397,6 +398,10 @@ if(DW5XL_BUILD_TESTS)
     target_include_directories(dw5xl_widescreen_settings_test PRIVATE src)
     target_compile_options(dw5xl_widescreen_settings_test PRIVATE ${DW5XL_ARCH_FLAGS})
     add_test(NAME widescreen_settings COMMAND dw5xl_widescreen_settings_test)
+    add_executable(dw5xl_back_button_test tests/back_button_test.cpp)
+    target_include_directories(dw5xl_back_button_test PRIVATE ../external/PS2Recomp/ps2xRuntime/include)
+    target_compile_options(dw5xl_back_button_test PRIVATE ${DW5XL_ARCH_FLAGS})
+    add_test(NAME back_button COMMAND dw5xl_back_button_test)
     add_executable(dw5xl_disc_validation_test tests/disc_validation_test.cpp)
     target_link_libraries(dw5xl_disc_validation_test PRIVATE ps2_runtime)
     target_include_directories(dw5xl_disc_validation_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
