@@ -63,6 +63,8 @@ add_executable(dw5xl
     src/dw5xl_widescreen.cpp
     src/dw5xl_pc_settings.cpp
     src/dw5xl_main_menu.cpp
+    src/dw5xl_frame_probe.cpp
+    src/dw5xl_smoothing.cpp
     setup/wizard_console.cpp
 )
 target_include_directories(dw5xl PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
@@ -90,7 +92,7 @@ set_target_properties(dw5xl PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
 if(DW5XL_BATCHED)
     set_target_properties(dw5xl PROPERTIES UNITY_BUILD OFF)
 endif()
-set_source_files_properties(src/dw5xl_allocators.cpp src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp src/dw5xl_install.cpp src/dw5xl_load_original.cpp src/dw5xl_widescreen.cpp src/dw5xl_pc_settings.cpp src/dw5xl_main_menu.cpp setup/wizard_console.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
+set_source_files_properties(src/dw5xl_allocators.cpp src/dw5xl_pad2.cpp src/dw5xl_images.cpp src/ipu_idec.cpp src/dw5xl_overlays.cpp src/dw5xl_install.cpp src/dw5xl_load_original.cpp src/dw5xl_widescreen.cpp src/dw5xl_pc_settings.cpp src/dw5xl_main_menu.cpp src/dw5xl_frame_probe.cpp src/dw5xl_smoothing.cpp setup/wizard_console.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
 # Lifted VU1 microprograms are translated from the game's own microcode (dw5xl_vu1lift, run by the launcher or
 # tools/regen.sh) into the ignored recomp/dw5xl/vu1/ folder. Game-derived: never committed. Without it,
 # VU1 microcode runs in the interpreter.

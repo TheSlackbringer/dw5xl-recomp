@@ -2,7 +2,7 @@
 // frame can be studied repeatedly with either renderer.
 //
 //   dw5xl_gsrender <rec> <cpu|vulkan> <outdir> <tick>[,<tick>...]
-//                  [--fb fbp,fbw,width,height] [--stop-at record] [--skip a-b[,a-b...]]
+//                  [--fb fbp,fbw,width,height] [--raw] [--stop-at record] [--skip a-b[,a-b...]]
 //                  [--probe x,y[;x,y...] --z zbp,zpsm]
 //
 // The recording must start with an Initialize record (full recordings, or
@@ -39,6 +39,7 @@ namespace
     {
         uint32_t fbp = 0, fbw = 0, width = 0, height = 0;
         bool set = false;
+        bool raw = false; // --raw: the whole GS memory next to each fb dump (<path>.vram.bin, all four bytes)
     };
 
     void writePpm(const std::string &path, const std::vector<uint8_t> &rgba, uint32_t width, uint32_t height,
@@ -59,6 +60,14 @@ namespace
     {
         std::vector<uint8_t> vram;
         backend.SnapshotVram(vram);
+        if (fb.raw)
+        {
+            std::FILE *file = std::fopen((path + ".vram.bin").c_str(), "wb");
+            if (!file)
+                throw std::runtime_error("cannot write " + path + ".vram.bin");
+            std::fwrite(vram.data(), 1u, vram.size(), file);
+            std::fclose(file);
+        }
         std::vector<uint8_t> rgba(size_t(fb.width) * fb.height * 4u);
         for (uint32_t y = 0; y < fb.height; ++y)
             for (uint32_t x = 0; x < fb.width; ++x)
@@ -99,6 +108,8 @@ int main(int argc, char **argv)
                     throw std::runtime_error("--fb wants fbp,fbw,width,height");
                 fb.set = true;
             }
+            else if (arg == "--raw")
+                fb.raw = true;
             else if (arg == "--stop-at" && i + 1 < argc)
                 stopAt = std::strtoull(argv[++i], nullptr, 10);
             else if (arg == "--skip" && i + 1 < argc)

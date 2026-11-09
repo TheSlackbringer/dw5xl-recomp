@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -711,17 +712,20 @@ namespace ps2_syscalls
                         if (!byte) break;
                         preview[count] = *byte;
                     }
-                std::fprintf(stderr, "[dw5xl:sfx-rpc] tick=%llu sid=%08x rpc=%x client=%08x send=%08x size=%u preview=%u pc=%08x ra=%08x words=",
-                             static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()),
-                             sid, rpcNum, clientPtr, sendBuf, sendSize, count,
-                             ctx->pc, getRegU32(ctx, 31));
-                for (uint32_t offset = 0u; offset + 4u <= count; offset += 4u)
+                // One write per line (issue 049: another thread's log line could cut into a line written in parts).
+                char line[384];
+                int used = std::snprintf(line, sizeof(line),
+                                         "[dw5xl:sfx-rpc] tick=%llu sid=%08x rpc=%x client=%08x send=%08x size=%u preview=%u pc=%08x ra=%08x words=",
+                                         static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()),
+                                         sid, rpcNum, clientPtr, sendBuf, sendSize, count,
+                                         ctx->pc, getRegU32(ctx, 31));
+                for (uint32_t offset = 0u; offset + 4u <= count && used > 0 && used < int(sizeof(line)) - 10; offset += 4u)
                 {
                     uint32_t word;
                     std::memcpy(&word, preview + offset, sizeof(word));
-                    std::fprintf(stderr, "%s%08x", offset ? "," : "", word);
+                    used += std::snprintf(line + used, sizeof(line) - used, "%s%08x", offset ? "," : "", word);
                 }
-                std::fputc('\n', stderr);
+                std::fprintf(stderr, "%s\n", line);
             }
             // A WAIT call from a callback (interrupt-like) must not block its thread: it runs at once, as before.
             if ((mode & kSifRpcModeNowait) != 0u || !runtime->eeScheduler().insideInvocation())
@@ -773,10 +777,12 @@ namespace ps2_syscalls
                     if (inserted || it->second.first != reply0 || ((sid == 0x4B534E47u || sid == 0x4B534E48u) && ksngTrace))
                     {
                         it->second.first = reply0;
-                        std::cerr << "[dw5xl:rpc] sid=0x" << std::hex << sid << " rpc=0x" << rpcNum << " #" << std::dec
-                                  << it->second.second << " send=" << sendSize << " [" << std::hex << send0 << " " << send1
-                                  << " " << send2 << "] reply0=0x" << reply0 << " handled=" << iopResult.handled
-                                  << " endFn=0x" << endFunction << std::dec << std::endl;
+                        std::ostringstream line; // one write per line (issue 049)
+                        line << "[dw5xl:rpc] sid=0x" << std::hex << sid << " rpc=0x" << rpcNum << " #" << std::dec
+                             << it->second.second << " send=" << sendSize << " [" << std::hex << send0 << " " << send1
+                             << " " << send2 << "] reply0=0x" << reply0 << " handled=" << iopResult.handled
+                             << " endFn=0x" << endFunction << std::dec << '\n';
+                        std::cerr << line.str() << std::flush;
                     }
                 }
             };

@@ -603,6 +603,22 @@ namespace ps2_stubs
 #else
         localtime_r(&now, &localTm);
 #endif
+        // DW5XL-DEBUG issue 049: PS2X_TEST_CLOCK=hh:mm:ss answers that time (on 2026-01-01) instead of the PC's: the game
+        // seeds its random numbers from the time of day (009 work.md), so test runs of the same code can then match.
+        if (const char *pinned = std::getenv("PS2X_TEST_CLOCK"); pinned && *pinned)
+        {
+            int h = 0, m = 0, s = 0;
+            if (std::sscanf(pinned, "%d:%d:%d", &h, &m, &s) == 3)
+            {
+                localTm = std::tm{};
+                localTm.tm_hour = h;
+                localTm.tm_min = m;
+                localTm.tm_sec = s;
+                localTm.tm_mday = 1;
+                localTm.tm_mon = 0;
+                localTm.tm_year = 126;
+            }
+        }
 
         // sceCdCLOCK format (BCD fields).
         clockData[0] = 0;

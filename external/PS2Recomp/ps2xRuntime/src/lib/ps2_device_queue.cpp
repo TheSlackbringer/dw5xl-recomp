@@ -1413,4 +1413,17 @@ namespace ps2x::device
         q->submit(std::move(command));
         return true;
     }
+
+    bool submitDetachedVif1(PS2Memory &mem, std::vector<uint8_t> stream)
+    {
+        // A GsCall, not a Transfer: workerCheckpointVif1Input() leaves it alone (no pause or cancel part-way) and no
+        // DMA completion is applied for it.
+        PS2Memory *m = &mem;
+        return submitGsCall(mem, [m, data = std::move(stream)]
+                            {
+                                m->processVIF1Data(data.data(), static_cast<uint32_t>(data.size()));
+                                if (m->m_gifArbiter)
+                                    m->m_gifArbiter->drain();
+                            });
+    }
 }

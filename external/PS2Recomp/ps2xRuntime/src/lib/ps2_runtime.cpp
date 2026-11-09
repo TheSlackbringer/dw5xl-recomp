@@ -808,6 +808,24 @@ namespace ps2x_dev
             }
         }
 
+        // Issue 049: a frame dump holds the picture this window frame shows, named by the field it shows; called right
+        // after the window latched it (with field pacing exactly the field the scheduler announced). Before, the dump
+        // was written before the latch and named by the scheduler's current field, so it could hold the previous window
+        // frame's picture under a later field: which picture a field's dump held depended on a race with the game's
+        // flips. A field the window does not show is not saved.
+        void dumpPresented(uint64_t field)
+        {
+            if (dumpEvery == 0u || field < dumpFrom || field > dumpTo)
+                return;
+            const uint64_t bucket = field / dumpEvery;
+            if (bucket == lastDumpBucket)
+                return;
+            lastDumpBucket = bucket;
+            char name[64];
+            std::snprintf(name, sizeof(name), "/frame_%06llu.png", static_cast<unsigned long long>(field));
+            writePng(dumpDir() + name);
+        }
+
         void step(uint64_t tick)
         {
             GSTrace::onTick(tick);
@@ -820,17 +838,6 @@ namespace ps2x_dev
                     mask |= ev.mask;
             g_padPressedMask.store(mask, std::memory_order_relaxed);
 
-            if (dumpEvery != 0u && tick >= dumpFrom && tick <= dumpTo)
-            {
-                const uint64_t bucket = tick / dumpEvery;
-                if (bucket != lastDumpBucket)
-                {
-                    lastDumpBucket = bucket;
-                    char name[64];
-                    std::snprintf(name, sizeof(name), "/frame_%06llu.png", static_cast<unsigned long long>(tick));
-                    writePng(dumpDir() + name);
-                }
-            }
             if (exitTick != 0u && tick >= exitTick)
             {
                 writePng(dumpDir() + "/final.png");
@@ -3937,6 +3944,7 @@ void PS2Runtime::run()
         uint32_t displayWidth = FB_WIDTH;
         uint32_t displayHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight, displayWidth, displayHeight, fieldPaced ? &paced : nullptr);
+        devHarness.dumpPresented(s_windowFrameField);
 
         BeginDrawing();
         ClearBackground(BLACK);

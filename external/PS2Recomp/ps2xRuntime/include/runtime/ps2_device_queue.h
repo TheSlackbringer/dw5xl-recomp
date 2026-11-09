@@ -209,6 +209,10 @@ namespace ps2x::device
     bool submitTransfers(PS2Memory &mem, TransferSnapshot &&snapshot, bool hadVif0);
     bool submitGsRegWrites(PS2Memory &mem, std::vector<GsRegWrite> writes);
     bool submitGsCall(PS2Memory &mem, std::function<void()> call);
+    // Issue 049 (in-between pictures): a VIF1 stream that is not a guest DMA transfer, e.g. a changed copy of a
+    // game's command list. It runs in queue order through VIF1, VU1, GIF and GS like a transfer's VIF1 data, but no
+    // DMA channel or completion is involved, so the guest never sees it. Synchronous executor: runs at once.
+    bool submitDetachedVif1(PS2Memory &mem, std::vector<uint8_t> stream);
 }
 
 #endif // PS2_DEVICE_QUEUE_H
