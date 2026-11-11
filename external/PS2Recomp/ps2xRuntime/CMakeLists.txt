@@ -11,7 +11,7 @@ option(PS2X_ENABLE_RUNNER_PCH "Precompile the heavy runtime headers for ps2Entry
 option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
 
 option(PS2X_ENABLE_RUNTIME_LOGS "Enable PS2 runtime logs" ON)
-option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime logs" ON)
+option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime logs" OFF)
 option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" ON)
 option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
 option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
