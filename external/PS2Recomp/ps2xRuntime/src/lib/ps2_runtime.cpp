@@ -1465,6 +1465,10 @@ PS2Runtime::~PS2Runtime()
         requestStop();
         // Join the device worker before the GS/VU1/arbiter members it drives go away.
         ps2x::device::detach(m_memory);
+        // Then the GS worker. m_gs is declared after m_gifArbiter, so it and its renderer are destroyed first, and
+        // the arbiter's own destructor would join the worker only after that, with GS work still running through
+        // them (a crash at exit on a busy PC; CTest gs_worker_teardown).
+        m_gifArbiter.setWorkerEnabled(false);
         m_iopSubsystem.reset();
         m_iopHost.reset();
         m_audioBackend.stopPcmStream();
