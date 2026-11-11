@@ -24,8 +24,7 @@ namespace vl
     void LiftAccess::prepareActive(Run &c)
     {
         VU1Interpreter &v = vu(c);
-        prepare(c, v.m_unit == VU1Interpreter::Unit::VU0 ? v.m_activeMemory->getVU0Code() : v.m_activeMemory->getVU1Code(),
-                v.m_activeMemory);
+        prepare(c, v.trackedCode(v.m_activeMemory), v.m_activeMemory);
     }
     namespace { std::atomic<int> g_enabledOverride{-1}; }
     void setEnabledOverride(int value) { g_enabledOverride.store(value, std::memory_order_relaxed); }
@@ -198,6 +197,12 @@ namespace vl
     }
 }
 
+VU1Interpreter::LiftCounters &VU1Interpreter::liftCounters()
+{
+    static LiftCounters s_byUnit[2];
+    return m_host ? m_ownLiftCounters : s_byUnit[m_unit == Unit::VU0 ? 1 : 0];
+}
+
 bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_t dataSize, PS2Memory *memory)
 {
     // PS2X_VU1_LIFT / PS2X_VU0_LIFT (issue 025): enabled by default, unset or != "0" -> true; "0" -> false.
@@ -205,7 +210,7 @@ bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_
     // switch, counters and caches.
     const bool vu0 = m_unit == Unit::VU0;
     const int unitIndex = vu0 ? 1 : 0;
-    const char *tag = vu0 ? "vu0lift" : "vu1lift";
+    const char *tag = m_host ? (vu0 ? "vu0lift.own" : "vu1lift.own") : (vu0 ? "vu0lift" : "vu1lift");
     static const bool s_enabled[2] = {
         []
         {
@@ -223,18 +228,18 @@ bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_
                 std::fprintf(stderr, "[vu0lift] enabled\n");
             return on;
         }()};
-    static uint64_t s_totalCallsByUnit[2] = {}, s_guardBailByUnit[2] = {}, s_findMissByUnit[2] = {}, s_findHitByUnit[2] = {};
-    uint64_t &s_totalCalls = s_totalCallsByUnit[unitIndex];
-    uint64_t &s_guardBail = s_guardBailByUnit[unitIndex];
-    uint64_t &s_findMiss = s_findMissByUnit[unitIndex];
-    uint64_t &s_findHit = s_findHitByUnit[unitIndex];
+    LiftCounters &counters = liftCounters();
+    uint64_t &s_totalCalls = counters.calls;
+    uint64_t &s_guardBail = counters.guardBail;
+    uint64_t &s_findMiss = counters.findMiss;
+    uint64_t &s_findHit = counters.findHit;
 
     ++s_totalCalls;
 
     const uint32_t unitSize = vu0 ? 0x1000u : 0x4000u;
     const int forced = vl::enabledOverride();
-    if (forced == 0 || (forced < 0 && !s_enabled[unitIndex]) || !memory || codeSize != unitSize || dataSize != unitSize ||
-        vuCode != (vu0 ? memory->getVU0Code() : memory->getVU1Code()) || !m_activeVuData)
+    if (forced == 0 || (forced < 0 && !s_enabled[unitIndex]) || (!memory && !m_host) || codeSize != unitSize ||
+        dataSize != unitSize || vuCode != trackedCode(memory) || !m_activeVuData)
         return false;
 
     // Lifted schedules start from idle pipelines.
@@ -265,7 +270,7 @@ bool VU1Interpreter::runLifted(const uint8_t *vuCode, uint32_t codeSize, uint32_
     };
     thread_local LookupCache s_cacheByUnit[2];
     LookupCache &cache = s_cacheByUnit[unitIndex];
-    const uint64_t generation = vu0 ? memory->getVU0CodeGeneration() : memory->getVU1CodeGeneration();
+    const uint64_t generation = trackedGeneration(memory);
     if (vuCode != cache.code || generation != cache.generation || !cache.current)
     {
         // Four independent lanes over 64-bit words: ~2k multiplies, not 16k dependent ones.
@@ -391,7 +396,7 @@ bool VU1Interpreter::runLiftedChecked(uint8_t *vuCode, uint32_t codeSize, uint8_
     // packets must be identical. The game continues with the lifted result.
     // PS2X_VU0_LIFT_VERIFY=1 does the same for VU0 microprograms (issue 025); log tag [vu0verify].
     const int unitIndex = m_unit == Unit::VU0 ? 1 : 0;
-    const char *tag = unitIndex ? "vu0verify" : "vu1verify";
+    const char *tag = m_host ? (unitIndex ? "vu0verify.own" : "vu1verify.own") : (unitIndex ? "vu0verify" : "vu1verify");
     static const bool s_verify[2] = {
         []
         {
@@ -412,10 +417,10 @@ bool VU1Interpreter::runLiftedChecked(uint8_t *vuCode, uint32_t codeSize, uint8_
     if (!s_verify[unitIndex])
         return runLifted(vuCode, codeSize, dataSize, memory);
 
-    static uint64_t s_runsByUnit[2] = {}, s_mismatchesByUnit[2] = {}, s_skippedByUnit[2] = {};
-    uint64_t &s_runs = s_runsByUnit[unitIndex];
-    uint64_t &s_mismatches = s_mismatchesByUnit[unitIndex];
-    uint64_t &s_skipped = s_skippedByUnit[unitIndex];
+    LiftCounters &counters = liftCounters();
+    uint64_t &s_runs = counters.runs;
+    uint64_t &s_mismatches = counters.mismatches;
+    uint64_t &s_skipped = counters.skipped;
     // PS2X_VU1_VERIFY_DUMP=<prefix>: the first mismatching runs are saved as <prefix>.<n>.code/.data/.state (the
     // PS2X_VU1_RUN_CAPTURE format, replayable offline) plus .txt with the entry pipeline state. Game data: keep local.
     static const char *s_dumpPrefix = std::getenv("PS2X_VU1_VERIFY_DUMP");

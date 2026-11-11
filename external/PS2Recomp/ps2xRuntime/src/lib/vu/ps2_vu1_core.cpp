@@ -1059,7 +1059,12 @@ void VU1Interpreter::finishXgkick()
         }
     }
 
-    if (m_activeMemory)
+    if (m_host)
+    {
+        if (m_host->gif)
+            m_host->gif(m_xgkick.packet.data(), m_xgkick.totalBytes);
+    }
+    else if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)
         m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);
@@ -1791,19 +1796,33 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
     m_decodedCodeCacheValid = true;
 }
 
+const uint8_t *VU1Interpreter::trackedCode(const PS2Memory *memory) const
+{
+    if (m_host)
+        return m_host->code;
+    if (!memory)
+        return nullptr;
+    return m_unit == Unit::VU1 ? memory->getVU1Code() : memory->getVU0Code();
+}
+
+uint64_t VU1Interpreter::trackedGeneration(const PS2Memory *memory) const
+{
+    if (m_host)
+        return m_host->generation ? m_host->generation->load(std::memory_order_relaxed) : 0u;
+    return m_unit == Unit::VU1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
+}
+
 const VU1Interpreter::DecodedInstructionPair &VU1Interpreter::getDecodedInstructionPairForPc(
     const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc)
 {
     if ((pc & 7u) != 0u)
         return m_uncachedDecoded = decodeInstructionPair(vuCode, pc);
 
-    const bool trackedVu1Code = memory != nullptr &&
-                                ((m_unit == Unit::VU1 && vuCode == memory->getVU1Code()) ||
-                                 (m_unit == Unit::VU0 && vuCode == memory->getVU0Code()));
-    if (!trackedVu1Code)
+    const uint8_t *tracked = trackedCode(memory);
+    if (!tracked || vuCode != tracked)
         return m_uncachedDecoded = decodeInstructionPair(vuCode, pc);
 
-    const uint64_t generation = m_unit == Unit::VU1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
+    const uint64_t generation = trackedGeneration(memory);
     if (!m_decodedCodeCacheValid ||
         m_cachedVuCode != vuCode ||
         m_cachedMemory != memory ||
@@ -1992,7 +2011,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
 #if defined(DW5XL_DEVELOPER_DIAGNOSTICS) && DW5XL_DEVELOPER_DIAGNOSTICS
     const ProfileVu1Run profileRun{m_unit == Unit::VU1 && !m_verifyShadow, m_state.pc, m_cycle, m_cycle};
 #endif
-    if (census(m_unit).enabled() && memory)
+    if (census(m_unit).enabled() && memory && !m_host)
     {
         VuCensus &c = census(m_unit);
         c.lastHash = c.hashOf(vuCode, codeSize, codeGeneration(m_unit, *memory));
@@ -2030,7 +2049,7 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
 #if defined(DW5XL_DEVELOPER_DIAGNOSTICS) && DW5XL_DEVELOPER_DIAGNOSTICS
     const ProfileVu1Run profileRun{m_unit == Unit::VU1 && !m_verifyShadow, m_state.pc, m_cycle, m_cycle};
 #endif
-    if (census(m_unit).enabled())
+    if (census(m_unit).enabled() && !m_host)
     {
         VuCensus &c = census(m_unit);
         const uint64_t before = m_cycle;
@@ -2065,7 +2084,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_activeGs = &gs;
     m_activeMemory = memory;
 
-    if (census(m_unit).enabled() && !m_verifyShadow)
+    if (census(m_unit).enabled() && !m_verifyShadow && !m_host)
     {
         census(m_unit).lastRunBudgetExhausted = false;
         census(m_unit).lastRunAbnormalStop = false;
@@ -2254,7 +2273,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             break;
     }
 
-    if (census(m_unit).enabled() && !m_verifyShadow)
+    if (census(m_unit).enabled() && !m_verifyShadow && !m_host)
     {
         census(m_unit).lastRunBudgetExhausted = !programEnded && m_cycle >= budgetEnd;
         census(m_unit).lastRunAbnormalStop = !programEnded && m_cycle < budgetEnd && !m_stopRequested;

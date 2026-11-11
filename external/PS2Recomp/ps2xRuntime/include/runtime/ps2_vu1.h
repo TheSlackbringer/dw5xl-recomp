@@ -2,8 +2,10 @@
 #define PS2_VU1_H
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <vector>
 
@@ -84,6 +86,26 @@ public:
     };
 
     explicit VU1Interpreter(Unit unit = Unit::VU1);
+
+    // DW5XL (issue 049, amendment v3.7): what a VU that is not the runtime memory object's own reaches outside
+    // itself (the VIF1/VU1 of in-between pictures; see Vif1Unit). execute() and resume() are then called without a
+    // memory object. Without a host (the game's VU0 and VU1) everything goes through the memory object.
+    struct Host
+    {
+        // This VU's program memory: the decoded-code cache and the translated code are used for it only.
+        const uint8_t *code = nullptr;
+        // Changes with every change of the program memory. Values from PS2Memory::nextCodeGeneration(), so that no
+        // two program memories ever share one.
+        const std::atomic<uint64_t> *generation = nullptr;
+        // A finished XGKICK packet (PATH1).
+        std::function<void(const uint8_t *, uint32_t)> gif;
+    };
+    // `host` outlives the interpreter's runs; nullptr: the memory object again.
+    void setHost(const Host *host)
+    {
+        m_host = host;
+        m_decodedCodeCacheValid = false;
+    }
 
     void reset();
     // Hardware micro-execution reset: preserve architectural registers/code/data.
@@ -293,6 +315,19 @@ private:
     uint32_t m_activeVuDataSize = 0;
     GS *m_activeGs = nullptr;
     PS2Memory *m_activeMemory = nullptr;
+    const Host *m_host = nullptr;
+    // Counters of the translated runs and of their verifier ([vu1lift:hit], [vu1verify]). The runtime's VU0 and VU1
+    // share one set per unit; a VU with a host runs on a thread of its own and counts for itself.
+    struct LiftCounters
+    {
+        uint64_t calls = 0, guardBail = 0, findMiss = 0, findHit = 0; // runLifted
+        uint64_t runs = 0, mismatches = 0, skipped = 0;               // runLiftedChecked
+    };
+    LiftCounters m_ownLiftCounters{};
+    LiftCounters &liftCounters();
+    // The program memory whose changes are counted (the caches hold for it only), and the count.
+    const uint8_t *trackedCode(const PS2Memory *memory) const;
+    uint64_t trackedGeneration(const PS2Memory *memory) const;
     bool m_stopRequested = false;
     bool m_pendingHaltD = false;
     bool m_pendingHaltT = false;

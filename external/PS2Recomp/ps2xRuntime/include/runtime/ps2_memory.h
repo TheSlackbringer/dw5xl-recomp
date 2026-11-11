@@ -13,6 +13,7 @@
 #include <exception>
 
 #include "gs/ps2_gif_arbiter.h"
+#include "ps2_vif1_unit.h"
 #if defined(_MSC_VER)
 #include <intrin.h>
 #elif defined(USE_SSE2NEON)
@@ -228,28 +229,7 @@ static_assert(sizeof(GSRegisters) == (20u * sizeof(uint64_t)), "GSRegisters layo
 static_assert(alignof(GSRegisters) == alignof(uint64_t), "GSRegisters alignment must remain 64-bit");
 static_assert(std::atomic<uint64_t>::is_always_lock_free, "GS CSR atomic must be lock-free on all supported targets");
 
-// PS2 VIF (VPU Interface) registers
-struct VIFRegisters
-{
-    uint32_t stat;   // Status
-    uint32_t fbrst;  // VIF Force Break
-    uint32_t err;    // Error status
-    uint32_t mark;   // Interrupt control
-    uint32_t cycle;  // Transfer mode
-    uint32_t mode;   // Mode control
-    uint32_t num;    // Data amount counter
-    uint32_t mask;   // Data mask
-    uint32_t code;   // VIFcode
-    uint32_t itops;  // ITOP save
-    uint32_t base;   // Base address
-    uint32_t ofst;   // Offset
-    uint32_t tops;   // TOPS
-    uint32_t itop;   // ITOP
-    uint32_t top;    // TOP
-    uint32_t row[4]; // Transfer row data
-    uint32_t col[4]; // Transfer column data
-};
-static_assert(sizeof(VIFRegisters) == (23u * sizeof(uint32_t)), "VIFRegisters layout changed unexpectedly");
+// PS2 VIF (VPU Interface) registers: VIFRegisters, in ps2_vif1_unit.h (issue 049 v3.7)
 
 // PS2 DMA registers
 struct DMARegisters
@@ -350,10 +330,10 @@ public:
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
     void setVu1MscntCallback(Vu1MscntCallback cb) { m_vu1MscntCallback = std::move(cb); }
 
-    uint8_t *getVU1Code() { return m_vu1Code; }
-    const uint8_t *getVU1Code() const { return m_vu1Code; }
-    uint8_t *getVU1Data() { return m_vu1Data; }
-    const uint8_t *getVU1Data() const { return m_vu1Data; }
+    uint8_t *getVU1Code() { return m_vif1.vu1Code; }
+    const uint8_t *getVU1Code() const { return m_vif1.vu1Code; }
+    uint8_t *getVU1Data() { return m_vif1.vu1Data; }
+    const uint8_t *getVU1Data() const { return m_vif1.vu1Data; }
     uint8_t *getVU0Code() { return m_vu0Code; }
     const uint8_t *getVU0Code() const { return m_vu0Code; }
     uint8_t *getVU0Data() { return m_vu0Data; }
@@ -414,7 +394,10 @@ public:
     GSRegisters gs_regs;
     uint8_t *m_gsVRAM;
     VIFRegisters vif0_regs;
-    VIFRegisters vif1_regs;
+    // DW5XL (issue 049 v3.7): the game's VIF1 as a unit (Vif1Unit: one implementation, any number of instances).
+    // This object keeps its own names for the unit's parts, so everything that reads or saves them is unchanged.
+    Vif1Unit m_vif1;
+    VIFRegisters &vif1_regs = m_vif1.regs;
     DMARegisters dma_regs[10]; // 10 DMA channels
 
     // Resolve the existing mapped native-access window to a physical-style
@@ -448,11 +431,11 @@ public:
 
     uint8_t *m_vu0Code = nullptr;
     uint8_t *m_vu0Data = nullptr;
-    uint8_t *m_vu1Code = nullptr;
-    uint8_t *m_vu1Data = nullptr;
+    uint8_t *&m_vu1Code = m_vif1.vu1Code;
+    uint8_t *&m_vu1Data = m_vif1.vu1Data;
     bool m_path3Masked = false;
-    uint32_t m_vif1PendingPath2ImageQwc = 0u;
-    bool m_vif1PendingPath2DirectHl = false;
+    uint32_t &m_vif1PendingPath2ImageQwc = m_vif1.pendingPath2ImageQwc;
+    bool &m_vif1PendingPath2DirectHl = m_vif1.pendingPath2DirectHl;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct PendingTransfer

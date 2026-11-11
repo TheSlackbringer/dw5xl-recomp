@@ -434,6 +434,12 @@ if(DW5XL_BUILD_TESTS)
     target_link_libraries(dw5xl_vu1_xgkick_tail_test PRIVATE ps2_runtime)
     target_compile_options(dw5xl_vu1_xgkick_tail_test PRIVATE ${DW5XL_ARCH_FLAGS})
     add_test(NAME vu1_xgkick_tail COMMAND dw5xl_vu1_xgkick_tail_test)
+    # DW5XL-TEST issue 049 v3.7 (P2.6b-1): VIF1 and VU1 as one implementation with more than one instance.
+    add_executable(dw5xl_vif1_units_test tests/vif1_units_test.cpp)
+    target_link_libraries(dw5xl_vif1_units_test PRIVATE ps2_runtime)
+    target_compile_options(dw5xl_vif1_units_test PRIVATE ${DW5XL_ARCH_FLAGS})
+    add_test(NAME vif1_units COMMAND dw5xl_vif1_units_test)
+    set_tests_properties(vif1_units PROPERTIES TIMEOUT 120)
     add_executable(dw5xl_gif_arbiter_order_test tests/gif_arbiter_order_test.cpp)
     target_link_libraries(dw5xl_gif_arbiter_order_test PRIVATE ps2_runtime)
     add_test(NAME gif_arbiter_order COMMAND dw5xl_gif_arbiter_order_test)
@@ -513,6 +519,20 @@ if(DW5XL_BUILD_TESTS)
         target_link_options(dw5xl_vu1_async_queue_tsan_test PRIVATE -fsanitize=thread)
         add_test(NAME vu1_async_queue_tsan COMMAND dw5xl_vu1_async_queue_tsan_test)
         set_tests_properties(vu1_async_queue_tsan PROPERTIES TIMEOUT 20 ENVIRONMENT "TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1")
+        # Issue 049 v3.7 (P2.6b-1): two VIF1/VU1 units on two threads share no unguarded data. The VIF1
+        # interpreter and the VU interpreter are recompiled instrumented as well.
+        file(GLOB DW5XL_VU_SRC CONFIGURE_DEPENDS "${DW5XL_RUNTIME_SRC}/vu/*.cpp")
+        add_executable(dw5xl_vif1_units_tsan_test
+            tests/vif1_units_test.cpp
+            "${DW5XL_RUNTIME_SRC}/ps2_memory.cpp"
+            "${DW5XL_RUNTIME_SRC}/ps2_vif1_interpreter.cpp"
+            "${DW5XL_RUNTIME_SRC}/gs/ps2_gif_arbiter.cpp"
+            ${DW5XL_VU_SRC})
+        target_link_libraries(dw5xl_vif1_units_tsan_test PRIVATE ps2_runtime)
+        target_compile_options(dw5xl_vif1_units_tsan_test PRIVATE ${DW5XL_ARCH_FLAGS} -fsanitize=thread -g -O1)
+        target_link_options(dw5xl_vif1_units_tsan_test PRIVATE -fsanitize=thread)
+        add_test(NAME vif1_units_tsan COMMAND dw5xl_vif1_units_tsan_test)
+        set_tests_properties(vif1_units_tsan PROPERTIES TIMEOUT 120 ENVIRONMENT "TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1")
     endif()
 
     # DW5XL-TEST: GS stream recording comparison and offline VIF1 replay (tools/gsreplay).
