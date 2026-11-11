@@ -112,6 +112,10 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
   machine-specific fixes. Correctness is defined by PS2 behaviour. (Portability requirement, 2026-10-18.)
 - **The user's desktop is off limits:** never send synthetic input to it, never screenshot it (use frame dumps),
   never unlock it, never edit `~/.config/PCSX2`. Visible windows only for a manual test session or when asked.
+- **No verbose-log builds in the user's windows (2026-11-11):** never open a visible window for the user from a build
+  with `PS2X_ENABLE_AGRESSIVE_LOGS=ON`: the whole game runs in slow motion while the FPS and VSync counters still
+  read 50, and timed tests are off too. The default is OFF since 2026-11-11, but a build folder keeps the value it was
+  configured with: check its `CMakeCache.txt` before a window or a test run (`dw5test.py` refuses such a build).
 - **Game runs and builds go through the slots (2026-11-11, issue 064; replaces "one game at a time"):**
   `notes/issues/tests/slots.py` shares the PC between sessions and between the ports (DW5 and DBZIW use the same
   slots). `alone`: a run that measures time (FPS, late fields, frame times, hitches, sound gaps) has the PC to itself.
