@@ -11,6 +11,7 @@
 //   6. a direct write into GS memory: all pages; equal after the copy.
 // "Equal" compares the single-rate GS memory (4 MB) of both, read back from the renderer.
 // Exit code 77: no Vulkan device (skipped).
+#include "ps2_runtime.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/state_archive.h"
@@ -21,6 +22,14 @@
 #include <cstdlib>
 #include <exception>
 #include <vector>
+
+// The GS's state functions come from an object file that also holds the runtime's (found on the Windows build,
+// 2026-11-11: the linker takes the runtime with it there): the table the generated code would bring, as in the
+// other runtime tests.
+extern const uint32_t g_ps2RecompiledFunctionTableBase = 0x1000;
+extern const uint32_t g_ps2RecompiledFunctionTableEnd = 0x1004;
+extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = 1;
+PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[] = {nullptr};
 
 namespace
 {
