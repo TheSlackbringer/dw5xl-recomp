@@ -7,9 +7,12 @@ import struct
 import subprocess
 import tempfile
 import unittest
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from recompiler_path import recompiler
 
 ROOT = Path(__file__).resolve().parents[2]
-RECOMP = Path(os.environ.get('PS2X_TEST_RECOMPILER', str(ROOT / 'build-recomp/ps2xRecomp/ps2_recomp')))
+RECOMP = recompiler()
 PREFIX = '[setup-timing] '
 
 
