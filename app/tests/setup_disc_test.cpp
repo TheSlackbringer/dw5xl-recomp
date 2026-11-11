@@ -1,6 +1,7 @@
 // Setup wizard core (issue 011): ISO 9660 reading, disc recognition and verified extraction on a small
 // synthetic image built here (no game data).
 #include "disc_setup.h"
+#include "test_scratch.h"
 #include "synthetic_iso.h"
 
 #include <iostream>
@@ -28,7 +29,7 @@ int main()
 {
     try
     {
-        const fs::path dir = fs::temp_directory_path() / "dw5xl_setup_disc_test";
+        const fs::path dir = fs::temp_directory_path() / scratchName("dw5xl_setup_disc_test");
         fs::remove_all(dir);
         fs::create_directories(dir);
         const fs::path image = dir / "test.iso";

@@ -1908,6 +1908,10 @@ PS2Runtime::~PS2Runtime()
         // Issue 049 v3.7: the pictures' device and what the GS side still holds of its packets.
         m_pictureDevice.reset();
         m_gifArbiter.dropSideBefore(~0ull);
+        // Then the GS worker. m_gs is declared after m_gifArbiter, so it and its renderer are destroyed first, and
+        // the arbiter's own destructor would join the worker only after that, with GS work still running through
+        // them (a crash at exit on a busy PC; CTest gs_worker_teardown).
+        m_gifArbiter.setWorkerEnabled(false);
         m_iopSubsystem.reset();
         m_iopHost.reset();
         m_audioBackend.stopPcmStream();

@@ -9,12 +9,14 @@ import tempfile
 import unittest
 import sys
 import re
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from recompiler_path import recompiler
 
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'tools/debug'))
 from generated_sources import BatchError,validate_batch_index,virtual_inventory
 
-RECOMP = Path(os.environ.get('PS2X_TEST_RECOMPILER', 'build-recomp/ps2xRecomp/ps2_recomp'))
+RECOMP = recompiler()
 PREFIX = '[setup-timing] '
 
 class OutputCandidates(unittest.TestCase):

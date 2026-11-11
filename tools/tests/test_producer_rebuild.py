@@ -3,11 +3,14 @@ import os
 from pathlib import Path
 import struct
 import unittest
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from recompiler_path import recompiler
 
 
 class ProducerRebuild(unittest.TestCase):
     def test_windows_producer_uses_reproducible_image_metadata(self):
-        exe=Path(os.environ.get('PS2X_TEST_RECOMPILER','build-recomp/ps2xRecomp/ps2_recomp'))
+        exe=recompiler()
         data=exe.read_bytes()
         if not data.startswith(b'MZ'):
             self.skipTest('PE metadata guard applies to Windows; full rebuilt-byte comparison is separate')

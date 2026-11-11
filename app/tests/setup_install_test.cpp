@@ -1,6 +1,7 @@
 // Installed mode (issue 011 v4): player data folder, install marker, and the wizard's install-only run, on the
 // synthetic image (no game data).
 #include "disc_wait.h"
+#include "test_scratch.h"
 #include "install_state.h"
 #include "setup_pipeline.h"
 #include "synthetic_iso.h"
@@ -39,7 +40,7 @@ int main()
 {
     try
     {
-        const fs::path dir = fs::temp_directory_path() / "dw5xl_setup_install_test";
+        const fs::path dir = fs::temp_directory_path() / scratchName("dw5xl_setup_install_test");
         fs::remove_all(dir);
         fs::create_directories(dir);
         const fs::path iso = dir / "disc.iso";
