@@ -105,8 +105,18 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
   machine-specific fixes. Correctness is defined by PS2 behaviour. (Portability requirement, 2026-10-18.)
 - **The user's desktop is off limits:** never send synthetic input to it, never screenshot it (use frame dumps),
   never unlock it, never edit `~/.config/PCSX2`. Visible windows only for a manual test session or when asked.
-- **One game at a time;** no builds or test runs while the user has a window open. Tests use the silent sink
-  `dw5xl_codex_tests`; live play uses the default output. Never change audio defaults or route other apps.
+- **Game runs and builds go through the slots (2026-11-11, issue 064; replaces "one game at a time"):**
+  `notes/issues/tests/slots.py` shares the PC between sessions and between the ports (DW5 and DBZIW use the same
+  slots). `alone`: a run that measures time (FPS, late fields, frame times, hitches, sound gaps) has the PC to itself.
+  `beside`: runs that only check results (pictures, crashes, save states), up to 4 at once. `build`: one build at a
+  time, at low priority, never during an `alone` run. A run waits for its slot; it does not fail. Tests take their
+  slot in `dw5test.py` (`alone` unless the test's file is in `dw5test.SIDE_BY_SIDE`; a test joins that list only
+  after its pass criteria were read for anything timed). By hand: `slots.py alone|beside|build -- <command>`;
+  `slots.py status` shows who holds what. Never start a game or a build around the slots, and never ask for `beside`
+  for a run whose result depends on time. Each session works in its own worktree and build folder.
+  No builds or test runs while the user has a window open (`run.py play|window` take the whole PC; a game started by
+  hand makes every run wait). Tests use the silent sink `dw5xl_codex_tests`; live play uses the default output.
+  Never change audio defaults or route other apps.
 - **Downloads need explicit permission** (name, source, size).
 - **Nothing derived from the game in Git:** no game files (`game/`, `discs/`), Ghidra DBs, generated or lifted C++
   (`recomp/*/output/`, `recomp/dw5xl/vu1/`), frame dumps, captures, microcode `.bin`, screenshots. Scan before every
@@ -131,11 +141,12 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
   before expensive batches; at ≤10 % left, checkpoint (`work.md`, index) before continuing.
 
 ## Essentials
-- Build: `cmake --build app/build` (all), `--target dw5xl` (game). Regenerate code: `tools/regen.sh main|ovl00|…`
+- Build: `notes/issues/tests/slots.py build -- cmake --build app/build` (all), `--target dw5xl` (game); the slot
+  keeps a build out of other sessions' timing runs. Regenerate code: `tools/regen.sh main|ovl00|…`
   (needs the player's disc in `game/dw5xl/`). CTests: `cd app/build && ctest`.
 - Run all fast checks plus checks relevant to the changed area (testing rule above). Available issue tiers: `run.py NNN|quick|standard`
   (no full tier, owner 2026-11-03); recommend the standard tier after at least three fixed specs and ask the user before running it.
-  Perf/stutter: `tools/heavy_battle_test.py` (no frame dumps when measuring timing).
+  Perf/stutter: `slots.py alone -- tools/heavy_battle_test.py` (no frame dumps when measuring timing).
 - Unsure how the original looks or behaves: compare with PCSX2 first (`tools/pcsx2_reference.py`), then ask the user
   for what screenshots can't show (feel, sound timing).
 - Debug code: `DW5XL-DEBUG` (kept, env-gated) and `TEMP-DEBUG` (remove before committing).
@@ -173,8 +184,9 @@ it. No mid-function hooks. Never patch disc files or generated output by hand.
 
 ### Running the game by hand (prefer the issue tests and helpers)
 From `game/dw5xl`: `PS2X_GS_BACKEND=vulkan PS2X_HIDDEN=1 PS2X_GS_SCALE=1 PS2X_GS_SSAA=1 PULSE_SINK=dw5xl_codex_tests
-PS2X_HOST_INPUT="<tick>:<KEY>:<hold>,..." PS2X_DUMP_DIR=<dir> PS2X_DUMP_EVERY=<n> PS2X_EXIT_TICK=<n> timeout <s>
-../../app/build/dw5xl ./SLES_538.60 > run.log 2>&1`. Ticks are PAL vsyncs (50/s). Keys: ENTER (Start), X (Cross),
+PS2X_HOST_INPUT="<tick>:<KEY>:<hold>,..." PS2X_DUMP_DIR=<dir> PS2X_DUMP_EVERY=<n> PS2X_EXIT_TICK=<n>
+../../notes/issues/tests/slots.py alone -- timeout <s> ../../app/build/dw5xl ./SLES_538.60 > run.log 2>&1` (the slot:
+`alone`, or `beside` for a run that measures no time). Ticks are PAL vsyncs (50/s). Keys: ENTER (Start), X (Cross),
 C (Circle), Z (Square), V (Triangle), UP DOWN LEFT RIGHT, Q/E (L1/R1); leave ~100 ticks between menu presses.
 Known routes (main menu, Opening, battle resume, heavy fight, defeat): `notes/issues/tests/dw5test.py`.
 Timeline: Koei logo 0–200, Start at 400 skips to the main menu (up by ~750).
