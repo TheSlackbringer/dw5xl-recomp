@@ -33,12 +33,18 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
 2. **Spec approval before any work.** Draft the spec (fact-finding needed to write it is fine); the user approves.
    Push back with reasons when you think a spec is wrong; the user decides and can overrule. No fixes or experimental
    code changes without an approved spec. While away, the user can allow work on an unapproved spec — explicitly.
-3. **A test per issue, written first:** `notes/issues/tests/issue_NNN_*.py` prints PASS/FAIL and must FAIL on the bug
-   before the fix (where measurable). Runner: `notes/issues/tests/run.py NNN|quick|standard|list`; helpers and routes in
-   `tests/dw5test.py`. Closed issues keep their tests as regression guards.
-4. **Testing by change (2026-10-21, replaces mandatory suite gates):** run all fast automated checks
-   after every change: unit tests, Python unit tests and static checks. Also run checks relevant to the changed
-   code and behaviour. Use CI to validate builds. Slow gameplay runs are separate from the fast checks.
+3. **A test per issue, written first, and the cheapest one that shows the bug (2026-11-11, issue 065):** a unit test
+   (CTest) where the bug can be shown without the game; otherwise a reading of the go's runs (`tests/go.py`); a new
+   game run only with its reason in the spec. `notes/issues/tests/issue_NNN_*.py` prints PASS/FAIL and must FAIL on
+   the bug before the fix (where measurable). Runner: `notes/issues/tests/run.py NNN|go|area <name>|list`; helpers and
+   routes in `tests/dw5test.py`. Closed issues keep their tests: they run by name or by area, not day to day.
+4. **Testing by change (2026-11-11, issue 065: the game is run only to check performance):** after every change run
+   the unit tests (`ctest`), Python unit tests and static checks. For performance run **the go**, `run.py go`: the
+   unit tests, then three timed runs of the compiled program (the Opening at 4x from a cold start; the Lu Bu fight at
+   4x from its save state, a timed minute and a short untimed tail; the Opening at 1x). About 5.5 minutes after a
+   compile, seconds for the same program again. Run an old game test only for the area you are changing
+   (`run.py area <name>`; `run.py area` lists the groups) or when the user asks, and before a release.
+   Use CI to validate builds.
    **No full tier any more (owner 2026-11-03: too long, too many tests).** After fixing at least three specs,
    recommend a standard-tier run and ask the user directly before running it. Never start a tier without the user's
    explicit approval or request. There is no automatic broad-suite
@@ -65,7 +71,8 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
   waiting, applying the choice may not. A request to fix something is not agreement with a particular approach.
 - **Native over emulation;** model hardware only where the runtime must. Prefer the game's own SDK code over runtime
   HLE stubs. Find root causes; no workarounds that paper over symptoms. Survey existing approaches before inventing.
-- **Performance changes must give identical output** (same frames, same sound). Test at **1x**: every run passes
+- **Performance changes must give identical output** (same frames, same sound). The go (issue 065) times the game at
+  4x and at 1x and checks the `[output] scale=` line of its runs itself. Every other test run is at **1x**: it passes
   `PS2X_GS_SCALE=1 PS2X_GS_SSAA=1` and you check the `[output] scale=1x` log line.
 - **Exact saved-frame comparison (2026-10-22):** Use `tools/debug/compare_frames.py` for renderer/shader,
   VU graphics math, framebuffer/presentation changes, optimizations/refactors in those paths, and visual-regression
@@ -105,8 +112,18 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
   machine-specific fixes. Correctness is defined by PS2 behaviour. (Portability requirement, 2026-10-18.)
 - **The user's desktop is off limits:** never send synthetic input to it, never screenshot it (use frame dumps),
   never unlock it, never edit `~/.config/PCSX2`. Visible windows only for a manual test session or when asked.
-- **One game at a time;** no builds or test runs while the user has a window open. Tests use the silent sink
-  `dw5xl_codex_tests`; live play uses the default output. Never change audio defaults or route other apps.
+- **Game runs and builds go through the slots (2026-11-11, issue 064; replaces "one game at a time"):**
+  `notes/issues/tests/slots.py` shares the PC between sessions and between the ports (DW5 and DBZIW use the same
+  slots). `alone`: a run that measures time (FPS, late fields, frame times, hitches, sound gaps) has the PC to itself.
+  `beside`: runs that only check results (pictures, crashes, save states), up to 4 at once. `build`: one build at a
+  time, at low priority, never during an `alone` run. A run waits for its slot; it does not fail. Tests take their
+  slot in `dw5test.py` (`alone` unless the test's file is in `dw5test.SIDE_BY_SIDE`; a test joins that list only
+  after its pass criteria were read for anything timed). By hand: `slots.py alone|beside|build -- <command>`;
+  `slots.py status` shows who holds what. Never start a game or a build around the slots, and never ask for `beside`
+  for a run whose result depends on time. Each session works in its own worktree and build folder.
+  No builds or test runs while the user has a window open (`run.py play|window` take the whole PC; a game started by
+  hand makes every run wait). Tests use the silent sink `dw5xl_codex_tests`; live play uses the default output.
+  Never change audio defaults or route other apps.
 - **Downloads need explicit permission** (name, source, size).
 - **Nothing derived from the game in Git:** no game files (`game/`, `discs/`), Ghidra DBs, generated or lifted C++
   (`recomp/*/output/`, `recomp/dw5xl/vu1/`), frame dumps, captures, microcode `.bin`, screenshots. Scan before every
@@ -131,11 +148,14 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
   before expensive batches; at ≤10 % left, checkpoint (`work.md`, index) before continuing.
 
 ## Essentials
-- Build: `cmake --build app/build` (all), `--target dw5xl` (game). Regenerate code: `tools/regen.sh main|ovl00|…`
+- Build: `notes/issues/tests/slots.py build -- cmake --build app/build` (all), `--target dw5xl` (game); the slot
+  keeps a build out of other sessions' timing runs. Regenerate code: `tools/regen.sh main|ovl00|…`
   (needs the player's disc in `game/dw5xl/`). CTests: `cd app/build && ctest`.
-- Run all fast checks plus checks relevant to the changed area (testing rule above). Available issue tiers: `run.py NNN|quick|standard`
-  (no full tier, owner 2026-11-03); recommend the standard tier after at least three fixed specs and ask the user before running it.
-  Perf/stutter: `tools/heavy_battle_test.py` (no frame dumps when measuring timing).
+- After a change: the unit tests, then `run.py go` for performance (testing rule above; `run.py go --replay` plays a
+  program's runs again). A game test by name or area only for the code you are changing: `run.py NNN`,
+  `run.py area <name>`. The old tiers `run.py quick|standard` remain (no full tier, owner 2026-11-03); recommend the
+  standard tier after at least three fixed specs and ask the user before running it.
+  The long fights: `slots.py alone -- tools/heavy_battle_test.py` (no frame dumps when measuring timing).
 - Unsure how the original looks or behaves: compare with PCSX2 first (`tools/pcsx2_reference.py`), then ask the user
   for what screenshots can't show (feel, sound timing).
 - Debug code: `DW5XL-DEBUG` (kept, env-gated) and `TEMP-DEBUG` (remove before committing).
@@ -173,8 +193,9 @@ it. No mid-function hooks. Never patch disc files or generated output by hand.
 
 ### Running the game by hand (prefer the issue tests and helpers)
 From `game/dw5xl`: `PS2X_GS_BACKEND=vulkan PS2X_HIDDEN=1 PS2X_GS_SCALE=1 PS2X_GS_SSAA=1 PULSE_SINK=dw5xl_codex_tests
-PS2X_HOST_INPUT="<tick>:<KEY>:<hold>,..." PS2X_DUMP_DIR=<dir> PS2X_DUMP_EVERY=<n> PS2X_EXIT_TICK=<n> timeout <s>
-../../app/build/dw5xl ./SLES_538.60 > run.log 2>&1`. Ticks are PAL vsyncs (50/s). Keys: ENTER (Start), X (Cross),
+PS2X_HOST_INPUT="<tick>:<KEY>:<hold>,..." PS2X_DUMP_DIR=<dir> PS2X_DUMP_EVERY=<n> PS2X_EXIT_TICK=<n>
+../../notes/issues/tests/slots.py alone -- timeout <s> ../../app/build/dw5xl ./SLES_538.60 > run.log 2>&1` (the slot:
+`alone`, or `beside` for a run that measures no time). Ticks are PAL vsyncs (50/s). Keys: ENTER (Start), X (Cross),
 C (Circle), Z (Square), V (Triangle), UP DOWN LEFT RIGHT, Q/E (L1/R1); leave ~100 ticks between menu presses.
 Known routes (main menu, Opening, battle resume, heavy fight, defeat): `notes/issues/tests/dw5test.py`.
 Timeline: Koei logo 0–200, Start at 400 skips to the main menu (up by ~750).
