@@ -565,6 +565,41 @@ int main()
               "without a measurement for five seconds one picture is tried again");
     }
 
+    {
+        // Amendment v3.7 (P2.6a): the picture that was let through to learn the cost came back and is not to be
+        // counted (the first one after the time line started again: its caches were cold). The next frame tries one
+        // again at once, not after half a second.
+        PictureBudget budget;
+        budget.frame(1000.0, 1013.0, kField, 5.0);
+        const bool tried = budget.admit(1000.5) && !budget.admit(1001.0);
+        budget.frame(1020.0, 1033.0, kField, 5.0);
+        const bool waits = !budget.admit(1020.5);
+        budget.probeDone();
+        budget.frame(1040.0, 1053.0, kField, 5.0);
+        const bool again = budget.admit(1040.5) && !budget.admit(1041.0);
+        budget.measured(1045.0, 4.0);
+        budget.frame(1060.0, 1073.0, kField, 5.0);
+        check(tried && waits && again && budget.known() && budget.admit(1060.5),
+              "a trial picture that is not counted lets the next frame try one at once");
+    }
+
+    {
+        // Amendment v3.7 (P2.6a): a break in the game's own clock between two frames, read from the PS2 field clock:
+        // the field's number and its start no longer move together. The cases are the ones measured on 2026-11-11
+        // (a quick save, the MENU, a state load back, the first frame after a state load ahead).
+        check(!fieldClockBroke(3599u, 1000.0, 3600u, 1020.0, kField), "frames one field apart: the field clock ran evenly");
+        check(!fieldClockBroke(3599u, 1000.0, 3600u, 1020.4, kField) && !fieldClockBroke(3599u, 1000.0, 3600u, 1019.6, kField),
+              "a field that starts a little late or early is no break");
+        check(!fieldClockBroke(3599u, 1000.0, 3601u, 1040.0, kField) && !fieldClockBroke(3599u, 1000.0, 3604u, 1100.0, kField),
+              "the game missed fields (more fields, as much more time): no break");
+        check(fieldClockBroke(3600u, 1000.0, 3601u, 1095.2, kField), "a quick save: one field on, 95 ms later: a break");
+        check(fieldClockBroke(3700u, 1000.0, 3701u, 4956.5, kField), "the MENU: one field on, four seconds later: a break");
+        check(fieldClockBroke(3800u, 1000.0, 3601u, 1281.5, kField), "a state load: the fields go back: a break");
+        check(fieldClockBroke(29u, 1000.0, 3151u, 1237.4, kField), "a state load ahead: many fields on in a quarter second: a break");
+        check(fieldClockBroke(3600u, 1000.0, 3600u, 1020.0, kField), "the same field twice: a break");
+        check(!fieldClockBroke(3600u, 1000.0, 3601u, 1500.0, 0.0), "without a field length nothing is judged");
+    }
+
     std::printf("%s (%d failed)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

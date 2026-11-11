@@ -283,6 +283,16 @@ namespace dw5xl::smooth
         changed();
     }
 
+    bool fieldClockBroke(uint64_t beforeField, double beforeStart, uint64_t field, double start, double fieldMs)
+    {
+        if (!(fieldMs > 0.0))
+            return false;
+        if (field <= beforeField)
+            return true;
+        const double expected = static_cast<double>(field - beforeField) * fieldMs;
+        return std::fabs((start - beforeStart) - expected) > fieldMs / 2.0;
+    }
+
     double TimeLine::frame(uint32_t number, double instant, double field, const Display &display, std::vector<Picture> &out)
     {
         if (!m_have || number != m_number + 1u || !(instant > m_instant) || !(field > 0.0))

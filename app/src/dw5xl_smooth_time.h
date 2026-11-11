@@ -203,6 +203,9 @@ namespace dw5xl::smooth
         // A picture: how long it took from the moment the device could start it (it was queued, or the picture
         // before it had left) until it had left the device. `first`: it was its frame's first picture.
         void measured(double nowMs, double pictureMs, bool first = true);
+        // The picture let through to learn the cost came back and is not to be counted (amendment v3.7: the first
+        // one after the time line started again, drawn with caches that had to be filled): the next one is tried.
+        void probeDone() { m_probing = false; }
         // The game: how long it took from the moment the device was free for it at its field (the field's start,
         // or later when pictures ran past it) to the end of its next frame.
         void gameTook(double nowMs, double ms);
@@ -227,6 +230,14 @@ namespace dw5xl::smooth
         bool m_probing = false;
         double m_probeUntil = 0.0;
     };
+
+    // Amendment v3.7 (P2.6a): a break in the game's own clock between two frames. The PS2 field clock shows it: a
+    // field's number and its start no longer move together. Field `beforeField` began at `beforeStart`, field `field`
+    // at `start` (ms), a field is `fieldMs` long. True when the time between them differs from the fields between
+    // them by more than half a field (the game stood still: the MENU, a save, a load; measured 2026-11-11: a quick
+    // save 95 ms, the MENU four seconds, for one field), or the fields did not go on (a state load back). A game
+    // that misses fields is no break: more fields pass, and as much more time. No field length: nothing is judged.
+    bool fieldClockBroke(uint64_t beforeField, double beforeStart, uint64_t field, double start, double fieldMs);
 
     // Amendment v3.6 (approved 2026-11-10): in-between pictures are made when the game has finished a frame, one
     // field before it sends the list. The field in which it will send it is the next one of the PS2 field clock,

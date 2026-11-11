@@ -364,12 +364,14 @@ double g_headStart = 0.0;                           // ... to this fixed head st
 // PS2X_SMOOTH_LIST_HASH=1 (criterion 6b): the list is hashed at the frame end and at the send ("hash=" in the
 // time-line log); it costs a second copy of the list at each point, so it is not for timing runs.
 bool g_atEnd = false, g_hashLists = false;
-// Fact-finding 2026-11-11 (owner: "Yes, find out"), PS2X_SMOOTH_GS2=1: the pictures are drawn on a GS memory of
-// their own (PS2Runtime::pictureGs: the same renderer and graphics device). When the game has finished a frame the
-// pages that changed are copied there; the pictures' GIF packets go there and are read from there; nothing is
-// drawn, kept or put back on the game's GS. PS2X_SMOOTH_GS2_CHECK=<n>: after every n-th copy the two memories are
-// compared page by page (slow: both are read back).
-bool g_gs2 = false;
+// Amendment v3.7 (approved 2026-11-11), change 1: the pictures are drawn on a GS memory of their own
+// (PS2Runtime::pictureGs: the same renderer and graphics device). When the game has finished a frame the pages that
+// changed are copied there; the pictures' GIF packets go there and are read from there; nothing is drawn, kept or
+// put back on the game's GS. PS2X_SMOOTH_GS2_CHECK=<n> (criterion 6c): after every n-th copy the two memories are
+// compared page by page (slow: both are read back) and "[smooth:check]" is logged.
+// PS2X_SMOOTH_GS2=0 (DW5XL-DEBUG): the rollback on the game's GS (v3.2), kept for comparisons until the picture GS
+// has passed its criteria on both PCs; then it goes, with its part of the renderer patch.
+bool g_gs2 = true;
 unsigned g_gs2Check = 0;
 struct Gs2 { uint64_t syncs = 0, pages = 0, refused = 0, checks = 0, differ = 0; double ms = 0.0, longest = 0.0; };
 Gs2 g_gs2Stats;
@@ -408,6 +410,19 @@ Built g_built;
 // spare, or missed its field: the reserve that keeps a heavier moment from costing a field.
 double g_firstTagMs = 0.0, g_lastTagMs = 0.0;
 uint64_t g_judgeFrom = 0, g_lastTimedFrame = 0;     // the rate choice judges frames from here on (not a line's first second)
+// Amendment v3.7 (P2.6a): a break in the game's own clock between two frames: the game stood still (the MENU, a save,
+// a load) or a state was loaded. Read from the PS2 field clock (dw5xl::smooth::fieldClockBroke) and the runtime's
+// count of state loads. After a break the time line starts again (measured 2026-11-11 without this: a quick save
+// of 82 ms switched the pictures off for 20 seconds, and the MENU left a head start of 660 ms to be reached), the
+// picture GS gets every page, and after a load the frame before is not used for in-between values.
+struct ClockWatch {
+    bool have = false, pending = false, allPages = false;
+    uint64_t field = 0, loads = 0, stops = 0, jumps = 0;
+    double instantMs = 0.0;
+};
+ClockWatch g_clock;
+uint64_t g_lineFrom = 0;                            // the time line started (again) with this frame: older pictures are not measured
+uint64_t g_measureFrom = 0;                         // ... and the first frame with pictures after it is not either (cold caches)
 uint64_t g_deviceNs = 0, g_deviceCount = 0;         // ps2x::device::detachedVif1Totals at the last frame
 double g_pictureCost = 0.0;                         // the device time of one picture, the last frames' average (ms; 0: none yet)
 
@@ -636,6 +651,29 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
     g_newFrames = at.number;
     const bool haveInstant = at.haveInstant;
     const double instantMs = at.instantMs, listMs = at.takenMs, spareMs = at.spareMs;
+    {
+        // A break in the game's own clock since the frame before (g_clock, above).
+        const uint64_t loads = runtime->stateLoadCount();
+        const bool loaded = loads != g_clock.loads;
+        const bool stood = haveInstant && g_clock.have &&
+                           dw5xl::smooth::fieldClockBroke(g_clock.field, g_clock.instantMs, at.sendField, instantMs, at.fieldMs);
+        if (loaded || stood) {
+            const double apart = g_clock.have ? instantMs - g_clock.instantMs : 0.0;
+            std::fprintf(stderr, "[smooth:break] frame=%llu field=%llu before=%llu apart=%.1f kind=%s\n",
+                         static_cast<unsigned long long>(at.number), static_cast<unsigned long long>(at.sendField),
+                         static_cast<unsigned long long>(g_clock.field), apart, loaded ? "load" : "stood");
+            g_clock.pending = true;                 // the time line starts again with this frame
+            g_clock.allPages = true;                // the picture GS gets every page with its next copy
+            ++(loaded ? g_clock.jumps : g_clock.stops);
+            if (loaded) g_beforeFrame = ~0ull;      // the frame before is not this frame's in game time
+        }
+        g_clock.loads = loads;
+        if (haveInstant) {
+            g_clock.have = true;
+            g_clock.field = at.sendField;
+            g_clock.instantMs = instantMs;
+        }
+    }
     // The deflicker packet of the frame start before stands in for the next one's. That holds only while the scene
     // kind is steady: the first frame after a change (menu to battle, a state load) has a frame start of another
     // kind before it (another packet size) and gets no pictures.
@@ -715,10 +753,13 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                 g_usedEnvValid = true;
             }
             if (g_gs2) {
-                // All pages when the frames did not follow one another (another scene, a state load in between).
-                const bool everything = g_gs2LastFrame + 1u != g_newFrames;
+                // All pages when the frames did not follow one another (another scene in between) or the game's
+                // clock broke (a state load, the MENU with a change of settings; g_clock). The GS says "all pages"
+                // itself after a load or a change of scale (GS::takeWrittenPages); this does not rely on it.
+                const bool everything = g_gs2LastFrame + 1u != g_newFrames || g_clock.allPages;
+                g_clock.allPages = false;
                 g_gs2LastFrame = g_newFrames;
-                ps2x::device::submitGsSideCall(mem, [runtime, everything] {
+                ps2x::device::submitGsSideCall(mem, [runtime, everything, frameField] {
                     const auto t0 = Clock::now();
                     uint32_t pages = 0, differ = 0;
                     const bool check = g_gs2Check != 0u && (g_gs2Stats.syncs + 1u) % g_gs2Check == 0u;
@@ -734,9 +775,10 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                     } else {
                         ++s.checks;
                         s.differ += differ;
-                        if (differ != 0u)
-                            std::fprintf(stderr, "[smooth:gs2] after copy %llu the two GS memories differ in %u pages\n",
-                                         static_cast<unsigned long long>(s.syncs), differ);
+                        // Criterion 6c (amendment v3.7) reads this line: one per comparison.
+                        std::fprintf(stderr, "[smooth:check] copy=%llu field=%llu pages=%u differ=%u\n",
+                                     static_cast<unsigned long long>(s.syncs),
+                                     static_cast<unsigned long long>(frameField), pages, ok ? differ : 512u);
                     }
                     if (s.syncs % 250u == 0u)
                         std::fprintf(stderr, "[smooth:gs2] %llu copies into the picture GS: %.1f pages each, %.3f ms average "
@@ -859,14 +901,29 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
             const double fieldMs = at.fieldMs;
             // What the window reported since the last frame: every picture feeds the head start's measure and its
             // frame's note.
+            // The line starts (again) with this frame: the frames did not follow one another (another scene in
+            // between), or the game's clock broke (g_clock). Pictures announced before are void, and what they and
+            // the first frame with pictures afterwards report is not measured: they were made across the break, or
+            // with caches that had to be filled first (measured 2026-11-11: 13.3 ms for the first picture after a
+            // change of render scale, 6.5 ms for those after it).
+            const bool restart = g_lastTimedFrame + 1u != g_newFrames || g_clock.pending;
+            g_clock.pending = false;
+            if (restart) {
+                dc::voidFrom(0.0);
+                g_line.reset();
+                g_lineFrom = g_newFrames;
+                g_measureFrom = g_newFrames + 2u;   // this frame gets no pictures (the line's first), the next the first ones
+            }
             {
                 std::vector<dc::Outcome> outcomes;
                 dc::takeOutcomes(outcomes);
                 for (const dc::Outcome &o : outcomes) {
+                    if (o.timed.frame < g_lineFrom) continue;      // made before the line started again
+                    const bool measure = o.timed.frame >= g_measureFrom;
                     // A frame whose own list came a quarter field late is the rate choice's matter, not the head start's.
                     // (At the frame end the list is taken before its instant; a frame finished late in its field
                     // needs a larger head start, which is the meter's matter.)
-                    if (at.atEnd || o.timed.listMs - o.timed.instantMs < fieldMs / 4.0)
+                    if (measure && (at.atEnd || o.timed.listMs - o.timed.instantMs < fieldMs / 4.0))
                         g_meter.add(listMs, o.timed.headStartMs, o.timed.atMs - (o.readyMs + o.handMs));
                     g_auto.shown += o.shown ? 1u : 0u;
                     g_auto.late += o.shown ? 0u : 1u;
@@ -874,9 +931,11 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                         if (note.frame != o.timed.frame) continue;
                         // What this picture cost: from the moment the device could start it (it was queued, or the
                         // picture before it had left) until it had left the device.
-                        if (at.atEnd) {
+                        if (at.atEnd && measure) {
                             const double from = note.reported == 0u ? o.timed.queuedMs : std::max(o.timed.queuedMs, note.lastStarted);
                             g_budget.measured(listMs, o.startedMs - from, note.reported == 0u);
+                        } else if (at.atEnd && note.reported == 0u) {
+                            g_budget.probeDone();   // not counted: the next frame's first picture is the one to learn from
                         }
                         if (note.reported == 0u || o.startedMs < note.firstStarted) note.firstStarted = o.startedMs;
                         if (note.reported == 0u || o.startedMs > note.lastStarted) note.lastStarted = o.startedMs;
@@ -888,7 +947,7 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
             }
             // Frames whose pictures are all reported and whose next list has come (this one, for the newest note).
             g_rate.configure(grid.follows, grid.periodMs, fieldMs, static_cast<int>(g_copies));
-            if (g_lastTimedFrame + 1u != g_newFrames) {             // the line starts (again): its first second is not judged
+            if (restart) {                          // the line starts (again): its first seconds are not judged
                 g_notes.clear();
                 g_judgeFrom = g_newFrames + 250u;    // measured 2026-11-11: the first seconds after a state load are rough
             }
@@ -1394,7 +1453,8 @@ void install(PS2Runtime &runtime)
         }
     }
     std::fprintf(stderr, "[smooth] prototype: %u copies of each new frame's list, %s%s%s%s\n", g_copies,
-                 g_rollback ? (g_empty ? "in place with a rollback, clear only" : "in place with a rollback")
+                 g_rollback ? (g_gs2 ? (g_empty ? "on the picture GS, clear only" : "on the picture GS")
+                                     : (g_empty ? "in place with a rollback, clear only" : "in place with a rollback"))
                  : g_after ? "after the game's list" : "before the game's list",
                  g_fullClear ? ", every row cleared first (experiment: changes the game's last row)" : "",
                  g_read ? ", each read out as an in-between picture" : "",

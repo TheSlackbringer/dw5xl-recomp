@@ -148,7 +148,9 @@ public:
     // they are after everything it was sent so far, copied into this GS (on the graphics card).
     bool copyPagesFrom(GS &source, const std::bitset<512> &pages);
     // The pages written since the last call (draws, local copies, uploads); from now on they are collected
-    // (again). The first call says "all of them".
+    // (again). The first call says "all of them", and so does the first one after a change that cannot be named page
+    // by page: a state load, a change of the output scale or of the samples, a direct write, another renderer
+    // (issue 049 v3.7: the picture GS must not keep a page from before such a change).
     std::bitset<512> takeWrittenPages();
     // The single-rate GS memory as the renderer holds it (4 MB), after a flush.
     void snapshotVram(std::vector<uint8_t> &out);
@@ -367,6 +369,9 @@ private:
     void noteRollbackWriteUnlocked(uint32_t basePage, uint32_t fbw, uint8_t psm, uint32_t x0, uint32_t y0,
                                    uint32_t x1, uint32_t y1);
     bool m_collectWritePages = false;
+    // Issue 049 v3.7: GS memory changed in a way that is not collected page by page (a state load, the output scale
+    // or samples, a direct write, another renderer): takeWrittenPages() says "all pages" once.
+    std::atomic<bool> m_allPagesChanged{true};
     bool m_writeSetUploads = false; // host-to-local transfers count as writes (set by beginRollbackWriteSet)
     std::bitset<512> m_writePages;
     std::atomic<uint64_t> m_rollbackOutside{0};

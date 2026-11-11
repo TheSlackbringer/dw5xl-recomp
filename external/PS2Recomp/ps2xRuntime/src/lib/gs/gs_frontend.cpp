@@ -124,6 +124,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     if (!m_backend)
         m_backend = makeGsRasterBackend();
     m_backend->Initialize(vram, vramSize);
+    m_allPagesChanged.store(true, std::memory_order_release); // issue 049 v3.7
     GSTrace::initialize();
     GSTrace::setLocalMemory(vram, vramSize);
     GSTrace::setPrivilegedRegisters(privRegs);
@@ -184,10 +185,11 @@ std::bitset<512> GS::takeWrittenPages()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     std::bitset<512> pages;
-    if (m_collectWritePages && m_writeSetUploads)
+    const bool all = m_allPagesChanged.exchange(false, std::memory_order_acq_rel);
+    if (m_collectWritePages && m_writeSetUploads && !all)
         pages = m_writePages;
     else
-        pages.set(); // nothing was collected so far: any page may have changed
+        pages.set(); // nothing was collected so far, or the memory changed otherwise: any page may have changed
     m_writePages.reset();
     m_writeSetFrameKey = m_writeSetScissorKey = ~0ull;
     m_writeSetUploads = true;
@@ -2317,6 +2319,7 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 
     m_backend = std::move(backend);
     m_backend->Initialize(m_localMemoryStorage, m_localMemorySize);
+    m_allPagesChanged.store(true, std::memory_order_release); // issue 049 v3.7: another renderer's memory
 }
 
 uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
@@ -2330,6 +2333,7 @@ void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (m_backend)
         m_backend->WriteVram(psm, base, bw, x, y, value);
+    m_allPagesChanged.store(true, std::memory_order_release); // issue 049 v3.7: not collected page by page
 }
 
 GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
@@ -2397,7 +2401,10 @@ void GS::setResolutionScale(uint32_t scale)
     std::lock_guard<std::mutex> lock(m_backendLifetimeMutex);
     if (m_backend)
     {
+        const uint32_t before = m_backend->GetResolutionScale();
         m_backend->SetResolutionScale(scale);
+        if (m_backend->GetResolutionScale() != before)
+            m_allPagesChanged.store(true, std::memory_order_release); // issue 049 v3.7: the renderer's copies start anew
     }
     m_forceFieldRead.store(true, std::memory_order_release); // issue 023 2R: the new output needs a fresh read
 }
@@ -2415,7 +2422,13 @@ uint32_t GS::getResolutionScale() const
 void GS::setAASamples(uint32_t samples)
 {
     std::lock_guard<std::mutex> lock(m_backendLifetimeMutex);
-    if (m_backend) m_backend->SetAASamples(samples);
+    if (m_backend)
+    {
+        const uint32_t before = m_backend->GetAASamples();
+        m_backend->SetAASamples(samples);
+        if (m_backend->GetAASamples() != before)
+            m_allPagesChanged.store(true, std::memory_order_release); // issue 049 v3.7
+    }
     m_forceFieldRead.store(true, std::memory_order_release); // issue 023 2R: the new output needs a fresh read
 }
 

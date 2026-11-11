@@ -148,8 +148,11 @@ void GS::serializeState(ps2x::StateArchive &a)
     if (!m_backend)
         throw ps2x::StateError("no GS renderer");
     m_backend->SerializeState(a);
-    if (a.loading()) // issue 027 v4: the window shows the loaded display at once (latchHostPresentationFrame)
-        m_presentAfterLoad.store(true, std::memory_order_release);
+    if (a.loading())
+    {
+        m_presentAfterLoad.store(true, std::memory_order_release); // issue 027 v4: the window shows the loaded display at once (latchHostPresentationFrame)
+        m_allPagesChanged.store(true, std::memory_order_release);  // issue 049 v3.7: the whole GS memory is another one
+    }
 }
 
 // The GS front end's own registers and transfer state (the save state's "GSFE" section; also the part of a rollback
