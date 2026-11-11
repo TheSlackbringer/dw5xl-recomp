@@ -2,6 +2,7 @@
 // its output. The test runs itself as a fake recompiler: with DW5XL_FAKE_RECOMP set (inherited by the children it
 // starts) it only translates the one config it is given and never runs the test again. No game data is used.
 #include "codegen.h"
+#include "test_scratch.h"
 #include "run_process.h"
 #include "../../external/PS2Recomp/ps2xRecomp/include/ps2recomp/producer_dependencies.h"
 #include <iomanip>
@@ -97,7 +98,7 @@ int main(int argc, char **argv)
     try
     {
         const fs::path self = fs::absolute(argv[0]);
-        const fs::path root = fs::temp_directory_path() / "dw5xl setup codegen Jürgen";
+        const fs::path root = fs::temp_directory_path() / scratchName("dw5xl setup codegen Jürgen");
         fs::remove_all(root);
 
         // 1. The config rewrite keeps other lines and quotes paths with spaces and non-ASCII characters.

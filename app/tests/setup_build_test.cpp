@@ -2,6 +2,7 @@
 // tools are found, and that a cancel stops a running program. The real build needs generated game code and is
 // checked locally (see notes, issue 011).
 #include "build_game.h"
+#include "test_scratch.h"
 #include "run_process.h"
 #include "setup_layout.h"
 
@@ -64,7 +65,7 @@ void setEnv(const char *name, const char *value)
 
 void layoutTests()
 {
-    const fs::path root = fs::temp_directory_path() / "dw5xl_setup_layout_test";
+    const fs::path root = fs::temp_directory_path() / scratchName("dw5xl_setup_layout_test");
     fs::remove_all(root);
     touch(root / "app" / "CMakeLists.txt");
     fs::create_directories(root / "recomp");
@@ -111,7 +112,7 @@ void layoutTests()
 
 void linuxUpdateTests()
 {
-    const fs::path scratch = fs::temp_directory_path() / "dw5xl update sources Jürgen";
+    const fs::path scratch = fs::temp_directory_path() / scratchName("dw5xl update sources Jürgen");
     fs::remove_all(scratch);
     const fs::path package = scratch / "first mount", data = scratch / "player";
     for (const char *folder : {"app", "external", "recomp", "tools"})
@@ -147,7 +148,7 @@ void linuxUpdateTests()
 // A program that runs 30 s is stopped within a few seconds of a cancel.
 void cancelTest(const char *self)
 {
-    const fs::path dir = fs::temp_directory_path() / "dw5xl_setup_cancel_test";
+    const fs::path dir = fs::temp_directory_path() / scratchName("dw5xl_setup_cancel_test");
     fs::remove_all(dir);
     fs::create_directories(dir);
     setEnv("DW5XL_SLEEP_CHILD", "1"); // the child (this program) sleeps instead of testing; see main()
@@ -258,7 +259,7 @@ int main(int argc, char **argv)
         require(has(rel, "-DDW5XL_RECOMP_ROOT=C:/Users/p/AppData/Local/DW5XL/recomp"),
                 "release: the generated code is read from the player data folder");
         { // a newer release in another folder: the old build configuration is reset, compiled files stay
-            const fs::path b = fs::temp_directory_path() / "dw5xl_setup_moved_test";
+            const fs::path b = fs::temp_directory_path() / scratchName("dw5xl_setup_moved_test");
             fs::remove_all(b);
             fs::create_directories(b / "CMakeFiles");
             std::ofstream(b / "CMakeCache.txt") << "FOO:BOOL=ON\nCMAKE_HOME_DIRECTORY:INTERNAL=C:/Games/DW5XL-old/app\n";
@@ -275,7 +276,7 @@ int main(int argc, char **argv)
         linuxUpdateTests();
         cancelTest(argc > 0 ? argv[0] : "");
         { // 042: cancel only after the real grandchild has started, then verify it terminated.
-            const auto dir=fs::temp_directory_path()/"dw5xl_setup_tree_test";
+            const auto dir=fs::temp_directory_path() / scratchName("dw5xl_setup_tree_test");
             fs::remove_all(dir);fs::create_directories(dir);unsigned long leaf=0;
 #ifdef _WIN32
             HANDLE process=nullptr;
@@ -306,7 +307,7 @@ int main(int argc, char **argv)
         }
 #ifdef __linux__
         { // Independent concurrent launches must not share cancellation ownership.
-            const auto dir=fs::temp_directory_path()/"dw5xl_setup_independent_tree_test";
+            const auto dir=fs::temp_directory_path() / scratchName("dw5xl_setup_independent_tree_test");
             fs::remove_all(dir);fs::create_directories(dir);
             std::atomic<bool> stop{false},finished{false};
             std::mutex readyMutex;std::condition_variable ready;pid_t sentinel=0;
@@ -363,7 +364,7 @@ int main(int argc, char **argv)
 #endif
 #ifdef _WIN32
         { // Cancelling one owned tree must complete without stopping an independent launch.
-            const auto dir=fs::temp_directory_path()/"dw5xl_setup_windows_independent_test";
+            const auto dir=fs::temp_directory_path() / scratchName("dw5xl_setup_windows_independent_test");
             fs::remove_all(dir);fs::create_directories(dir);
             std::atomic<bool> stop{false},finished{false};
             std::mutex readyMutex;std::condition_variable ready;HANDLE sentinel=nullptr;

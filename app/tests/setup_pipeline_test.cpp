@@ -1,6 +1,7 @@
 // Setup wizard pipeline (issue 011): step order, progress, errors and cancel, on the synthetic image with stand-in
 // generate / lift / build steps (the real ones need the player's disc and are checked locally, see notes).
 #include "install_state.h"
+#include "test_scratch.h"
 #include "setup_pipeline.h"
 #include "synthetic_iso.h"
 
@@ -88,7 +89,7 @@ int main()
 {
     try
     {
-        const fs::path dir = fs::temp_directory_path() / "dw5xl_setup_pipeline_test";
+        const fs::path dir = fs::temp_directory_path() / scratchName("dw5xl_setup_pipeline_test");
         fs::remove_all(dir);
         fs::create_directories(dir);
         const fs::path iso = dir / "disc.iso";
