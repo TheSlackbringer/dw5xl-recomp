@@ -48,6 +48,22 @@
 //   ("[smooth:end] ... hash=", "[smooth:list] ... hash=" with PS2X_SMOOTH_TIMELINE=1). PS2X_SMOOTH_EVERY=<n>:
 //   without timed pictures, pictures only for every n-th frame (proofs at a scale where one before every game
 //   frame does not fit).
+//   Amendment v3.7, changes 2 to 4 (approved 2026-11-11 with additions; P2.6b-3, the owner's go 2026-11-11):
+//   PS2X_SMOOTH_DEVICE2=1 (with ":rollback", the picture GS and pictures made at the frame end): the pictures run on
+//   a VIF1/VU1 device of their own (ps2x::PictureDevice, a thread of its own), not through the game's. At the frame
+//   end one job goes into the game's device queue: there the display registers for the pictures' reads are taken
+//   and the game's VIF1/VU1 state is copied as the pictures' start (addition 2); the pictures' VIF1/VU1 work begins
+//   at once. From there a call in the game's GS stream drops what the GS side still holds of the frame before's
+//   pictures, copies the changed pages into the picture GS and lets this frame's packets be read: the GS thread
+//   reads them one at a time between the game's own packets, the game's first (change 3), while the pictures' VU1
+//   goes on. A picture's read follows its last packet there. Change 4: a picture is started only when it will be
+//   handed over before its own instant on screen and will have left the device before the next frame's end, by the
+//   longest a picture took lately (PictureBudget::admitBy); one not started tells the head start's measure by how
+//   much it would have missed, and counts for the rate choice as v3.6's did. "[smooth:device2] ..." every 250 frames.
+//   PS2X_SMOOTH_DEVICE2_CHECK=1 (criterion 6d, with unchanged copies, PS2X_SMOOTH_FIXED_T=1): the PATH1/PATH2 bytes
+//   the game's device makes from a frame's list (between two marks in device order around the game's own send) and
+//   those the pictures' device makes from the copy's list part are hashed: "[smooth:device] frame= field= bytes=
+//   game= picture= same=".
 #include "dw5xl_smooth_list.h"
 #include "dw5xl_smooth_time.h"
 #include "game_overrides.h"
@@ -56,6 +72,7 @@
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_device_queue.h"
 #include "runtime/ps2_display_clock.h"
+#include "runtime/ps2_picture_device.h"
 #include "runtime/gs/gs_frontend.h"
 
 #include <algorithm>
@@ -65,6 +82,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -372,6 +390,50 @@ bool g_atEnd = false, g_hashLists = false;
 // PS2X_SMOOTH_GS2=0 (DW5XL-DEBUG): the rollback on the game's GS (v3.2), kept for comparisons until the picture GS
 // has passed its criteria on both PCs; then it goes, with its part of the renderer patch.
 bool g_gs2 = true;
+// v3.7 changes 2 to 4: PS2X_SMOOTH_DEVICE2=1, the pictures on a device of their own; PS2X_SMOOTH_DEVICE2_CHECK=1,
+// criterion 6d (see the top of the file).
+bool g_device2 = false, g_device2Check = false;
+struct DeviceFrame { GSPresentationRequest captured{}; };   // what a frame's pictures share on the pictures' device
+ps2x::GifStreamHash g_tapHash;                      // the game's device's PATH1/PATH2 packets of one list (device order)
+bool g_tapOn = false;
+struct DeviceCheck { uint64_t frame = 0, field = 0, game = 0, gameBytes = 0, picture = 0, pictureBytes = 0; bool haveGame = false, havePicture = false; };
+std::mutex g_checkMutex;
+std::deque<DeviceCheck> g_checks;
+ps2x::PictureDevice::Totals g_device2Before;        // the totals at the last "[smooth:device2]" line
+GifArbiter::SideTotals g_sideBefore;                // and the GS side's
+uint64_t g_sideNs = 0;                              // the GS side's time at the last frame (a picture's cost)
+uint64_t g_ownEndFrame = 0;                         // the frame end before this one (change 4: how long a frame is)
+double g_ownEndMs = 0.0;
+
+// Criterion 6d: one side's hash of a frame's list; the line is printed when both sides are known.
+void deviceCheck(uint64_t frame, bool game, uint64_t field, uint64_t hash, uint64_t bytes)
+{
+    std::lock_guard<std::mutex> lock(g_checkMutex);
+    auto it = std::find_if(g_checks.begin(), g_checks.end(), [frame](const DeviceCheck &c) { return c.frame == frame; });
+    if (it == g_checks.end()) {
+        if (g_checks.size() >= 64u) g_checks.pop_front();   // frames one side never reported
+        g_checks.emplace_back();
+        it = g_checks.end() - 1;
+        it->frame = frame;
+    }
+    if (game) {
+        it->haveGame = true;
+        it->field = field;
+        it->game = hash;
+        it->gameBytes = bytes;
+    } else if (!it->havePicture) {
+        it->havePicture = true;
+        it->picture = hash;
+        it->pictureBytes = bytes;
+    }
+    if (!it->haveGame || !it->havePicture) return;
+    std::fprintf(stderr, "[smooth:device] frame=%llu field=%llu bytes=%llu game=%016llx picture=%016llx same=%d\n",
+                 static_cast<unsigned long long>(frame), static_cast<unsigned long long>(it->field),
+                 static_cast<unsigned long long>(it->gameBytes), static_cast<unsigned long long>(it->game),
+                 static_cast<unsigned long long>(it->picture),
+                 it->game == it->picture && it->gameBytes == it->pictureBytes ? 1 : 0);
+    g_checks.erase(it);
+}
 unsigned g_gs2Check = 0;
 struct Gs2 { uint64_t syncs = 0, pages = 0, refused = 0, checks = 0, differ = 0; double ms = 0.0, longest = 0.0; };
 Gs2 g_gs2Stats;
@@ -743,10 +805,14 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
     // The frame's list is sent in this field; its pictures belong to the next one (shown before the game's own).
     const uint64_t frameField = at.sendField;
     unsigned count = 0, queued = 0;                 // the pictures this frame gets (set before the first), and those handed over
+    std::shared_ptr<DeviceFrame> deviceFrame;       // PS2X_SMOOTH_DEVICE2
     const auto finished = [&](float t, const std::vector<uint8_t> &body, const dc::Timed *info = nullptr) {
-        std::vector<uint8_t> stream(headFor(t));
-        stream.insert(stream.end(), body.begin(), body.end());
-        stream.insert(stream.end(), deflicker.begin(), deflicker.end());
+        std::vector<uint8_t> stream;
+        if (!g_device2) {
+            stream = headFor(t);
+            stream.insert(stream.end(), body.begin(), body.end());
+            stream.insert(stream.end(), deflicker.begin(), deflicker.end());
+        }
         if (queued == 0u) {
             if (at.atEnd) {
                 g_usedEnv = envThis;                // checked at the send against the environment the game puts
@@ -759,7 +825,7 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                 const bool everything = g_gs2LastFrame + 1u != g_newFrames || g_clock.allPages;
                 g_clock.allPages = false;
                 g_gs2LastFrame = g_newFrames;
-                ps2x::device::submitGsSideCall(mem, [runtime, everything, frameField] {
+                std::function<void()> copyPages = [runtime, everything, frameField] {
                     const auto t0 = Clock::now();
                     uint32_t pages = 0, differ = 0;
                     const bool check = g_gs2Check != 0u && (g_gs2Stats.syncs + 1u) % g_gs2Check == 0u;
@@ -787,7 +853,25 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                                      s.ms / 250.0, s.longest, static_cast<unsigned long long>(s.refused),
                                      static_cast<unsigned long long>(s.checks), static_cast<unsigned long long>(s.differ)),
                         s.pages = 0, s.ms = 0.0, s.longest = 0.0;
-                });
+                };
+                if (g_device2) {
+                    // One job in the game's device queue (addition 2): the display registers are read in the order
+                    // of the game's writes, and the game's VIF1/VU1 state as it is there is the pictures' start
+                    // (their VIF1/VU1 work begins). From there, in the game's GS stream: the page copy, after which
+                    // the GS side reads this frame's packets.
+                    deviceFrame = std::make_shared<DeviceFrame>();
+                    const uint64_t frame = g_newFrames;
+                    auto job = [runtime, frame, frameField, shared = deviceFrame, copyPages] {
+                        shared->captured = runtime->gs().captureFieldScanoutRequest(frameField + 1u);
+                        runtime->pictureDevice().takeStart(frame, runtime->memory().m_vif1, runtime->vu1());
+                        runtime->gifArbiter().submitCall([runtime, frame, copyPages] {
+                            runtime->pictureDevice().open(frame, copyPages);
+                        });
+                    };
+                    if (!ps2x::device::submitGsCall(mem, job)) job();
+                } else {
+                    ps2x::device::submitGsSideCall(mem, std::move(copyPages));
+                }
             } else {
                 ps2x::device::submitGsSideCall(mem, [runtime] {
                     const auto t0 = Clock::now();
@@ -802,6 +886,41 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                 std::fprintf(stderr, "[smooth:trace] pictures field %llu deflicker packet %016llx\n",
                              static_cast<unsigned long long>(frameField),
                              static_cast<unsigned long long>(at.atEnd ? g_startHash : g_startHashPrevious));
+        }
+        if (g_device2) {
+            const unsigned index = queued++;
+            const uint64_t tag = g_read ? gsPictureTag(frameField, index + 1u, count) : 0u;
+            if (g_read && info) {
+                dc::Timed timed = *info;
+                timed.queuedMs = dc::nowMs();
+                dc::announce(tag, timed);           // before the picture can be read
+            }
+            ps2x::PictureDevice::Picture picture;
+            picture.frame = g_newFrames;
+            picture.head = headFor(t);
+            picture.body = body;
+            picture.tail = deflicker;
+            picture.hashBody = g_device2Check && index == 0u;
+            picture.done = [runtime, shared = deviceFrame, tag, frame = g_newFrames, read = g_read,
+                            check = picture.hashBody](const ps2x::PictureDevice::Result &result) {
+                if (check && result.drawn) deviceCheck(frame, false, 0u, result.bodyHash, result.bodyBytes);
+                if (!read) return;
+                if (result.drawn) {
+                    runtime->pictureGs().submitPictureRead(shared->captured, tag);
+                    return;
+                }
+                // Given up or dropped (the next frame's end or its page copy came first): it is reported as not
+                // shown, so its frame's account closes.
+                dc::Timed timed;
+                if (!dc::take(tag, timed)) return;
+                dc::Outcome outcome;
+                outcome.timed = timed;
+                outcome.startedMs = outcome.readyMs = dc::nowMs();
+                outcome.givenUp = true;
+                dc::report(outcome);
+            };
+            runtime->pictureDevice().submit(std::move(picture));
+            return;
         }
         if (g_gs2)
             ps2x::device::submitDetachedVif1(mem, std::move(stream), [runtime] { runtime->setGifToPictureGs(true); },
@@ -919,7 +1038,7 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                 dc::takeOutcomes(outcomes);
                 for (const dc::Outcome &o : outcomes) {
                     if (o.timed.frame < g_lineFrom) continue;      // made before the line started again
-                    const bool measure = o.timed.frame >= g_measureFrom;
+                    const bool measure = o.timed.frame >= g_measureFrom && !o.givenUp;
                     // A frame whose own list came a quarter field late is the rate choice's matter, not the head start's.
                     // (At the frame end the list is taken before its instant; a frame finished late in its field
                     // needs a larger head start, which is the meter's matter.)
@@ -934,6 +1053,8 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                         if (at.atEnd && measure) {
                             const double from = note.reported == 0u ? o.timed.queuedMs : std::max(o.timed.queuedMs, note.lastStarted);
                             g_budget.measured(listMs, o.startedMs - from, note.reported == 0u);
+                            // v3.7 change 4: and from there until the window could hand it over.
+                            g_budget.afterDevice(listMs, o.readyMs - o.startedMs + o.handMs);
                         } else if (at.atEnd && note.reported == 0u) {
                             g_budget.probeDone();   // not counted: the next frame's first picture is the one to learn from
                         }
@@ -955,14 +1076,24 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
             const double reserve = fieldMs / 4.0;
             {
                 // What one picture costs on the device: the streams run since the last frame.
-                uint64_t ns = 0, count = 0;
-                ps2x::device::detachedVif1Totals(ns, count);
+                uint64_t ns = 0, count = 0, sideNs = g_sideNs;
+                if (g_device2) {
+                    // Its VIF1/VU1 work and the GS's reading of its packets run side by side: the longer one.
+                    const ps2x::PictureDevice::Totals totals = runtime->pictureDevice().totals();
+                    ns = totals.workNs;
+                    count = totals.pictures;
+                    sideNs = runtime->gifArbiter().sideTotals().ns;
+                } else {
+                    ps2x::device::detachedVif1Totals(ns, count);
+                }
                 if (count > g_deviceCount) {
-                    const double cost = static_cast<double>(ns - g_deviceNs) / 1e6 / static_cast<double>(count - g_deviceCount);
+                    const double cost = static_cast<double>(std::max(ns - g_deviceNs, sideNs - g_sideNs)) / 1e6 /
+                                        static_cast<double>(count - g_deviceCount);
                     g_pictureCost = g_pictureCost > 0.0 ? g_pictureCost + (cost - g_pictureCost) * 0.1 : cost;
                 }
                 g_deviceNs = ns;
                 g_deviceCount = count;
+                g_sideNs = sideNs;
             }
             while (!g_notes.empty()) {
                 const FrameNote &note = g_notes.front();
@@ -994,8 +1125,10 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                 // Room: how long before the next field began the frame's last picture left the device. (Not "before the
                 // game's next list came": the game waits for the device there, so that never goes below zero.) With
                 // pictures made at the frame end the game's next send is this frame's own, at its instant.
-                (void)nextList;
-                f.room = note.reported == 0u ? fieldMs : (at.atEnd ? note.instantMs : nextInstant) - note.lastStarted;
+                // On the pictures' own device (v3.7) a frame's pictures have until the next frame's end
+                // (nextList): the next frame's start is taken there, and its pages are copied soon after.
+                f.room = note.reported == 0u ? fieldMs
+                         : (g_device2 ? nextList : at.atEnd ? note.instantMs : nextInstant) - note.lastStarted;
                 f.cost = g_pictureCost;
                 g_rate.frame(f);
                 ++g_auto.frames;
@@ -1029,7 +1162,30 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
             // v3.6, change 3: only the pictures that will have left the device when the game's field begins, by
             // the longest a picture took lately. The later ones of the frame are left out.
             unsigned noRoom = 0;
-            if (at.atEnd) {
+            if (at.atEnd && g_device2) {
+                // v3.7, change 4: on their own device the pictures are not in the game's way. A picture is started
+                // when it will be handed over before its own instant on screen and will have left the device
+                // before the next frame's end (the pictures' GS is this frame's until then), by the longest a
+                // picture took lately. One that would miss its instant says by how much: what the head start
+                // would have had to be, as a picture that ran late reports it.
+                const double now = dc::nowMs();
+                const double frameMs = g_ownEndFrame + 1u == g_newFrames ? std::max(fieldMs, listMs - g_ownEndMs) : fieldMs;
+                g_ownEndFrame = g_newFrames;
+                g_ownEndMs = listMs;
+                g_budget.frameOwn(now, listMs + frameMs);
+                size_t kept = 0;
+                for (const dw5xl::smooth::Picture &picture : asked) {
+                    double missBy = 0.0;
+                    if (g_budget.admitBy(now, picture.at, &missBy)) {
+                        asked[kept++] = picture;
+                        continue;
+                    }
+                    ++noRoom;
+                    if (missBy > 0.0 && g_newFrames >= g_measureFrom && !g_headFixed)
+                        g_meter.add(listMs, g_line.headStart(), -missBy);
+                }
+                asked.resize(kept);
+            } else if (at.atEnd) {
                 const double now = dc::nowMs();
                 g_budget.frame(now, instantMs, fieldMs, reserve);
                 size_t fit = 0;
@@ -1145,6 +1301,25 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
             g_saveMs = g_restoreMs = g_saveMax = g_restoreMax = 0.0;
         }
     });
+    if (g_device2 && (g_frames + 1u) % 250u == 0u) {
+        const ps2x::PictureDevice::Totals now = runtime->pictureDevice().totals();
+        const ps2x::PictureDevice::Totals &was = g_device2Before;
+        const GifArbiter::SideTotals side = runtime->gifArbiter().sideTotals();
+        const double n = static_cast<double>(std::max<uint64_t>(now.pictures - was.pictures, 1u));
+        std::fprintf(stderr, "[smooth:device2] %llu pictures on their own device, %llu given up, %llu dropped on the GS "
+                     "side; per picture: VIF1 and VU1 %.3f ms, the GS's reading of its packets %.3f ms (%.0f packets; the "
+                     "game went first %.2f times), %.2f MB of packets\n",
+                     static_cast<unsigned long long>(now.pictures - was.pictures),
+                     static_cast<unsigned long long>(now.givenUp - was.givenUp),
+                     static_cast<unsigned long long>(now.dropped - was.dropped),
+                     static_cast<double>(now.workNs - was.workNs) / 1e6 / n,
+                     static_cast<double>(side.ns - g_sideBefore.ns) / 1e6 / n,
+                     static_cast<double>(side.packets - g_sideBefore.packets) / n,
+                     static_cast<double>(side.gaveWay - g_sideBefore.gaveWay) / n,
+                     static_cast<double>(now.bytes - was.bytes) / 1048576.0 / n);
+        g_device2Before = now;
+        g_sideBefore = side;
+    }
     if (++g_frames % 250u == 0u) {
         std::fprintf(stderr, "[smooth] %llu frames with %u pictures in place (%s), %llu not copied, %llu without a "
                      "frame start, field %llu; matrix tags per frame %.1f, recordings outside the list %.1f\n",
@@ -1262,6 +1437,14 @@ void atSend(uint8_t *ram, PS2Runtime *runtime, uint32_t list)
     const uint64_t hash = g_hashLists ? listHash(ram, list, tte) : 0u;
     const dw5xl::smooth::FinishedFrames::Sent sent = g_finished.sent(list & 0x0FFFFFFFu, hash, fieldNumber);
     const bool ended = g_atEnd && sent.finished;
+    if (g_device2Check) {
+        // Criterion 6d: the game's own list ends here in device order; its PATH1/PATH2 packets are hashed up to here.
+        auto mark = [frame = static_cast<uint64_t>(sent.number), fieldNumber, ended] {
+            g_tapOn = false;
+            if (ended) deviceCheck(frame, true, fieldNumber, g_tapHash.hash, g_tapHash.bytes);
+        };
+        if (!ps2x::device::submitGsCall(runtime->memory(), mark)) mark();
+    }
     const double firstTag = ended ? g_endFirstTagMs : g_firstTagMs, lastTag = ended ? g_endLastTagMs : g_lastTagMs;
     if (haveInstant && dc::logTimeline())
         std::fprintf(stderr, "[smooth:list] frame=%u field=%llu at=%.3f sent=%.3f first=%.3f last=%.3f hash=%016llx\n",
@@ -1323,6 +1506,14 @@ void send(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
             std::vector<uint8_t> clear(g_envPrevious);
             clear.insert(clear.end(), g_env.begin(), g_env.end());
             ps2x::device::submitDetachedVif1(runtime->memory(), std::move(clear));
+        }
+        if (g_device2Check) {
+            // Criterion 6d: the game's own list starts here in device order (its end: atSend).
+            auto mark = [] {
+                g_tapHash = ps2x::GifStreamHash{};
+                g_tapOn = true;
+            };
+            if (!ps2x::device::submitGsCall(runtime->memory(), mark)) mark();
         }
         originalSend(ram, ctx, runtime);
         atSend(ram, runtime, list);
@@ -1462,6 +1653,25 @@ void install(PS2Runtime &runtime)
     if (g_gs2 && g_rollback)
         std::fprintf(stderr, "[smooth] the pictures are drawn on a GS memory of their own (no rollback on the game's GS)\n");
     g_gs2 = g_gs2 && g_rollback;
+    {
+        const char *v = std::getenv("PS2X_SMOOTH_DEVICE2");
+        const bool asked = v && *v && *v != '0';
+        g_device2 = asked && g_gs2 && g_atEnd;
+        if (asked && !g_device2)
+            std::fprintf(stderr, "[smooth] the pictures' own device declined: it needs the picture GS and pictures made at "
+                         "the game's frame end\n");
+        if (g_device2) {
+            runtime.pictureDevice();                // made here, before the game runs
+            const char *c = std::getenv("PS2X_SMOOTH_DEVICE2_CHECK");
+            g_device2Check = c && *c && *c != '0';
+            if (g_device2Check)
+                runtime.memory().m_gifTap = [](GifPathId path, const uint8_t *data, uint32_t size) {
+                    if (g_tapOn) g_tapHash.add(path, data, size);
+                };
+            std::fprintf(stderr, "[smooth] the pictures run on a VIF1/VU1 device of their own%s\n",
+                         g_device2Check ? "; the GIF packets of every frame's list are compared with the game's device's" : "");
+        }
+    }
     if (g_rollback && !g_empty && g_blendedOnly) {
         std::fprintf(stderr, "[smooth] blended content only: two pictures per frame, the list before and this list at t = 0, "
                      "each with only what the two lists share\n");

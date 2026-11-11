@@ -3,7 +3,7 @@
 //
 //   dw5xl_gsrender <rec> <cpu|vulkan> <outdir> <tick>[,<tick>...]
 //                  [--fb fbp,fbw,width,height] [--raw] [--stop-at record] [--skip a-b[,a-b...]]
-//                  [--probe x,y[;x,y...] --z zbp,zpsm]
+//                  [--probe x,y[;x,y...] --z zbp,zpsm] [--flush a-b[,a-b...]]
 //
 // The recording must start with an Initialize record (full recordings, or
 // windowed ones made with PS2X_GS_RECORD_FROM, which snapshot VRAM when the
@@ -14,6 +14,8 @@
 // --stop-at writes tick<N>.fb.ppm right before that record instead (for
 // following one frame draw by draw); --skip leaves out Submit records.
 // --probe prints the colour (and with --z the depth) of those pixels at the stop.
+// --flush ends the renderer's open work right before each of those records (issue 049: a picture must not depend
+// on where that happens).
 
 #include "gs/gs_record_format.h"
 #include "runtime/gs/gs_cpu_backend.h"
@@ -95,7 +97,7 @@ int main(int argc, char **argv)
             ticks.insert(std::strtoull(tok, nullptr, 10));
         FbSpec fb;
         uint64_t stopAt = UINT64_MAX;
-        std::vector<std::pair<uint64_t, uint64_t>> skips;
+        std::vector<std::pair<uint64_t, uint64_t>> skips, flushes;
         std::vector<std::pair<uint32_t, uint32_t>> probes;
         uint32_t zbp = 0, zpsm = 0;
         bool haveZ = false;
@@ -121,6 +123,17 @@ int main(int argc, char **argv)
                         skips.emplace_back(a, b);
                     else
                         skips.emplace_back(std::strtoull(tok, nullptr, 10), std::strtoull(tok, nullptr, 10));
+                }
+            }
+            else if (arg == "--flush" && i + 1 < argc)
+            {
+                for (char *tok = std::strtok(argv[++i], ","); tok; tok = std::strtok(nullptr, ","))
+                {
+                    uint64_t a = 0, b = 0;
+                    if (std::sscanf(tok, "%lu-%lu", &a, &b) == 2)
+                        flushes.emplace_back(a, b);
+                    else
+                        flushes.emplace_back(std::strtoull(tok, nullptr, 10), std::strtoull(tok, nullptr, 10));
                 }
             }
             else if (arg == "--probe" && i + 1 < argc)
@@ -186,6 +199,13 @@ int main(int argc, char **argv)
                         *backend, fb.set ? fb : lastTarget);
                 return 0;
             }
+            if (initialized)
+                for (const auto &[a, b] : flushes)
+                    if (index >= a && index <= b)
+                    {
+                        backend->Flush();
+                        break;
+                    }
             switch (static_cast<Op>(op))
             {
             case Op::Initialize:

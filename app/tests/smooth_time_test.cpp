@@ -584,6 +584,53 @@ int main()
     }
 
     {
+        // Amendment v3.7, change 4: on a device of their own a picture has one deadline, its own instant on screen;
+        // one that cannot make it is not started. And the pictures' GS is a frame's until the next frame's end.
+        PictureBudget budget;
+        // Nothing measured yet: one picture is let through to learn what a picture costs.
+        budget.frameOwn(1000.0, 1020.0);
+        const bool first = budget.admitBy(1000.0, 1010.0), second = budget.admitBy(1000.0, 1018.0);
+        check(!budget.known() && first && !second, "own device, the cost not known yet: one picture, no more");
+
+        // A frame's first picture leaves the device after 6 ms at most, one after it 4 ms later; from there to the
+        // window's hand-over 2 ms. The frame ends at 2000; instants at 2009, 2017 and 2025.
+        budget.measured(1990.0, 6.0, true);
+        budget.measured(1990.0, 4.0, false);
+        budget.afterDevice(1990.0, 2.0);
+        budget.afterDevice(1991.0, 1.5);                // the longest lately counts
+        budget.frameOwn(2000.0, 2020.0);
+        double miss = 1.0;
+        const bool a = budget.admitBy(2000.0, 2009.0, &miss);  // off the device at 2006, handed over by 2008
+        const bool onTime = a && std::fabs(miss + 1.0) < 1e-9;
+        const bool b = budget.admitBy(2000.0, 2017.0, &miss);  // 2010, 2012
+        const bool c = budget.admitBy(2000.0, 2025.0, &miss);  // 2014, 2016
+        check(std::fabs(budget.after() - 2.0) < 1e-9 && onTime && b && c,
+              "own device: a picture that will be handed over before its instant is started");
+
+        // The same frame with its first instant at 2007: the first picture would be 1 ms late and is not started.
+        // The second is then the first on the device (6 ms): 2006, 2008, in time for 2017.
+        budget.frameOwn(2020.0, 2040.0);
+        const bool late = !budget.admitBy(2020.0, 2027.0, &miss) && std::fabs(miss - 1.0) < 1e-9;
+        const bool then = budget.admitBy(2020.0, 2037.0, &miss) && std::fabs(miss + 9.0) < 1e-9;
+        check(late && then, "own device: a picture that cannot make its instant is not started; by how much it would miss is told");
+
+        // Four pictures every 5 ms from 2049 on: each would make its instant, but the fourth would still be on the
+        // device at the next frame's end (2040 + 6 + 3 x 4 = 2058, the frame ends at 2057): it is not started.
+        budget.frameOwn(2040.0, 2057.0);
+        const bool three = budget.admitBy(2040.0, 2049.0) && budget.admitBy(2040.0, 2054.0) && budget.admitBy(2040.0, 2059.0);
+        const bool fourth = budget.admitBy(2040.0, 2064.0, &miss);
+        check(three && !fourth && miss < 0.0,
+              "own device: a picture that would still be on the device at the next frame's end is not started");
+
+        // The device is still busy with the frame's earlier pictures when a later one is asked for: it starts
+        // after them (2060 + 6, then + 4: 2070, handed over by 2072: in time for 2073, not for 2071).
+        budget.frameOwn(2060.0, 2080.0);
+        const bool one = budget.admitBy(2060.0, 2069.0);
+        const bool tight = !budget.admitBy(2063.0, 2071.0, &miss) && std::fabs(miss - 1.0) < 1e-9;
+        check(one && tight && budget.admitBy(2063.0, 2073.0), "own device: a frame's pictures run one after the other");
+    }
+
+    {
         // Amendment v3.7 (P2.6a): a break in the game's own clock between two frames, read from the PS2 field clock:
         // the field's number and its start no longer move together. The cases are the ones measured on 2026-11-11
         // (a quick save, the MENU, a state load back, the first frame after a state load ahead).

@@ -418,6 +418,29 @@ private:
     void recordViWriteForBranch(uint8_t reg, int32_t oldValue);
     void reportReservedInstruction(bool upper, uint32_t instruction);
     float broadcast(const float *vf, uint8_t bc);
+
+public:
+    // DW5XL (issue 049, amendment v3.7, addition 2): everything a save state holds of this VU (serializeState), as a
+    // value: the pictures' VU1 starts every picture from the game's VU1 as it was when the game finished its frame.
+    // Caches, the host and the counters are not part of it. Keep in step with serializeState (CTest picture_device).
+    struct RunState
+    {
+        VU1State state;
+        std::array<FlagPipelineEntry, kMaxFlagEntries> flagPipeline;
+        ScalarPipelineEntry fdiv;
+        std::array<ScalarPipelineEntry, 2> efu;
+        std::array<PendingStore, kMaxPendingStores> storePipeline;
+        XgkickPipeline xgkick; // of its packet only the bytes copied so far count
+        std::array<uint64_t, kReadySlotCount> ready;
+        uint64_t cycle, efuResourceReady, nextCommitCycle, writebackHorizon;
+        uint32_t flagMask, efuMask, storeMask, workingClip, currentUpperInstruction;
+        float fmacQ, fmacI;
+        int32_t viBranchBackupValue;
+        uint8_t viBranchBackupReg;
+        bool viBranchBackupValid, stopRequested, pendingHaltD, pendingHaltT;
+    };
+    void saveRunState(RunState &out) const;
+    void loadRunState(const RunState &in);
 };
 
 #endif

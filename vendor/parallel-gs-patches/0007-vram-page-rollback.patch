@@ -16,12 +16,20 @@ A second GS memory (DW5XL issue 049, fact-finding 2026-11-11): GSInterface::copy
 copies pages of another GSInterface on the same device into this one's VRAM on the GPU (every slice in use,
 each page's flag, the current CLUT), so extra pictures can be drawn apart from the game's GS.
 
+Two GS memories drawing in turns (DW5XL issue 049, amendment v3.7): each keeps its own work open while the
+other draws, so that where the turns fall does not show in a picture (what a render pass draws depends on where
+it ends). Granite waits for every open command buffer of the device when a frame context ends, and
+GSRenderer::flush_submit ends one. With GSInterface::set_frame_context_hold(hold) a flush leaves the frame
+context alone while `hold` says true; the caller makes it say so while another GS memory of the device has open
+command buffers (GSInterface::has_open_command_buffers). The frame context is only where the device frees
+things.
+
 Applies on top of 0001-0006.
 
 diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
 --- a/gs/gs_interface.cpp
 +++ b/gs/gs_interface.cpp
-@@ -4271,6 +4271,163 @@
+@@ -4271,6 +4271,163 @@ const void *GSInterface::map_vram_read(size_t offset, size_t size)
  	return static_cast<const uint8_t *>(renderer.begin_host_vram_access()) + offset;
  }
  
@@ -188,7 +196,7 @@ diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
 diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
 --- a/gs/gs_interface.hpp
 +++ b/gs/gs_interface.hpp
-@@ -299,6 +299,24 @@
+@@ -299,6 +299,29 @@ public:
  	void end_vram_write(size_t offset, size_t size);
  	const void *map_vram_read(size_t offset, size_t size);
  
@@ -207,13 +215,18 @@ diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
 +	// super-sample flag) and its current CLUT; textures cached from those pages are invalidated here. Both are
 +	// flushed first. The registers are the caller's. False when the two differ in memory size.
 +	bool copy_pages_from(GSInterface &source, const uint32_t *pages, size_t num_pages);
++	// DW5XL issue 049: two GS memories of one device draw in turns, each with its own work left open meanwhile
++	// (see GSRenderer::set_frame_context_hold). `hold` says true while another memory of the device has open
++	// command buffers.
++	void set_frame_context_hold(std::function<bool()> hold) { renderer.set_frame_context_hold(std::move(hold)); }
++	bool has_open_command_buffers() const { return renderer.has_open_command_buffers(); }
 +	// Bytes one save copies on the GPU.
 +	uint64_t rollback_bytes() const;
 +
  	void flush();
  
  	void clobber_register_state();
-@@ -333,6 +351,10 @@
+@@ -333,6 +356,10 @@ private:
  	uint64_t query_timeline();
  
  	void mark_texture_state_dirty();
@@ -227,7 +240,7 @@ diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
 diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
 --- a/gs/gs_renderer.cpp
 +++ b/gs/gs_renderer.cpp
-@@ -357,6 +357,165 @@
+@@ -357,6 +357,175 @@ void GSRenderer::set_field_aware_super_sampling(bool enable)
  	field_aware_super_sampling = enable;
  }
  
@@ -383,6 +396,16 @@ diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
 +	device->submit(cmd);
 +}
 +
++void GSRenderer::set_frame_context_hold(std::function<bool()> hold)
++{
++	frame_context_hold = std::move(hold);
++}
++
++bool GSRenderer::has_open_command_buffers() const
++{
++	return direct_cmd || async_transfer_cmd || triangle_setup_cmd || clear_cmd || heuristic_cmd || binning_cmd;
++}
++
 +void GSRenderer::rollback_restore(uint32_t clut_instance, bool single_rate_only)
 +{
 +	if (rollback_buffer)
@@ -393,10 +416,29 @@ diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
  void GSRenderer::init_vram(const GSOptions &options)
  {
  	Vulkan::BufferCreateInfo info = {};
+@@ -1212,7 +1381,9 @@ void GSRenderer::flush_submit(uint64_t value)
+ 
+ 	// If we have a timeline trace, we'd like it to be somewhat readable.
+ 	// Only do garbage collection at frame boundaries.
+-	if (!device->get_system_handles().timeline_trace_file)
++	// DW5XL issue 049: and not while another renderer of the device has open command buffers (the device
++	// would wait for them).
++	if (!device->get_system_handles().timeline_trace_file && !(frame_context_hold && frame_context_hold()))
+ 		device->next_frame_context();
+ 
+ 	log_timestamps();
 diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
 --- a/gs/gs_renderer.hpp
 +++ b/gs/gs_renderer.hpp
-@@ -326,7 +326,40 @@
+@@ -12,6 +12,7 @@
+ #include "page_tracker.hpp"
+ #include "shaders/data_structures.h"
+ #include "shaders/slangmosh_iface.hpp"
++#include <functional>
+ #include <queue>
+ #include <future>
+ #include <atomic>
+@@ -326,7 +327,48 @@ public:
  
  	void set_field_aware_super_sampling(bool enable);
  
@@ -419,8 +461,16 @@ diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
 +	// have flushed first.
 +	void copy_pages_from(GSRenderer &source, const std::vector<std::pair<VkDeviceSize, VkDeviceSize>> &ranges,
 +	                     uint32_t num_slices, uint32_t source_clut, uint32_t clut_instance);
++	// DW5XL issue 049: more than one renderer on the same device, each with work of its own left open while
++	// another one draws. A flush ends the device's frame context, and the device then waits for every open
++	// command buffer, whoever holds it. So with `hold` set, a flush leaves the frame context alone while `hold`
++	// says true (another renderer of the device has open command buffers). The frame context is only where the
++	// device frees things: nothing drawn depends on where it ends.
++	void set_frame_context_hold(std::function<bool()> hold);
++	bool has_open_command_buffers() const;
 +
  private:
++	std::function<bool()> frame_context_hold;
 +	Vulkan::BufferHandle rollback_buffer;
 +	std::vector<std::pair<VkDeviceSize, VkDeviceSize>> rollback_ranges;
 +	uint32_t rollback_slices = 0;
@@ -440,7 +490,7 @@ diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
 diff --git a/gs/page_tracker.cpp b/gs/page_tracker.cpp
 --- a/gs/page_tracker.cpp
 +++ b/gs/page_tracker.cpp
-@@ -144,6 +144,20 @@
+@@ -144,6 +144,20 @@ void PageTracker::mark_external_write(const PageRect &rect)
  	invalidate_texture_cache(UINT32_MAX);
  }
  
@@ -464,7 +514,7 @@ diff --git a/gs/page_tracker.cpp b/gs/page_tracker.cpp
 diff --git a/gs/page_tracker.hpp b/gs/page_tracker.hpp
 --- a/gs/page_tracker.hpp
 +++ b/gs/page_tracker.hpp
-@@ -201,6 +201,10 @@
+@@ -201,6 +201,10 @@ public:
  
  	bool texture_may_super_sample(const PageRect &rect) const;
  

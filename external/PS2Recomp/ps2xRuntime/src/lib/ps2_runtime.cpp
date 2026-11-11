@@ -10,6 +10,7 @@
 #include "gs/gs_trace.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_device_queue.h"
+#include "runtime/ps2_picture_device.h"
 #include "runtime/ps2_settings.h"
 #include "runtime/ps2_stdio_pump.h"
 #include "runtime/ps2_profile_markers.h"
@@ -1904,6 +1905,9 @@ PS2Runtime::~PS2Runtime()
         requestStop();
         // Join the device worker before the GS/VU1/arbiter members it drives go away.
         ps2x::device::detach(m_memory);
+        // Issue 049 v3.7: the pictures' device and what the GS side still holds of its packets.
+        m_pictureDevice.reset();
+        m_gifArbiter.dropSideBefore(~0ull);
         m_iopSubsystem.reset();
         m_iopHost.reset();
         m_audioBackend.stopPcmStream();
@@ -1953,6 +1957,30 @@ void PS2Runtime::setPictureReadSubmitted(std::function<void()> submitted)
     m_gs.setPictureReadSubmitted(submitted);
     if (m_pictureGs)
         m_pictureGs->setPictureReadSubmitted(submitted);
+}
+
+ps2x::PictureDevice &PS2Runtime::pictureDevice()
+{
+    if (!m_pictureDevice)
+    {
+        // Its packets go to the GS thread's side stream (the game's packets first), and from there to the picture
+        // GS only (syncCoreSubsystems).
+        ps2x::PictureDevice::Hooks hooks;
+        hooks.gif = [this](std::shared_ptr<GifArbiter::SideBatch> batch)
+        { return m_gifArbiter.submitSide(std::move(batch)); };
+        hooks.dropBefore = [this](uint64_t frame)
+        {
+            const bool cut = m_gifArbiter.dropSideBefore(frame);
+            // A picture that was cut off may have left a GIF tag unfinished on the picture GS.
+            GS *picture = m_pictureGsPtr.load(std::memory_order_acquire);
+            if (cut && picture)
+                picture->resetGifInput();
+            return cut;
+        };
+        hooks.allow = [this](uint64_t frame) { m_gifArbiter.allowSide(frame); };
+        m_pictureDevice = std::make_unique<ps2x::PictureDevice>(m_gs, std::move(hooks));
+    }
+    return *m_pictureDevice;
 }
 
 bool PS2Runtime::syncPictureGs(bool everything, uint32_t *pages, uint32_t *differ)
@@ -2263,6 +2291,13 @@ bool PS2Runtime::syncCoreSubsystems()
                                             m_gs.processGIFPacket(data, size);
                                     });
     m_gifArbiter.setWorkerEnabled(GifArbiter::workerRequestedByEnv());
+    // Issue 049 v3.7: the packets of the pictures' device (the side stream) go to the picture GS, never to the
+    // game's: without a picture GS (the renderer has no second memory) they are dropped.
+    m_gifArbiter.setSideProcessFn([this](GifPathId, const uint8_t *data, uint32_t size)
+                                  {
+                                      if (GS *picture = m_pictureGsPtr.load(std::memory_order_acquire))
+                                          picture->processGIFPacket(data, size);
+                                  });
     m_memory.setGifArbiter(&m_gifArbiter);
     // VIF1 MSCAL/MSCNT. On the async device worker the VU1 D/T enables come from
     // the kick-time FBRST snapshot and the D/T stop bits go to the command's

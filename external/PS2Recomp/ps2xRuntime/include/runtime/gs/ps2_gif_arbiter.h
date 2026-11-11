@@ -1,10 +1,12 @@
 #ifndef PS2_GIF_ARBITER_H
 #define PS2_GIF_ARBITER_H
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -64,6 +66,39 @@ public:
     void reset();
     bool empty() const { return m_queue.empty() && m_outbox.empty(); }
 
+    // DW5XL (issue 049, amendment v3.7, change 3: "the game first"): a second stream to the GS worker, for the
+    // in-between pictures' device. Side batches are processed in the order they were submitted, but only while
+    // nothing of the main stream is waiting: between two side packets the main stream's packets and calls go
+    // first. A batch belongs to a group (the pictures' frame); a group's batches are processed only once
+    // allowSide() named it. Without a GS worker side batches are processed where they are submitted or allowed.
+    struct SideBatch
+    {
+        struct Packet { GifPathId path; uint32_t offset, size; };
+        uint64_t group = 0;
+        std::vector<uint8_t> bytes;  // the packets, one after the other
+        std::vector<Packet> packets;
+        // The last batch of its unit (one picture) has one. Called once: on the GS side right after the batch's
+        // packets (dropped = false), or where the batch is dropped (dropped = true). It must not call the arbiter.
+        std::function<void(bool dropped)> then;
+    };
+    using SideProcessFn = std::function<void(GifPathId, const uint8_t *, uint32_t)>;
+    void setSideProcessFn(SideProcessFn fn); // before the first batch
+    // Any thread (one producer). False: the batch's group was dropped already; `then` is not called.
+    bool submitSide(std::shared_ptr<SideBatch> batch);
+    // Any thread; inside a call of the main stream it takes effect at that place in the stream. Side work of
+    // groups below `group` that is waiting or half done is dropped, and later batches of those groups are
+    // refused. True when a unit was cut off: a batch of it was dropped, or its last batch had not come yet.
+    bool dropSideBefore(uint64_t group);
+    // Batches of groups up to `group` may be processed from now on (same threads as dropSideBefore).
+    void allowSide(uint64_t group);
+    struct SideTotals
+    {
+        uint64_t packets = 0, bytes = 0;
+        uint64_t ns = 0;      // processing them
+        uint64_t gaveWay = 0; // times the main stream went first in the middle of a batch
+    };
+    SideTotals sideTotals() const;
+
 private:
     ProcessPacketFn m_processFn;
     std::vector<GifArbiterPacket> m_queue;
@@ -92,6 +127,25 @@ private:
     void startWorker();
     void stopWorker();
     void workerLoop();
+
+    // The side stream (issue 049 v3.7). Under m_workerMutex, except m_sideCurrent, m_sideAt and the open unit while
+    // m_sideRunning is set: they are then the GS worker's alone (runSide).
+    SideProcessFn m_sideProcessFn;
+    std::deque<std::shared_ptr<SideBatch>> m_side;
+    std::shared_ptr<SideBatch> m_sideCurrent; // taken from m_side, m_sideAt packets of it are processed
+    size_t m_sideAt = 0;
+    bool m_sideRunning = false;               // the GS worker is processing side packets
+    int m_sideHold = 0;                       // dropSideBefore() on another thread waits for the worker to pause
+    bool m_sideUnitOpen = false;              // the last batch processed was not its unit's last
+    uint64_t m_sideUnitGroup = 0;
+    uint64_t m_sideMinGroup = 0;              // batches of groups below are refused
+    uint64_t m_sideAllowed = 0;               // batches of groups up to this one may be processed
+    std::atomic<bool> m_mainWaiting{false};   // the main stream has work for the GS worker (set under the lock)
+    std::recursive_mutex m_sideInline;        // no GS worker: one thread at a time processes or drops side batches
+    std::atomic<uint64_t> m_sidePackets{0}, m_sideBytes{0}, m_sideNs{0}, m_sideGaveWay{0};
+    bool sideReady() const;                   // under m_workerMutex
+    void runSide();
+    void drainSideInline();
 
     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
     static uint8_t pathPriority(GifPathId id);

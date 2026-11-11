@@ -440,6 +440,12 @@ if(DW5XL_BUILD_TESTS)
     target_compile_options(dw5xl_vif1_units_test PRIVATE ${DW5XL_ARCH_FLAGS})
     add_test(NAME vif1_units COMMAND dw5xl_vif1_units_test)
     set_tests_properties(vif1_units PROPERTIES TIMEOUT 120)
+    # DW5XL-TEST issue 049 v3.7 (P2.6b-2): the pictures' own VIF1/VU1 device.
+    add_executable(dw5xl_picture_device_test tests/picture_device_test.cpp)
+    target_link_libraries(dw5xl_picture_device_test PRIVATE ps2_runtime)
+    target_compile_options(dw5xl_picture_device_test PRIVATE ${DW5XL_ARCH_FLAGS})
+    add_test(NAME picture_device COMMAND dw5xl_picture_device_test)
+    set_tests_properties(picture_device PROPERTIES TIMEOUT 120)
     add_executable(dw5xl_gif_arbiter_order_test tests/gif_arbiter_order_test.cpp)
     target_link_libraries(dw5xl_gif_arbiter_order_test PRIVATE ps2_runtime)
     add_test(NAME gif_arbiter_order COMMAND dw5xl_gif_arbiter_order_test)
@@ -533,6 +539,20 @@ if(DW5XL_BUILD_TESTS)
         target_link_options(dw5xl_vif1_units_tsan_test PRIVATE -fsanitize=thread)
         add_test(NAME vif1_units_tsan COMMAND dw5xl_vif1_units_tsan_test)
         set_tests_properties(vif1_units_tsan PROPERTIES TIMEOUT 120 ENVIRONMENT "TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1")
+        # Issue 049 v3.7 (P2.6b-2): the pictures' device is driven from three threads (the game's device, the
+        # game's GS side, the game thread) beside its own.
+        add_executable(dw5xl_picture_device_tsan_test
+            tests/picture_device_test.cpp
+            "${DW5XL_RUNTIME_SRC}/ps2_picture_device.cpp"
+            "${DW5XL_RUNTIME_SRC}/ps2_memory.cpp"
+            "${DW5XL_RUNTIME_SRC}/ps2_vif1_interpreter.cpp"
+            "${DW5XL_RUNTIME_SRC}/gs/ps2_gif_arbiter.cpp"
+            ${DW5XL_VU_SRC})
+        target_link_libraries(dw5xl_picture_device_tsan_test PRIVATE ps2_runtime)
+        target_compile_options(dw5xl_picture_device_tsan_test PRIVATE ${DW5XL_ARCH_FLAGS} -fsanitize=thread -g -O1)
+        target_link_options(dw5xl_picture_device_tsan_test PRIVATE -fsanitize=thread)
+        add_test(NAME picture_device_tsan COMMAND dw5xl_picture_device_tsan_test)
+        set_tests_properties(picture_device_tsan PROPERTIES TIMEOUT 120 ENVIRONMENT "TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1")
     endif()
 
     # DW5XL-TEST: GS stream recording comparison and offline VIF1 replay (tools/gsreplay).
@@ -556,6 +576,12 @@ if(DW5XL_BUILD_TESTS)
     target_link_libraries(dw5xl_gs_second_memory_test PRIVATE ps2_runtime)
     target_include_directories(dw5xl_gs_second_memory_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
     add_test(NAME gs_second_memory COMMAND dw5xl_gs_second_memory_test)
+    # DW5XL-TEST issue 049 v3.7 (P2.6b-3): the two GS memories draw in turns and neither's work ends at a turn
+    # (skipped without a Vulkan device).
+    add_executable(dw5xl_gs_turns_test tests/gs_turns_test.cpp)
+    target_link_libraries(dw5xl_gs_turns_test PRIVATE ps2_runtime)
+    target_include_directories(dw5xl_gs_turns_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME gs_turns COMMAND dw5xl_gs_turns_test)
     # DW5XL-TEST issue 049 v3.7: the picture GS follows the game's GS through a state load, a change of scale or
     # samples and a direct write (the GS front end's list of written pages; skipped without a Vulkan device).
     add_executable(dw5xl_gs_picture_sync_test tests/gs_picture_sync_test.cpp)
@@ -579,6 +605,7 @@ if(DW5XL_BUILD_TESTS)
     set_tests_properties(gs_rollback PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     set_tests_properties(gs_second_memory PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
     set_tests_properties(gs_picture_sync PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+    set_tests_properties(gs_turns PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
     if(NOT WIN32) # drives the tools through a POSIX shell (env -u, quoting, wait status)
     add_executable(dw5xl_gsreplay_test tests/gsreplay_test.cpp)
     target_link_libraries(dw5xl_gsreplay_test PRIVATE ps2_runtime)

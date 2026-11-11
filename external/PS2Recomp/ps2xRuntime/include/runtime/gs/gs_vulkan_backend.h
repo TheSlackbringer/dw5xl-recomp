@@ -43,6 +43,9 @@ public:
     uint32_t GetResolutionScale() const override;
     void SetAASamples(uint32_t samples) override;
     uint32_t GetAASamples() const override;
+    // DW5XL-TEST (issue 049 v3.7): the stretches of work (render passes) this memory's renderer has ended since the
+    // last call; what is still open is flushed first.
+    uint32_t TakeRenderPasses();
 private:
     struct Impl;
     explicit GSVulkanBackend(std::unique_ptr<Impl> impl);

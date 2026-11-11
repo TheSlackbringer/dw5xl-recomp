@@ -274,6 +274,7 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
 
 class PS2Runtime;
 namespace ps2x { class StateArchive; } // DW5XL (issue 027): runtime/state_archive.h
+namespace ps2x { class PictureDevice; } // DW5XL (issue 049 v3.7): runtime/ps2_picture_device.h
 
 // Generated module metadata and entries have static lifetime. Registration does
 // not activate a module; the game-specific loader validates loaded bytes first.
@@ -564,6 +565,10 @@ public:
     }
     bool syncPictureGs(bool everything, uint32_t *pages = nullptr, uint32_t *differ = nullptr);
     void setGifToPictureGs(bool on) { m_gifToPictureGs = on; }
+    // Issue 049 (amendment v3.7, changes 2 and 3): the pictures' own VIF1/VU1 device, on a thread of its own
+    // (runtime/ps2_picture_device.h). Made on first use, before the game runs; the GS thread reads its packets into
+    // the picture GS between the game's own (GifArbiter's side stream).
+    ps2x::PictureDevice &pictureDevice();
     // Called after every picture read is started, on either GS (issue 049 v3.5; see GS::setPictureReadSubmitted).
     void setPictureReadSubmitted(std::function<void()> submitted);
     inline void setResolutionScale(uint32_t scale) { m_gs.setResolutionScale(scale); }
@@ -643,6 +648,7 @@ private:
     std::unique_ptr<GS> m_pictureGs;            // after m_gs: it goes first
     std::atomic<GS *> m_pictureGsPtr{nullptr};
     bool m_gifToPictureGs = false;              // GS side only
+    std::unique_ptr<ps2x::PictureDevice> m_pictureDevice; // after the two GS: it goes first
     std::function<void()> m_pictureReadSubmitted;
     std::mutex m_pictureReadSubmittedMutex;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;

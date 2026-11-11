@@ -104,6 +104,7 @@ namespace ps2x::display_clock
         double readyMs = 0.0;   // its read was finished
         double handMs = 0.0;    // what the window needed from taking it to handing it over (a dropped one: the last such time)
         bool shown = false;     // false: it missed its instant
+        bool givenUp = false;   // it was never drawn (issue 049 v3.7: the pictures' device gave it up); then not shown
     };
     void report(const Outcome &outcome);
     void takeOutcomes(std::vector<Outcome> &out);

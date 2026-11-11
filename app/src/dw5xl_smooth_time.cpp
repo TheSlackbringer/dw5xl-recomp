@@ -80,6 +80,49 @@ namespace dw5xl::smooth
         return true;
     }
 
+    void PictureBudget::afterDevice(double nowMs, double ms)
+    {
+        if (ms >= 0.0)
+            add(m_after, nowMs, ms);
+    }
+
+    void PictureBudget::frameOwn(double nowMs, double untilMs)
+    {
+        prune(m_costs, nowMs);
+        prune(m_next, nowMs);
+        prune(m_after, nowMs);
+        m_allowance = 0.0;
+        m_latest = untilMs;
+        m_busyUntil = nowMs;
+        m_admitted = 0;
+    }
+
+    bool PictureBudget::admitBy(double nowMs, double atMs, double *missBy)
+    {
+        if (missBy)
+            *missBy = 0.0;
+        const double start = std::max(nowMs, m_busyUntil);
+        if (!known())
+        {
+            // What a picture costs is not known: one is let through to learn it, as in admit().
+            if (m_admitted != 0 || start >= m_latest || (m_probing && nowMs < m_probeUntil))
+                return false;
+            m_probing = true;
+            m_probeUntil = nowMs + kProbeMs;
+            ++m_admitted;
+            return true;
+        }
+        const double left = start + (m_admitted == 0 ? cost() : nextCost()); // when it will have left the device
+        const double miss = left + after() - atMs;
+        if (missBy)
+            *missBy = miss;
+        if (miss > 0.0 || left > m_latest)
+            return false;
+        m_busyUntil = left;
+        ++m_admitted;
+        return true;
+    }
+
     FinishedFrames::Coming FinishedFrames::finished(uint32_t list, uint64_t hash, uint64_t lastField, double lastStart,
                                                     double period)
     {

@@ -220,11 +220,26 @@ namespace dw5xl::smooth
         // One more picture of this frame: true when it fits, and it then counts as started.
         bool admit(double nowMs);
 
+        // Amendment v3.7, change 4: on a device of their own the pictures are in nobody's way, and a picture has one
+        // deadline left, its own instant on screen. One that cannot make it is not started, by the same measure
+        // (the longest a picture took lately). The pictures' GS is a frame's only until the next frame's pages are
+        // copied there, so a picture that would still be on the device at the next frame's end is not started
+        // either. Used in place of frame() and admit().
+        //  - afterDevice(): a picture that ran: how long it took from the moment it had left the device until the
+        //    window could hand it over (its read, and the window's own time).
+        //  - frameOwn(): a frame's pictures may use their device from now on, until `untilMs` (the next frame's end).
+        //  - admitBy(): one more picture of this frame, on screen at `atMs`. True: it will make it, and it counts
+        //    as started. `missBy`: by how much it would miss its instant (0 or less: it would not).
+        void afterDevice(double nowMs, double ms);
+        double after() const { return m_after.empty() ? 0.0 : m_after.front().second; }
+        void frameOwn(double nowMs, double untilMs);
+        bool admitBy(double nowMs, double atMs, double *missBy = nullptr);
+
       private:
         using Window = std::deque<std::pair<double, double>>; // (time, value), values falling: the front is the largest
         static void add(Window &window, double nowMs, double value);
         static void prune(Window &window, double nowMs);
-        Window m_costs, m_next, m_game;
+        Window m_costs, m_next, m_game, m_after;
         double m_latest = 0.0, m_busyUntil = 0.0, m_allowance = 0.0;
         int m_admitted = 0;
         bool m_probing = false;

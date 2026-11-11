@@ -47,10 +47,25 @@ struct GSVulkanDevice
     Vulkan::Context context;
     Vulkan::Device device;
     std::mutex mutex;
-    // Granite waits for every open command buffer of the device when a frame context ends, and every flush of a GS
-    // memory ends one. So only one memory may have open command buffers at a time: the one used last. It is
-    // flushed when another one takes over (Impl::access).
-    ParallelGS::GSInterface *active = nullptr;
+    // The GS memories of this device (Impl registers its own). They draw in turns, and each keeps its work open
+    // while another one draws: where the turns fall must not show in a picture (issue 049 v3.7), and what
+    // paraLLEl-GS draws depends on where its work ends. Granite waits for every open command buffer of the device
+    // when a frame context ends, and a flush of a GS memory ends one. So a memory's flush leaves the frame context
+    // alone while another memory has open command buffers (GSInterface::set_frame_context_hold), and whatever
+    // else waits for the device flushes every memory first (flushAll).
+    std::vector<ParallelGS::GSInterface *> memories;
+    bool otherOpen(const ParallelGS::GSInterface *self) const
+    {
+        for (const ParallelGS::GSInterface *memory : memories)
+            if (memory != self && memory->has_open_command_buffers())
+                return true;
+        return false;
+    }
+    void flushAll()
+    {
+        for (ParallelGS::GSInterface *memory : memories)
+            memory->flush();
+    }
 
     GSVulkanDevice()
     {
@@ -149,7 +164,7 @@ struct GSVulkanBackend::Impl
         if (scale == currentScale.load(std::memory_order_relaxed) &&
             samples == aaSamples.load(std::memory_order_relaxed))
             return;
-        gs.flush();
+        shared->flushAll(); // the change waits for the device: nothing of any memory may be open
         dirty = false;
         for (auto &slot : scanoutState.slots)
             if (slot.pending && slot.fence) slot.fence->wait();
@@ -202,12 +217,16 @@ struct GSVulkanBackend::Impl
         else
             std::fprintf(stderr, "[gs:vulkan] device=%s vendor=0x%04x device=0x%04x; GPU compute rasterization (AA=%u samples)\n",
                 gpu.deviceName, gpu.vendorID, gpu.deviceID, static_cast<unsigned>(opts.super_sampling));
+        shared->memories.push_back(&gs);
+        gs.set_frame_context_hold([this] { return shared->otherOpen(&gs); });
     }
     ~Impl()
     {
-        auto lock = access(); // the other memories are flushed; this one is the active one
-        gs.flush(); device.wait_idle();
-        shared->active = nullptr;
+        auto lock = access();
+        shared->flushAll(); device.wait_idle();
+        shared->memories.erase(std::remove(shared->memories.begin(), shared->memories.end(), &gs), shared->memories.end());
+        // The renderer flushes once more when it goes (without the device lock): the frame context stays.
+        gs.set_frame_context_hold([] { return true; });
         const char *stats = std::getenv("PS2X_STATS");
         if (stats && *stats && *stats != '0')
             std::fprintf(stderr, "[gs:vulkan] draws=%llu GPU scanouts=%llu CPU display conversions=%llu\n",
@@ -221,14 +240,6 @@ struct GSVulkanBackend::Impl
         // Granite requires a thread-local index even with one command pool.
         std::unique_lock lock(mutex);
         Util::register_thread_index(0);
-        if (shared->active != &gs)
-        {
-            // Another memory of this device was used last: its work is submitted before this one opens a command
-            // buffer (GSVulkanDevice::active).
-            if (shared->active)
-                shared->active->flush();
-            shared->active = &gs;
-        }
         return lock;
     }
 
@@ -325,10 +336,9 @@ std::unique_ptr<GSRasterBackend> GSVulkanBackend::MakeSecondMemory()
 {
     auto lock = m_impl->access();
     auto &p = *m_impl;
-    // Making a GS memory waits for the device to be idle: nothing of this one may be open.
-    p.gs.flush();
+    // Making a GS memory waits for the device to be idle: nothing of any memory may be open.
+    p.shared->flushAll();
     p.dirty = false;
-    p.shared->active = nullptr;
     return std::unique_ptr<GSRasterBackend>(new GSVulkanBackend(std::make_unique<Impl>(p.shared, &p)));
 }
 
@@ -441,11 +451,16 @@ void GSVulkanBackend::UploadImage(const uint8_t *data, uint32_t bytes)
     if (complete) { p.transferState.direction = 3; p.transferState.totalPixels = 0; }
 }
 void GSVulkanBackend::Flush() { auto lock = m_impl->access(); m_impl->flushIfDirty(); }
+uint32_t GSVulkanBackend::TakeRenderPasses()
+{
+    auto lock = m_impl->access(); m_impl->flushIfDirty();
+    return m_impl->gs.consume_flush_stats().num_render_passes;
+}
 void GSVulkanBackend::TextureFlush() { auto lock = m_impl->access(); m_impl->reg(Reg::TEXFLUSH, 0, true); }
 void GSVulkanBackend::Sync(GSSyncReason reason)
 {
     auto lock = m_impl->access(); m_impl->flushIfDirty();
-    if (reason == GSSyncReason::Reset) m_impl->device.wait_idle();
+    if (reason == GSSyncReason::Reset) { m_impl->shared->flushAll(); m_impl->device.wait_idle(); }
 }
 void GSVulkanBackend::SnapshotVram(std::vector<uint8_t> &out) const
 {
@@ -657,7 +672,8 @@ bool GSVulkanBackend::PresentInto(const GSPresentationRequest &request, Presenta
         out = p.scanout.PresentFromLocalMemory(request, &p.fieldWeaver);
         updated = static_cast<bool>(out);
         ++p.convertedPresentations;
-        p.device.next_frame_context();
+        if (!p.shared->otherOpen(&p.gs))
+            p.device.next_frame_context();
     }
     const char *stats = std::getenv("PS2X_STATS");
     if (stats && *stats && *stats != '0' && (p.gpuPresentations + p.convertedPresentations) % 300u == 0)

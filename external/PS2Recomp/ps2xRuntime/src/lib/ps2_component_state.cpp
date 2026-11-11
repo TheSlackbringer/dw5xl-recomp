@@ -7,6 +7,9 @@
 #include "runtime/ps2_vu1.h"
 #include "runtime/state_archive.h"
 
+#include <algorithm>
+#include <cstring>
+
 void PS2Memory::serializeState(ps2x::StateArchive &a)
 {
     auto transfers = [](ps2x::StateArchive &x, std::vector<PendingTransfer> &list)
@@ -234,4 +237,80 @@ void VU1Interpreter::serializeState(ps2x::StateArchive &a)
         m_cachedCodeSize = 0;
         m_cachedCodeGeneration = 0;
     }
+}
+
+// DW5XL (issue 049, amendment v3.7, addition 2): the members serializeState saves, as a value. An XGKICK packet is
+// copied only as far as it has been filled (nothing beyond is ever read).
+namespace
+{
+    template <typename Xgkick>
+    void copyXgkick(Xgkick &to, const Xgkick &from)
+    {
+        to.sourceAddress = from.sourceAddress;
+        to.totalBytes = from.totalBytes;
+        to.copiedBytes = from.copiedBytes;
+        to.currentTagEnd = from.currentTagEnd;
+        to.cycleCredit = from.cycleCredit;
+        to.issueCycle = from.issueCycle;
+        to.active = from.active;
+        to.currentTagEop = from.currentTagEop;
+        std::memcpy(to.packet.data(), from.packet.data(), std::min<size_t>(from.copiedBytes, from.packet.size()));
+    }
+}
+
+void VU1Interpreter::saveRunState(RunState &s) const
+{
+    s.state = m_state;
+    s.flagPipeline = m_flagPipeline;
+    s.fdiv = m_fdiv;
+    s.efu = m_efu;
+    s.storePipeline = m_storePipeline;
+    copyXgkick(s.xgkick, m_xgkick);
+    std::memcpy(s.ready.data(), m_ready.data(), sizeof(uint64_t) * s.ready.size());
+    s.cycle = m_cycle;
+    s.efuResourceReady = m_efuResourceReady;
+    s.nextCommitCycle = m_nextCommitCycle;
+    s.writebackHorizon = m_writebackHorizon;
+    s.flagMask = m_flagMask;
+    s.efuMask = m_efuMask;
+    s.storeMask = m_storeMask;
+    s.workingClip = m_workingClip;
+    s.currentUpperInstruction = m_currentUpperInstruction;
+    s.fmacQ = m_fmacQ;
+    s.fmacI = m_fmacI;
+    s.viBranchBackupValue = m_viBranchBackupValue;
+    s.viBranchBackupReg = m_viBranchBackupReg;
+    s.viBranchBackupValid = m_viBranchBackupValid;
+    s.stopRequested = m_stopRequested;
+    s.pendingHaltD = m_pendingHaltD;
+    s.pendingHaltT = m_pendingHaltT;
+}
+
+void VU1Interpreter::loadRunState(const RunState &s)
+{
+    m_state = s.state;
+    m_flagPipeline = s.flagPipeline;
+    m_fdiv = s.fdiv;
+    m_efu = s.efu;
+    m_storePipeline = s.storePipeline;
+    copyXgkick(m_xgkick, s.xgkick);
+    std::memcpy(m_ready.data(), s.ready.data(), sizeof(uint64_t) * s.ready.size());
+    m_cycle = s.cycle;
+    m_efuResourceReady = s.efuResourceReady;
+    m_nextCommitCycle = s.nextCommitCycle;
+    m_writebackHorizon = s.writebackHorizon;
+    m_flagMask = s.flagMask;
+    m_efuMask = s.efuMask;
+    m_storeMask = s.storeMask;
+    m_workingClip = s.workingClip;
+    m_currentUpperInstruction = s.currentUpperInstruction;
+    m_fmacQ = s.fmacQ;
+    m_fmacI = s.fmacI;
+    m_viBranchBackupValue = s.viBranchBackupValue;
+    m_viBranchBackupReg = s.viBranchBackupReg;
+    m_viBranchBackupValid = s.viBranchBackupValid;
+    m_stopRequested = s.stopRequested;
+    m_pendingHaltD = s.pendingHaltD;
+    m_pendingHaltT = s.pendingHaltT;
+    // The decoded code and the translated programs' lookup stay: they belong to this VU's own program memory.
 }

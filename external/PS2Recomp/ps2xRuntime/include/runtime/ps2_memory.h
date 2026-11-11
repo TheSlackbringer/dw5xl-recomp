@@ -343,6 +343,9 @@ public:
     void flushMaskedPath3Packets(bool drainImmediately = true);
 
     void submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately = true, bool path2DirectHl = false);
+    // DW5XL-DEBUG (issue 049, criterion 6d): sees every PATH1 and PATH2 packet the game's device hands over, on the
+    // thread that hands it over (the device worker). Set before the game runs; empty: off.
+    std::function<void(GifPathId, const uint8_t *, uint32_t)> m_gifTap;
     void processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount);
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr);

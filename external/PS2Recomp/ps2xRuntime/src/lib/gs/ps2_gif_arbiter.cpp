@@ -82,19 +82,46 @@ void GifArbiter::workerLoop()
     GifArbiterPacket pkt;
     for (;;)
     {
+        bool side = false;
         {
             std::unique_lock<std::mutex> lock(m_workerMutex);
             recycle(m_returned, std::move(pkt.data));
             pkt.data = {};
             m_workerBusy = false;
+            const bool wasSide = m_sideRunning;
+            m_sideRunning = false;
             if (m_pending.empty())
+                m_mainWaiting.store(false, std::memory_order_release);
+            if (m_pending.empty() || wasSide)
                 m_idleCv.notify_all();
-            m_workCv.wait(lock, [this] { return m_stopWorker || !m_pending.empty(); });
-            if (m_pending.empty())
+            m_workCv.wait(lock, [this] { return m_stopWorker || !m_pending.empty() || sideReady(); });
+            if (!m_pending.empty())
+            {
+                pkt = std::move(m_pending.front());
+                m_pending.pop_front();
+                m_workerBusy = true;
+            }
+            else if (m_stopWorker)
+            {
                 return;
-            pkt = std::move(m_pending.front());
-            m_pending.pop_front();
-            m_workerBusy = true;
+            }
+            else
+            {
+                // Issue 049 v3.7: nothing of the game's is waiting, so the pictures' packets are read.
+                if (!m_sideCurrent)
+                {
+                    m_sideCurrent = std::move(m_side.front());
+                    m_side.pop_front();
+                    m_sideAt = 0;
+                }
+                m_sideRunning = true;
+                side = true;
+            }
+        }
+        if (side)
+        {
+            runSide();
+            continue;
         }
         if (pkt.call)
         {
@@ -106,6 +133,178 @@ void GifArbiter::workerLoop()
         m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         g_gifArbiterCurrentPath = 0;
     }
+}
+
+bool GifArbiter::sideReady() const
+{
+    return m_sideHold == 0 && (m_sideCurrent || (!m_side.empty() && m_side.front()->group <= m_sideAllowed));
+}
+
+// The batch in m_sideCurrent, from packet m_sideAt on: one packet at a time, until the main stream has work.
+void GifArbiter::runSide()
+{
+    SideBatch &batch = *m_sideCurrent;
+    const auto from = std::chrono::steady_clock::now();
+    uint64_t packets = 0, bytes = 0;
+    bool gaveWay = false;
+    while (m_sideAt < batch.packets.size())
+    {
+        if (m_mainWaiting.load(std::memory_order_acquire))
+        {
+            gaveWay = true; // the game first
+            break;
+        }
+        const SideBatch::Packet &p = batch.packets[m_sideAt++];
+        if (m_sideProcessFn)
+        {
+            g_gifArbiterCurrentPath = static_cast<int>(p.path);
+            m_sideProcessFn(p.path, batch.bytes.data() + p.offset, p.size);
+            g_gifArbiterCurrentPath = 0;
+        }
+        ++packets;
+        bytes += p.size;
+    }
+    if (m_sideAt >= batch.packets.size())
+    {
+        m_sideUnitOpen = !batch.then;
+        m_sideUnitGroup = batch.group;
+        if (batch.then)
+        {
+            batch.then(false);
+            batch.then = nullptr;
+        }
+        m_sideCurrent.reset();
+        m_sideAt = 0;
+    }
+    m_sidePackets.fetch_add(packets, std::memory_order_relaxed);
+    m_sideBytes.fetch_add(bytes, std::memory_order_relaxed);
+    m_sideNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - from).count()), std::memory_order_relaxed);
+    m_sideGaveWay.fetch_add(gaveWay ? 1u : 0u, std::memory_order_relaxed);
+}
+
+// No GS worker: the waiting batches that are allowed, on the calling thread.
+void GifArbiter::drainSideInline()
+{
+    std::lock_guard<std::recursive_mutex> turn(m_sideInline);
+    for (;;)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_workerMutex);
+            if (m_sideCurrent || m_side.empty() || m_side.front()->group > m_sideAllowed)
+                return;
+            m_sideCurrent = std::move(m_side.front());
+            m_side.pop_front();
+            m_sideAt = 0;
+        }
+        runSide(); // m_mainWaiting is never set without a worker: the whole batch
+    }
+}
+
+void GifArbiter::setSideProcessFn(SideProcessFn fn)
+{
+    std::lock_guard<std::mutex> lock(m_workerMutex);
+    m_sideProcessFn = std::move(fn);
+}
+
+bool GifArbiter::submitSide(std::shared_ptr<SideBatch> batch)
+{
+    if (!batch)
+        return false;
+    bool wake = false;
+    {
+        std::lock_guard<std::mutex> lock(m_workerMutex);
+        if (batch->group < m_sideMinGroup)
+            return false;
+        wake = m_async && !m_workerBusy && !m_sideRunning; // a worker that may be waiting
+        m_side.push_back(std::move(batch));
+    }
+    if (wake)
+        m_workCv.notify_one();
+    else if (!m_async)
+        drainSideInline();
+    return true;
+}
+
+bool GifArbiter::dropSideBefore(uint64_t group)
+{
+    std::vector<std::shared_ptr<SideBatch>> dropped;
+    bool cut = false, wake = false;
+    {
+        std::unique_lock<std::recursive_mutex> turn(m_sideInline, std::defer_lock);
+        if (!m_async)
+            turn.lock();
+        std::unique_lock<std::mutex> lock(m_workerMutex);
+        // From another thread than the GS worker: not in the middle of a side packet (the worker starts no other
+        // side packet while this waits).
+        const bool other = m_async && std::this_thread::get_id() != m_worker.get_id();
+        if (other)
+        {
+            ++m_sideHold;
+            m_idleCv.wait(lock, [this] { return !m_sideRunning; });
+            --m_sideHold;
+        }
+        if (group > m_sideMinGroup)
+            m_sideMinGroup = group;
+        if (m_sideCurrent && m_sideCurrent->group < group)
+        {
+            dropped.push_back(std::move(m_sideCurrent));
+            m_sideCurrent.reset();
+            m_sideAt = 0;
+        }
+        for (auto it = m_side.begin(); it != m_side.end();)
+        {
+            if ((*it)->group < group)
+            {
+                dropped.push_back(std::move(*it));
+                it = m_side.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        cut = !dropped.empty() || (m_sideUnitOpen && m_sideUnitGroup < group);
+        if (cut)
+            m_sideUnitOpen = false;
+        wake = other && sideReady();
+    }
+    if (wake)
+        m_workCv.notify_one();
+    for (std::shared_ptr<SideBatch> &batch : dropped)
+    {
+        if (batch->then)
+        {
+            batch->then(true);
+            batch->then = nullptr;
+        }
+    }
+    return cut;
+}
+
+void GifArbiter::allowSide(uint64_t group)
+{
+    bool wake = false;
+    {
+        std::lock_guard<std::mutex> lock(m_workerMutex);
+        if (group > m_sideAllowed)
+            m_sideAllowed = group;
+        wake = m_async && !m_workerBusy && !m_sideRunning && sideReady();
+    }
+    if (wake)
+        m_workCv.notify_one();
+    else if (!m_async)
+        drainSideInline();
+}
+
+GifArbiter::SideTotals GifArbiter::sideTotals() const
+{
+    SideTotals totals;
+    totals.packets = m_sidePackets.load(std::memory_order_relaxed);
+    totals.bytes = m_sideBytes.load(std::memory_order_relaxed);
+    totals.ns = m_sideNs.load(std::memory_order_relaxed);
+    totals.gaveWay = m_sideGaveWay.load(std::memory_order_relaxed);
+    return totals;
 }
 
 void GifArbiter::submitCall(std::function<void()> call)
@@ -136,6 +335,7 @@ void GifArbiter::flushOutbox()
         wake = !m_workerBusy && m_pending.empty();
         for (auto &pkt : m_outbox)
             m_pending.push_back(std::move(pkt));
+        m_mainWaiting.store(true, std::memory_order_release); // issue 049 v3.7: side packets give way
         if (kGifStats) // DW5XL-DEBUG issue 025
             m_stats.pendingMax = std::max(m_stats.pendingMax, m_pending.size());
         if (m_spare.empty())
