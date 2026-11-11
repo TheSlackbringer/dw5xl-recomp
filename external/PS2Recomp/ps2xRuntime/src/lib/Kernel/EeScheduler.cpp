@@ -1634,6 +1634,54 @@ EeScheduler::PresentationField EeScheduler::waitForPresentationField(uint64_t la
     return {lastShown, false};
 }
 
+EeScheduler::TimedPresentationField EeScheduler::waitForPresentationFieldUntil(
+    uint64_t lastShown, std::chrono::steady_clock::time_point until) const
+{
+    // Issue 049 v3.5: waitForPresentationField with two more ways out (see the header). A wake that came before
+    // the wait began is kept, so none is lost.
+    namespace pp = ps2x::presentation;
+    const auto period = vblankPeriod(palVideoMode());
+    std::unique_lock lock(m_presentationMutex);
+    const auto announced = [this] { return pp::announcedField(m_presentationTick.load(std::memory_order_acquire)); };
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t wanted = lastShown == pp::kNoField ? 0u : lastShown + 1u;
+    auto scheduledEnd = now;
+    if (m_scheduledEndKnown && wanted >= m_scheduledEndField)
+        scheduledEnd = m_scheduledEndTime + period * static_cast<int64_t>(wanted - m_scheduledEndField);
+    const auto giveUp = pp::giveUp(scheduledEnd, now, period);
+    const bool sooner = until < giveUp;
+    m_presentationCv.wait_until(lock, sooner ? until : giveUp, [&] {
+        return pp::isNewer(announced(), lastShown) || m_presentationWoken || m_stopRequested.load(std::memory_order_acquire);
+    });
+    const bool woken = m_presentationWoken;
+    m_presentationWoken = false;
+    const uint64_t field = announced();
+    if (pp::isNewer(field, lastShown))
+        return {field, true, false};
+    return {lastShown, false, woken || (sooner && std::chrono::steady_clock::now() < giveUp)};
+}
+
+void EeScheduler::wakePresentationWait() const
+{
+    {
+        std::lock_guard lock(m_presentationMutex);
+        m_presentationWoken = true;
+    }
+    m_presentationCv.notify_all();
+}
+
+bool EeScheduler::lastFieldStart(std::chrono::steady_clock::time_point &time, uint64_t &field,
+                                 std::chrono::nanoseconds &period) const
+{
+    std::lock_guard lock(m_presentationMutex);
+    if (!m_scheduledEndKnown)
+        return false;
+    time = m_scheduledEndTime - kVBlankDuration; // the boundary itself; its VBlank ends kVBlankDuration later
+    field = m_scheduledEndField + 1u;            // the field ending there is m_scheduledEndField
+    period = vblankPeriod(palVideoMode());
+    return true;
+}
+
 uint32_t EeScheduler::setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp)
 {
     assertExecutor();

@@ -212,7 +212,15 @@ namespace ps2x::device
     // Issue 049 (in-between pictures): a VIF1 stream that is not a guest DMA transfer, e.g. a changed copy of a
     // game's command list. It runs in queue order through VIF1, VU1, GIF and GS like a transfer's VIF1 data, but no
     // DMA channel or completion is involved, so the guest never sees it. Synchronous executor: runs at once.
-    bool submitDetachedVif1(PS2Memory &mem, std::vector<uint8_t> stream);
+    // gsBefore / gsAfter (optional) run on the GS side, in order with the stream's GIF packets (GifArbiter::
+    // submitCall): just before its first one and right after its last one (e.g. sending them to another GS).
+    bool submitDetachedVif1(PS2Memory &mem, std::vector<uint8_t> stream, std::function<void()> gsBefore = {},
+                            std::function<void()> gsAfter = {});
+    // Issue 049 P2.5d: what the detached streams have cost on the device so far: their time in nanoseconds (VIF1,
+    // VU1, GIF up to the hand-over to the GS) and how many there were. For "what does one more picture cost".
+    void detachedVif1Totals(uint64_t &nanoseconds, uint64_t &count);
+    // An ordered call on the GS side with no stream (e.g. copying the GS at a point of the game's GS work).
+    bool submitGsSideCall(PS2Memory &mem, std::function<void()> gsCall);
 }
 
 #endif // PS2_DEVICE_QUEUE_H

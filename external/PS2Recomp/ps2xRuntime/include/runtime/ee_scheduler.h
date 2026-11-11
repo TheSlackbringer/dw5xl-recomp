@@ -364,6 +364,20 @@ public:
         bool fresh = false;
     };
     PresentationField waitForPresentationField(uint64_t lastShown) const;
+    // Issue 049 v3.5: the same wait for a window that also shows pictures between fields. It returns no later than
+    // `until`, and at once after wakePresentationWait() (a picture has arrived). `early` says the wait ended that
+    // way, before the window would have given up on the field.
+    struct TimedPresentationField
+    {
+        uint64_t field = ps2x::presentation::kNoField;
+        bool fresh = false;
+        bool early = false;
+    };
+    TimedPresentationField waitForPresentationFieldUntil(uint64_t lastShown, std::chrono::steady_clock::time_point until) const;
+    void wakePresentationWait() const;
+    // Issue 049 v3.5: the newest field boundary (VBlank start) on the field clock: its host time, the number of the
+    // field that begins there, and the length of a field. False until the first boundary after a reset or a state load.
+    bool lastFieldStart(std::chrono::steady_clock::time_point &time, uint64_t &field, std::chrono::nanoseconds &period) const;
     // Issue 009 v4.4 (design 1a): called at an event service (executor, outside guest code) with the token of an EE
     // request whose IOP part has ended.
     void setIopRpcCompletionHandler(std::function<void(uint64_t)> handler) { m_iopRpcCompletion = std::move(handler); }
@@ -509,6 +523,7 @@ private:
     uint64_t m_scheduledEndField = 0;
     std::chrono::steady_clock::time_point m_scheduledEndTime{};
     bool m_scheduledEndKnown = false;
+    mutable bool m_presentationWoken = false; // issue 049 v3.5: wakePresentationWait(); under m_presentationMutex
     // Issue 009 v4.4 (design 1a): finishes an EE request whose IOP part has ended (RPC.cpp registers it).
     std::function<void(uint64_t)> m_iopRpcCompletion;
     std::atomic<bool> m_palVideoMode{false};

@@ -1,6 +1,7 @@
 #ifndef PS2_GS_FRONTEND_H
 #define PS2_GS_FRONTEND_H
 
+#include <functional>
 #include <array>
 #include <atomic>
 #include <bitset>
@@ -106,10 +107,51 @@ class GS
 public:
     // DW5XL (issue 027): GS state for save states (drawing registers, vertex queue, GIF path progress, renderer).
     void serializeState(ps2x::StateArchive &archive);
+    // Issue 049 v3.2 (in-between pictures drawn in place on this GS). GS side, in stream order.
+    // beginRollbackWriteSet: from here on, the pages the game's draws and local copies write are collected.
+    // saveRollback: after the game's list: stops collecting and keeps those pages, the registers, the palette
+    // and the field-read bookkeeping. rollback: after the frame's last in-between picture: puts all of it back.
+    // Both return false when there is nothing to keep or the renderer has no rollback.
+    // `uploads` (v3.6): the pages the game's uploads write are collected too. In-between pictures drawn before the
+    // game's own list make that list's uploads early, so those pages must go back as well.
+    void beginRollbackWriteSet(bool uploads = false);
+    bool saveRollback();
+    bool rollback();
+    uint64_t rollbackBytes() const;   // bytes the last saveRollback copied on the GPU
+    uint32_t rollbackPages() const;   // pages in the last saved set
+    // Pages kept on their first write behind a rollback point (they were not in the saved set).
+    uint64_t rollbackPagesAdded() const { return m_rollbackAdded.load(std::memory_order_relaxed); }
+    // Draw runs and local copies behind a rollback point that could write a page outside the saved set (0 when the
+    // in-between pictures use the game's own targets, as they must).
+    uint64_t rollbackWritesOutside() const { return m_rollbackOutside.load(std::memory_order_relaxed); }
+    // submitPictureRead: GS side, right after an in-between picture's draws: reads the displayed picture as the
+    // field's read would (same display registers, lined up by the field the picture was drawn for), but as a
+    // picture of its own with `tag`; none of the field reads' bookkeeping is touched. captured: the display
+    // registers in the game's write order, vsyncTick = the field the picture belongs to.
+    // collectPictureReads (window thread): the finished ones, oldest first, appended.
+    void submitPictureRead(const GSPresentationRequest &captured, uint64_t tag);
+    bool pictureReadsActive() const { return m_pictureReads.load(std::memory_order_acquire); }
+    bool collectPictureReads(std::vector<GSPictureRead> &out);
+    // Issue 049 v3.5: a thread of the window's waits here for the next picture read to finish (see the backend's
+    // WaitPictureRead); `submitted` is called GS side each time a picture read has been started.
+    bool waitPictureRead(uint64_t timeoutNs);
+    void setPictureReadSubmitted(std::function<void()> submitted);
     GS();
     ~GS() = default;
 
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
+    // Issue 049 (fact-finding 2026-11-11): this GS as a second memory of `first`'s renderer, on the same graphics
+    // device: registers and VRAM of its own, for extra pictures drawn apart from the game's GS. False when the
+    // renderer has no second memory. It must be destroyed before `first`.
+    bool initAsSecondMemory(GS &first, uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs);
+    // GS side, in stream order: the given pages of `source`, its palette, its registers and its read bookkeeping as
+    // they are after everything it was sent so far, copied into this GS (on the graphics card).
+    bool copyPagesFrom(GS &source, const std::bitset<512> &pages);
+    // The pages written since the last call (draws, local copies, uploads); from now on they are collected
+    // (again). The first call says "all of them".
+    std::bitset<512> takeWrittenPages();
+    // The single-rate GS memory as the renderer holds it (4 MB), after a flush.
+    void snapshotVram(std::vector<uint8_t> &out);
     void reset();
     // GIF_CTRL.RST resets packet input, not GS registers or VRAM.
     void resetGifInput();
@@ -149,6 +191,9 @@ public:
     // maxField (issue 023 fix 2): reads of later fields stay for their own frame (UINT64_MAX = no limit).
     void latchHostPresentationFrame(uint64_t waitForField = UINT64_MAX, uint64_t maxField = UINT64_MAX);
     uint64_t hostPresentationGeneration() const;
+    // The field the latched picture was read for. With GS-side field reads it is behind the field the window
+    // announced whenever that field's read had not finished in time (issue 049).
+    uint64_t hostPresentationField() const;
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
@@ -275,8 +320,11 @@ private:
     bool m_hostPresentationUsedPreferred = false;
     bool m_hasHostPresentationFrame = false;
     uint64_t m_hostPresentationGeneration = 0;
+    uint64_t m_hostPresentationField = 0;
     // Issue 023: field scanouts run on the GS side (false: the window reads at host time, e.g. the CPU renderer).
     std::atomic<bool> m_fieldScanouts{false};
+    std::atomic<bool> m_pictureReads{false}; // issue 049: an in-between picture has been read out
+    std::function<void()> m_pictureReadSubmitted; // issue 049 v3.5; under m_stateMutex
     std::mutex m_fieldScanoutMutex;
     std::condition_variable m_fieldScanoutCv;
     uint64_t m_lastSubmittedField = 0;
@@ -314,6 +362,25 @@ private:
     std::array<uint8_t, 512> m_pictureTarget{};
     DisplayRegs m_lastFieldReadRegs{};
     bool m_hasLastFieldRead = false;
+    // Issue 049 v3.2: the write set of the game's frame and the rollback point (see saveRollback).
+    void serializeRegisters(ps2x::StateArchive &archive);
+    void noteRollbackWriteUnlocked(uint32_t basePage, uint32_t fbw, uint8_t psm, uint32_t x0, uint32_t y0,
+                                   uint32_t x1, uint32_t y1);
+    bool m_collectWritePages = false;
+    bool m_writeSetUploads = false; // host-to-local transfers count as writes (set by beginRollbackWriteSet)
+    std::bitset<512> m_writePages;
+    std::atomic<uint64_t> m_rollbackOutside{0};
+    std::atomic<uint64_t> m_rollbackAdded{0};
+    uint64_t m_writeSetFrameKey = ~0ull, m_writeSetScissorKey = ~0ull;
+    struct RollbackPoint
+    {
+        bool set = false;
+        std::vector<uint8_t> registers;
+        uint64_t displayWritesSinceRead = 0;
+        std::array<uint8_t, 512> pictureTarget{};
+        DrawOverlap drawOverlap{};
+        uint32_t pages = 0;
+    } m_rollback;
     // Output scale/AA change, reset or a loaded save state: the next field is read even without a GS write.
     std::atomic<bool> m_forceFieldRead{true};
     // Issue 027 v4: a state load dropped the presented picture; the window's next latch reads the loaded display once

@@ -290,6 +290,8 @@ struct GSPresentationRequest
     bool hasPreferredSource = false;
     // Issue 023 step 2K: the field the displayed picture was drawn for (0 even, 1 odd), -1 if not known.
     int8_t fieldTarget = -1;
+    // Issue 049 v3.2: a picture read's tag (GSPictureRead); 0 for a field's read.
+    uint64_t pictureTag = 0;
 };
 
 struct PresentationFrame
@@ -306,12 +308,34 @@ struct PresentationFrame
     uint32_t displayFbp = 0;
     uint32_t sourceFbp = 0;
     bool usedPreferred = false;
+    // The field this picture was read for (issue 049: when the GS is behind, the window still shows an earlier
+    // field's picture under the field it announced).
+    uint64_t field = 0;
 
     explicit operator bool() const
     {
         return !pixels.empty() && width != 0u && height != 0u;
     }
 };
+
+// Issue 049 v3.2: an in-between picture read out of the GS (GS::submitPictureRead). `field` is the field it belongs
+// to: it is shown before that field's own picture. The tag says which picture it is: the field its game frame's list
+// was sent in, and which of how many pictures between the previous game picture and that frame's (index 1..count).
+struct GSPictureRead
+{
+    uint64_t tag = 0;
+    uint64_t field = 0;
+    PresentationFrame frame;
+    double readyMs = 0.0; // issue 049 v3.5: when its read was finished (steady clock, ms); 0 = not stamped
+    double startedMs = 0.0; // and when the read was started GS side (its drawing was done on the device); 0 = not stamped
+};
+inline uint64_t gsPictureTag(uint64_t frameField, uint32_t index, uint32_t count)
+{
+    return (frameField << 16) | (uint64_t(count & 0xFFu) << 8) | uint64_t(index & 0xFFu);
+}
+inline uint64_t gsPictureTagFrameField(uint64_t tag) { return tag >> 16; }
+inline uint32_t gsPictureTagIndex(uint64_t tag) { return uint32_t(tag & 0xFFu); }
+inline uint32_t gsPictureTagCount(uint64_t tag) { return uint32_t((tag >> 8) & 0xFFu); }
 
 enum class GSSyncReason : uint8_t
 {

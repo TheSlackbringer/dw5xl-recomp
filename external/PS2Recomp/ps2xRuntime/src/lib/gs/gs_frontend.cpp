@@ -4,6 +4,7 @@
 #include "runtime/ps2_memory.h"
 #include "gs_trace.h"
 #include "gs_record.h"
+#include "runtime/state_archive.h"
 #include <atomic>
 #include <algorithm>
 #include <chrono>
@@ -137,6 +138,73 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     reset();
 }
 
+bool GS::initAsSecondMemory(GS &first, uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+{
+    std::unique_ptr<GSRasterBackend> backend;
+    {
+        std::lock_guard<std::recursive_mutex> lock(first.m_stateMutex);
+        if (first.m_backend)
+            backend = first.m_backend->MakeSecondMemory();
+    }
+    if (!backend)
+        return false;
+    m_localMemoryStorage = vram;
+    m_localMemorySize = vramSize;
+    m_privRegs = privRegs;
+    {
+        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+        m_backend = std::move(backend);
+    }
+    m_backend->Initialize(vram, vramSize);
+    reset();
+    return true;
+}
+
+bool GS::copyPagesFrom(GS &source, const std::bitset<512> &pages)
+{
+    std::scoped_lock lock(source.m_stateMutex, m_stateMutex);
+    if (!m_backend || !source.m_backend)
+        return false;
+    source.m_backend->Flush();
+    m_backend->Flush();
+    if (!m_backend->CopyPagesFrom(*source.m_backend, pages))
+        return false;
+    ps2x::StateArchive out = ps2x::StateArchive::writer();
+    source.serializeRegisters(out);
+    ps2x::StateArchive in = ps2x::StateArchive::reader(out.data());
+    serializeRegisters(in);
+    m_displayWritesSinceRead = source.m_displayWritesSinceRead;
+    m_pictureTarget = source.m_pictureTarget;
+    m_drawOverlap = {};
+    m_displayPagesValid = false;
+    return true;
+}
+
+std::bitset<512> GS::takeWrittenPages()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::bitset<512> pages;
+    if (m_collectWritePages && m_writeSetUploads)
+        pages = m_writePages;
+    else
+        pages.set(); // nothing was collected so far: any page may have changed
+    m_writePages.reset();
+    m_writeSetFrameKey = m_writeSetScissorKey = ~0ull;
+    m_writeSetUploads = true;
+    m_collectWritePages = true;
+    return pages;
+}
+
+void GS::snapshotVram(std::vector<uint8_t> &out)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    out.clear();
+    if (!m_backend)
+        return;
+    m_backend->Flush();
+    m_backend->SnapshotVram(out);
+}
+
 void GS::reset()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -199,6 +267,7 @@ void GS::reset()
         m_hostPresentationUsedPreferred = false;
         m_hasHostPresentationFrame = false;
         m_hostPresentationGeneration = 0u;
+        m_hostPresentationField = 0u;
     }
 
     m_debugHistoryWrite = 0;
@@ -644,8 +713,76 @@ void GS::noteDisplayWriteUnlocked(uint32_t basePage, uint32_t fbw, uint8_t psm, 
         ++m_displayWritesSinceRead;
 }
 
+void GS::noteRollbackWriteUnlocked(uint32_t basePage, uint32_t fbw, uint8_t psm, uint32_t x0, uint32_t y0,
+                                   uint32_t x1, uint32_t y1)
+{
+    if (m_collectWritePages)
+    {
+        forEachGsPage(basePage, fbw, psm, x0, y0, x1, y1, [this](uint32_t page) { m_writePages.set(page); });
+        return;
+    }
+    // Behind the rollback point: a page that is not in the saved set is kept now, before this write (v3.6: a
+    // picture drawn before the game's own list can write a page the frame before did not, a new texture for one).
+    // This runs before the write is handed to the renderer, so the page is kept as it is after everything
+    // submitted so far. A renderer that cannot add pages leaves it out: counted, and the rollback will not put it back.
+    std::bitset<512> missing;
+    forEachGsPage(basePage, fbw, psm, x0, y0, x1, y1, [this, &missing](uint32_t page)
+    {
+        if (page < m_writePages.size() && !m_writePages.test(page))
+            missing.set(page);
+    });
+    if (missing.none())
+        return;
+    uint32_t added = 0;
+    if (m_backend)
+    {
+        m_backend->Flush();
+        added = m_backend->AddRollbackPages(missing);
+    }
+    if (added == missing.count())
+    {
+        m_writePages |= missing;
+        m_rollback.pages += added;
+        m_rollbackAdded.fetch_add(added, std::memory_order_relaxed);
+        return;
+    }
+    if (m_rollbackOutside.fetch_add(missing.count(), std::memory_order_relaxed) == 0u)
+        std::fprintf(stderr, "[gs:rollback] a write behind the rollback point reaches %zu pages that are not in the saved "
+                     "set and could not be added: the rollback will not put them back\n", missing.count());
+}
+
+void GS::beginRollbackWriteSet(bool uploads)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_writeSetUploads = uploads;
+    m_writePages.reset();
+    m_writeSetFrameKey = m_writeSetScissorKey = ~0ull;
+    m_collectWritePages = true;
+}
+
 void GS::noteDrawWriteUnlocked(const GSContext &context, const GSPrimitiveBatch *draw)
 {
+    if (m_collectWritePages || m_rollback.set)
+    {
+        // Issue 049 v3.2: the pages this run of draws can write (frame and depth buffer inside the scissor). While the
+        // game's frame is collected they go into the set; behind the rollback point (the in-between pictures) they
+        // must all be in it already, or the rollback would leave them changed: counted as writes outside the set.
+        const GSFrameReg &f = context.frame;
+        const GSScissorReg &s = context.scissor;
+        const uint64_t frameKey = uint64_t(f.fbp) | (uint64_t(f.fbw) << 9) | (uint64_t(f.psm) << 15) |
+                                  (uint64_t(context.zbuf.zbp) << 21) | (uint64_t(context.zbuf.psm) << 30) |
+                                  (uint64_t(context.zbuf.zmask ? 1u : 0u) << 36);
+        const uint64_t scissorKey = uint64_t(s.x0) | (uint64_t(s.x1) << 16) | (uint64_t(s.y0) << 32) |
+                                    (uint64_t(s.y1) << 48);
+        if (frameKey != m_writeSetFrameKey || scissorKey != m_writeSetScissorKey)
+        {
+            m_writeSetFrameKey = frameKey;
+            m_writeSetScissorKey = scissorKey;
+            noteRollbackWriteUnlocked(f.fbp, f.fbw, f.psm, s.x0, s.y0, s.x1, s.y1);
+            if (!context.zbuf.zmask)
+                noteRollbackWriteUnlocked(context.zbuf.zbp, f.fbw, context.zbuf.psm, s.x0, s.y0, s.x1, s.y1);
+        }
+    }
     // Issue 023 step 2K: a game that draws each picture for one interlaced field offsets it by half a line
     // (XYOFFSET.ofy, 1/16 pixel units); a copy keeps the field of the buffer it copies.
     const bool textured = draw && draw->state.prim.tme;
@@ -774,6 +911,12 @@ void GS::submitFieldScanout(const GSPresentationRequest &captured)
                      (regsChanged || forced) ? 1 : 0, repeat ? 1 : 0);
         s_lastTotal = total;
     }
+    // DW5XL-DEBUG issue 049: PS2X_SMOOTH_TRACE=1 logs every read's line-up (the field its picture was made for).
+    static const bool s_smoothTrace = [] { const char *v = std::getenv("PS2X_SMOOTH_TRACE"); return v && *v && *v != '0'; }();
+    if (s_smoothTrace)
+        std::fprintf(stderr, "[smooth:trace] read field %llu target %d repeat %d writes %llu\n",
+                     static_cast<unsigned long long>(request.vsyncTick), int(request.fieldTarget), repeat ? 1 : 0,
+                     static_cast<unsigned long long>(writes));
     if (repeat)
     {
         // The field is done for the window (field pacing waits for it), but there is nothing new to read.
@@ -794,6 +937,70 @@ void GS::submitFieldScanout(const GSPresentationRequest &captured)
         m_hasSubmittedField = true;
     }
     m_fieldScanoutCv.notify_all();
+}
+
+void GS::submitPictureRead(const GSPresentationRequest &captured, uint64_t tag)
+{
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    if (!m_backend || !m_privRegs)
+        return;
+    GSPresentationRequest request = buildPresentationRequestUnlocked(); // GS-side state in stream order
+    request.pmode = captured.pmode;
+    request.smode2 = captured.smode2;
+    request.dispfb1 = captured.dispfb1;
+    request.display1 = captured.display1;
+    request.dispfb2 = captured.dispfb2;
+    request.display2 = captured.display2;
+    request.bgcolor = captured.bgcolor;
+    request.vsyncTick = captured.vsyncTick;
+    request.pictureTag = tag;
+    {
+        // As a field's read (issue 023 step 2K): the field the displayed buffer's picture was drawn for.
+        const uint64_t dispfb = (captured.pmode & 1u) ? captured.dispfb1 : captured.dispfb2;
+        request.fieldTarget = int8_t(m_pictureTarget[dispfb & 0x1FFu]) - 1;
+    }
+    // DW5XL-DEBUG issue 049: PS2X_SMOOTH_TRACE=1 logs every read's line-up (the field its picture was made for).
+    static const bool s_smoothTrace = [] { const char *v = std::getenv("PS2X_SMOOTH_TRACE"); return v && *v && *v != '0'; }();
+    if (s_smoothTrace)
+        std::fprintf(stderr, "[smooth:trace] picture field %llu target %d tag %llx\n",
+                     static_cast<unsigned long long>(request.vsyncTick), int(request.fieldTarget),
+                     static_cast<unsigned long long>(tag));
+    if (m_backend->SubmitPictureRead(request))
+    {
+        m_pictureReads.store(true, std::memory_order_release);
+        if (m_pictureReadSubmitted)
+            m_pictureReadSubmitted();
+    }
+}
+
+bool GS::waitPictureRead(uint64_t timeoutNs)
+{
+    std::function<void(uint64_t)> waiter;
+    bool collectable = false;
+    {
+        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+        if (!m_backend)
+            return false;
+        waiter = m_backend->PictureReadWaiter(collectable);
+    }
+    if (collectable)
+        return true;
+    if (!waiter)
+        return false;
+    waiter(timeoutNs); // no lock held: the window's field read and the GS go on meanwhile
+    return true;
+}
+
+void GS::setPictureReadSubmitted(std::function<void()> submitted)
+{
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    m_pictureReadSubmitted = std::move(submitted);
+}
+
+bool GS::collectPictureReads(std::vector<GSPictureRead> &out)
+{
+    std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+    return m_backend && m_backend->CollectPictureReads(out);
 }
 
 void GS::latchHostPresentationFrame(uint64_t waitForField, uint64_t maxField)
@@ -846,6 +1053,8 @@ void GS::latchHostPresentationFrame(uint64_t waitForField, uint64_t maxField)
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Presentation);
             updated = m_backend->PresentInto(request, m_latchedFrame);
+            if (updated)
+                m_latchedFrame.field = request.vsyncTick;
         }
     }
 
@@ -870,6 +1079,7 @@ void GS::latchHostPresentationFrame(uint64_t waitForField, uint64_t maxField)
         m_hostPresentationSourceFbp = sourceFbp;
         m_hostPresentationUsedPreferred = usedPreferred;
         m_hasHostPresentationFrame = hasFrame;
+        m_hostPresentationField = m_latchedFrame.field;
         ++m_hostPresentationGeneration;
     }
 
@@ -884,6 +1094,12 @@ uint64_t GS::hostPresentationGeneration() const
 {
     std::lock_guard<std::mutex> lock(m_presentationMutex);
     return m_hostPresentationGeneration;
+}
+
+uint64_t GS::hostPresentationField() const
+{
+    std::lock_guard<std::mutex> lock(m_presentationMutex);
+    return m_hostPresentationField;
 }
 
 bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
@@ -1786,6 +2002,14 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             m_pictureTarget[page & 0x1FFu] = 0u; // issue 023 step 2K: not drawn for a field
             if (m_bitbltbuf.dbp % 32u != 0u)
                 noteDisplayWriteUnlocked(page + 1u, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, x0, y0, x1, y1);
+            if ((m_collectWritePages || m_rollback.set) && (m_trxdir == 2u || m_writeSetUploads))
+            {
+                // Issue 049 v3.2: a local copy's destination depends on what was drawn (an upload's does not).
+                // v3.6: pictures drawn before the game's own list make its uploads early: those count too.
+                noteRollbackWriteUnlocked(page, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, x0, y0, x1, y1);
+                if (m_bitbltbuf.dbp % 32u != 0u)
+                    noteRollbackWriteUnlocked(page + 1u, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, x0, y0, x1, y1);
+            }
         }
 
         if (m_backend)

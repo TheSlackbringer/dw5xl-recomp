@@ -37,6 +37,7 @@ struct VulkanGsScanoutState
         uint32_t displayFbp = 0;
         uint32_t sourceFbp = 0;
         uint64_t vsyncTick = 0;
+        uint64_t tag = 0; // issue 049: a picture read's tag, 0 for a field's read
         uint32_t displayWidth = 0;
         uint32_t displayHeight = 0;
         bool highResolution = false;
@@ -58,6 +59,7 @@ struct VulkanGsScanoutState
         uint32_t displayFbp = 0;
         uint32_t sourceFbp = 0;
         uint64_t vsyncTick = 0;
+        uint64_t tag = 0; // issue 049: a picture read's tag, 0 for a field's read
         uint32_t displayWidth = 0;
         uint32_t displayHeight = 0;
         bool highResolution = false;
@@ -142,7 +144,8 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
                      const GSPresentationRequest &request,
                      uint32_t outputScale = 1,
                      bool flushBeforeVsync = true,
-                     bool antiAliased = false);
+                     bool antiAliased = false,
+                     bool pictureRead = false); // issue 049: an in-between picture's read (no progress lines)
 
 // Issue 023. Caller holds the device lock. Stages the finished readbacks in field order without starting a new one,
 // none of a field after maxField (fix 2: it stays for that field's own window frame).

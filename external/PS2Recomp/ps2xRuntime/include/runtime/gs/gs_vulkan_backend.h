@@ -13,6 +13,15 @@ public:
     void Initialize(uint8_t *, uint32_t) override;
     void Reset() override;
     void SerializeState(ps2x::StateArchive &archive) override; // DW5XL (issue 027)
+    bool SaveRollback(const std::bitset<512> &pages) override; // DW5XL (issue 049 v3.2)
+    bool Rollback() override;
+    uint32_t AddRollbackPages(const std::bitset<512> &pages) override;
+    uint64_t RollbackBytes() const override;
+    std::unique_ptr<GSRasterBackend> MakeSecondMemory() override; // DW5XL (issue 049, fact-finding)
+    bool CopyPagesFrom(GSRasterBackend &source, const std::bitset<512> &pages) override;
+    bool SubmitPictureRead(const GSPresentationRequest &) override;
+    bool CollectPictureReads(std::vector<GSPictureRead> &) override;
+    std::function<void(uint64_t)> PictureReadWaiter(bool &collectable) override;
     void Submit(const GSPrimitiveBatch &) override;
     void LoadClut(const GSTex0Reg &, const GSTexClutReg &) override;
     void BeginTransfer(const GSTransferCommand &) override;
@@ -36,5 +45,6 @@ public:
     uint32_t GetAASamples() const override;
 private:
     struct Impl;
+    explicit GSVulkanBackend(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> m_impl;
 };

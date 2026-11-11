@@ -65,6 +65,8 @@ add_executable(dw5xl
     src/dw5xl_main_menu.cpp
     src/dw5xl_frame_probe.cpp
     src/dw5xl_smoothing.cpp
+    src/dw5xl_smooth_list.cpp
+    src/dw5xl_smooth_time.cpp
     setup/wizard_console.cpp
 )
 target_include_directories(dw5xl PRIVATE "${DW5XL_GENERATED_DIR}" "${PS2RECOMP_DIR}/ps2xRuntime/src/lib")
@@ -524,6 +526,32 @@ if(DW5XL_BUILD_TESTS)
     target_link_libraries(dw5xl_vif1_replay PRIVATE ps2_runtime)
     target_include_directories(dw5xl_vif1_replay PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${DW5XL_GSREPLAY_DIR}")
     target_compile_options(dw5xl_vif1_replay PRIVATE ${DW5XL_ARCH_FLAGS})
+    # DW5XL-TEST issue 049 v3.2: the GS rollback point on the Vulkan renderer (skipped without a Vulkan device).
+    add_executable(dw5xl_gs_rollback_test tests/gs_rollback_test.cpp)
+    target_link_libraries(dw5xl_gs_rollback_test PRIVATE ps2_runtime)
+    target_include_directories(dw5xl_gs_rollback_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME gs_rollback COMMAND dw5xl_gs_rollback_test)
+    # DW5XL-TEST issue 049 (fact-finding): a second GS memory on the same Vulkan device (skipped without a device).
+    add_executable(dw5xl_gs_second_memory_test tests/gs_second_memory_test.cpp)
+    target_link_libraries(dw5xl_gs_second_memory_test PRIVATE ps2_runtime)
+    target_include_directories(dw5xl_gs_second_memory_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME gs_second_memory COMMAND dw5xl_gs_second_memory_test)
+    # DW5XL-TEST issue 049 P2.4: a frame's command list as our own data (stream, map, matrix tags); no game data.
+    add_executable(dw5xl_smooth_list_test tests/smooth_list_test.cpp src/dw5xl_smooth_list.cpp)
+    target_include_directories(dw5xl_smooth_list_test PRIVATE src)
+    add_test(NAME smooth_list COMMAND dw5xl_smooth_list_test)
+    add_executable(dw5xl_smooth_builder_test tests/smooth_builder_test.cpp src/dw5xl_smooth_list.cpp)
+    target_include_directories(dw5xl_smooth_builder_test PRIVATE src)
+    add_test(NAME smooth_builder COMMAND dw5xl_smooth_builder_test)
+    # DW5XL-TEST issue 049 v3.5: the time line of the in-between pictures and the display's clock; no game data.
+    add_executable(dw5xl_smooth_time_test tests/smooth_time_test.cpp src/dw5xl_smooth_time.cpp)
+    target_include_directories(dw5xl_smooth_time_test PRIVATE src)
+    add_test(NAME smooth_time COMMAND dw5xl_smooth_time_test)
+    add_executable(dw5xl_display_clock_test tests/display_clock_test.cpp "${PS2RECOMP_DIR}/ps2xRuntime/src/lib/ps2_display_clock.cpp")
+    target_include_directories(dw5xl_display_clock_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME display_clock COMMAND dw5xl_display_clock_test)
+    set_tests_properties(gs_rollback PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    set_tests_properties(gs_second_memory PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
     if(NOT WIN32) # drives the tools through a POSIX shell (env -u, quoting, wait status)
     add_executable(dw5xl_gsreplay_test tests/gsreplay_test.cpp)
     target_link_libraries(dw5xl_gsreplay_test PRIVATE ps2_runtime)

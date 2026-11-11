@@ -108,6 +108,7 @@ void consumeSlot(Vulkan::Device &device, VulkanGsScanoutState &state, VulkanGsSc
     read.displayFbp = slot.displayFbp;
     read.sourceFbp = slot.sourceFbp;
     read.vsyncTick = slot.vsyncTick;
+    read.tag = slot.tag;
     read.displayWidth = slot.displayWidth;
     read.displayHeight = slot.displayHeight;
     read.highResolution = slot.highResolution;
@@ -176,7 +177,8 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
                      const GSPresentationRequest &request,
                      uint32_t outputScale,
                      bool flushBeforeVsync,
-                     bool antiAliased)
+                     bool antiAliased,
+                     bool pictureRead)
 {
     using namespace ParallelGS;
     using namespace Vulkan;
@@ -203,7 +205,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
                        ((request.display2 >> 44) & 0x7FFu) >= 480;
 
     static uint64_t s_lastLoggedTick = 0;
-    if (request.vsyncTick == 0 || request.vsyncTick >= s_lastLoggedTick + 100u)
+    if (!pictureRead && (request.vsyncTick == 0 || request.vsyncTick >= s_lastLoggedTick + 100u))
     {
         s_lastLoggedTick = request.vsyncTick;
         std::fprintf(stderr, "[vulkan:present] tick=%llu pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx -> c1=(%u,%u) c2=(%u,%u) isPal=%d\n",
@@ -338,6 +340,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     curSlot.displayFbp = first.enabled ? first.framebuffer.FBP : second.framebuffer.FBP;
     curSlot.sourceFbp = curSlot.displayFbp;
     curSlot.vsyncTick = request.vsyncTick;
+    curSlot.tag = request.pictureTag;
     curSlot.highResolution = output.high_resolution_scanout;
     const uint32_t outputShift = output.high_resolution_scanout ? output.high_resolution_scale_log2 : 0u;
     const uint32_t outputShiftX = output.high_resolution_scanout ? output.high_resolution_scale_x_log2 : 0u;
@@ -373,7 +376,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     }
 
     static uint64_t s_lastLoggedTickVsync = 0;
-    if (request.vsyncTick == 0 || request.vsyncTick >= s_lastLoggedTickVsync + 100u)
+    if (!pictureRead && (request.vsyncTick == 0 || request.vsyncTick >= s_lastLoggedTickVsync + 100u))
     {
         s_lastLoggedTickVsync = request.vsyncTick;
         const uint32_t resultWidth = state.staged.empty() ? state.lastFrame.width : state.staged.back().w;
@@ -455,6 +458,7 @@ bool finishVulkanGsPresentInto(Vulkan::Device &device, VulkanGsScanoutState &sta
         frame.strideBytes = read.w * 4u;
         frame.displayWidth = read.displayWidth;
         frame.displayHeight = read.displayHeight;
+        frame.field = read.vsyncTick;
         // Rows are contiguous (stride = width): one pass copies every RGBA pixel and forces alpha (the top byte
         // of the little-endian word) opaque. Every byte is overwritten, so a same-size buffer is not cleared first.
         const size_t pixelCount = static_cast<size_t>(read.w) * read.h;

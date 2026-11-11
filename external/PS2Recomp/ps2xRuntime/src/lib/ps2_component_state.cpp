@@ -81,9 +81,81 @@ void GSRasterBackend::SerializeState(ps2x::StateArchive &)
     throw ps2x::StateError("this renderer does not support save states (use the Vulkan renderer)");
 }
 
+// Issue 049 v3.2: the rollback point of the in-between pictures (gs_frontend.h).
+bool GS::saveRollback()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_collectWritePages = false;
+    m_rollback.set = false;
+    if (!m_backend || m_writePages.none())
+        return false;
+    m_backend->Flush();
+    if (!m_backend->SaveRollback(m_writePages))
+        return false;
+    ps2x::StateArchive out = ps2x::StateArchive::writer();
+    serializeRegisters(out);
+    m_rollback.registers = out.data();
+    m_rollback.displayWritesSinceRead = m_displayWritesSinceRead;
+    m_rollback.pictureTarget = m_pictureTarget;
+    m_rollback.drawOverlap = m_drawOverlap;
+    m_rollback.pages = static_cast<uint32_t>(m_writePages.count());
+    m_rollback.set = true;
+    return true;
+}
+
+bool GS::rollback()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (!m_rollback.set || !m_backend)
+        return false;
+    m_rollback.set = false;
+    m_backend->Flush();
+    if (!m_backend->Rollback())
+        return false;
+    ps2x::StateArchive in = ps2x::StateArchive::reader(m_rollback.registers);
+    serializeRegisters(in);
+    m_displayWritesSinceRead = m_rollback.displayWritesSinceRead;
+    m_pictureTarget = m_rollback.pictureTarget;
+    m_drawOverlap = m_rollback.drawOverlap;
+    return true;
+}
+
+uint64_t GS::rollbackBytes() const
+{
+    return m_backend ? m_backend->RollbackBytes() : 0u;
+}
+
+uint32_t GS::rollbackPages() const
+{
+    return m_rollback.pages;
+}
+
 void GS::serializeState(ps2x::StateArchive &a)
 {
     m_forceFieldRead.store(true, std::memory_order_release); // issue 023 2R: read the next field after a load
+    serializeRegisters(a);
+    if (a.loading())
+    {
+        // Host presentation is rebuilt from the next fields.
+        std::lock_guard lock(m_snapshotMutex);
+        m_displaySnapshot.clear();
+        m_latchedFrame = {};
+        m_hasHostPresentationFrame = false;
+        ++m_hostPresentationGeneration;
+        std::lock_guard fieldLock(m_fieldScanoutMutex);
+        m_hasSubmittedField = false;
+    }
+    if (!m_backend)
+        throw ps2x::StateError("no GS renderer");
+    m_backend->SerializeState(a);
+    if (a.loading()) // issue 027 v4: the window shows the loaded display at once (latchHostPresentationFrame)
+        m_presentAfterLoad.store(true, std::memory_order_release);
+}
+
+// The GS front end's own registers and transfer state (the save state's "GSFE" section; also the part of a rollback
+// point that is not the renderer's).
+void GS::serializeRegisters(ps2x::StateArchive &a)
+{
     a.tag("GSFE");
     a.value(m_gifPathStates);
     a.value(m_localMemorySize);
@@ -120,22 +192,6 @@ void GS::serializeState(ps2x::StateArchive &a)
     a.value(m_preferredDisplaySourceFrame);
     a.value(m_preferredDisplayDestFbp);
     a.value(m_hasPreferredDisplaySource);
-    if (a.loading())
-    {
-        // Host presentation is rebuilt from the next fields.
-        std::lock_guard lock(m_snapshotMutex);
-        m_displaySnapshot.clear();
-        m_latchedFrame = {};
-        m_hasHostPresentationFrame = false;
-        ++m_hostPresentationGeneration;
-        std::lock_guard fieldLock(m_fieldScanoutMutex);
-        m_hasSubmittedField = false;
-    }
-    if (!m_backend)
-        throw ps2x::StateError("no GS renderer");
-    m_backend->SerializeState(a);
-    if (a.loading()) // issue 027 v4: the window shows the loaded display at once (latchHostPresentationFrame)
-        m_presentAfterLoad.store(true, std::memory_order_release);
 }
 
 void VU1Interpreter::serializeState(ps2x::StateArchive &a)

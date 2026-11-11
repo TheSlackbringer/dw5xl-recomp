@@ -549,6 +549,23 @@ public:
     void pictureRect(float &x, float &y, float &w, float &h) const { x = m_pictureRect[0]; y = m_pictureRect[1]; w = m_pictureRect[2]; h = m_pictureRect[3]; }
     inline GS &gs() { return m_gs; }
     inline const GS &gs() const { return m_gs; }
+    // Issue 049 (fact-finding 2026-11-11): extra pictures on a GS memory of their own (the same renderer and
+    // graphics device as the game's GS; GS::initAsSecondMemory), so that nothing of them is drawn on the game's GS.
+    // pictureGs(): that GS once it exists, else the game's (any thread).
+    // syncPictureGs() (GS side, in stream order): makes it on first use and copies into it the pages that changed
+    // on either side since the last call (`everything`: all pages), with palette and registers. False when the
+    // renderer has no second memory. `pages`: how many were copied. `differ` (when not null): the two single-rate
+    // memories are compared afterwards, and it gets the number of pages that differ.
+    // setGifToPictureGs() (GS side): the next GIF packets go to the picture GS.
+    inline GS &pictureGs()
+    {
+        GS *picture = m_pictureGsPtr.load(std::memory_order_acquire);
+        return picture ? *picture : m_gs;
+    }
+    bool syncPictureGs(bool everything, uint32_t *pages = nullptr, uint32_t *differ = nullptr);
+    void setGifToPictureGs(bool on) { m_gifToPictureGs = on; }
+    // Called after every picture read is started, on either GS (issue 049 v3.5; see GS::setPictureReadSubmitted).
+    void setPictureReadSubmitted(std::function<void()> submitted);
     inline void setResolutionScale(uint32_t scale) { m_gs.setResolutionScale(scale); }
     inline uint32_t getResolutionScale() const { return m_gs.getResolutionScale(); }
     inline void SetResolutionScale(uint32_t scale) { m_gs.setResolutionScale(scale); }
@@ -622,6 +639,12 @@ private:
     PS2Memory m_memory;
     GifArbiter m_gifArbiter;
     GS m_gs;
+    std::vector<uint8_t> m_pictureVram;         // issue 049 (fact-finding): see pictureGs()
+    std::unique_ptr<GS> m_pictureGs;            // after m_gs: it goes first
+    std::atomic<GS *> m_pictureGsPtr{nullptr};
+    bool m_gifToPictureGs = false;              // GS side only
+    std::function<void()> m_pictureReadSubmitted;
+    std::mutex m_pictureReadSubmittedMutex;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
     PS2AudioBackend m_audioBackend;

@@ -39,17 +39,51 @@ uint32_t transferBits(uint8_t psm)
 }
 }
 
-struct GSVulkanBackend::Impl
+// The Vulkan device of a renderer. Issue 049 (fact-finding 2026-11-11): it can hold more than one GS memory (the
+// game's, and one for extra pictures), so that pages are copied between them on the graphics card.
+struct GSVulkanDevice
 {
-    // Declaration order ensures interface dies before device before context.
+    // Declaration order ensures the device dies before the context.
     Vulkan::Context context;
     Vulkan::Device device;
+    std::mutex mutex;
+    // Granite waits for every open command buffer of the device when a frame context ends, and every flush of a GS
+    // memory ends one. So only one memory may have open command buffers at a time: the one used last. It is
+    // flushed when another one takes over (Impl::access).
+    ParallelGS::GSInterface *active = nullptr;
+
+    GSVulkanDevice()
+    {
+        if (!Vulkan::Context::init_loader(nullptr))
+            throw std::runtime_error("Vulkan loader is unavailable");
+        context.set_num_thread_indices(1);
+        if (!context.init_instance_and_device(nullptr, 0, nullptr, 0,
+            Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT |
+            Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT |
+            Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT))
+            throw std::runtime_error("Vulkan device creation failed");
+        device.set_context(context);
+        // Keep enough Granite PerFrame contexts that a multi-flush field + 3-slot
+        // async readback ring never wraps and blocks inside per_frame->begin() while
+        // holding the GS device mutex.
+        device.init_frame_contexts(16);
+    }
+};
+
+struct GSVulkanBackend::Impl
+{
+    // Declaration order ensures the interface dies before the device (which lives as long as any of its memories).
+    std::shared_ptr<GSVulkanDevice> shared;
+    Vulkan::Device &device;
     ParallelGS::GSInterface gs;
-    mutable std::mutex mutex;
+    std::mutex &mutex;
     std::vector<uint8_t> snapshot = std::vector<uint8_t>(vramBytes);
     GSCpuBackend scanout;
     ReusableFieldWeaver fieldWeaver;
     VulkanGsScanoutState scanoutState;
+    // Issue 049 v3.2: the reads of in-between pictures have a ring and a weaver state of their own.
+    ReusableFieldWeaver pictureWeaver;
+    VulkanGsScanoutState pictureScanout;
     std::array<uint64_t, 128> state{};
     std::array<bool, 128> valid{};
     GSTransferCommand transfer{};
@@ -58,6 +92,19 @@ struct GSVulkanBackend::Impl
     std::vector<uint8_t> uploadTail;
     std::vector<uint8_t> fifo;
     size_t fifoRead = 0;
+    // Issue 049 v3.2: what a rollback puts back beside the renderer's pages and palette.
+    struct RollbackPoint
+    {
+        bool set = false;
+        ParallelGS::RegisterState regs{};
+        std::array<uint64_t, 128> state{};
+        std::array<bool, 128> valid{};
+        GSTransferCommand transfer{};
+        GSTransferSnapshot transferState{};
+        uint64_t uploadedBytes = 0;
+        std::vector<uint8_t> uploadTail, fifo;
+        size_t fifoRead = 0;
+    } rollback;
     bool initialized = false;
     bool dirty = false;
     uint64_t draws = 0;
@@ -115,22 +162,12 @@ struct GSVulkanBackend::Impl
         std::fprintf(stderr, "[gs:vulkan] Output=%ux AA=%ux (%u samples)\n", scale, samples / minSamplesFor(scale), samples);
     }
 
-    Impl()
+    Impl() : Impl(std::make_shared<GSVulkanDevice>(), nullptr) {}
+    // `like`: a second memory on the same device, with the output scale and samples of that one (the caller holds
+    // the device lock and has flushed every other memory). Without it: the renderer's first memory.
+    Impl(std::shared_ptr<GSVulkanDevice> owner, const Impl *like)
+        : shared(std::move(owner)), device(shared->device), mutex(shared->mutex)
     {
-        if (!Vulkan::Context::init_loader(nullptr))
-            throw std::runtime_error("Vulkan loader is unavailable");
-        context.set_num_thread_indices(1);
-        if (!context.init_instance_and_device(nullptr, 0, nullptr, 0,
-            Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT |
-            Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT |
-            Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT))
-            throw std::runtime_error("Vulkan device creation failed");
-        device.set_context(context);
-        // Keep enough Granite PerFrame contexts that a multi-flush field + 3-slot
-        // async readback ring never wraps and blocks inside per_frame->begin() while
-        // holding the GS device mutex.
-        device.init_frame_contexts(16);
-
         ParallelGS::GSOptions opts{};
         opts.dynamic_super_sampling = true;
         const char *scaleEnv = std::getenv("PS2X_GS_SCALE");
@@ -140,7 +177,10 @@ struct GSVulkanBackend::Impl
             if (requested == 1 || requested == 2 || requested == 4 || requested == 8 || requested == 16)
                 requestedSamples = requested;
         }
-        const uint32_t outputScale = supportedScale(scaleEnv ? std::strtoul(scaleEnv, nullptr, 10) : 1u);
+        if (like)
+            requestedSamples = like->requestedSamples;
+        const uint32_t outputScale = like ? like->currentScale.load(std::memory_order_relaxed)
+                                          : supportedScale(scaleEnv ? std::strtoul(scaleEnv, nullptr, 10) : 1u);
         currentScale.store(outputScale, std::memory_order_relaxed);
         const uint32_t samples = effectiveSamples(outputScale);
         opts.super_sampling = static_cast<ParallelGS::SuperSampling>(samples);
@@ -156,13 +196,18 @@ struct GSVulkanBackend::Impl
         const auto &gpu = device.get_gpu_properties();
         if (gpu.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
             throw std::runtime_error("software Vulkan devices are not a GPU renderer");
-        std::fprintf(stderr, "[gs:vulkan] device=%s vendor=0x%04x device=0x%04x; GPU compute rasterization (AA=%u samples)\n",
-            gpu.deviceName, gpu.vendorID, gpu.deviceID, static_cast<unsigned>(opts.super_sampling));
+        if (like)
+            std::fprintf(stderr, "[gs:vulkan] a second GS memory on the same device (AA=%u samples)\n",
+                static_cast<unsigned>(opts.super_sampling));
+        else
+            std::fprintf(stderr, "[gs:vulkan] device=%s vendor=0x%04x device=0x%04x; GPU compute rasterization (AA=%u samples)\n",
+                gpu.deviceName, gpu.vendorID, gpu.deviceID, static_cast<unsigned>(opts.super_sampling));
     }
     ~Impl()
     {
-        Util::register_thread_index(0);
+        auto lock = access(); // the other memories are flushed; this one is the active one
         gs.flush(); device.wait_idle();
+        shared->active = nullptr;
         const char *stats = std::getenv("PS2X_STATS");
         if (stats && *stats && *stats != '0')
             std::fprintf(stderr, "[gs:vulkan] draws=%llu GPU scanouts=%llu CPU display conversions=%llu\n",
@@ -176,6 +221,14 @@ struct GSVulkanBackend::Impl
         // Granite requires a thread-local index even with one command pool.
         std::unique_lock lock(mutex);
         Util::register_thread_index(0);
+        if (shared->active != &gs)
+        {
+            // Another memory of this device was used last: its work is submitted before this one opens a command
+            // buffer (GSVulkanDevice::active).
+            if (shared->active)
+                shared->active->flush();
+            shared->active = &gs;
+        }
         return lock;
     }
 
@@ -265,6 +318,54 @@ struct GSVulkanBackend::Impl
 };
 
 GSVulkanBackend::GSVulkanBackend() : m_impl(std::make_unique<Impl>()) {}
+GSVulkanBackend::GSVulkanBackend(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
+
+// DW5XL (issue 049, fact-finding 2026-11-11): a second GS memory on this renderer's device.
+std::unique_ptr<GSRasterBackend> GSVulkanBackend::MakeSecondMemory()
+{
+    auto lock = m_impl->access();
+    auto &p = *m_impl;
+    // Making a GS memory waits for the device to be idle: nothing of this one may be open.
+    p.gs.flush();
+    p.dirty = false;
+    p.shared->active = nullptr;
+    return std::unique_ptr<GSRasterBackend>(new GSVulkanBackend(std::make_unique<Impl>(p.shared, &p)));
+}
+
+bool GSVulkanBackend::CopyPagesFrom(GSRasterBackend &source, const std::bitset<512> &pages)
+{
+    auto *from = dynamic_cast<GSVulkanBackend *>(&source);
+    if (!from || from == this || from->m_impl->shared != m_impl->shared)
+        return false;
+    auto lock = m_impl->access(); // one lock for the device: it covers both memories
+    auto &p = *m_impl;
+    auto &s = *from->m_impl;
+    if (p.currentScale.load(std::memory_order_relaxed) != s.currentScale.load(std::memory_order_relaxed) ||
+        p.aaSamples.load(std::memory_order_relaxed) != s.aaSamples.load(std::memory_order_relaxed))
+    {
+        p.requestedSamples = s.requestedSamples;
+        p.applyOutput(s.currentScale.load(std::memory_order_relaxed));
+    }
+    std::vector<uint32_t> list;
+    for (uint32_t page = 0; page < 512u; ++page)
+        if (pages.test(page))
+            list.push_back(page);
+    if (!p.gs.copy_pages_from(s.gs, list.data(), list.size())) // flushes both first
+        return false;
+    s.dirty = false;
+    p.gs.get_register_state() = s.gs.get_register_state();
+    p.gs.clobber_register_state();
+    p.state = s.state;
+    p.valid = s.valid;
+    p.transfer = s.transfer;
+    p.transferState = s.transferState;
+    p.uploadedBytes = s.uploadedBytes;
+    p.uploadTail = s.uploadTail;
+    p.fifo = s.fifo;
+    p.fifoRead = s.fifoRead;
+    p.dirty = true; // the copies are submitted with the next flush
+    return true;
+}
 GSVulkanBackend::~GSVulkanBackend() = default;
 void GSVulkanBackend::Initialize(uint8_t *vram, uint32_t size)
 {
@@ -362,6 +463,149 @@ void GSVulkanBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32
     p.gs.end_vram_write(0, vramBytes);
     p.dirty = true;
 }
+// DW5XL (issue 049 v3.2): the rollback point. paraLLEl-GS keeps the pages (every slice), their super-sample flags and
+// the palette (runtime patch 0007); the register state and this backend's own shadows are kept here.
+bool GSVulkanBackend::SaveRollback(const std::bitset<512> &pages)
+{
+    auto lock = m_impl->access();
+    auto &p = *m_impl;
+    std::vector<uint32_t> list;
+    for (uint32_t page = 0; page < 512u; ++page)
+        if (pages.test(page))
+            list.push_back(page);
+    if (list.empty())
+        return false;
+    p.gs.rollback_save(list.data(), list.size()); // flushes first
+    p.dirty = false;
+    auto &r = p.rollback;
+    r.regs = p.gs.get_register_state();
+    r.state = p.state;
+    r.valid = p.valid;
+    r.transfer = p.transfer;
+    r.transferState = p.transferState;
+    r.uploadedBytes = p.uploadedBytes;
+    r.uploadTail = p.uploadTail;
+    r.fifo = p.fifo;
+    r.fifoRead = p.fifoRead;
+    r.set = true;
+    return true;
+}
+
+uint32_t GSVulkanBackend::AddRollbackPages(const std::bitset<512> &pages)
+{
+    auto lock = m_impl->access();
+    auto &p = *m_impl;
+    if (!p.rollback.set)
+        return 0;
+    std::vector<uint32_t> list;
+    for (uint32_t page = 0; page < 512u; ++page)
+        if (pages.test(page))
+            list.push_back(page);
+    if (list.empty())
+        return 0;
+    return static_cast<uint32_t>(p.gs.rollback_add(list.data(), list.size())); // flushes first
+}
+
+bool GSVulkanBackend::Rollback()
+{
+    auto lock = m_impl->access();
+    auto &p = *m_impl;
+    auto &r = p.rollback;
+    if (!r.set)
+        return false;
+    r.set = false;
+    if (!p.gs.rollback_restore()) // flushes first
+        return false;
+    p.gs.get_register_state() = r.regs;
+    p.gs.clobber_register_state();
+    p.state = r.state;
+    p.valid = r.valid;
+    p.transfer = r.transfer;
+    p.transferState = r.transferState;
+    p.uploadedBytes = r.uploadedBytes;
+    p.uploadTail = r.uploadTail;
+    p.fifo = r.fifo;
+    p.fifoRead = r.fifoRead;
+    p.dirty = true; // the copies back are submitted with the next flush
+    return true;
+}
+
+uint64_t GSVulkanBackend::RollbackBytes() const
+{
+    auto lock = m_impl->access();
+    return m_impl->gs.rollback_bytes();
+}
+
+// DW5XL (issue 049 v3.2): the read of an in-between picture is a field's read with a queue of its own.
+bool GSVulkanBackend::SubmitPictureRead(const GSPresentationRequest &request)
+{
+    auto lock = m_impl->access();
+    auto &p = *m_impl;
+    try
+    {
+        presentVulkanGs(p.gs, p.device, p.pictureScanout, request, p.currentScale.load(std::memory_order_relaxed),
+                        p.dirty, p.requestedSamples > 1u, true);
+    }
+    catch (const std::exception &error)
+    {
+        static bool s_logged = false;
+        if (!s_logged)
+            std::fprintf(stderr, "[gs:vulkan] picture read not supported: %s\n", error.what());
+        s_logged = true;
+        return false;
+    }
+    p.dirty = false;
+    return true;
+}
+
+bool GSVulkanBackend::CollectPictureReads(std::vector<GSPictureRead> &out)
+{
+    auto lock = m_impl->access();
+    auto &p = *m_impl;
+    p.pictureScanout.recycleRetired();
+    collectVulkanGsReads(p.device, p.pictureScanout);
+    std::vector<VulkanGsScanoutState::StagedRead> reads = std::move(p.pictureScanout.staged);
+    p.pictureScanout.staged.clear();
+    if (reads.empty())
+        return false;
+    lock.unlock(); // the copies run without the device lock, as a field's do: the GS worker keeps drawing
+    bool any = false;
+    std::vector<VulkanGsScanoutState::StagedRead> one(1);
+    for (auto &read : reads)
+    {
+        // Every picture comes out by itself (a field's reads collapse into the newest one).
+        GSPictureRead picture;
+        picture.tag = read.tag;
+        picture.field = read.vsyncTick;
+        one.front() = std::move(read);
+        if (finishVulkanGsPresentInto(p.device, p.pictureScanout, one, &p.pictureWeaver, picture.frame) && picture.frame)
+        {
+            out.push_back(std::move(picture));
+            any = true;
+        }
+        read = std::move(one.front());
+    }
+    lock.lock();
+    for (auto &read : reads)
+        p.pictureScanout.retired.push_back(std::move(read));
+    return any;
+}
+
+std::function<void(uint64_t)> GSVulkanBackend::PictureReadWaiter(bool &collectable)
+{
+    auto lock = m_impl->access();
+    auto &p = *m_impl;
+    // A finished read: staged already, or in a slot whose GPU work is done.
+    collectable = !p.pictureScanout.staged.empty();
+    for (auto &slot : p.pictureScanout.slots)
+        collectable = collectable || (slot.pending && slot.fence && slot.fence->wait_timeout(0));
+    Vulkan::Fence fence = pendingFieldReadFence(p.pictureScanout, UINT64_MAX);
+    if (!fence)
+        return {};
+    // The fence keeps itself alive; the device outlives every reader (the window stops its reader before the GS goes).
+    return [fence](uint64_t timeoutNs) mutable { fence->wait_timeout(timeoutNs); };
+}
+
 GSTransferSnapshot GSVulkanBackend::GetTransferSnapshot() const
 {
     auto lock = m_impl->access(); return m_impl->transferState;

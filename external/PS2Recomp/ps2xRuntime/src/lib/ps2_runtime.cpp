@@ -34,6 +34,7 @@
 #include <limits>
 #include <chrono>
 #include <atomic>
+#include <deque>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -46,6 +47,7 @@
 #include <cmath>
 #include "runtime/hotkeys.h"
 #include "runtime/ps2_present_feedback.h"
+#include "runtime/ps2_display_clock.h"
 
 namespace ps2_stubs
 {
@@ -502,23 +504,20 @@ namespace ps2x_dev
         return (v && *v) ? std::strtoull(v, nullptr, 0) : def;
     }
 
-    static bool writePng(const std::string &path)
+    // A picture (RGBA rows `stride` bytes apart) as a PNG.
+    static bool writePngOf(const uint8_t *pixels, size_t stride, uint32_t width, uint32_t height, const std::string &path)
     {
-        if (s_lastFrame.empty() || s_lastFrameW == 0u || s_lastFrameH == 0u)
-            return false;
-        // s_lastFrame rows are FB_WIDTH (640) pixels apart
-        const size_t stride = s_lastFrame.size() / std::max<size_t>(1u, s_lastFrameRows) ;
-        std::vector<uint8_t> px(static_cast<size_t>(s_lastFrameW) * s_lastFrameH * 4u);
-        for (uint32_t y = 0; y < s_lastFrameH; ++y)
-            std::memcpy(px.data() + static_cast<size_t>(y) * s_lastFrameW * 4u,
-                        s_lastFrame.data() + static_cast<size_t>(y) * stride,
-                        static_cast<size_t>(s_lastFrameW) * 4u);
+        std::vector<uint8_t> px(static_cast<size_t>(width) * height * 4u);
+        for (uint32_t y = 0; y < height; ++y)
+            std::memcpy(px.data() + static_cast<size_t>(y) * width * 4u,
+                        pixels + static_cast<size_t>(y) * stride,
+                        static_cast<size_t>(width) * 4u);
         for (size_t i = 3; i < px.size(); i += 4)
             px[i] = 0xFF;
         Image img{};
         img.data = px.data();
-        img.width = static_cast<int>(s_lastFrameW);
-        img.height = static_cast<int>(s_lastFrameH);
+        img.width = static_cast<int>(width);
+        img.height = static_cast<int>(height);
         img.mipmaps = 1;
         img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
         // DW5XL issue 047: a dump shows a wide picture's shape in the window. A 4:3 window keeps the stored picture,
@@ -540,11 +539,409 @@ namespace ps2x_dev
         return ok;
     }
 
+    static bool writePng(const std::string &path)
+    {
+        if (s_lastFrame.empty() || s_lastFrameW == 0u || s_lastFrameH == 0u)
+            return false;
+        // s_lastFrame rows are FB_WIDTH (640) pixels apart
+        const size_t stride = s_lastFrame.size() / std::max<size_t>(1u, s_lastFrameRows);
+        return writePngOf(s_lastFrame.data(), stride, s_lastFrameW, s_lastFrameH, path);
+    }
+
     static std::string dumpDir()
     {
         const char *d = std::getenv("PS2X_DUMP_DIR");
         return (d && *d) ? std::string(d) : std::string(".");
     }
+
+    // Issue 049 v3.2 (P2.3b): the in-between pictures the GS side has read out, oldest first. A picture between the
+    // game's pictures N-1 and N belongs to the field that shows N and waits here until the window has shown that
+    // field. P2.5 shows them at the monitor's rate; until then they are kept and counted: "in time" = read out
+    // before the window frame that shows its field's own picture.
+    // DW5XL-DEBUG PS2X_SMOOTH_DUMP=<dir>: with every frame dump (PS2X_DUMP_EVERY / _FROM / _TO), the in-between
+    // pictures waiting for the dumped field are saved as <dir>/inb_<frame field>_<index>of<count>.png, on the frame
+    // dumps' pixel grid (frame field: the field their game frame's list was sent in, normally the one before). So an
+    // in-between picture and its field's own picture are always saved together.
+    // Issue 049 v3.5 (P2.5c): finished picture reads as events. The window cannot wait for the GPU and for the next
+    // field at once, so a thread of its own waits for each read to finish, stamps the time and wakes the window.
+    struct PictureReader
+    {
+        PS2Runtime *rt = nullptr;
+        std::thread thread;
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool stop = false;
+        uint64_t submitted = 0u, handled = 0u;
+        std::vector<GSPictureRead> ready;
+        std::deque<double> startedAt; // when each read not yet delivered was started, oldest first
+
+        ~PictureReader() { shutdown(); }
+        void start(PS2Runtime *runtime)
+        {
+            rt = runtime;
+            rt->setPictureReadSubmitted([this] {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    ++submitted;
+                    startedAt.push_back(ps2x::display_clock::nowMs());
+                }
+                cv.notify_one();
+            });
+            thread = std::thread([this] { run(); });
+        }
+        void run()
+        {
+            ThreadNaming::SetCurrentThreadName("PictureReader");
+            std::vector<GSPictureRead> fresh;
+            std::unique_lock<std::mutex> lock(mutex);
+            while (!stop)
+            {
+                cv.wait(lock, [this] { return stop || submitted != handled; });
+                if (stop)
+                    break;
+                const uint64_t target = submitted;
+                lock.unlock();
+                // Waits for the GPU with no lock of the GS held (the window's field read is not kept waiting).
+                const bool inTheWorks = rt->pictureGs().waitPictureRead(20'000'000ull);
+                fresh.clear();
+                rt->pictureGs().collectPictureReads(fresh);
+                const double now = ps2x::display_clock::nowMs();
+                const bool any = !fresh.empty();
+                lock.lock();
+                for (GSPictureRead &picture : fresh)
+                {
+                    picture.readyMs = now;
+                    if (!startedAt.empty())
+                    {
+                        picture.startedMs = startedAt.front(); // reads finish in the order they were started in
+                        startedAt.pop_front();
+                    }
+                    ready.push_back(std::move(picture));
+                    ++handled;
+                }
+                if (!inTheWorks && !any)
+                {
+                    handled = target; // a read that gave no picture: nothing left to wait for
+                    startedAt.clear();
+                }
+                if (handled > submitted)
+                    handled = submitted;
+                if (any)
+                {
+                    lock.unlock();
+                    rt->eeScheduler().wakePresentationWait();
+                    lock.lock();
+                }
+            }
+        }
+        void take(std::vector<GSPictureRead> &out)
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (GSPictureRead &picture : ready)
+                out.push_back(std::move(picture));
+            ready.clear();
+        }
+        void shutdown()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                stop = true;
+            }
+            cv.notify_all();
+            if (thread.joinable())
+                thread.join();
+            if (rt)
+                rt->setPictureReadSubmitted({});
+            rt = nullptr;
+        }
+    };
+
+    struct InBetweenQueue
+    {
+        std::deque<GSPictureRead> pictures;
+        std::vector<GSPictureRead> fresh;
+
+        // Issue 049 v3.5 (P2.5c): timed pictures, each made for one instant on screen, in the order of those
+        // instants. The reader thread delivers the reads; the code that made a picture announced its instant under
+        // the read's tag (ps2x::display_clock).
+        struct TimedPicture
+        {
+            GSPictureRead read;
+            ps2x::display_clock::Timed info;
+        };
+        std::deque<TimedPicture> timed;
+        bool readerOwnsReads = false; // the reader thread collects the reads: collect() below leaves them alone
+        struct TimedStats
+        {
+            uint64_t arrived = 0u, shown = 0u, late = 0u, isVoid = 0u, wrongSize = 0u, handedLate = 0u, frames = 0u;
+            double readySum = 0.0, readyMax = 0.0;   // first picture of a frame: ready this long after the frame's instant
+            double listSum = 0.0, listMax = 0.0;     // the frame's list arrived this long after the frame's instant
+            double buildSum = 0.0, deviceSum = 0.0, readSum = 0.0; // of that: building, on the device, the read
+            double buildMax = 0.0, deviceMax = 0.0, readMax = 0.0;
+            double earlySum = 0.0, earlyMin = 1e9;   // a picture was ready this long before its instant
+            double handedSum = 0.0, handedMin = 1e9; // a shown picture was handed over this long before its instant
+        } stats;
+        uint32_t lastFrame = 0u;
+        bool haveFrame = false;
+        double lastShownAtMs = 0.0; // the instant of the last timed picture that was shown
+        double lastHandMs = 0.0;    // what the window last needed from taking a picture to handing it over
+        uint64_t shownForStats = 0u, hiddenForStats = 0u; // for [present:stats]: pictures shown / new field pictures not shown
+
+        void collectTimed(PictureReader &reader)
+        {
+            fresh.clear();
+            reader.take(fresh);
+            for (GSPictureRead &picture : fresh)
+            {
+                ps2x::display_clock::Timed info;
+                if (!ps2x::display_clock::take(picture.tag, info))
+                {
+                    pictures.push_back(std::move(picture)); // not a timed picture: the test path (saved with its field)
+                    continue;
+                }
+                ++stats.arrived;
+                if (!haveFrame || info.frame != lastFrame)
+                {
+                    haveFrame = true;
+                    lastFrame = info.frame;
+                    ++stats.frames;
+                    const double ready = picture.readyMs - info.instantMs, list = info.listMs - info.instantMs;
+                    stats.readySum += ready;
+                    stats.readyMax = std::max(stats.readyMax, ready);
+                    stats.listSum += list;
+                    stats.listMax = std::max(stats.listMax, list);
+                    const double build = info.queuedMs - info.listMs, device = picture.startedMs - info.queuedMs,
+                                 read = picture.readyMs - picture.startedMs;
+                    stats.buildSum += build;
+                    stats.buildMax = std::max(stats.buildMax, build);
+                    stats.deviceSum += device;
+                    stats.deviceMax = std::max(stats.deviceMax, device);
+                    stats.readSum += read;
+                    stats.readMax = std::max(stats.readMax, read);
+                }
+                const double early = info.atMs - picture.readyMs;
+                stats.earlySum += early;
+                stats.earlyMin = std::min(stats.earlyMin, early);
+                if (info.isVoid)
+                {
+                    ++stats.isVoid;
+                    continue;
+                }
+                auto at = timed.end();
+                while (at != timed.begin() && std::prev(at)->info.atMs > info.atMs)
+                    --at;
+                timed.insert(at, TimedPicture{std::move(picture), info});
+            }
+        }
+        // The front picture is done with: `handedMs` >= 0: shown, handed to the window then; < 0: not shown (reason).
+        enum class Dropped { Late, WrongSize };
+        void dropFront(Dropped why)
+        {
+            if (why == Dropped::Late)
+                ++stats.late;
+            else
+                ++stats.wrongSize;
+            if (why == Dropped::Late)
+            {
+                ps2x::display_clock::Outcome outcome;
+                outcome.timed = timed.front().info;
+                outcome.startedMs = timed.front().read.startedMs;
+                outcome.readyMs = timed.front().read.readyMs;
+                outcome.handMs = lastHandMs;
+                ps2x::display_clock::report(outcome);
+            }
+            if (ps2x::display_clock::logTimeline())
+                std::fprintf(stderr, "[smooth:missed] refresh=%lld at=%.3f frame=%u t=%.5f ready=%.3f started=%.3f reason=%s\n",
+                             static_cast<long long>(timed.front().info.refresh), timed.front().info.atMs, timed.front().info.frame,
+                             timed.front().info.t, timed.front().read.readyMs, timed.front().read.startedMs, why == Dropped::Late ? "late" : "size");
+            timed.pop_front();
+            report();
+        }
+        void shownFront(double handedMs, double handMs)
+        {
+            const ps2x::display_clock::Timed &info = timed.front().info;
+            ++stats.shown;
+            ++shownForStats;
+            lastShownAtMs = info.atMs;
+            lastHandMs = handMs;
+            {
+                ps2x::display_clock::Outcome outcome;
+                outcome.timed = info;
+                outcome.startedMs = timed.front().read.startedMs;
+                outcome.readyMs = timed.front().read.readyMs;
+                outcome.handMs = handMs;
+                outcome.shown = true;
+                ps2x::display_clock::report(outcome);
+            }
+            const double before = info.atMs - handedMs;
+            stats.handedSum += before;
+            stats.handedMin = std::min(stats.handedMin, before);
+            stats.handedLate += before < 0.0 ? 1u : 0u;
+            if (ps2x::display_clock::logTimeline())
+                std::fprintf(stderr, "[smooth:shown] refresh=%lld at=%.3f frame=%u t=%.5f handed=%.3f ready=%.3f started=%.3f\n",
+                             static_cast<long long>(info.refresh), info.atMs, info.frame, info.t, handedMs, timed.front().read.readyMs,
+                             timed.front().read.startedMs);
+            timed.pop_front();
+            report();
+        }
+        void report()
+        {
+            const uint64_t done = stats.shown + stats.late + stats.wrongSize;
+            if (done < 500u)
+                return;
+            const double frames = static_cast<double>(std::max<uint64_t>(stats.frames, 1u));
+            const double arrived = static_cast<double>(std::max<uint64_t>(stats.arrived, 1u));
+            const double shown = static_cast<double>(std::max<uint64_t>(stats.shown, 1u));
+            std::fprintf(stderr, "[smooth:timed] %llu pictures shown, %llu too late for their instant, %llu void, %llu of another "
+                         "size, %llu handed over after their instant; %llu frames: the list arrived %.2f ms after the frame's "
+                         "instant (%.2f at most), its first picture was ready %.2f ms after it (%.2f at most); a picture was "
+                         "ready %.2f ms before its instant (%.2f at least), handed over %.2f ms before it (%.2f at least); "
+                         "the first picture's time after the list: built and queued %.2f ms (%.2f at most), then until its "
+                         "read was started %.2f ms (%.2f), then until the read was finished %.2f ms (%.2f)\n",
+                         static_cast<unsigned long long>(stats.shown), static_cast<unsigned long long>(stats.late),
+                         static_cast<unsigned long long>(stats.isVoid), static_cast<unsigned long long>(stats.wrongSize),
+                         static_cast<unsigned long long>(stats.handedLate), static_cast<unsigned long long>(stats.frames),
+                         stats.listSum / frames, stats.listMax, stats.readySum / frames, stats.readyMax, stats.earlySum / arrived,
+                         stats.earlyMin, stats.handedSum / shown, stats.handedMin, stats.buildSum / frames, stats.buildMax,
+                         stats.deviceSum / frames, stats.deviceMax, stats.readSum / frames, stats.readMax);
+            stats = TimedStats{};
+        }
+        uint64_t collected = 0u, inTime = 0u, late = 0u, saved = 0u, logged = 0u, notPaired = 0u;
+        size_t longest = 0u;
+
+        // Window thread, right after the window latched the field it shows.
+        void collect(PS2Runtime *rt, uint64_t shownField)
+        {
+            if (readerOwnsReads)
+                return;
+            fresh.clear();
+            rt->pictureGs().collectPictureReads(fresh);
+            for (GSPictureRead &picture : fresh)
+            {
+                ++collected;
+                if (picture.field > shownField)
+                    ++inTime;
+                else
+                    ++late;
+                pictures.push_back(std::move(picture));
+            }
+            longest = std::max(longest, pictures.size());
+            if (collected >= logged + 250u)
+            {
+                logged = collected;
+                std::fprintf(stderr, "[smooth:queue] %llu in-between pictures read out: %llu in time, %llu late; longest "
+                             "queue %zu; %llu saved; window at field %llu\n",
+                             static_cast<unsigned long long>(collected), static_cast<unsigned long long>(inTime),
+                             static_cast<unsigned long long>(late), longest, static_cast<unsigned long long>(saved),
+                             static_cast<unsigned long long>(shownField));
+            }
+        }
+
+        // The pictures waiting for `field`, saved next to that field's frame dump. `pictureField` is the field of
+        // the picture the window shows: when the GS is behind, the window still shows an earlier field's picture
+        // under this field's number and the frame dump holds that one. The in-between pictures are then not
+        // saved (they would be paired with another frame's picture), only counted.
+        void dump(uint64_t field, uint64_t pictureField)
+        {
+            static const std::string s_dir = []
+            {
+                const char *d = std::getenv("PS2X_SMOOTH_DUMP");
+                return std::string(d ? d : "");
+            }();
+            if (s_dir.empty())
+                return;
+            if (pictureField != field)
+            {
+                size_t waiting = 0u;
+                for (const GSPictureRead &picture : pictures)
+                    waiting += picture.field == field ? 1u : 0u;
+                if (waiting != 0u)
+                {
+                    notPaired += waiting;
+                    std::fprintf(stderr, "[smooth:dump] field %llu saved with the picture of field %llu (its own was "
+                                 "not read out yet): %zu in-between pictures not saved, %llu so far\n",
+                                 static_cast<unsigned long long>(field), static_cast<unsigned long long>(pictureField),
+                                 waiting, static_cast<unsigned long long>(notPaired));
+                }
+                return;
+            }
+            for (const GSPictureRead &picture : pictures)
+            {
+                if (picture.field != field)
+                    continue;
+                const PresentationFrame &f = picture.frame;
+                const size_t stride = f.strideBytes ? f.strideBytes : static_cast<size_t>(f.width) * 4u;
+                if (stride * f.height > f.pixels.size())
+                    continue;
+                // The same limits as the window's own copy of a field's picture (UploadFrame).
+                const uint32_t width = std::min<uint32_t>(f.width, FB_WIDTH * 4u);
+                const uint32_t height = std::min<uint32_t>(f.height, FB_HEIGHT * 4u);
+                char name[96];
+                std::snprintf(name, sizeof(name), "/inb_%06llu_%uof%u.png",
+                              static_cast<unsigned long long>(gsPictureTagFrameField(picture.tag)),
+                              gsPictureTagIndex(picture.tag), gsPictureTagCount(picture.tag));
+                if (writePngOf(f.pixels.data(), stride, width, height, s_dir + name))
+                    ++saved;
+            }
+        }
+
+        // The window has shown `shownField`: its in-between pictures are over.
+        void retire(uint64_t shownField)
+        {
+            while (!pictures.empty() && pictures.front().field <= shownField)
+            {
+                pictures.pop_front();
+                ++notShown;
+            }
+        }
+
+        // Issue 049 P2.5 (step 1): the next picture to show after the field `shownField` and before the one after it:
+        // the first waiting picture of field shownField + 1 (they are read out in the order they are shown in).
+        const GSPictureRead *next(uint64_t shownField) const
+        {
+            for (const GSPictureRead &picture : pictures)
+            {
+                if (picture.field == shownField + 1u)
+                    return &picture;
+            }
+            return nullptr;
+        }
+
+        // `picture` (from next()) is done with: shown, or too late for its time.
+        void done(const GSPictureRead *picture, bool wasShown, double lateMs)
+        {
+            for (auto at = pictures.begin(); at != pictures.end(); ++at)
+            {
+                if (&*at != picture)
+                    continue;
+                pictures.erase(at);
+                break;
+            }
+            if (wasShown)
+            {
+                ++shown;
+                lateSum += lateMs;
+                lateMax = std::max(lateMax, lateMs);
+            }
+            else
+            {
+                ++tooLate;
+            }
+            if ((shown + tooLate) % 500u == 0u)
+            {
+                std::fprintf(stderr, "[smooth:show] %llu in-between pictures shown, %llu too late for their time, %llu never "
+                             "taken; shown %.2f ms after their time on average, %.2f at most; field period %.2f ms\n",
+                             static_cast<unsigned long long>(shown), static_cast<unsigned long long>(tooLate),
+                             static_cast<unsigned long long>(notShown), shown ? lateSum / static_cast<double>(shown) : 0.0,
+                             lateMax, periodMs);
+                lateSum = lateMax = 0.0;
+                shown = tooLate = notShown = 0u;
+            }
+        }
+        uint64_t shown = 0u, tooLate = 0u, notShown = 0u;
+        double lateSum = 0.0, lateMax = 0.0, periodMs = 20.0;
+    };
+    static InBetweenQueue s_inBetween;
 
     static void writeThreads(std::ostream &o, PS2Runtime *rt)
     {
@@ -813,17 +1210,19 @@ namespace ps2x_dev
         // was written before the latch and named by the scheduler's current field, so it could hold the previous window
         // frame's picture under a later field: which picture a field's dump held depended on a race with the game's
         // flips. A field the window does not show is not saved.
-        void dumpPresented(uint64_t field)
+        // Returns true when it saved the field.
+        bool dumpPresented(uint64_t field)
         {
             if (dumpEvery == 0u || field < dumpFrom || field > dumpTo)
-                return;
+                return false;
             const uint64_t bucket = field / dumpEvery;
             if (bucket == lastDumpBucket)
-                return;
+                return false;
             lastDumpBucket = bucket;
             char name[64];
             std::snprintf(name, sizeof(name), "/frame_%06llu.png", static_cast<unsigned long long>(field));
             writePng(dumpDir() + name);
+            return true;
         }
 
         void step(uint64_t tick)
@@ -1108,6 +1507,31 @@ static int configuredHostTargetFps()
 static uint64_t s_windowFrameField = 0;
 static bool s_windowFrameNewPicture = false;
 
+// Issue 049 P2.5 (step 1): an in-between picture into the window's texture, as UploadFrame puts a field's picture
+// there. The texture keeps the size the field pictures gave it; a picture of another size is not shown.
+static bool UploadPicture(Texture2D &tex, const PresentationFrame &frame)
+{
+    const size_t stride = frame.strideBytes ? frame.strideBytes : static_cast<size_t>(frame.width) * 4u;
+    const uint32_t copyWidth = std::min<uint32_t>(frame.width, FB_WIDTH * 4u);
+    const uint32_t copyHeight = std::min<uint32_t>(frame.height, FB_HEIGHT * 4u);
+    const uint32_t texWidth = static_cast<uint32_t>(tex.width), texHeight = static_cast<uint32_t>(tex.height);
+    if (copyWidth == 0u || copyHeight == 0u || copyWidth > texWidth || copyHeight > texHeight ||
+        stride * frame.height > frame.pixels.size())
+        return false;
+    if (frame.width == texWidth && frame.height == texHeight && stride == static_cast<size_t>(texWidth) * 4u)
+    {
+        UpdateTexture(tex, frame.pixels.data());
+        return true;
+    }
+    static std::vector<uint8_t> s_padded;
+    s_padded.assign(static_cast<size_t>(texWidth) * texHeight * 4u, 0u);
+    for (uint32_t y = 0; y < copyHeight; ++y)
+        std::memcpy(s_padded.data() + static_cast<size_t>(y) * texWidth * 4u, frame.pixels.data() + static_cast<size_t>(y) * stride,
+                    static_cast<size_t>(copyWidth) * 4u);
+    UpdateTexture(tex, s_padded.data());
+    return true;
+}
+
 // The texture grows to the largest presented image (4x output); smaller frames
 // occupy its top-left corner. Display dimensions keep the logical aspect ratio.
 // paced (field pacing, issue 023 fix 2): the field the scheduler announced for this frame; nullptr = 60 FPS loop.
@@ -1149,6 +1573,10 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
             const uint64_t gen = rt->gs().hostPresentationGeneration();
             s_newPictures += gen != s_lastGen ? 1u : 0u;
             s_lastGen = gen;
+            // Issue 049 v3.5: timed pictures shown count as new pictures; a field's new picture that was not shown does not.
+            s_newPictures += ps2x_dev::s_inBetween.shownForStats;
+            s_newPictures -= std::min(s_newPictures, ps2x_dev::s_inBetween.hiddenForStats);
+            ps2x_dev::s_inBetween.shownForStats = ps2x_dev::s_inBetween.hiddenForStats = 0u;
             ++s_frames;
             s_lastNs = now;
             if (now - s_windowStartNs >= 1000000000ull)
@@ -1194,6 +1622,10 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
             s_hasLatchedInitialFrame = true;
         }
     }
+
+    // Issue 049 v3.2 (P2.3b): in-between pictures read out on the GS side (nothing to do unless they are made).
+    if (rt->pictureGs().pictureReadsActive())
+        ps2x_dev::s_inBetween.collect(rt, s_windowFrameField);
 
     const uint64_t generation = rt->gs().hostPresentationGeneration();
     // DW5XL-DEBUG issue 023: PS2X_WEAVE_TRACE=1 also logs every window frame: field it shows, whether it latched a new
@@ -1514,6 +1946,58 @@ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, con
     return m_iopSubsystem->loadModule(path, arguments, argumentSize);
 }
 
+void PS2Runtime::setPictureReadSubmitted(std::function<void()> submitted)
+{
+    std::lock_guard<std::mutex> lock(m_pictureReadSubmittedMutex);
+    m_pictureReadSubmitted = submitted;
+    m_gs.setPictureReadSubmitted(submitted);
+    if (m_pictureGs)
+        m_pictureGs->setPictureReadSubmitted(submitted);
+}
+
+bool PS2Runtime::syncPictureGs(bool everything, uint32_t *pages, uint32_t *differ)
+{
+    if (!m_pictureGs)
+    {
+        auto picture = std::make_unique<GS>();
+        m_pictureVram.assign(PS2_GS_VRAM_SIZE, 0u);
+        // The privileged registers are the game's (read only: a picture is read with the game's display settings).
+        if (!picture->initAsSecondMemory(m_gs, m_pictureVram.data(), static_cast<uint32_t>(m_pictureVram.size()),
+                                         &m_memory.gs()))
+            return false;
+        std::lock_guard<std::mutex> lock(m_pictureReadSubmittedMutex);
+        picture->setPictureReadSubmitted(m_pictureReadSubmitted);
+        m_pictureGs = std::move(picture);
+        m_pictureGsPtr.store(m_pictureGs.get(), std::memory_order_release);
+        everything = true;
+    }
+    std::bitset<512> changed = m_gs.takeWrittenPages() | m_pictureGs->takeWrittenPages();
+    if (everything)
+        changed.set();
+    if (pages)
+        *pages = static_cast<uint32_t>(changed.count());
+    if (!m_pictureGs->copyPagesFrom(m_gs, changed))
+        return false;
+    if (differ)
+    {
+        std::vector<uint8_t> game, picture;
+        m_gs.snapshotVram(game);
+        m_pictureGs->snapshotVram(picture);
+        uint32_t count = 0;
+        if (game.size() == picture.size() && !game.empty())
+        {
+            for (size_t page = 0; page * 8192u < game.size(); ++page)
+                count += std::memcmp(&game[page * 8192u], &picture[page * 8192u], 8192u) != 0 ? 1u : 0u;
+        }
+        else
+        {
+            count = 512u;
+        }
+        *differ = count;
+    }
+    return true;
+}
+
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
 {
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
@@ -1771,7 +2255,13 @@ bool PS2Runtime::syncCoreSubsystems()
     ps2x::device::detach(m_memory);
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+                                    {
+                                        // Issue 049 (fact-finding): a picture's packets go to the picture GS.
+                                        if (m_gifToPictureGs && m_pictureGs)
+                                            m_pictureGs->processGIFPacket(data, size);
+                                        else
+                                            m_gs.processGIFPacket(data, size);
+                                    });
     m_gifArbiter.setWorkerEnabled(GifArbiter::workerRequestedByEnv());
     m_memory.setGifArbiter(&m_gifArbiter);
     // VIF1 MSCAL/MSCNT. On the async device worker the VU1 D/T enables come from
@@ -3848,11 +4338,76 @@ void PS2Runtime::run()
     ps2x_dev::Harness devHarness;
     devHarness.runtime = this;
     devHarness.init();
+    // Issue 049 v3.5 (P2.5c), DW5XL-DEBUG PS2X_SMOOTH_SHOW=1 until the MOTION SMOOTHING row exists: in a battle
+    // the window shows timed pictures only, each made for one instant on screen (the code that makes them asks the
+    // time line, app/src/dw5xl_smooth_time.h). The display is a test display so far (PS2X_TEST_DISPLAY=<Hz>|follow);
+    // real displays come with P2.5a's platform code. A field's own picture is still taken every field (tests save
+    // it) but is not shown while timed pictures cover the present.
+    static const bool s_smoothShow = [] { const char *v = std::getenv("PS2X_SMOOTH_SHOW"); return v && *v && *v != '0'; }();
+    using SmoothClock = std::chrono::steady_clock;
+    namespace dc = ps2x::display_clock;
+    dc::Grid displayGrid;
+    const bool haveDisplay = dc::parseTestDisplay(std::getenv("PS2X_TEST_DISPLAY"), dc::nowMs(), displayGrid);
+    if (haveDisplay)
+    {
+        dc::publish(displayGrid);
+        if (displayGrid.follows)
+            std::fprintf(stderr, "[window] test display: follows the window%s\n", displayGrid.periodMs > 0.0 ? ", with a top rate" : "");
+        else
+            std::fprintf(stderr, "[window] test display: fixed rate, %.4f ms per refresh (%.3f Hz)\n", displayGrid.periodMs,
+                         1000.0 / displayGrid.periodMs);
+    }
+    const bool timedMode = s_smoothShow && haveDisplay && hostFpsOverride == 0 && m_eeScheduler;
+    ps2x_dev::PictureReader pictureReader;
+    if (timedMode)
+    {
+        ps2x_dev::s_inBetween.readerOwnsReads = true;
+        pictureReader.start(this);
+    }
+    SmoothClock::time_point fieldAnnouncedAt{};
+    double fieldPeriodMs = 20.0;
+    // Following display: how long a turn takes from its start to its swap, the longest of the last 32 (measured).
+    std::array<double, 32> turnMs{};
+    size_t turnAt = 0u;
+    uint32_t presentWidth = FB_WIDTH, presentHeight = DEFAULT_DISPLAY_HEIGHT;
+    uint32_t displayWidth = FB_WIDTH, displayHeight = DEFAULT_DISPLAY_HEIGHT;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         const bool fieldPaced = hostFpsOverride == 0 && m_eeScheduler;
         EeScheduler::PresentationField paced{};
-        if (fieldPaced)
+        bool inBetween = false;                             // this turn shows a timed picture (the queue's front)
+        bool wokeEarly = false;
+        double turnStartMs = 0.0;
+        auto timedWake = SmoothClock::time_point::max();
+        if (timedMode)
+        {
+            auto &queue = ps2x_dev::s_inBetween;
+            queue.collectTimed(pictureReader);
+            const double now = dc::nowMs();
+            // Fixed rate: a picture whose instant has passed missed its refresh. Following display: a picture is on
+            // screen when it is presented, so a late one is still shown unless the next one's instant has come too.
+            while (!queue.timed.empty() &&
+                   (displayGrid.follows ? queue.timed.size() >= 2u && now >= queue.timed[1].info.atMs
+                                        : now >= queue.timed.front().info.atMs))
+                queue.dropFront(ps2x_dev::InBetweenQueue::Dropped::Late);
+            if (!queue.timed.empty())
+            {
+                // Fixed rate: handed over in the refresh interval before its instant. Following display: presented
+                // at its instant; the turn starts as much earlier as a turn has lately taken up to its swap.
+                const double at = queue.timed.front().info.atMs;
+                const double lead = displayGrid.follows ? *std::max_element(turnMs.begin(), turnMs.end()) : displayGrid.periodMs;
+                if (now >= at - lead)
+                {
+                    inBetween = true;
+                    turnStartMs = now;
+                }
+                else
+                {
+                    timedWake = dc::fromMs(at - lead);
+                }
+            }
+        }
+        if (fieldPaced && !inBetween)
         {
             // Issue 027: a state load sets the field number back; the loaded game's fields are new to the window
             // (otherwise it would wait until the game passed the field it showed before the load).
@@ -3862,9 +4417,32 @@ void PS2Runtime::run()
                 lastShownField = ps2x::presentation::kNoField;
             }
             const auto waitStart = std::chrono::steady_clock::now();
-            paced = m_eeScheduler->waitForPresentationField(lastShownField);
+            if (timedMode)
+            {
+                // Also woken by a picture's arrival and at the next picture's hand-over time.
+                const auto got = m_eeScheduler->waitForPresentationFieldUntil(lastShownField, timedWake);
+                paced.field = got.field;
+                paced.fresh = got.fresh;
+                wokeEarly = got.early;
+            }
+            else
+            {
+                paced = m_eeScheduler->waitForPresentationField(lastShownField);
+            }
             if (paced.fresh)
+            {
                 lastShownField = paced.field;
+                // The field period as the window sees it (issue 049 P2.5): the time between two announcements, smoothed.
+                const auto announced = SmoothClock::now();
+                if (fieldAnnouncedAt != SmoothClock::time_point{})
+                {
+                    const double ms = std::chrono::duration<double, std::milli>(announced - fieldAnnouncedAt).count();
+                    if (ms > 10.0 && ms < 40.0)
+                        fieldPeriodMs += (ms - fieldPeriodMs) * 0.05;
+                }
+                fieldAnnouncedAt = announced;
+                ps2x_dev::s_inBetween.periodMs = fieldPeriodMs;
+            }
             // DW5XL-DEBUG issue 009 v4.7: the first window frames after a host pause ends (owner: "the picture takes a
             // moment to start again").
             if (const int64_t resumedNs = m_lastHostResumeNs.load(std::memory_order_acquire); resumedNs != 0)
@@ -3939,12 +4517,41 @@ void PS2Runtime::run()
 
             }
         });
-        uint32_t presentWidth = FB_WIDTH;
-        uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        uint32_t displayWidth = FB_WIDTH;
-        uint32_t displayHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight, displayWidth, displayHeight, fieldPaced ? &paced : nullptr);
-        devHarness.dumpPresented(s_windowFrameField);
+        if (timedMode && !inBetween && !paced.fresh && wokeEarly)
+            continue; // woken for a picture's arrival or its hand-over time: the next turn decides
+        if (inBetween)
+        {
+            // A timed picture: the window keeps the last field's sizes.
+            if (!UploadPicture(frameTex, ps2x_dev::s_inBetween.timed.front().read.frame))
+            {
+                ps2x_dev::s_inBetween.dropFront(ps2x_dev::InBetweenQueue::Dropped::WrongSize);
+                continue;
+            }
+        }
+        else
+        {
+            presentWidth = FB_WIDTH;
+            presentHeight = DEFAULT_DISPLAY_HEIGHT;
+            displayWidth = FB_WIDTH;
+            displayHeight = DEFAULT_DISPLAY_HEIGHT;
+            UploadFrame(frameTex, this, presentWidth, presentHeight, displayWidth, displayHeight, fieldPaced ? &paced : nullptr);
+        }
+        const bool fieldDumped = !inBetween && devHarness.dumpPresented(s_windowFrameField);
+        if (!inBetween && pictureGs().pictureReadsActive())
+        {
+            // Issue 049 v3.2 (P2.3b): the in-between pictures that waited for this field.
+            if (fieldDumped)
+                ps2x_dev::s_inBetween.dump(s_windowFrameField, m_gs.hostPresentationField());
+            ps2x_dev::s_inBetween.retire(s_windowFrameField);
+        }
+        if (timedMode && !inBetween && paced.fresh && ps2x_dev::s_inBetween.lastShownAtMs >= dc::nowMs() - fieldPeriodMs)
+        {
+            // Timed pictures cover the present (one was shown for an instant less than a field ago): the field's own
+            // picture was taken (and saved if a test asked) but is not shown. When they stop, or miss their instants,
+            // the window shows fields again.
+            ps2x_dev::s_inBetween.hiddenForStats += s_windowFrameNewPicture ? 1u : 0u;
+            continue;
+        }
 
         BeginDrawing();
         ClearBackground(BLACK);
@@ -4172,8 +4779,47 @@ void PS2Runtime::run()
                 s_shotPath.clear();
             }
         }
+        double handedMs = 0.0, handMs = 0.0;
+        if (inBetween)
+        {
+            handMs = dc::nowMs() - turnStartMs; // what this turn needed up to the swap
+            turnMs[turnAt++ % turnMs.size()] = handMs;
+            if (displayGrid.follows)
+            {
+                // Presented at its instant: sleep close to it, then spin.
+                const auto due = dc::fromMs(ps2x_dev::s_inBetween.timed.front().info.atMs);
+                if (due - SmoothClock::now() > std::chrono::milliseconds(2))
+                    std::this_thread::sleep_until(due - std::chrono::milliseconds(1));
+                while (SmoothClock::now() < due)
+                    std::this_thread::yield();
+            }
+            handedMs = dc::nowMs();
+        }
         EndDrawing();
-        ps2x::present_feedback::frameSwapped(s_windowFrameField, s_windowFrameNewPicture); // DW5XL-DEBUG issue 023 3S
+        if (inBetween)
+        {
+            ps2x_dev::s_inBetween.shownFront(handedMs, handMs);
+        }
+        else
+        {
+            ps2x::present_feedback::frameSwapped(s_windowFrameField, s_windowFrameNewPicture); // DW5XL-DEBUG issue 023 3S
+            // DW5XL-DEBUG issue 049 v3.5: PS2X_SMOOTH_TIMELINE=1: a field's own picture and the refresh that shows it.
+            if (paced.fresh && dc::logTimeline())
+            {
+                const double swapped = dc::nowMs();
+                if (haveDisplay && !displayGrid.follows)
+                {
+                    const int64_t refresh = dc::refreshAfter(displayGrid, swapped);
+                    std::fprintf(stderr, "[smooth:game] refresh=%lld at=%.3f field=%llu\n", static_cast<long long>(refresh),
+                                 dc::instantOf(displayGrid, refresh), static_cast<unsigned long long>(s_windowFrameField));
+                }
+                else
+                {
+                    std::fprintf(stderr, "[smooth:game] refresh=-1 at=%.3f field=%llu\n", swapped,
+                                 static_cast<unsigned long long>(s_windowFrameField));
+                }
+            }
+        }
 
         if (WindowShouldClose())
         {
@@ -4183,6 +4829,7 @@ void PS2Runtime::run()
         }
     }
 
+    pictureReader.shutdown(); // issue 049 v3.5: before the GS goes
     requestStop();
     if (gameThread.joinable())
     {
