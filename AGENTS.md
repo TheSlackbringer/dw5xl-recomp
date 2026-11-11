@@ -33,12 +33,18 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
 2. **Spec approval before any work.** Draft the spec (fact-finding needed to write it is fine); the user approves.
    Push back with reasons when you think a spec is wrong; the user decides and can overrule. No fixes or experimental
    code changes without an approved spec. While away, the user can allow work on an unapproved spec — explicitly.
-3. **A test per issue, written first:** `notes/issues/tests/issue_NNN_*.py` prints PASS/FAIL and must FAIL on the bug
-   before the fix (where measurable). Runner: `notes/issues/tests/run.py NNN|quick|standard|list`; helpers and routes in
-   `tests/dw5test.py`. Closed issues keep their tests as regression guards.
-4. **Testing by change (2026-10-21, replaces mandatory suite gates):** run all fast automated checks
-   after every change: unit tests, Python unit tests and static checks. Also run checks relevant to the changed
-   code and behaviour. Use CI to validate builds. Slow gameplay runs are separate from the fast checks.
+3. **A test per issue, written first, and the cheapest one that shows the bug (2026-11-11, issue 065):** a unit test
+   (CTest) where the bug can be shown without the game; otherwise a reading of the go's runs (`tests/go.py`); a new
+   game run only with its reason in the spec. `notes/issues/tests/issue_NNN_*.py` prints PASS/FAIL and must FAIL on
+   the bug before the fix (where measurable). Runner: `notes/issues/tests/run.py NNN|go|area <name>|list`; helpers and
+   routes in `tests/dw5test.py`. Closed issues keep their tests: they run by name or by area, not day to day.
+4. **Testing by change (2026-11-11, issue 065: the game is run only to check performance):** after every change run
+   the unit tests (`ctest`), Python unit tests and static checks. For performance run **the go**, `run.py go`: the
+   unit tests, then three timed runs of the compiled program (the Opening at 4x from a cold start; the Lu Bu fight at
+   4x from its save state, a timed minute and a short untimed tail; the Opening at 1x). About 5.5 minutes after a
+   compile, seconds for the same program again. Run an old game test only for the area you are changing
+   (`run.py area <name>`; `run.py area` lists the groups) or when the user asks, and before a release.
+   Use CI to validate builds.
    **No full tier any more (owner 2026-11-03: too long, too many tests).** After fixing at least three specs,
    recommend a standard-tier run and ask the user directly before running it. Never start a tier without the user's
    explicit approval or request. There is no automatic broad-suite
@@ -65,7 +71,8 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
   waiting, applying the choice may not. A request to fix something is not agreement with a particular approach.
 - **Native over emulation;** model hardware only where the runtime must. Prefer the game's own SDK code over runtime
   HLE stubs. Find root causes; no workarounds that paper over symptoms. Survey existing approaches before inventing.
-- **Performance changes must give identical output** (same frames, same sound). Test at **1x**: every run passes
+- **Performance changes must give identical output** (same frames, same sound). The go (issue 065) times the game at
+  4x and at 1x and checks the `[output] scale=` line of its runs itself. Every other test run is at **1x**: it passes
   `PS2X_GS_SCALE=1 PS2X_GS_SSAA=1` and you check the `[output] scale=1x` log line.
 - **Exact saved-frame comparison (2026-10-22):** Use `tools/debug/compare_frames.py` for renderer/shader,
   VU graphics math, framebuffer/presentation changes, optimizations/refactors in those paths, and visual-regression
@@ -144,9 +151,11 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
 - Build: `notes/issues/tests/slots.py build -- cmake --build app/build` (all), `--target dw5xl` (game); the slot
   keeps a build out of other sessions' timing runs. Regenerate code: `tools/regen.sh main|ovl00|…`
   (needs the player's disc in `game/dw5xl/`). CTests: `cd app/build && ctest`.
-- Run all fast checks plus checks relevant to the changed area (testing rule above). Available issue tiers: `run.py NNN|quick|standard`
-  (no full tier, owner 2026-11-03); recommend the standard tier after at least three fixed specs and ask the user before running it.
-  Perf/stutter: `slots.py alone -- tools/heavy_battle_test.py` (no frame dumps when measuring timing).
+- After a change: the unit tests, then `run.py go` for performance (testing rule above; `run.py go --replay` plays a
+  program's runs again). A game test by name or area only for the code you are changing: `run.py NNN`,
+  `run.py area <name>`. The old tiers `run.py quick|standard` remain (no full tier, owner 2026-11-03); recommend the
+  standard tier after at least three fixed specs and ask the user before running it.
+  The long fights: `slots.py alone -- tools/heavy_battle_test.py` (no frame dumps when measuring timing).
 - Unsure how the original looks or behaves: compare with PCSX2 first (`tools/pcsx2_reference.py`), then ask the user
   for what screenshots can't show (feel, sound timing).
 - Debug code: `DW5XL-DEBUG` (kept, env-gated) and `TEMP-DEBUG` (remove before committing).
