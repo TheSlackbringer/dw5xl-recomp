@@ -1730,9 +1730,15 @@ void install(PS2Runtime &runtime)
         std::fprintf(stderr, "[smooth] the pictures are drawn on a GS memory of their own (no rollback on the game's GS)\n");
     g_gs2 = g_gs2 && g_rollback;
     {
+        // Issue 049, P2.6b-3 M2 (owner's go 2026-11-12): the pictures' own device is the default wherever it can
+        // run (the picture GS, pictures made at the game's frame end). PS2X_SMOOTH_DEVICE2=0: the pictures through
+        // the game's device, as before M2 (kept until M3).
         const char *v = std::getenv("PS2X_SMOOTH_DEVICE2");
-        const bool asked = v && *v && *v != '0';
-        g_device2 = asked && g_gs2 && g_atEnd;
+        const bool off = v && *v == '0';
+        const bool asked = v && *v && !off;
+        g_device2 = !off && g_gs2 && g_atEnd;
+        if (off)
+            std::fprintf(stderr, "[smooth] the pictures go through the game's device (PS2X_SMOOTH_DEVICE2=0)\n");
         if (asked && !g_device2)
             std::fprintf(stderr, "[smooth] the pictures' own device declined: it needs the picture GS and pictures made at "
                          "the game's frame end\n");

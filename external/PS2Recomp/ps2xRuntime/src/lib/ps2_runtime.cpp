@@ -4674,7 +4674,10 @@ void PS2Runtime::run()
         // F4 cycles native/2x/4x output; F3 cycles the anti-aliasing choice (1-16 samples
         // per output pixel). The two are independent: 2x/4x use 4/16 samples to build the
         // larger image and AA multiplies that, up to the 16-sample limit (4x: no extra AA).
-        if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::OutputScale)))
+        // DW5XL-DEBUG (issue 049, M2): a scripted press, "<tick>:F4:1" in PS2X_HOST_INPUT, as F5 and F9 have one:
+        // the output scale changed while the game runs, for hidden tests.
+        const bool scriptedScale = m_eeScheduler && ps2_host_input::scriptedKeyPress("F4", eeScheduler().currentVSyncTick());
+        if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::OutputScale)) || scriptedScale)
         {
             const uint32_t current = m_gs.getResolutionScale();
             m_gs.setResolutionScale(current == 1u ? 2u : current == 2u ? 4u : 1u);
