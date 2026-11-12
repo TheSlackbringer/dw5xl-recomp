@@ -11,24 +11,33 @@ option(PS2_GS_CACHE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSan
 option(PS2_GS_CACHE_BUILD_MEMORY_TESTS "Build tests for the new shared cached-reader API" ON)
 
 find_package(Threads REQUIRED)
-add_library(ps2_gs_cache_backend_under_test STATIC
-    "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_cpu_backend.cpp"
-    "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_frontend.cpp"
-    "${PS2_GS_RUNTIME_DIR}/src/lib/gs/ps2_gs_memory.cpp"
-)
-target_include_directories(ps2_gs_cache_backend_under_test PUBLIC "${PS2_GS_RUNTIME_DIR}/include")
-target_compile_features(ps2_gs_cache_backend_under_test PUBLIC cxx_std_20)
-target_compile_definitions(ps2_gs_cache_backend_under_test PRIVATE PS2_RUNTIME_LOGS=0 AGRESSIVE_LOGS=0)
-target_link_libraries(ps2_gs_cache_backend_under_test PUBLIC Threads::Threads)
-set_target_properties(ps2_gs_cache_backend_under_test PROPERTIES CXX_EXTENSIONS OFF)
+if(TARGET ps2_runtime)
+    # Inside the PS2Recomp tree: test the GS of the runtime as it is built. The three GS sources of the stand-alone
+    # library below no longer link on their own (they use the GS trace, the recorder, the save-state archive and
+    # runtime globals), so "build everything" stopped here.
+    add_library(ps2_gs_cache_backend_under_test INTERFACE)
+    target_link_libraries(ps2_gs_cache_backend_under_test INTERFACE ps2_runtime Threads::Threads)
+    target_compile_features(ps2_gs_cache_backend_under_test INTERFACE cxx_std_20)
+else()
+    add_library(ps2_gs_cache_backend_under_test STATIC
+        "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_cpu_backend.cpp"
+        "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_frontend.cpp"
+        "${PS2_GS_RUNTIME_DIR}/src/lib/gs/ps2_gs_memory.cpp"
+    )
+    target_include_directories(ps2_gs_cache_backend_under_test PUBLIC "${PS2_GS_RUNTIME_DIR}/include")
+    target_compile_features(ps2_gs_cache_backend_under_test PUBLIC cxx_std_20)
+    target_compile_definitions(ps2_gs_cache_backend_under_test PRIVATE PS2_RUNTIME_LOGS=0 AGRESSIVE_LOGS=0)
+    target_link_libraries(ps2_gs_cache_backend_under_test PUBLIC Threads::Threads)
+    set_target_properties(ps2_gs_cache_backend_under_test PROPERTIES CXX_EXTENSIONS OFF)
 
-if(PS2_GS_CACHE_SANITIZERS)
-    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" OR MSVC)
-        message(FATAL_ERROR "PS2_GS_CACHE_SANITIZERS requires a GCC/Clang sanitizer toolchain")
+    if(PS2_GS_CACHE_SANITIZERS)
+        if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" OR MSVC)
+            message(FATAL_ERROR "PS2_GS_CACHE_SANITIZERS requires a GCC/Clang sanitizer toolchain")
+        endif()
+        target_compile_options(ps2_gs_cache_backend_under_test PUBLIC
+            -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
+        target_link_options(ps2_gs_cache_backend_under_test PUBLIC -fsanitize=address,undefined)
     endif()
-    target_compile_options(ps2_gs_cache_backend_under_test PUBLIC
-        -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
-    target_link_options(ps2_gs_cache_backend_under_test PUBLIC -fsanitize=address,undefined)
 endif()
 
 function(add_gs_cache_suite target source prefix)
