@@ -1,5 +1,6 @@
 #include "runtime/ps2_device_queue.h"
 
+#include "runtime/ps2_hold_trace.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_profile_markers.h"
 #include "ThreadNaming.h"
@@ -346,7 +347,16 @@ namespace ps2x::device
             void waitGs(DrainReason reason)
             {
                 if (t_executingDepth == 0 && observesGs(reason) && mem.m_gifArbiter)
+                {
+                    if (ps2x::hold::enabled()) // DW5XL-DEBUG PS2X_HOLD_TRACE
+                    {
+                        const uint64_t from = ps2x::hold::nowNs();
+                        mem.m_gifArbiter->waitIdle();
+                        ps2x::hold::t_gsWaitNs += ps2x::hold::nowNs() - from;
+                        return;
+                    }
                     mem.m_gifArbiter->waitIdle();
+                }
             }
 
             void drainTo(uint64_t target, DrainReason reason)
@@ -379,6 +389,8 @@ namespace ps2x::device
                                         { return completed.load(std::memory_order_acquire) >= target; });
                         }
                         waitNs = nsSince(waitStart);
+                        if (ps2x::hold::enabled()) // DW5XL-DEBUG PS2X_HOLD_TRACE
+                            ps2x::hold::t_deviceWaitNs += waitNs;
                         ps2prof::record(ps2prof::Event::DeviceWaitEnd, target, static_cast<uint16_t>(reason)); // DW5XL-DEBUG
                     }
                     pendingBefore = submitted.load(std::memory_order_relaxed) - appliedNow;

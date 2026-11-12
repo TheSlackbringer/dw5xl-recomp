@@ -82,7 +82,9 @@ namespace ps2x
         void vif1CodeChanged() override { generation.store(PS2Memory::nextCodeGeneration(), std::memory_order_relaxed); }
         void vif1Checkpoint(uint32_t) override
         {
-            if (device.givenUp(frame) || device.cutNow())
+            // (m_refused, amendment v3.9: the GS side refused the picture at its start, there was no place for
+            // its read. Its VIF1 work stops here too.)
+            if (device.givenUp(frame) || device.cutNow() || device.m_refused)
                 throw GivenUp{};
         }
     };
@@ -255,6 +257,7 @@ namespace ps2x
             m_batches.push_back(m_batch);
         }
         m_batch->group = frame;
+        m_batch->unit = m_unitNumber;
         m_batch->bytes.clear();
         m_batch->packets.clear();
         m_batch->then = nullptr;
@@ -307,6 +310,7 @@ namespace ps2x
         m_packets = 0;
         m_cutAt = m_cutEvery != 0u && ++m_runs % m_cutEvery == 0u ? 1u + (m_runs / m_cutEvery * 97u) % 1000u : 0u;
         m_batch.reset();
+        ++m_unitNumber;
         newBatch(picture.frame);
 
         bool gaveUp = false;

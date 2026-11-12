@@ -8,6 +8,8 @@
 #include "device.hpp"
 #include "buffer.hpp"
 #include "fence.hpp"
+#include "runtime/gs/gs_read_ring.h"
+#include "runtime/ps2_hold_trace.h"
 #include "image.hpp"
 
 #include <algorithm>
@@ -81,6 +83,7 @@ void consumeSlot(Vulkan::Device &device, VulkanGsScanoutState &state, VulkanGsSc
         slot.pending = false;
         slot.image.reset();
         slot.fence.reset();
+        slot.done.reset();
         return;
     }
 
@@ -121,6 +124,7 @@ void consumeSlot(Vulkan::Device &device, VulkanGsScanoutState &state, VulkanGsSc
     slot.pending = false;
     slot.image.reset();
     slot.fence.reset();
+    slot.done.reset();
 }
 
 // A readback buffer of `bytes`: a free one of that size, else a new one.
@@ -143,6 +147,18 @@ Vulkan::BufferHandle acquireReadbackBuffer(Vulkan::Device &device, VulkanGsScano
 }
 }
 
+bool vulkanGsReadFinished(VulkanGsScanoutState::RbSlot &slot)
+{
+    if (!slot.done)
+        return true; // no read on the card for this place
+    if (!ps2x::hold::enabled())
+        return slot.done->finished();
+    const uint64_t from = ps2x::hold::nowNs();
+    const bool finished = slot.done->finished();
+    ps2x::hold::counters().fenceAsk[static_cast<size_t>(ps2x::hold::t_role)].add(ps2x::hold::nowNs() - from);
+    return finished;
+}
+
 void collectVulkanGsReads(Vulkan::Device &device, VulkanGsScanoutState &state, uint64_t maxField)
 {
     // Oldest pending readback first (the slot the next presentVulkanGs would reuse), in field order. A read that is
@@ -155,21 +171,37 @@ void collectVulkanGsReads(Vulkan::Device &device, VulkanGsScanoutState &state, u
             continue;
         if (slot.vsyncTick > maxField)
             break;
-        if (!slot.fence->wait_timeout(0))
+        if (!vulkanGsReadFinished(slot))
             break;
         consumeSlot(device, state, slot);
     }
 }
 
-Vulkan::Fence pendingFieldReadFence(VulkanGsScanoutState &state, uint64_t field)
+ps2x::gs::ReadWait pendingReadWait(VulkanGsScanoutState &state, uint64_t field)
 {
     for (uint32_t k = 0; k < 3u; ++k)
     {
         auto &slot = state.slots[(state.ringIndex + k) % 3u];
-        if (slot.pending && slot.fence && slot.vsyncTick <= field && !slot.fence->wait_timeout(0))
-            return slot.fence;
+        if (slot.pending && slot.fence && slot.vsyncTick <= field && !vulkanGsReadFinished(slot))
+            return ps2x::gs::ReadWait(slot.done);
     }
     return {};
+}
+
+namespace
+{
+    // What a read finds in the ring's oldest place (ps2x::gs::readPlace).
+    ps2x::gs::ReadPlace oldestPlace(VulkanGsScanoutState &state, bool pictureRead)
+    {
+        auto &slot = state.slots[state.ringIndex];
+        const bool finished = slot.pending && (!slot.fence || vulkanGsReadFinished(slot));
+        return ps2x::gs::readPlace(slot.pending, finished, pictureRead);
+    }
+}
+
+bool vulkanGsPictureReadHasPlace(VulkanGsScanoutState &state)
+{
+    return oldestPlace(state, true) != ps2x::gs::ReadPlace::Refuse;
 }
 
 void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
@@ -255,9 +287,18 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     // single-sampled picture, as before 1x rendered a 2x2 grid.
     info.resolve_super_samples = outputScale >= 2 || antiAliased;
 
+    // DW5XL-DEBUG PS2X_HOLD_TRACE: where a picture's read spends its time.
+    const bool holdTimed = pictureRead && ps2x::hold::enabled();
+    const uint64_t holdFrom = holdTimed ? ps2x::hold::nowNs() : 0u;
     if (flushBeforeVsync)
         gs.flush();
+    const uint64_t holdFlushed = holdTimed ? ps2x::hold::nowNs() : 0u;
     auto output = gs.vsync(info);
+    if (holdTimed)
+    {
+        ps2x::hold::counters().readFlush.add(holdFlushed - holdFrom);
+        ps2x::hold::counters().readVsync.add(ps2x::hold::nowNs() - holdFlushed);
+    }
     if (!output.image) throw std::runtime_error("ParallelGS GPU scanout returned no image");
     const auto width = output.image->get_width();
     auto height = output.image->get_height();
@@ -276,33 +317,37 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
         return e && *e && *e != '0';
     }();
 
+    const uint64_t holdSlots = holdTimed ? ps2x::hold::nowNs() : 0u; // DW5XL-DEBUG PS2X_HOLD_TRACE
     // 1. Prepare current slot: it is the oldest slot in the ring (submitted 3 frames ago)
     // and must be retired first to maintain chronological presentation order.
     auto &curSlot = state.slots[state.ringIndex];
-    if (curSlot.pending)
+    switch (oldestPlace(state, pictureRead))
     {
-        if (curSlot.fence && curSlot.fence->wait_timeout(0))
+    case ps2x::gs::ReadPlace::Free:
+        break;
+    case ps2x::gs::ReadPlace::Finished:
+        consumeSlot(device, state, curSlot);
+        break;
+    case ps2x::gs::ReadPlace::Refuse:
+        // Issue 049, amendment v3.9: a picture's read does not wait for the graphics card. (Its caller asks
+        // vulkanGsPictureReadHasPlace first, under the same lock: this is not reached from there.)
+        throw std::runtime_error("no place for a picture's read");
+    case ps2x::gs::ReadPlace::Wait:
+    {
+        const uint64_t before = metricsEnabled ? nowNs() : 0;
+        const bool completed = curSlot.fence->wait_timeout(20'000'000ull);
+        if (metricsEnabled)
         {
+            ++metrics.fullRingWaits;
+            if (!completed) ++metrics.waitTimeouts;
+            const uint64_t elapsed = nowNs() - before;
+            metrics.waitNs += elapsed;
+            metrics.maxWaitNs = std::max(metrics.maxWaitNs, elapsed);
+        }
+        if (curSlot.pending)
             consumeSlot(device, state, curSlot);
-        }
-        else
-        {
-            if (curSlot.fence)
-            {
-                const uint64_t before = metricsEnabled ? nowNs() : 0;
-                const bool completed = curSlot.fence->wait_timeout(20'000'000ull);
-                if (metricsEnabled)
-                {
-                    ++metrics.fullRingWaits;
-                    if (!completed) ++metrics.waitTimeouts;
-                    const uint64_t elapsed = nowNs() - before;
-                    metrics.waitNs += elapsed;
-                    metrics.maxWaitNs = std::max(metrics.maxWaitNs, elapsed);
-                }
-            }
-            if (curSlot.pending)
-                consumeSlot(device, state, curSlot);
-        }
+        break;
+    }
     }
 
     // 2. Consume newer pending slots in strict chronological order if already completed.
@@ -317,7 +362,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
                 nextSlot.fence->wait();
                 consumeSlot(device, state, nextSlot);
             }
-            else if (nextSlot.fence->wait_timeout(0))
+            else if (vulkanGsReadFinished(nextSlot))
             {
                 consumeSlot(device, state, nextSlot);
             }
@@ -329,6 +374,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
         }
     }
 
+    const uint64_t holdBuffer = holdTimed ? ps2x::hold::nowNs() : 0u;
     if (!curSlot.buf || curSlot.w != width || curSlot.h != height)
     {
         curSlot.buf = acquireReadbackBuffer(device, state, static_cast<VkDeviceSize>(width) * height * 4u);
@@ -336,6 +382,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
         curSlot.w = width;
         curSlot.h = height;
     }
+    const uint64_t holdSubmit = holdTimed ? ps2x::hold::nowNs() : 0u;
 
     curSlot.displayFbp = first.enabled ? first.framebuffer.FBP : second.framebuffer.FBP;
     curSlot.sourceFbp = curSlot.displayFbp;
@@ -362,17 +409,30 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     device.submit(command, &fence);
 
     curSlot.fence = std::move(fence);
+    // The fence keeps itself alive in the function; the device outlives every reader (the window stops its
+    // readers before the GS goes).
+    curSlot.done = std::make_shared<ps2x::gs::ReadDone>(
+        [keep = curSlot.fence, card = curSlot.fence.get()](uint64_t timeoutNs) { return card->wait_timeout(timeoutNs); });
     curSlot.image = output.image;
     curSlot.pending = true;
 
     state.ringIndex = (state.ringIndex + 1u) % 3u;
 
+    const uint64_t holdWait = holdTimed ? ps2x::hold::nowNs() : 0u;
     // For synchronous mode or initial startup frame: wait immediately
     if (s_sync || (!state.hasPresentedFrame && !state.lastFrame && state.staged.empty()))
     {
         if (curSlot.fence)
             curSlot.fence->wait();
         consumeSlot(device, state, curSlot);
+        if (holdTimed)
+            ps2x::hold::counters().readWait.add(ps2x::hold::nowNs() - holdWait);
+    }
+    if (holdTimed)
+    {
+        ps2x::hold::counters().readSlots.add(holdBuffer - holdSlots);
+        ps2x::hold::counters().readBuffer.add(holdSubmit - holdBuffer);
+        ps2x::hold::counters().readSubmit.add(holdWait - holdSubmit);
     }
 
     static uint64_t s_lastLoggedTickVsync = 0;

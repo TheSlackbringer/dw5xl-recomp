@@ -1982,6 +1982,13 @@ ps2x::PictureDevice &PS2Runtime::pictureDevice()
             return cut;
         };
         hooks.allow = [this](uint64_t frame) { m_gifArbiter.allowSide(frame); };
+        // Amendment v3.9: before a picture's first packet is read on the GS thread: is there a place for its read?
+        // If the three reads before it are unfinished on the graphics card, the picture is cut off there.
+        m_gifArbiter.setSideStartFn([this]
+        {
+            GS *picture = m_pictureGsPtr.load(std::memory_order_acquire);
+            return !picture || picture->pictureReadHasPlace();
+        });
         m_pictureDevice = std::make_unique<ps2x::PictureDevice>(m_gs, std::move(hooks));
     }
     return *m_pictureDevice;

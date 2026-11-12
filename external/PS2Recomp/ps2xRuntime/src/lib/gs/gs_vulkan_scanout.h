@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
+#include "runtime/gs/gs_read_ring.h"
 #include "runtime/gs/gs_types.h"
 #include "buffer.hpp"
 #include "fence.hpp"
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <memory>
 #include <mutex>
 #include <vector>
 #include <stdexcept>
@@ -31,6 +33,9 @@ struct VulkanGsScanoutState
     {
         Vulkan::BufferHandle buf;
         Vulkan::Fence fence;
+        // "Is the card done with this read?" for every thread (set with the fence): questions go through it, and
+        // so do the waits made without the device lock, so that a question never waits behind a wait.
+        std::shared_ptr<ps2x::gs::ReadDone> done;
         Vulkan::ImageHandle image;
         uint32_t w = 0;
         uint32_t h = 0;
@@ -117,6 +122,7 @@ struct VulkanGsScanoutState
         {
             slot.pending = false;
             slot.fence.reset();
+            slot.done.reset();
             slot.image.reset();
             slot.buf.reset();
             slot.w = 0;
@@ -150,9 +156,16 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
 // Issue 023. Caller holds the device lock. Stages the finished readbacks in field order without starting a new one,
 // none of a field after maxField (fix 2: it stays for that field's own window frame).
 void collectVulkanGsReads(Vulkan::Device &device, VulkanGsScanoutState &state, uint64_t maxField = UINT64_MAX);
-// Caller holds the device lock. The fence of the oldest unfinished readback of field `field` or older (empty if
-// they are all finished): the window waits on it without the device lock.
-Vulkan::Fence pendingFieldReadFence(VulkanGsScanoutState &state, uint64_t field);
+// Caller holds the device lock. Whether the graphics card is done with the read in a place, as far as that is known
+// without waiting (ps2x::gs::ReadDone). DW5XL-DEBUG PS2X_HOLD_TRACE: the question is timed by the asker's role.
+bool vulkanGsReadFinished(VulkanGsScanoutState::RbSlot &slot);
+// Issue 049, amendment v3.9. Caller holds the device lock. False: the ring's oldest place holds a read the graphics
+// card has not finished; a picture's read would have to wait there, so it is not made.
+bool vulkanGsPictureReadHasPlace(VulkanGsScanoutState &state);
+// Caller holds the device lock. A wait for the oldest unfinished readback of field `field` or older (empty if they
+// are all finished), announced here: the caller waits with it without the device lock, and lets it go before it
+// asks about reads again.
+ps2x::gs::ReadWait pendingReadWait(VulkanGsScanoutState &state, uint64_t field);
 
 // Caller has released the device lock. Copies the reads staged by presentVulkanGs, in order, into
 // outFrame (with the field weave), reusing outFrame.pixels capacity. Returns true if outFrame was updated.

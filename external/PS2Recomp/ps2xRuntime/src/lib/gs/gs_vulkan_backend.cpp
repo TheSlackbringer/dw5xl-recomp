@@ -2,7 +2,9 @@
 #include "runtime/gs/gs_vulkan_backend.h"
 #include "gs_vulkan_scanout.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_frame_context.h"
 #include "runtime/gs/ps2_gs_memory.h"
+#include "runtime/ps2_hold_trace.h"
 #include "runtime/state_archive.h"
 #include "gs_interface.hpp"
 #include "context.hpp"
@@ -218,7 +220,21 @@ struct GSVulkanBackend::Impl
             std::fprintf(stderr, "[gs:vulkan] device=%s vendor=0x%04x device=0x%04x; GPU compute rasterization (AA=%u samples)\n",
                 gpu.deviceName, gpu.vendorID, gpu.deviceID, static_cast<unsigned>(opts.super_sampling));
         shared->memories.push_back(&gs);
-        gs.set_frame_context_hold([this] { return shared->otherOpen(&gs); });
+        // Amendment v3.10: the second memory is the pictures'. Its flush moves the device on to the next frame
+        // context only when that does not wait for the graphics card (ps2x::gs::holdFrameContext). The device is
+        // asked where the flush would move on: every command buffer of this memory is submitted there, and the
+        // question is not asked while another memory has work open (it waits for open command buffers).
+        const ps2x::gs::Memory memory = like ? ps2x::gs::Memory::Pictures : ps2x::gs::Memory::Game;
+        gs.set_frame_context_hold([this, memory] {
+            return ps2x::gs::holdFrameContext(memory, shared->otherOpen(&gs), [this] {
+                if (!ps2x::hold::enabled())
+                    return !device.next_frame_context_is_non_blocking();
+                const uint64_t from = ps2x::hold::nowNs();
+                const bool wouldWait = !device.next_frame_context_is_non_blocking();
+                (wouldWait ? ps2x::hold::counters().contextLeft : ps2x::hold::counters().contextMoved).add(ps2x::hold::nowNs() - from);
+                return wouldWait;
+            });
+        });
     }
     ~Impl()
     {
@@ -234,11 +250,61 @@ struct GSVulkanBackend::Impl
                 static_cast<unsigned long long>(convertedPresentations));
     }
 
-    std::unique_lock<std::mutex> access()
+    // The device lock as its callers hold it. DW5XL-DEBUG PS2X_HOLD_TRACE: with the trace on it also counts how
+    // long the caller waited for the lock and how long it held it, by what the thread is doing (ps2x::hold).
+    struct Access
+    {
+        explicit Access(std::mutex &mutex)
+            : m_lock(mutex, std::defer_lock), m_timed(ps2x::hold::enabled()), m_role(ps2x::hold::t_role)
+        {
+            lock();
+        }
+        Access(Access &&other) noexcept
+            : m_lock(std::move(other.m_lock)), m_timed(other.m_timed), m_role(other.m_role), m_from(other.m_from)
+        {
+            other.m_timed = false;
+        }
+        Access(const Access &) = delete;
+        Access &operator=(const Access &) = delete;
+        ~Access()
+        {
+            if (m_lock.owns_lock())
+                held();
+        }
+        void lock()
+        {
+            if (!m_timed)
+            {
+                m_lock.lock();
+                return;
+            }
+            const uint64_t asked = ps2x::hold::nowNs();
+            m_lock.lock();
+            m_from = ps2x::hold::nowNs();
+            ps2x::hold::counters().lockWait[static_cast<size_t>(m_role)].add(m_from - asked);
+        }
+        void unlock()
+        {
+            held();
+            m_lock.unlock();
+        }
+
+      private:
+        void held()
+        {
+            if (m_timed)
+                ps2x::hold::counters().lockHeld[static_cast<size_t>(m_role)].add(ps2x::hold::nowNs() - m_from);
+        }
+        std::unique_lock<std::mutex> m_lock;
+        bool m_timed;
+        int m_role;
+        uint64_t m_from = 0;
+    };
+    Access access()
     {
         // EE, VU and presentation callers share this serialized device slot.
         // Granite requires a thread-local index even with one command pool.
-        std::unique_lock lock(mutex);
+        Access lock(mutex);
         Util::register_thread_index(0);
         return lock;
     }
@@ -342,8 +408,26 @@ std::unique_ptr<GSRasterBackend> GSVulkanBackend::MakeSecondMemory()
     return std::unique_ptr<GSRasterBackend>(new GSVulkanBackend(std::make_unique<Impl>(p.shared, &p)));
 }
 
+namespace
+{
+    // DW5XL-DEBUG PS2X_HOLD_TRACE: one backend function from start to end, its wait for the device lock included.
+    struct HoldTimed
+    {
+        ps2x::hold::Counter *counter;
+        uint64_t from;
+        explicit HoldTimed(ps2x::hold::Counter &c)
+            : counter(ps2x::hold::enabled() ? &c : nullptr), from(counter ? ps2x::hold::nowNs() : 0u) {}
+        ~HoldTimed()
+        {
+            if (counter)
+                counter->add(ps2x::hold::nowNs() - from);
+        }
+    };
+}
+
 bool GSVulkanBackend::CopyPagesFrom(GSRasterBackend &source, const std::bitset<512> &pages)
 {
+    HoldTimed holdTimed(ps2x::hold::counters().copyPages);
     auto *from = dynamic_cast<GSVulkanBackend *>(&source);
     if (!from || from == this || from->m_impl->shared != m_impl->shared)
         return false;
@@ -554,8 +638,13 @@ uint64_t GSVulkanBackend::RollbackBytes() const
 // DW5XL (issue 049 v3.2): the read of an in-between picture is a field's read with a queue of its own.
 bool GSVulkanBackend::SubmitPictureRead(const GSPresentationRequest &request)
 {
+    HoldTimed holdTimed(ps2x::hold::counters().pictureRead);
     auto lock = m_impl->access();
     auto &p = *m_impl;
+    // Issue 049, amendment v3.9: no place in the ring (the read three reads before is unfinished on the graphics
+    // card): the picture is not read, and nothing waits.
+    if (!vulkanGsPictureReadHasPlace(p.pictureScanout))
+        return false;
     try
     {
         presentVulkanGs(p.gs, p.device, p.pictureScanout, request, p.currentScale.load(std::memory_order_relaxed),
@@ -573,8 +662,15 @@ bool GSVulkanBackend::SubmitPictureRead(const GSPresentationRequest &request)
     return true;
 }
 
+bool GSVulkanBackend::PictureReadHasPlace()
+{
+    auto lock = m_impl->access();
+    return vulkanGsPictureReadHasPlace(m_impl->pictureScanout);
+}
+
 bool GSVulkanBackend::CollectPictureReads(std::vector<GSPictureRead> &out)
 {
+    ps2x::hold::Scope holdRole(ps2x::hold::Present); // DW5XL-DEBUG PS2X_HOLD_TRACE: the window's work
     auto lock = m_impl->access();
     auto &p = *m_impl;
     p.pictureScanout.recycleRetired();
@@ -613,12 +709,15 @@ std::function<void(uint64_t)> GSVulkanBackend::PictureReadWaiter(bool &collectab
     // A finished read: staged already, or in a slot whose GPU work is done.
     collectable = !p.pictureScanout.staged.empty();
     for (auto &slot : p.pictureScanout.slots)
-        collectable = collectable || (slot.pending && slot.fence && slot.fence->wait_timeout(0));
-    Vulkan::Fence fence = pendingFieldReadFence(p.pictureScanout, UINT64_MAX);
-    if (!fence)
+        collectable = collectable || (slot.pending && slot.fence && vulkanGsReadFinished(slot));
+    if (collectable)
+        return {}; // nothing to wait for, so no wait is announced
+    // The wait is announced here, under the device lock, and lasts as long as the returned function (amendment
+    // v3.9: the GS thread's questions about that read do not wait behind it).
+    auto wait = std::make_shared<ps2x::gs::ReadWait>(pendingReadWait(p.pictureScanout, UINT64_MAX));
+    if (!*wait)
         return {};
-    // The fence keeps itself alive; the device outlives every reader (the window stops its reader before the GS goes).
-    return [fence](uint64_t timeoutNs) mutable { fence->wait_timeout(timeoutNs); };
+    return [wait](uint64_t timeoutNs) { wait->wait(timeoutNs); };
 }
 
 GSTransferSnapshot GSVulkanBackend::GetTransferSnapshot() const
@@ -650,6 +749,7 @@ bool GSVulkanBackend::ClearFramebuffer(const GSContext &c, uint32_t rgba)
 }
 bool GSVulkanBackend::PresentInto(const GSPresentationRequest &request, PresentationFrame &out)
 {
+    ps2x::hold::Scope holdRole(ps2x::hold::Present); // DW5XL-DEBUG PS2X_HOLD_TRACE: the window's work
     auto lock = m_impl->access(); auto &p = *m_impl;
     bool gpuScanout = false;
     bool updated = false;
@@ -700,6 +800,7 @@ bool GSVulkanBackend::PresentInto(const GSPresentationRequest &request, Presenta
 }
 bool GSVulkanBackend::SubmitFieldScanout(const GSPresentationRequest &request)
 {
+    HoldTimed holdTimed(ps2x::hold::counters().fieldScanout);
     // GS side, in order with the game's GS work (issue 023): reads the field the PS2 has just finished showing.
     auto lock = m_impl->access(); auto &p = *m_impl;
     try
@@ -723,19 +824,20 @@ bool GSVulkanBackend::SubmitFieldScanout(const GSPresentationRequest &request)
 }
 bool GSVulkanBackend::CollectFieldScanouts(PresentationFrame &out, uint64_t waitForField, uint64_t maxField)
 {
+    ps2x::hold::Scope holdRole(ps2x::hold::Present); // DW5XL-DEBUG PS2X_HOLD_TRACE: the window's work
     auto lock = m_impl->access(); auto &p = *m_impl;
     p.scanoutState.recycleRetired();
     if (waitForField != UINT64_MAX)
     {
         // The window waits for the field it is about to show, without the device lock (the GS worker keeps drawing);
         // bounded by one PAL field like the field wait itself.
-        Vulkan::Fence fence = pendingFieldReadFence(p.scanoutState, waitForField);
-        if (fence)
+        // The wait is announced under the device lock and let go before the reads are asked about below.
+        ps2x::gs::ReadWait wait = pendingReadWait(p.scanoutState, waitForField);
+        if (wait)
         {
             lock.unlock();
-            fence->wait_timeout(20'000'000ull);
+            wait.wait(20'000'000ull);
             lock.lock();
-            fence.reset();
         }
     }
     collectVulkanGsReads(p.device, p.scanoutState, maxField);

@@ -129,7 +129,10 @@ public:
     // picture of its own with `tag`; none of the field reads' bookkeeping is touched. captured: the display
     // registers in the game's write order, vsyncTick = the field the picture belongs to.
     // collectPictureReads (window thread): the finished ones, oldest first, appended.
-    void submitPictureRead(const GSPresentationRequest &captured, uint64_t tag);
+    // False (amendment v3.9): the read was not made: there was no place for it, or the renderer has none.
+    bool submitPictureRead(const GSPresentationRequest &captured, uint64_t tag);
+    // GS side (amendment v3.9): is there a place for one more picture read? (GSRasterBackend::PictureReadHasPlace)
+    bool pictureReadHasPlace();
     bool pictureReadsActive() const { return m_pictureReads.load(std::memory_order_acquire); }
     bool collectPictureReads(std::vector<GSPictureRead> &out);
     // Issue 049 v3.5: a thread of the window's waits here for the next picture read to finish (see the backend's

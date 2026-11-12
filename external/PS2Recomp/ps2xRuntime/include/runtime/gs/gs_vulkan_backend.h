@@ -21,6 +21,7 @@ public:
     bool CopyPagesFrom(GSRasterBackend &source, const std::bitset<512> &pages) override;
     bool SubmitPictureRead(const GSPresentationRequest &) override;
     bool CollectPictureReads(std::vector<GSPictureRead> &) override;
+    bool PictureReadHasPlace() override;
     std::function<void(uint64_t)> PictureReadWaiter(bool &collectable) override;
     void Submit(const GSPrimitiveBatch &) override;
     void LoadClut(const GSTex0Reg &, const GSTexClutReg &) override;

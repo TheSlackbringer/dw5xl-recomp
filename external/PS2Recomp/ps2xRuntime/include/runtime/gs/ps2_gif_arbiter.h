@@ -75,6 +75,7 @@ public:
     {
         struct Packet { GifPathId path; uint32_t offset, size; };
         uint64_t group = 0;
+        uint64_t unit = 0;           // the unit (one picture) it belongs to, a running number; 0: not said
         std::vector<uint8_t> bytes;  // the packets, one after the other
         std::vector<Packet> packets;
         // The last batch of its unit (one picture) has one. Called once: on the GS side right after the batch's
@@ -85,6 +86,11 @@ public:
     void setSideProcessFn(SideProcessFn fn); // before the first batch
     // Any thread (one producer). False: the batch's group was dropped already; `then` is not called.
     bool submitSide(std::shared_ptr<SideBatch> batch);
+    // Issue 049, amendment v3.9: asked on the GS side right before the first packet of a unit would be read (only
+    // for batches that say their unit). False: the unit is refused. Nothing of it is read; its batches are dropped
+    // as they come up (its last one's `then` says dropped) and later ones are refused at submitSide.
+    using SideStartFn = std::function<bool()>;
+    void setSideStartFn(SideStartFn fn);
     // Any thread; inside a call of the main stream it takes effect at that place in the stream. Side work of
     // groups below `group` that is waiting or half done is dropped, and later batches of those groups are
     // refused. True when a unit was cut off: a batch of it was dropped, or its last batch had not come yet.
@@ -131,6 +137,9 @@ private:
     // The side stream (issue 049 v3.7). Under m_workerMutex, except m_sideCurrent, m_sideAt and the open unit while
     // m_sideRunning is set: they are then the GS worker's alone (runSide).
     SideProcessFn m_sideProcessFn;
+    SideStartFn m_sideStartFn;
+    uint64_t m_sideAskedUnit = 0;                    // the unit asked about last (the GS worker's alone)
+    std::atomic<uint64_t> m_sideRefusedUnit{0};      // the unit refused last: its batches are dropped and refused
     std::deque<std::shared_ptr<SideBatch>> m_side;
     std::shared_ptr<SideBatch> m_sideCurrent; // taken from m_side, m_sideAt packets of it are processed
     size_t m_sideAt = 0;

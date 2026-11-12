@@ -136,6 +136,7 @@ namespace ps2x
         GifStreamHash m_bodyHash;
         bool m_hashBody = false;
         bool m_refused = false;                         // the GS side refused a batch of it
+        uint64_t m_unitNumber = 0;                      // the running picture's number (its batches say it: v3.9)
         uint64_t m_bytes = 0;
         // DW5XL-DEBUG PS2X_SMOOTH_CUT_EVERY=n: every n-th picture stops part way, as one whose frame is over does,
         // after a number of packets that moves from one such picture to the next; what it made so far reaches the

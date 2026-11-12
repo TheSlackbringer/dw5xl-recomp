@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
 
 namespace dw5xl::smooth
 {
@@ -80,49 +81,6 @@ namespace dw5xl::smooth
         return true;
     }
 
-    void PictureBudget::afterDevice(double nowMs, double ms)
-    {
-        if (ms >= 0.0)
-            add(m_after, nowMs, ms);
-    }
-
-    void PictureBudget::frameOwn(double nowMs, double untilMs)
-    {
-        prune(m_costs, nowMs);
-        prune(m_next, nowMs);
-        prune(m_after, nowMs);
-        m_allowance = 0.0;
-        m_latest = untilMs;
-        m_busyUntil = nowMs;
-        m_admitted = 0;
-    }
-
-    bool PictureBudget::admitBy(double nowMs, double atMs, double *missBy)
-    {
-        if (missBy)
-            *missBy = 0.0;
-        const double start = std::max(nowMs, m_busyUntil);
-        if (!known())
-        {
-            // What a picture costs is not known: one is let through to learn it, as in admit().
-            if (m_admitted != 0 || start >= m_latest || (m_probing && nowMs < m_probeUntil))
-                return false;
-            m_probing = true;
-            m_probeUntil = nowMs + kProbeMs;
-            ++m_admitted;
-            return true;
-        }
-        const double left = start + (m_admitted == 0 ? cost() : nextCost()); // when it will have left the device
-        const double miss = left + after() - atMs;
-        if (missBy)
-            *missBy = miss;
-        if (miss > 0.0 || left > m_latest)
-            return false;
-        m_busyUntil = left;
-        ++m_admitted;
-        return true;
-    }
-
     FinishedFrames::Coming FinishedFrames::finished(uint32_t list, uint64_t hash, uint64_t lastField, double lastStart,
                                                     double period)
     {
@@ -162,7 +120,7 @@ namespace dw5xl::smooth
         return sent;
     }
 
-    void HeadStartMeter::add(double nowMs, double used, double spare)
+    void HeadStartMeter::add(double nowMs, uint32_t frame, double used, double spare)
     {
         const double need = used - spare;
         if (!m_any)
@@ -171,11 +129,44 @@ namespace dw5xl::smooth
             m_firstMs = nowMs;
         }
         m_lastMs = nowMs;
-        while (!m_needs.empty() && m_needs.back().second <= need)
-            m_needs.pop_back();
-        m_needs.emplace_back(nowMs, need);
-        while (m_needs.front().first < nowMs - kWindowMs)
-            m_needs.pop_front();
+        while (!m_frames.empty() && m_frames.front().ms < nowMs - kWindowMs)
+            m_frames.pop_front();
+        // The frame's entry: a frame's pictures are reported close together, so it is among the newest.
+        const auto entry = std::find_if(m_frames.rbegin(), m_frames.rend(), [frame](const Frame &f) { return f.frame == frame; });
+        if (entry != m_frames.rend())
+            entry->need = std::max(entry->need, need);
+        else
+            m_frames.push_back(Frame{nowMs, frame, need});
+
+        // The frames in the game's order, each with its place in that row. Then from the largest need down: the
+        // first need that the frames at or above it reached in kMoments separate moments (frames in a row are one
+        // moment), or in kFrames frames. Frames with the same need count together.
+        std::vector<std::pair<uint32_t, double>> row; // (frame, need)
+        row.reserve(m_frames.size());
+        for (const Frame &f : m_frames)
+            row.emplace_back(f.frame, f.need);
+        std::stable_sort(row.begin(), row.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+        std::vector<size_t> order(row.size());
+        std::iota(order.begin(), order.end(), size_t{0});
+        std::stable_sort(order.begin(), order.end(), [&row](size_t a, size_t b) { return row[a].second > row[b].second; });
+        std::vector<char> counted(row.size(), 0);
+        m_largest = row[order.front()].second;
+        m_wanted = m_largest; // nothing was reached often enough: the largest need
+        int moments = 0;
+        for (size_t i = 0; i < order.size(); ++i)
+        {
+            const size_t at = order[i];
+            const bool before = at > 0u && counted[at - 1u] != 0, after = at + 1u < counted.size() && counted[at + 1u] != 0;
+            moments += 1 - (before ? 1 : 0) - (after ? 1 : 0); // a new moment, one that grew, or two that became one
+            counted[at] = 1;
+            if (i + 1u < order.size() && row[order[i + 1u]].second == row[at].second)
+                continue;
+            if (moments >= kMoments || static_cast<int>(i + 1u) >= kFrames)
+            {
+                m_wanted = row[at].second;
+                break;
+            }
+        }
     }
 
     void RateChoice::configure(bool follows, double displayPeriod, double fieldPeriod, int mostPerFrame)
@@ -283,14 +274,16 @@ namespace dw5xl::smooth
         m_leastRoom = std::min(m_leastRoom, frame.room);
         m_leastSpare = std::min(m_leastSpare, frame.spare);
 
-        // Down: the game was held up repeatedly in the last frames.
+        // Down: the game was held up, or pictures were cut off (v3.8), repeatedly in the last frames. A picture
+        // kept out before it could hold the game up (v3.6, noRoom) counts among the frames, not as a moment.
         int heldUp = 0, moments = 0;
         bool before = false;
         for (const Frame &f : m_frames)
         {
-            heldUp += f.heldUp || f.noRoom ? 1 : 0;
-            moments += f.heldUp && !before ? 1 : 0;
-            before = f.heldUp;
+            const bool trouble = f.heldUp || f.cutOff;
+            heldUp += trouble || f.noRoom ? 1 : 0;
+            moments += trouble && !before ? 1 : 0;
+            before = trouble;
         }
         if (moments >= kHeldUpMoments || heldUp >= kHeldUpFrames)
         {
@@ -302,7 +295,7 @@ namespace dw5xl::smooth
             return;
         }
 
-        // Up: a full window without the game held up, the next level's wait over, and room before the field's start
+        // Up: a full window without any of that, the next level's wait over, and room before the field's start
         // in the tightest frame since this level began for the pictures the next level adds to a frame's largest batch.
         if (m_level + 1 >= m_levels || m_frames.size() < static_cast<size_t>(kWindow) || heldUp != 0 ||
             m_count < m_notBefore[static_cast<size_t>(m_level) + 1u])

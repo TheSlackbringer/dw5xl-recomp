@@ -109,6 +109,10 @@ public:
         (void)out;
         return false;
     }
+    // Issue 049, amendment v3.9: is there a place for one more picture read (GS side)? False while the three
+    // reads before it are unfinished on the graphics card: a picture is then cut off before it is drawn, and
+    // SubmitPictureRead returns false without waiting.
+    virtual bool PictureReadHasPlace() { return true; }
     // Issue 049 v3.5: a function that waits until the oldest picture read still in the works is finished (at most
     // the given nanoseconds). It is called with no lock of the GS held, so a thread that waits for picture reads
     // never keeps the window's field read or the GS waiting. Empty: no read is in the works. `collectable`: a

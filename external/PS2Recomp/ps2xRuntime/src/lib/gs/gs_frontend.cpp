@@ -941,11 +941,17 @@ void GS::submitFieldScanout(const GSPresentationRequest &captured)
     m_fieldScanoutCv.notify_all();
 }
 
-void GS::submitPictureRead(const GSPresentationRequest &captured, uint64_t tag)
+bool GS::pictureReadHasPlace()
+{
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    return !m_backend || m_backend->PictureReadHasPlace();
+}
+
+bool GS::submitPictureRead(const GSPresentationRequest &captured, uint64_t tag)
 {
     std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     if (!m_backend || !m_privRegs)
-        return;
+        return false;
     GSPresentationRequest request = buildPresentationRequestUnlocked(); // GS-side state in stream order
     request.pmode = captured.pmode;
     request.smode2 = captured.smode2;
@@ -967,12 +973,12 @@ void GS::submitPictureRead(const GSPresentationRequest &captured, uint64_t tag)
         std::fprintf(stderr, "[smooth:trace] picture field %llu target %d tag %llx\n",
                      static_cast<unsigned long long>(request.vsyncTick), int(request.fieldTarget),
                      static_cast<unsigned long long>(tag));
-    if (m_backend->SubmitPictureRead(request))
-    {
-        m_pictureReads.store(true, std::memory_order_release);
-        if (m_pictureReadSubmitted)
-            m_pictureReadSubmitted();
-    }
+    if (!m_backend->SubmitPictureRead(request))
+        return false;
+    m_pictureReads.store(true, std::memory_order_release);
+    if (m_pictureReadSubmitted)
+        m_pictureReadSubmitted();
+    return true;
 }
 
 bool GS::waitPictureRead(uint64_t timeoutNs)

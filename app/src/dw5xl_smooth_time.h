@@ -91,24 +91,41 @@ namespace dw5xl::smooth
         int m_lastStep = 0;
     };
 
-    // The head start this PC needs (v3.5, change 4): measured all the time, never a number in the code. Every
-    // picture says what head start would have put it on screen exactly in time; the answer is the largest of the
-    // last kWindowMs.
+    // The head start this PC needs (v3.5, change 4; v3.8, change 2): measured all the time, never a number in the
+    // code. Every picture that ran says what head start would have put it on screen exactly in time (its need); a
+    // game frame's need is the largest of its pictures'.
+    //  - The answer is the largest need that the frames of the last kWindowMs reached in kMoments separate moments
+    //    (a moment: measured frames in a row), or in kFrames frames.
+    //  - What only one moment needed is not followed: one moment can be a hiccup of the PC (the rate choice's
+    //    principle). Its pictures are left out, as late pictures are, and the others stay where they were. (Until
+    //    v3.8 the answer was the largest need of the window. Measured 2026-11-12: one slow picture then put every
+    //    picture on screen 4-5 ms later for five seconds.)
+    //  - While nothing was reached that often (the first frames), the largest need counts.
     class HeadStartMeter
     {
       public:
         static constexpr double kWindowMs = 5000.0;
-        // A picture: `used` = the head start in force when its instant was set; `spare` = how long before the
-        // moment it had to be handed over it was ready (below zero: too late by that much).
-        void add(double nowMs, double used, double spare);
-        bool measured() const { return !m_needs.empty(); }
+        static constexpr int kMoments = 2; // followed: what frames needed in this many separate moments ...
+        static constexpr int kFrames = 10; // ... or in this many frames of the window
+        // A picture of game frame `frame`: `used` = the head start in force when its instant was set; `spare` = how
+        // long before the moment it had to be handed over it was ready (below zero: too late by that much).
+        void add(double nowMs, uint32_t frame, double used, double spare);
+        bool measured() const { return !m_frames.empty(); }
         // Measurements cover less than half a second so far: the line should take wanted() at once.
-        bool warmingUp() const { return m_needs.empty() || m_lastMs - m_firstMs < 500.0; }
-        double wanted() const { return m_needs.empty() ? 0.0 : m_needs.front().second; }
+        bool warmingUp() const { return m_frames.empty() || m_lastMs - m_firstMs < 500.0; }
+        double wanted() const { return m_wanted; }
+        // The largest need of the window (what one picture needed at most; the answer until v3.8): for logs.
+        double largest() const { return m_largest; }
 
       private:
-        std::deque<std::pair<double, double>> m_needs; // (time, need), needs falling: the front is the largest in the window
-        double m_firstMs = 0.0, m_lastMs = 0.0;
+        struct Frame
+        {
+            double ms = 0.0; // when its first picture was reported
+            uint32_t frame = 0;
+            double need = 0.0;
+        };
+        std::deque<Frame> m_frames; // one per game frame with a measured picture, oldest first
+        double m_firstMs = 0.0, m_lastMs = 0.0, m_wanted = 0.0, m_largest = 0.0;
         bool m_any = false;
     };
 
@@ -122,15 +139,21 @@ namespace dw5xl::smooth
     // run a few milliseconds past the field's start do not hurt it; a single short moment can be a hiccup of the
     // PC. So only repeated trouble counts.
     //  - It starts at the fewest.
-    //  - Up one level: after kWindow frames without the game held up, and only when the pictures the next level
+    //  - Up one level: after kWindow frames without the game held up and without a picture that did not fit, and
+    //    only when the pictures the next level
     //    adds to a frame's largest batch fit before the next field's start in the tightest frame since this level
     //    began. (Measured 2026-11-11: a guess from the game's spare time let the rate climb to three pictures in a
     //    frame, which then cost the game fields. A level that only makes the largest batch more frequent needs
     //    no more room.)
     //  - Down one level: when the game was held up in kHeldUpMoments separate moments, or in kHeldUpFrames
     //    frames, of the last kWindow. Below the fewest: off (no pictures; the window shows the game's own).
-    //    A frame with a picture that did not fit before the game's field (v3.6: PictureBudget kept it out, so
-    //    nobody was harmed) counts among the kHeldUpFrames, not as a moment.
+    //  - Pictures that did not fit (v3.8, change 3; the pictures' own device): a frame with a picture that was cut
+    //    off, because it was still being drawn when the next frame's pictures needed the device. It counts as the
+    //    game held up does: two separate moments, or ten frames, bring the rate down one level. At the fewest
+    //    pictures they pause ("off") and are tried again after the wait. Nothing foretold counts: a picture that
+    //    ran to its end, however late, is the head start's matter.
+    //  - Pictures through the game's device (v3.6): a frame with a picture that PictureBudget kept out, because it
+    //    did not fit before the game's field (so nobody was harmed), counts among the kHeldUpFrames, not as a moment.
     //  - After every change the next kSettle frames are not judged (the game needs a few frames to recover).
     //  - A level that did not fit is tried again only after a wait that doubles each time.
     class RateChoice
@@ -149,6 +172,8 @@ namespace dw5xl::smooth
         {
             bool heldUp = false; // the game finished its next frame with less than its reserve to spare, or missed its field
             bool noRoom = false; // a picture the level asked for was not started: it did not fit before the game's field
+            bool cutOff = false; // v3.8, the pictures' own device: a picture of the frame was cut off (it was still
+                                 // being drawn when the next frame's pictures needed the device)
             double spare = 0.0;  // the game's spare time in that frame
             double reserve = 0.0; // the spare time the game is to keep
             double room = 0.0;   // how long before the next field began the frame's last picture left the device
@@ -195,6 +220,10 @@ namespace dw5xl::smooth
     //    from its field's start to the end of its next frame. Not known, or a heavy moment: nothing may wait.
     //  - While a picture's cost is not known, one picture is let through to learn it, and no other until that one
     //    is reported (or kProbeMs have passed).
+    // Amendment v3.8, change 1: this guard is for pictures that run through the game's device. On the pictures' own
+    // device nothing is foretold and every picture the time line asks for is started (v3.7's forecast for that
+    // device, frameOwn() and admitBy(), is gone: measured 2026-11-12, it showed the pictures 2-4 ms later and
+    // switched them off for 20 seconds at a time).
     class PictureBudget
     {
       public:
@@ -220,26 +249,11 @@ namespace dw5xl::smooth
         // One more picture of this frame: true when it fits, and it then counts as started.
         bool admit(double nowMs);
 
-        // Amendment v3.7, change 4: on a device of their own the pictures are in nobody's way, and a picture has one
-        // deadline left, its own instant on screen. One that cannot make it is not started, by the same measure
-        // (the longest a picture took lately). The pictures' GS is a frame's only until the next frame's pages are
-        // copied there, so a picture that would still be on the device at the next frame's end is not started
-        // either. Used in place of frame() and admit().
-        //  - afterDevice(): a picture that ran: how long it took from the moment it had left the device until the
-        //    window could hand it over (its read, and the window's own time).
-        //  - frameOwn(): a frame's pictures may use their device from now on, until `untilMs` (the next frame's end).
-        //  - admitBy(): one more picture of this frame, on screen at `atMs`. True: it will make it, and it counts
-        //    as started. `missBy`: by how much it would miss its instant (0 or less: it would not).
-        void afterDevice(double nowMs, double ms);
-        double after() const { return m_after.empty() ? 0.0 : m_after.front().second; }
-        void frameOwn(double nowMs, double untilMs);
-        bool admitBy(double nowMs, double atMs, double *missBy = nullptr);
-
       private:
         using Window = std::deque<std::pair<double, double>>; // (time, value), values falling: the front is the largest
         static void add(Window &window, double nowMs, double value);
         static void prune(Window &window, double nowMs);
-        Window m_costs, m_next, m_game, m_after;
+        Window m_costs, m_next, m_game;
         double m_latest = 0.0, m_busyUntil = 0.0, m_allowance = 0.0;
         int m_admitted = 0;
         bool m_probing = false;

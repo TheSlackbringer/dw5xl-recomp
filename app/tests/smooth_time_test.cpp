@@ -307,21 +307,75 @@ int main()
         check(std::fabs(atOnce.headStart() - 12.0) < 1e-9, "the first measurements of a session are taken at once");
     }
 
-    // The head start this PC needs: the largest need of the last five seconds.
+    // The head start this PC needs (amendment v3.8, change 2, approved 2026-11-12): what pictures needed in two
+    // separate moments, or in ten frames, of the last five seconds. What only one moment needed is not followed.
+    // (Until v3.8: the largest need of the last five seconds. The checks of that rule are replaced by these.)
     {
         HeadStartMeter meter;
         check(!meter.measured() && meter.warmingUp() && meter.wanted() == 0.0, "no picture yet: nothing measured");
-        meter.add(1000.0, 8.0, -6.0);  // too late by 6 ms with a head start of 8: needs 14
-        meter.add(1100.0, 14.0, 2.0);  // 2 ms to spare with 14: needs 12
+        meter.add(1000.0, 1u, 8.0, -6.0);  // too late by 6 ms with a head start of 8: needs 14
         check(meter.measured() && meter.warmingUp() && std::fabs(meter.wanted() - 14.0) < 1e-9,
-              "a picture that was 6 ms late with a head start of 8 ms asks for 14 ms");
-        meter.add(1600.0, 14.0, 1.0);
+              "the first picture was 6 ms late with a head start of 8 ms: it asks for 14 ms, and nothing else is known yet");
+        meter.add(1020.0, 2u, 14.0, 2.0);  // the frame right after it: needs 12
+        check(meter.warmingUp() && std::fabs(meter.wanted() - 14.0) < 1e-9,
+              "frames in a row are one moment: while nothing was needed twice, the largest need counts");
+        meter.add(1600.0, 3u, 14.0, 1.0);
         check(!meter.warmingUp(), "after half a second of measurements the warm-up is over");
-        meter.add(6050.0, 14.0, 2.5);  // the 14 is older than five seconds now
-        check(std::fabs(meter.wanted() - 13.0) < 1e-9, "a need older than five seconds no longer counts");
-        meter.add(6100.0, 13.0, 3.0);
-        meter.add(11200.0, 13.0, 3.0);
-        check(std::fabs(meter.wanted() - 10.0) < 1e-9, "the head start can fall again when the PC has time to spare");
+    }
+    {
+        // One picture per game frame, a frame every 20 ms. The steady case: every fifth frame's picture falls just
+        // after its frame's start and needs 3 ms, the others 1 ms.
+        struct Feed
+        {
+            HeadStartMeter meter;
+            double ms = 1000.0;
+            uint32_t frame = 0;
+            void picture(double need)
+            {
+                meter.add(ms, frame, need + 1.0, 1.0);
+            }
+            void frames(int count, double need = -1.0)
+            {
+                for (int i = 0; i < count; ++i)
+                {
+                    ++frame;
+                    ms += kField;
+                    picture(need >= 0.0 ? need : frame % 5u == 0u ? 3.0 : 1.0);
+                }
+            }
+            bool wants(double head) const { return std::fabs(meter.wanted() - head) < 1e-9; }
+        };
+        Feed a;
+        a.frames(100);
+        check(a.wants(3.0), "what pictures need again and again is followed (every fifth frame needs 3 ms: 3 ms)");
+        a.frames(3, 8.0);                  // one slow moment, three frames long: 8 ms
+        const bool atOnce = a.wants(3.0);
+        a.frames(22);
+        check(atOnce && a.wants(3.0), "one slow moment does not move the head start (three frames needed 8 ms: still 3 ms)");
+        a.frames(1, 7.0);                  // a second moment, half a second later: 7 ms
+        check(a.wants(7.0), "what two separate moments needed is followed (8 ms, then 7 ms: 7 ms)");
+        a.frames(230);                     // 4.6 s on: the first moment is older than five seconds, the second is not
+        const bool oneLeft = a.wants(3.0);
+        a.frames(40);
+        check(oneLeft && a.wants(3.0), "when a moment is older than five seconds the head start comes back (3 ms again)");
+
+        Feed b;
+        b.frames(100);
+        b.frames(9, 6.0);                  // the scene got heavier: frame after frame needs 6 ms
+        const bool nine = b.wants(3.0);
+        b.frames(1, 6.0);
+        check(nine && b.wants(6.0), "ten frames that needed more are followed, also in one moment (nine: not yet; the tenth: 6 ms)");
+        b.frames(260);
+        check(b.wants(3.0), "and five seconds after the heavier stretch the head start is back at 3 ms");
+
+        // A frame's need is the largest of its pictures'.
+        Feed c;
+        c.frames(1, 2.0);
+        c.picture(5.0);                    // a second picture of the same frame needed 5 ms
+        c.frames(3, 1.0);
+        c.frames(1, 4.0);
+        c.picture(1.0);
+        check(c.wants(4.0), "a frame with several pictures counts once, with the largest need (5 ms, later 4 ms: 4 ms)");
     }
 
     // "Never slower": the rate choice.
@@ -498,6 +552,82 @@ int main()
               "pictures that do not fit now and then change nothing; in ten frames of a hundred the rate goes down");
     }
 
+    // Amendment v3.8, change 3 (approved 2026-11-12): on the pictures' own device "did not fit" is a frame with a
+    // picture that was cut off (still being drawn when the next frame's pictures needed the device). The rate goes
+    // down one level when that happened in two separate moments, or in ten frames, of the last hundred; at the
+    // fewest pictures they pause and are tried again after the wait. Nothing foretold counts.
+    {
+        RateChoice choice;
+        choice.configure(false, 1000.0 / 240.0, kField, 5);    // a 240 Hz display: four levels
+        RateChoice::Frame fine;
+        fine.room = 12.0;
+        fine.spare = 14.0;
+        fine.reserve = 5.0;
+        fine.cost = 1.0;
+        RateChoice::Frame cut = fine;
+        cut.cutOff = true;
+        const auto feed = [&](const RateChoice::Frame &frame, int count) {
+            for (int i = 0; i < count; ++i)
+                choice.frame(frame);
+        };
+        for (int i = 0; i < 1000 && choice.level() < 2; ++i)
+            choice.frame(fine);
+        const bool atTwo = choice.level() == 2;
+        feed(fine, 30);
+        feed(cut, 3);                      // one moment, three frames long
+        feed(fine, 10);
+        const bool oneMoment = choice.level() == 2;
+        feed(cut, 1);                      // the second moment
+        check(atTwo && oneMoment && choice.level() == 1 && choice.on(),
+              "pictures cut off in one moment change nothing; in a second moment the rate goes down one level, not off");
+        feed(fine, 30);
+        feed(cut, 9);                      // one moment, nine frames long
+        const bool nine = choice.level() == 1;
+        feed(cut, 1);
+        check(nine && choice.level() == 0 && choice.on(),
+              "pictures cut off in ten frames of a hundred: down one level (nine in one moment: not yet)");
+        // At the fewest pictures: they pause, and are tried again after 1000 frames, then after twice that.
+        const auto offAndBack = [&]() {
+            feed(fine, 30);
+            feed(cut, 1);
+            feed(fine, 5);
+            const bool stillOn = choice.on();
+            feed(cut, 1);
+            if (!stillOn || choice.on())
+                return -1;
+            for (int i = 0; i < 5000; ++i)
+            {
+                choice.frame(cut);         // while they pause nothing is judged
+                if (choice.on())
+                    return i;
+            }
+            return -1;
+        };
+        const int first = offAndBack(), second = offAndBack();
+        check(first >= 990 && first <= 1000 && second >= 1990 && second <= 2000,
+              "at the fewest pictures, cut off in two moments: the pictures pause and are tried again after the wait, then twice that");
+    }
+    {
+        // Nothing foretold counts: frames whose last picture left the device late, with nothing cut off and the
+        // game not held up, do not bring the rate down.
+        RateChoice choice;
+        choice.configure(false, 1000.0 / 240.0, kField, 5);
+        RateChoice::Frame late;
+        late.room = -3.0;
+        late.spare = 14.0;
+        late.reserve = 5.0;
+        late.cost = 6.0;
+        bool down = false;
+        int before = choice.level();
+        for (int i = 0; i < 600; ++i)
+        {
+            choice.frame(late);
+            down = down || choice.level() < before;
+            before = choice.level();
+        }
+        check(!down && choice.on(), "pictures that ran to their end, however late, do not bring the rate down");
+    }
+
     // Amendment v3.6, change 3: a frame's pictures are drawn before the field in which the game sends its own list.
     {
         PictureBudget budget;
@@ -583,52 +713,8 @@ int main()
               "a trial picture that is not counted lets the next frame try one at once");
     }
 
-    {
-        // Amendment v3.7, change 4: on a device of their own a picture has one deadline, its own instant on screen;
-        // one that cannot make it is not started. And the pictures' GS is a frame's until the next frame's end.
-        PictureBudget budget;
-        // Nothing measured yet: one picture is let through to learn what a picture costs.
-        budget.frameOwn(1000.0, 1020.0);
-        const bool first = budget.admitBy(1000.0, 1010.0), second = budget.admitBy(1000.0, 1018.0);
-        check(!budget.known() && first && !second, "own device, the cost not known yet: one picture, no more");
-
-        // A frame's first picture leaves the device after 6 ms at most, one after it 4 ms later; from there to the
-        // window's hand-over 2 ms. The frame ends at 2000; instants at 2009, 2017 and 2025.
-        budget.measured(1990.0, 6.0, true);
-        budget.measured(1990.0, 4.0, false);
-        budget.afterDevice(1990.0, 2.0);
-        budget.afterDevice(1991.0, 1.5);                // the longest lately counts
-        budget.frameOwn(2000.0, 2020.0);
-        double miss = 1.0;
-        const bool a = budget.admitBy(2000.0, 2009.0, &miss);  // off the device at 2006, handed over by 2008
-        const bool onTime = a && std::fabs(miss + 1.0) < 1e-9;
-        const bool b = budget.admitBy(2000.0, 2017.0, &miss);  // 2010, 2012
-        const bool c = budget.admitBy(2000.0, 2025.0, &miss);  // 2014, 2016
-        check(std::fabs(budget.after() - 2.0) < 1e-9 && onTime && b && c,
-              "own device: a picture that will be handed over before its instant is started");
-
-        // The same frame with its first instant at 2007: the first picture would be 1 ms late and is not started.
-        // The second is then the first on the device (6 ms): 2006, 2008, in time for 2017.
-        budget.frameOwn(2020.0, 2040.0);
-        const bool late = !budget.admitBy(2020.0, 2027.0, &miss) && std::fabs(miss - 1.0) < 1e-9;
-        const bool then = budget.admitBy(2020.0, 2037.0, &miss) && std::fabs(miss + 9.0) < 1e-9;
-        check(late && then, "own device: a picture that cannot make its instant is not started; by how much it would miss is told");
-
-        // Four pictures every 5 ms from 2049 on: each would make its instant, but the fourth would still be on the
-        // device at the next frame's end (2040 + 6 + 3 x 4 = 2058, the frame ends at 2057): it is not started.
-        budget.frameOwn(2040.0, 2057.0);
-        const bool three = budget.admitBy(2040.0, 2049.0) && budget.admitBy(2040.0, 2054.0) && budget.admitBy(2040.0, 2059.0);
-        const bool fourth = budget.admitBy(2040.0, 2064.0, &miss);
-        check(three && !fourth && miss < 0.0,
-              "own device: a picture that would still be on the device at the next frame's end is not started");
-
-        // The device is still busy with the frame's earlier pictures when a later one is asked for: it starts
-        // after them (2060 + 6, then + 4: 2070, handed over by 2072: in time for 2073, not for 2071).
-        budget.frameOwn(2060.0, 2080.0);
-        const bool one = budget.admitBy(2060.0, 2069.0);
-        const bool tight = !budget.admitBy(2063.0, 2071.0, &miss) && std::fabs(miss - 1.0) < 1e-9;
-        check(one && tight && budget.admitBy(2063.0, 2073.0), "own device: a frame's pictures run one after the other");
-    }
+    // (Amendment v3.7, change 4, the forecast for the pictures' own device: replaced by amendment v3.8, change 1,
+    // approved 2026-11-12. Its functions and their checks are gone: nothing is foretold there.)
 
     {
         // Amendment v3.7 (P2.6a): a break in the game's own clock between two frames, read from the PS2 field clock:

@@ -56,16 +56,25 @@
 //   at once. From there a call in the game's GS stream drops what the GS side still holds of the frame before's
 //   pictures, copies the changed pages into the picture GS and lets this frame's packets be read: the GS thread
 //   reads them one at a time between the game's own packets, the game's first (change 3), while the pictures' VU1
-//   goes on. A picture's read follows its last packet there. Change 4: a picture is started only when it will be
-//   handed over before its own instant on screen and will have left the device before the next frame's end, by the
-//   longest a picture took lately (PictureBudget::admitBy); one not started tells the head start's measure by how
-//   much it would have missed, and counts for the rate choice as v3.6's did. "[smooth:device2] ..." every 250 frames.
+//   goes on. A picture's read follows its last packet there. "[smooth:device2] ..." every 250 frames.
+//   Amendment v3.8 (approved 2026-11-12; replaces v3.7's change 4): on their own device every picture the time line
+//   asks for is started; nothing is foretold. A picture not ready at its instant is left out by the window; one
+//   still being drawn when the next frame's pictures need the device is cut off there ("[smooth:cut]" with
+//   PS2X_SMOOTH_TIMELINE=1) and makes its frame one that "did not fit" for the rate choice. The head start follows
+//   what pictures needed in two separate moments or in ten frames (HeadStartMeter). "[smooth:level] frame= level=
+//   of=" (PS2X_SMOOTH_TIMELINE=1): the rate choice's level from that frame on (0: off).
+//   Amendment v3.9 (approved 2026-11-12): the game does not wait for the graphics card on a picture's behalf. A
+//   picture is cut off when the three pictures before it are still unfinished on the card: asked on the GS thread
+//   before its first packet is read (GifArbiter::setSideStartFn) and again at its read (GS::submitPictureRead says
+//   false); nothing waits at either place. It counts as cut off for the rate choice. PS2X_HOLD_TRACE=1 (fact-finding
+//   2026-11-12, kept): "[smooth:hold]", one line per game frame: what the game's send waited for.
 //   PS2X_SMOOTH_DEVICE2_CHECK=1 (criterion 6d, with unchanged copies, PS2X_SMOOTH_FIXED_T=1): the PATH1/PATH2 bytes
 //   the game's device makes from a frame's list (between two marks in device order around the game's own send) and
 //   those the pictures' device makes from the copy's list part are hashed: "[smooth:device] frame= field= bytes=
 //   game= picture= same=".
 #include "dw5xl_smooth_list.h"
 #include "dw5xl_smooth_time.h"
+#include "runtime/ps2_hold_trace.h"
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "ps2_runtime.h"
@@ -402,8 +411,6 @@ std::deque<DeviceCheck> g_checks;
 ps2x::PictureDevice::Totals g_device2Before;        // the totals at the last "[smooth:device2]" line
 GifArbiter::SideTotals g_sideBefore;                // and the GS side's
 uint64_t g_sideNs = 0;                              // the GS side's time at the last frame (a picture's cost)
-uint64_t g_ownEndFrame = 0;                         // the frame end before this one (change 4: how long a frame is)
-double g_ownEndMs = 0.0;
 
 // Criterion 6d: one side's hash of a frame's list; the line is printed when both sides are known.
 void deviceCheck(uint64_t frame, bool game, uint64_t field, uint64_t hash, uint64_t bytes)
@@ -445,7 +452,7 @@ Advance g_advance;
 std::vector<uint8_t> g_usedEnv;                     // the draw environment the last frame end took for the coming field
 bool g_usedEnvValid = false, g_endTte = false;
 double g_endFirstTagMs = 0.0, g_endLastTagMs = 0.0; // the tag times of the frame finished last
-int g_step = 0, g_perFrame = 0, g_loggedStep = 0;   // > 0: PS2X_SMOOTH_STEP / PS2X_SMOOTH_PER_FRAME (a fixed rate)
+int g_step = 0, g_perFrame = 0, g_loggedStep = 0, g_loggedLevel = -2;   // > 0: PS2X_SMOOTH_STEP / PS2X_SMOOTH_PER_FRAME (a fixed rate)
 dw5xl::smooth::TimeLine g_line;
 dw5xl::smooth::HeadStartMeter g_meter;
 dw5xl::smooth::RateChoice g_rate;
@@ -458,11 +465,12 @@ struct FrameNote {
     double instantMs = 0.0, listMs = 0.0;
     unsigned asked = 0, reported = 0;
     unsigned noRoom = 0;                            // pictures the time line asked for that did not fit before the game's field
+    unsigned cutOff = 0;                            // v3.8: pictures cut off (still being drawn when the next frame's needed the device)
     double firstStarted = 0.0, lastStarted = 0.0, firstQueued = 0.0;
     double spareMs = 0.0;                           // the game's spare time when it sent this frame's list
 };
 std::deque<FrameNote> g_notes;
-struct Auto { uint64_t frames = 0, heldUp = 0, late = 0, shown = 0, past = 0, noRoom = 0; double leastMargin = 1e18, marginSum = 0.0, costSum = 0.0, leastSpare = 1e18; uint64_t costs = 0; };
+struct Auto { uint64_t frames = 0, heldUp = 0, late = 0, shown = 0, past = 0, noRoom = 0, cutOff = 0, cutFrames = 0; double leastMargin = 1e18, marginSum = 0.0, costSum = 0.0, leastSpare = 1e18; uint64_t costs = 0; };
 Auto g_auto;
 struct Built { uint64_t pictures = 0, objects = 0, bones = 0, cameraCopies = 0, unmatched = 0, jumped = 0, cuts = 0; double ms = 0.0; };
 Built g_built;
@@ -905,14 +913,18 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                             check = picture.hashBody](const ps2x::PictureDevice::Result &result) {
                 if (check && result.drawn) deviceCheck(frame, false, 0u, result.bodyHash, result.bodyBytes);
                 if (!read) return;
-                if (result.drawn) {
-                    runtime->pictureGs().submitPictureRead(shared->captured, tag);
+                // Amendment v3.9: the read is refused when the three reads before it are unfinished on the graphics
+                // card (nothing waits for the card on a picture's behalf): the picture is cut off, as below.
+                if (result.drawn && runtime->pictureGs().submitPictureRead(shared->captured, tag))
                     return;
-                }
-                // Given up or dropped (the next frame's end or its page copy came first): it is reported as not
-                // shown, so its frame's account closes.
+                // Given up or dropped (the next frame's end or its page copy came first), cut off before its
+                // drawing or at its read (no place for its read): it is reported as not shown, so its frame's
+                // account closes.
                 dc::Timed timed;
                 if (!dc::take(tag, timed)) return;
+                if (dc::logTimeline())
+                    std::fprintf(stderr, "[smooth:cut] refresh=%lld at=%.3f frame=%u t=%.5f\n",
+                                 static_cast<long long>(timed.refresh), timed.atMs, timed.frame, timed.t);
                 dc::Outcome outcome;
                 outcome.timed = timed;
                 outcome.startedMs = outcome.readyMs = dc::nowMs();
@@ -1043,9 +1055,10 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                     // (At the frame end the list is taken before its instant; a frame finished late in its field
                     // needs a larger head start, which is the meter's matter.)
                     if (measure && (at.atEnd || o.timed.listMs - o.timed.instantMs < fieldMs / 4.0))
-                        g_meter.add(listMs, o.timed.headStartMs, o.timed.atMs - (o.readyMs + o.handMs));
+                        g_meter.add(listMs, o.timed.frame, o.timed.headStartMs, o.timed.atMs - (o.readyMs + o.handMs));
                     g_auto.shown += o.shown ? 1u : 0u;
-                    g_auto.late += o.shown ? 0u : 1u;
+                    g_auto.late += o.shown || o.givenUp ? 0u : 1u;
+                    g_auto.cutOff += o.givenUp ? 1u : 0u;
                     for (FrameNote &note : g_notes) {
                         if (note.frame != o.timed.frame) continue;
                         // What this picture cost: from the moment the device could start it (it was queued, or the
@@ -1053,14 +1066,13 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                         if (at.atEnd && measure) {
                             const double from = note.reported == 0u ? o.timed.queuedMs : std::max(o.timed.queuedMs, note.lastStarted);
                             g_budget.measured(listMs, o.startedMs - from, note.reported == 0u);
-                            // v3.7 change 4: and from there until the window could hand it over.
-                            g_budget.afterDevice(listMs, o.readyMs - o.startedMs + o.handMs);
                         } else if (at.atEnd && note.reported == 0u) {
                             g_budget.probeDone();   // not counted: the next frame's first picture is the one to learn from
                         }
                         if (note.reported == 0u || o.startedMs < note.firstStarted) note.firstStarted = o.startedMs;
                         if (note.reported == 0u || o.startedMs > note.lastStarted) note.lastStarted = o.startedMs;
                         if (note.reported == 0u || o.timed.queuedMs < note.firstQueued) note.firstQueued = o.timed.queuedMs;
+                        note.cutOff += o.givenUp ? 1u : 0u;
                         ++note.reported;
                         break;
                     }
@@ -1114,11 +1126,13 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                 }
                 dw5xl::smooth::RateChoice::Frame f;
                 // The frame the game worked on while this frame's pictures were drawn is the next one: did it keep its reserve?
-                // A frame whose pictures did not all fit before the game's field counts as well: the rate asks for
-                // more than this PC draws in that time.
+                // A frame whose pictures did not all fit counts as well: the rate asks for more than this PC draws in
+                // that time. Through the game's device: a picture kept out before the game's field (v3.6). On the
+                // pictures' own device (v3.8): a picture that was cut off.
                 const bool held = nextSpare < reserve || nextInstant - note.instantMs > 1.5 * fieldMs;
                 f.heldUp = held;
                 f.noRoom = note.noRoom != 0u;
+                f.cutOff = note.cutOff != 0u;
                 f.spare = nextSpare;
                 f.reserve = reserve;
                 g_auto.leastSpare = std::min(g_auto.leastSpare, nextSpare);
@@ -1134,6 +1148,7 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                 ++g_auto.frames;
                 g_auto.heldUp += held ? 1u : 0u;
                 g_auto.noRoom += note.noRoom;
+                g_auto.cutFrames += note.cutOff != 0u ? 1u : 0u;
                 if (note.reported != 0u) {
                     g_auto.leastMargin = std::min(g_auto.leastMargin, f.room);
                     g_auto.marginSum += f.room;
@@ -1145,6 +1160,12 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                 if (last) break;
             }
             const bool rateOn = g_step > 0 || g_perFrame > 0 || g_rate.on();
+            if (g_loggedLevel != g_rate.level()) {  // criterion 7h reads these: the level from this frame on (0: off)
+                g_loggedLevel = g_rate.level();
+                if (dc::logTimeline())
+                    std::fprintf(stderr, "[smooth:level] frame=%llu level=%d of=%d\n",
+                                 static_cast<unsigned long long>(g_newFrames), g_rate.level() + 1, g_rate.levels());
+            }
             g_line.setHeadStart(g_headFixed ? g_headStart : g_meter.wanted(), !g_headFixed && g_meter.warmingUp());
             g_line.setStep(g_step > 0 ? g_step : g_rate.step());
             g_line.setPerFrame(g_perFrame > 0 ? g_perFrame : g_rate.perFrame());
@@ -1159,33 +1180,14 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                 g_asked.capped += asked.size() - g_copies;
                 asked.resize(g_copies);
             }
-            // v3.6, change 3: only the pictures that will have left the device when the game's field begins, by
-            // the longest a picture took lately. The later ones of the frame are left out.
+            // Through the game's device (v3.6, change 3): only the pictures that will have left the device when the
+            // game's field begins, by the longest a picture took lately. The later ones of the frame are left out.
+            // On the pictures' own device (v3.8, change 1) they are in nobody's way: every picture the time line
+            // asks for is started and nothing is foretold. One that is not ready at its instant is left out by the
+            // window and tells the head start's measure what it needed; one still being drawn when the next
+            // frame's pictures need the device is cut off there (PictureDevice) and counts for the rate choice.
             unsigned noRoom = 0;
-            if (at.atEnd && g_device2) {
-                // v3.7, change 4: on their own device the pictures are not in the game's way. A picture is started
-                // when it will be handed over before its own instant on screen and will have left the device
-                // before the next frame's end (the pictures' GS is this frame's until then), by the longest a
-                // picture took lately. One that would miss its instant says by how much: what the head start
-                // would have had to be, as a picture that ran late reports it.
-                const double now = dc::nowMs();
-                const double frameMs = g_ownEndFrame + 1u == g_newFrames ? std::max(fieldMs, listMs - g_ownEndMs) : fieldMs;
-                g_ownEndFrame = g_newFrames;
-                g_ownEndMs = listMs;
-                g_budget.frameOwn(now, listMs + frameMs);
-                size_t kept = 0;
-                for (const dw5xl::smooth::Picture &picture : asked) {
-                    double missBy = 0.0;
-                    if (g_budget.admitBy(now, picture.at, &missBy)) {
-                        asked[kept++] = picture;
-                        continue;
-                    }
-                    ++noRoom;
-                    if (missBy > 0.0 && g_newFrames >= g_measureFrom && !g_headFixed)
-                        g_meter.add(listMs, g_line.headStart(), -missBy);
-                }
-                asked.resize(kept);
-            } else if (at.atEnd) {
+            if (at.atEnd && !g_device2) {
                 const double now = dc::nowMs();
                 g_budget.frame(now, instantMs, fieldMs, reserve);
                 size_t fit = 0;
@@ -1238,9 +1240,11 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
             }
             if (g_auto.frames >= 250u) {
                 const double with = static_cast<double>(std::max<uint64_t>(g_auto.costs, 1u));
-                std::fprintf(stderr, "[smooth:auto] %llu frames: level %d of %d (%s%d), head start %.2f ms (wanted %.2f%s); "
+                std::fprintf(stderr, "[smooth:auto] %llu frames: level %d of %d (%s%d), head start %.2f ms (wanted %.2f, one "
+                             "picture needed %.2f at most%s); "
                              "pictures shown %llu, too late %llu, %llu not started for lack of room (a frame's first picture took "
-                             "%.2f ms at most lately, one after it %.2f ms; the game's list may wait %.2f ms); the game held up in "
+                             "%.2f ms at most lately, one after it %.2f ms; the game's list may wait %.2f ms), %llu cut off in "
+                             "%llu frames; the game held up in "
                              "%llu frames; a frame's last picture left "
                              "the device %.2f ms before the next field began on average (%.2f at least, %llu frames past it); a "
                              "picture costs %.2f ms on the device; the game finished its frames with %.2f ms to spare at least "
@@ -1248,9 +1252,11 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                              static_cast<unsigned long long>(g_auto.frames), g_rate.level() + 1, g_rate.levels(),
                              !rateOn ? "off, step " : grid.follows ? "pictures per frame " : "step ",
                              grid.follows ? g_line.perFrame() : g_line.step(), g_line.headStart(), g_meter.wanted(),
+                             g_meter.largest(),
                              g_headFixed ? ", fixed by a switch" : "", static_cast<unsigned long long>(g_auto.shown),
                              static_cast<unsigned long long>(g_auto.late), static_cast<unsigned long long>(g_auto.noRoom),
                              g_budget.cost(), g_budget.nextCost(), g_budget.allowance(),
+                             static_cast<unsigned long long>(g_auto.cutOff), static_cast<unsigned long long>(g_auto.cutFrames),
                              static_cast<unsigned long long>(g_auto.heldUp),
                              g_auto.marginSum / with, g_auto.costs ? g_auto.leastMargin : 0.0,
                              static_cast<unsigned long long>(g_auto.past), g_auto.costSum / with, g_auto.leastSpare, reserve);
@@ -1423,6 +1429,69 @@ void frameEnd(uint8_t *ram, PS2Runtime *runtime)
 }
 
 // The game sends a new frame's list (the display thread, at a field's start).
+// DW5XL-DEBUG PS2X_HOLD_TRACE=1 (fact-finding 2026-11-12: what holds the game up at 4x): one line per game frame at
+// the game's send, "[smooth:hold]". Times in ms; a/b/c is total / how many / the longest single one, all since the
+// line before.
+//   late       the send, after its field began            start      the frame start (its first packet), after the same
+//   pre_dev, pre_gs   this thread's waits in drains (for its device's worker, for the GS thread) from the send
+//                     before to the frame start;   dev, gs: from the frame start to the send
+//   game, call, pic   the GS thread: the game's packets, calls in the game's GS order, the pictures' packets
+//   lw_*, lh_*        the GS backend's device lock: waited for it / held it, by what the thread was doing (other: the
+//                     game's threads; game, pic, call: the GS thread at such a packet or call; present: the window)
+//   copy, scanout, read   the page copy into the picture GS, a field's scanout, a picture's read (start to end)
+//   rflush, rvsync        inside a picture's read: the flush before it, paraLLEl-GS's vsync,
+//   rslots, rbuffer, rsubmit, rwait   the ring's slots, the read's buffer, the submit, the wait at its end
+//   ask_*                 questions "is the card done with this read?" (a read's fence, no timeout), by who asked:
+//                         as lw_* (pic: the GS thread at a picture's packet or its start; call: at a call, as a read)
+double g_holdStartMs = 0.0;
+uint64_t g_holdStartDevice = 0, g_holdStartGs = 0, g_holdSentDevice = 0, g_holdSentGs = 0;
+void holdLine(uint32_t frame, uint64_t field, double instantMs, double sentMs)
+{
+    namespace hold = ps2x::hold;
+    constexpr size_t kCount = 4u * hold::Roles + 11u;
+    static std::array<hold::Value, kCount> before{};
+    hold::Counters &c = hold::counters();
+    std::array<hold::Value, kCount> now{};
+    size_t n = 0;
+    for (auto *group : {&c.packets, &c.lockWait, &c.lockHeld})
+        for (hold::Counter &counter : *group) now[n++] = hold::take(counter);
+    now[n++] = hold::take(c.copyPages);
+    now[n++] = hold::take(c.fieldScanout);
+    now[n++] = hold::take(c.pictureRead);
+    now[n++] = hold::take(c.readFlush);
+    now[n++] = hold::take(c.readVsync);
+    now[n++] = hold::take(c.readSlots);
+    now[n++] = hold::take(c.readBuffer);
+    now[n++] = hold::take(c.readSubmit);
+    now[n++] = hold::take(c.readWait);
+    for (hold::Counter &counter : c.fenceAsk) now[n++] = hold::take(counter);
+    now[n++] = hold::take(c.contextMoved);
+    now[n++] = hold::take(c.contextLeft);
+    const auto ms = [](uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+    char parts[kCount][40];
+    for (size_t i = 0; i < kCount; ++i)
+        std::snprintf(parts[i], sizeof(parts[i]), "%.2f/%llu/%.2f", ms(now[i].ns - before[i].ns),
+                      static_cast<unsigned long long>(now[i].count - before[i].count), ms(now[i].maxNs));
+    before = now;
+    const size_t P = 0u, W = hold::Roles, H = 2u * hold::Roles, F = 3u * hold::Roles, A = F + 9u;
+    std::fprintf(stderr, "[smooth:hold] frame=%u field=%llu late=%.2f start=%.2f pre_dev=%.2f pre_gs=%.2f dev=%.2f gs=%.2f "
+                 "game=%s call=%s pic=%s lw_other=%s lw_game=%s lw_pic=%s lw_present=%s lw_call=%s lh_other=%s lh_game=%s "
+                 "lh_pic=%s lh_present=%s lh_call=%s copy=%s scanout=%s read=%s rflush=%s rvsync=%s rslots=%s rbuffer=%s "
+                 "rsubmit=%s rwait=%s ask_other=%s ask_game=%s ask_pic=%s ask_present=%s ask_call=%s ctx_moved=%s ctx_left=%s\n",
+                 frame, static_cast<unsigned long long>(field), sentMs - instantMs, g_holdStartMs - instantMs,
+                 ms(g_holdStartDevice - g_holdSentDevice), ms(g_holdStartGs - g_holdSentGs),
+                 ms(hold::t_deviceWaitNs - g_holdStartDevice), ms(hold::t_gsWaitNs - g_holdStartGs),
+                 parts[P + hold::GameGs], parts[P + hold::GsCall], parts[P + hold::PictureGs],
+                 parts[W + hold::Other], parts[W + hold::GameGs], parts[W + hold::PictureGs], parts[W + hold::Present],
+                 parts[W + hold::GsCall], parts[H + hold::Other], parts[H + hold::GameGs], parts[H + hold::PictureGs],
+                 parts[H + hold::Present], parts[H + hold::GsCall], parts[F], parts[F + 1u], parts[F + 2u], parts[F + 3u],
+                 parts[F + 4u], parts[F + 5u], parts[F + 6u], parts[F + 7u], parts[F + 8u],
+                 parts[A + hold::Other], parts[A + hold::GameGs], parts[A + hold::PictureGs], parts[A + hold::Present],
+                 parts[A + hold::GsCall], parts[A + hold::Roles], parts[A + hold::Roles + 1u]);
+    g_holdSentDevice = hold::t_deviceWaitNs;
+    g_holdSentGs = hold::t_gsWaitNs;
+}
+
 void atSend(uint8_t *ram, PS2Runtime *runtime, uint32_t list)
 {
     namespace dc = ps2x::display_clock;
@@ -1450,6 +1519,8 @@ void atSend(uint8_t *ram, PS2Runtime *runtime, uint32_t list)
         std::fprintf(stderr, "[smooth:list] frame=%u field=%llu at=%.3f sent=%.3f first=%.3f last=%.3f hash=%016llx\n",
                      sent.number, static_cast<unsigned long long>(fieldNumber), instantMs, listMs, firstTag, lastTag,
                      static_cast<unsigned long long>(hash));
+    if (haveInstant && ps2x::hold::enabled())
+        holdLine(sent.number, fieldNumber, instantMs, listMs);
     if (g_atEnd) {
         // What the frame end took as known in advance: the field, the list, the transfer mode, the draw environment.
         ++g_advance.frames;
@@ -1528,6 +1599,11 @@ void sendN(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
 {
     const uint32_t ra = getRegU32(ctx, 31);
     if (ra == kStartSendA || ra == kStartSendB) {
+        if (ps2x::hold::enabled()) {                // DW5XL-DEBUG PS2X_HOLD_TRACE: the frame start begins here
+            g_holdStartMs = ps2x::display_clock::nowMs();
+            g_holdStartDevice = ps2x::hold::t_deviceWaitNs;
+            g_holdStartGs = ps2x::hold::t_gsWaitNs;
+        }
         // The battle's frame start (FUN_001429e0 with the half-line offset set per frame) sends from kStartSendB.
         g_battleStartPrevious = g_battleStart;
         g_battleStart = ra == kStartSendB;

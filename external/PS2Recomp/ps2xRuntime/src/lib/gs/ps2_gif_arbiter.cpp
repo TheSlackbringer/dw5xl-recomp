@@ -1,4 +1,5 @@
 #include "runtime/gs/ps2_gif_arbiter.h"
+#include "runtime/ps2_hold_trace.h"
 #include "ThreadNaming.h"
 #include <algorithm>
 #include <chrono>
@@ -118,20 +119,30 @@ void GifArbiter::workerLoop()
                 side = true;
             }
         }
+        const bool timed = ps2x::hold::enabled(); // DW5XL-DEBUG PS2X_HOLD_TRACE: what the GS thread spends its time on
         if (side)
         {
+            ps2x::hold::Scope role(ps2x::hold::PictureGs);
             runSide();
             continue;
         }
         if (pkt.call)
         {
+            ps2x::hold::Scope role(ps2x::hold::GsCall);
+            const uint64_t from = timed ? ps2x::hold::nowNs() : 0u;
             pkt.call();
             pkt.call = nullptr;
+            if (timed)
+                ps2x::hold::counters().packets[ps2x::hold::GsCall].add(ps2x::hold::nowNs() - from);
             continue;
         }
+        ps2x::hold::Scope role(ps2x::hold::GameGs);
+        const uint64_t from = timed ? ps2x::hold::nowNs() : 0u;
         g_gifArbiterCurrentPath = static_cast<int>(pkt.pathId);
         m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         g_gifArbiterCurrentPath = 0;
+        if (timed)
+            ps2x::hold::counters().packets[ps2x::hold::GameGs].add(ps2x::hold::nowNs() - from);
     }
 }
 
@@ -144,6 +155,34 @@ bool GifArbiter::sideReady() const
 void GifArbiter::runSide()
 {
     SideBatch &batch = *m_sideCurrent;
+    // Issue 049, amendment v3.9: before a unit's first packet is read: may it start? (The answer comes from the
+    // renderer: is there a place for the picture's read.) A unit refused is dropped batch by batch as they come up.
+    if (batch.unit != 0u)
+    {
+        if (m_sideAt == 0u && batch.unit != m_sideAskedUnit)
+        {
+            m_sideAskedUnit = batch.unit;
+            SideStartFn start;
+            {
+                std::lock_guard<std::mutex> lock(m_workerMutex);
+                start = m_sideStartFn;
+            }
+            if (start && !start())
+                m_sideRefusedUnit.store(batch.unit, std::memory_order_release);
+        }
+        if (batch.unit == m_sideRefusedUnit.load(std::memory_order_acquire))
+        {
+            if (batch.then)
+            {
+                batch.then(true);
+                batch.then = nullptr;
+            }
+            m_sideUnitOpen = false; // nothing of it was read: no unit is half done
+            m_sideCurrent.reset();
+            m_sideAt = 0;
+            return;
+        }
+    }
     const auto from = std::chrono::steady_clock::now();
     uint64_t packets = 0, bytes = 0;
     bool gaveWay = false;
@@ -157,9 +196,13 @@ void GifArbiter::runSide()
         const SideBatch::Packet &p = batch.packets[m_sideAt++];
         if (m_sideProcessFn)
         {
+            const bool timed = ps2x::hold::enabled(); // DW5XL-DEBUG PS2X_HOLD_TRACE
+            const uint64_t packetFrom = timed ? ps2x::hold::nowNs() : 0u;
             g_gifArbiterCurrentPath = static_cast<int>(p.path);
             m_sideProcessFn(p.path, batch.bytes.data() + p.offset, p.size);
             g_gifArbiterCurrentPath = 0;
+            if (timed)
+                ps2x::hold::counters().packets[ps2x::hold::PictureGs].add(ps2x::hold::nowNs() - packetFrom);
         }
         ++packets;
         bytes += p.size;
@@ -207,6 +250,12 @@ void GifArbiter::setSideProcessFn(SideProcessFn fn)
     m_sideProcessFn = std::move(fn);
 }
 
+void GifArbiter::setSideStartFn(SideStartFn fn)
+{
+    std::lock_guard<std::mutex> lock(m_workerMutex);
+    m_sideStartFn = std::move(fn);
+}
+
 bool GifArbiter::submitSide(std::shared_ptr<SideBatch> batch)
 {
     if (!batch)
@@ -216,6 +265,8 @@ bool GifArbiter::submitSide(std::shared_ptr<SideBatch> batch)
         std::lock_guard<std::mutex> lock(m_workerMutex);
         if (batch->group < m_sideMinGroup)
             return false;
+        if (batch->unit != 0u && batch->unit == m_sideRefusedUnit.load(std::memory_order_acquire))
+            return false; // amendment v3.9: its unit was refused at its start
         wake = m_async && !m_workerBusy && !m_sideRunning; // a worker that may be waiting
         m_side.push_back(std::move(batch));
     }

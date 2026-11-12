@@ -18,7 +18,22 @@
 //      packets of it that were read already are a picture cut off, which the next opening reports;
 //   8. VU1's state as a value (RunState) is what a save state holds of it, also in the middle of an XGKICK;
 //   9. the side stream without a GS worker: batches are read where they are submitted or allowed.
+// Amendment v3.9 (approved 2026-11-12): the game does not wait for the graphics card on a picture's behalf.
+//  10. a picture is asked about once, on the GS side, before its first packet would be read; with no place for its
+//      read it is cut off there: nothing of it is read, it is answered "not drawn" once, and what the device still
+//      hands over of it is refused. The next picture, with a place free, is read whole;
+//  11. the read's choice at the ring's oldest place: a field's read waits for the graphics card, a picture's never.
+//  12. the question "is the card done with this read?" never waits behind another thread's wait for the same read
+//      (ps2x::gs::ReadDone; the card's handle lets one caller in at a time): while a thread waits, or has announced
+//      its wait, the answer is "unfinished" at once, without the card; the waiting thread's result is the answer
+//      afterwards; with nobody waiting the question goes to the card.
+// Amendment v3.10 (approved 2026-11-12): a picture's flush does not wait for the graphics card either.
+//  13. a flush of the pictures' GS memory moves the device on to its next frame context only when that does not
+//      wait for the card (ps2x::gs::holdFrameContext); the game's memory moves on as before, whatever the card is
+//      doing; while another memory has work open neither moves on, and the card is not asked.
 #include "ps2_runtime.h"
+#include "runtime/gs/gs_frame_context.h"
+#include "runtime/gs/gs_read_ring.h"
 #include "runtime/ps2_picture_device.h"
 #include "runtime/state_archive.h"
 
@@ -34,6 +49,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 extern const uint32_t g_ps2RecompiledFunctionTableBase = 0x1000;
@@ -51,6 +67,40 @@ void check(bool ok, const std::string &what)
     std::printf("%s  %s\n", ok ? "PASS" : "FAIL", what.c_str());
     g_failures += ok ? 0 : 1;
 }
+
+// Part 12: a stand-in for the graphics card's handle of one read. As a Granite fence it lets one caller in at a
+// time, for the whole of that caller's wait.
+struct FakeCard
+{
+    std::mutex one;                       // the handle's own lock
+    std::mutex state;
+    std::condition_variable changed;
+    bool done = false;
+    std::atomic<uint32_t> calls{0}, asks{0};
+    std::atomic<bool> inWait{false};
+    bool wait(uint64_t timeoutNs)
+    {
+        ++calls;
+        if (timeoutNs == 0u)
+            ++asks;
+        std::lock_guard<std::mutex> only(one);
+        std::unique_lock<std::mutex> lock(state);
+        if (timeoutNs == 0u)
+            return done;
+        inWait.store(true);
+        const bool finished = changed.wait_for(lock, std::chrono::nanoseconds(timeoutNs), [this] { return done; });
+        inWait.store(false);
+        return finished;
+    }
+    void finish()
+    {
+        {
+            std::lock_guard<std::mutex> lock(state);
+            done = true;
+        }
+        changed.notify_all();
+    }
+};
 
 struct Stream
 {
@@ -427,6 +477,124 @@ void run()
     check(totals.pictures == 7u && totals.givenUp == 2u && totals.dropped == 1u,
           "the device counted 7 pictures sent, 2 given up, 1 of the sent dropped on the GS side");
 
+    // 10
+    {
+        std::atomic<bool> place{false};
+        std::atomic<uint32_t> asked{0};
+        gsSide.setSideStartFn([&] {
+            asked.fetch_add(1u);
+            return place.load();
+        });
+        device.takeStart(7u, mem.m_vif1, game.rt.vu1());
+        open(7u);
+        seen.take();
+        device.submit(picture(seen, 7u, body));
+        check(seen.waitDone(1u), "10. a picture without a place for its read is answered");
+        device.waitIdle();
+        gsSide.waitIdle();
+        {
+            std::lock_guard<std::mutex> lock(seen.mutex);
+            check(seen.done.size() == 1u && !seen.done[0].drawn && seen.gif.empty() && asked.load() == 1u,
+                  "10. it was cut off before its first packet: asked once, not drawn, nothing of it read");
+        }
+        seen.take();
+        // A picture of more than one batch, with VIF1 work after its first batch: what comes later is refused.
+        const uint32_t many = static_cast<uint32_t>(ps2x::PictureDevice::kBatchPackets) + 8u;
+        Stream longWork;
+        for (uint32_t i = 0; i < many; ++i) {
+            const Stream one = direct(0xDDDD0000ull + i);
+            longWork.words.insert(longWork.words.end(), one.words.begin(), one.words.end());
+        }
+        for (uint32_t i = 0; i < 1024u * 1024u; ++i) longWork.code(0x00, 0, 0);
+        device.submit(picture(seen, 7u, longWork.bytes()));
+        check(seen.waitDone(1u), "10. a longer picture without a place is answered");
+        device.waitIdle();
+        gsSide.waitIdle();
+        {
+            std::lock_guard<std::mutex> lock(seen.mutex);
+            check(seen.done.size() == 1u && !seen.done[0].drawn && seen.gif.empty() && asked.load() == 2u,
+                  "10. it is answered once, not drawn, and nothing of its later batches is read");
+        }
+        seen.take();
+        place.store(true);
+        device.submit(picture(seen, 7u, body));
+        check(seen.waitDone(1u), "10. the next picture of the frame is run");
+        gsSide.waitIdle();
+        {
+            std::lock_guard<std::mutex> lock(seen.mutex);
+            check(seen.done.size() == 1u && seen.done[0].drawn && seen.gif.size() == reference.size() && asked.load() == 3u,
+                  "10. with a place free it is asked about once and read whole");
+        }
+        seen.take();
+        gsSide.setSideStartFn(nullptr);
+        device.waitIdle();
+        gsSide.waitIdle();
+    }
+
+    // 11
+    {
+        using ps2x::gs::ReadPlace;
+        using ps2x::gs::readPlace;
+        check(readPlace(false, false, false) == ReadPlace::Free && readPlace(false, false, true) == ReadPlace::Free,
+              "11. a free place is used, by a field's read and by a picture's");
+        check(readPlace(true, true, false) == ReadPlace::Finished && readPlace(true, true, true) == ReadPlace::Finished,
+              "11. a place whose read is finished on the graphics card is emptied and used");
+        check(readPlace(true, false, false) == ReadPlace::Wait,
+              "11. a field's read waits for the graphics card when the read three reads before is unfinished");
+        check(readPlace(true, false, true) == ReadPlace::Refuse,
+              "11. a picture's read never waits: with the three reads before it unfinished it is refused");
+    }
+
+    // 12
+    {
+        using ps2x::gs::ReadDone;
+        using ps2x::gs::ReadWait;
+        const auto make = [](const std::shared_ptr<FakeCard> &card) {
+            return std::make_shared<ReadDone>([card](uint64_t timeoutNs) { return card->wait(timeoutNs); });
+        };
+        {
+            auto card = std::make_shared<FakeCard>();
+            auto read = make(card);
+            check(!read->finished() && card->asks.load() == 1u, "12. with nobody waiting the question goes to the card: unfinished");
+            card->finish();
+            check(read->finished() && card->asks.load() == 2u, "12. and finished, once the card is done");
+            check(read->finished() && card->calls.load() == 2u, "12. a read known to be finished is not asked about again");
+        }
+        {
+            auto card = std::make_shared<FakeCard>();
+            auto read = make(card);
+            {
+                ReadWait wait(read);
+                check(!read->finished() && card->calls.load() == 0u,
+                      "12. a wait announced, not begun: the answer is unfinished, without the card");
+                const bool got = wait.wait(1'000'000ull);
+                check(!got && !read->finished() && card->asks.load() == 0u,
+                      "12. a wait that ran out, still announced: unfinished, without a question to the card");
+            }
+            check(!read->finished() && card->asks.load() == 1u, "12. the wait withdrawn: the question goes to the card again");
+        }
+        {
+            auto card = std::make_shared<FakeCard>();
+            auto read = make(card);
+            ReadWait wait(read);
+            std::atomic<int> result{-1};
+            std::thread waiter([&wait, &result] { result.store(wait.wait(2'000'000'000ull) ? 1 : 0); });
+            while (!card->inWait.load())
+                std::this_thread::yield();
+            const auto from = std::chrono::steady_clock::now();
+            const bool answer = read->finished();
+            const double tookMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count();
+            char what[200];
+            std::snprintf(what, sizeof(what), "12. while another thread waits on the card for the read, the question is "
+                          "answered without the card: unfinished (it took %.3f ms)", tookMs);
+            check(!answer && card->asks.load() == 0u, what);
+            card->finish();
+            waiter.join();
+            check(result.load() == 1 && read->finished() && card->asks.load() == 0u,
+                  "12. the waiting thread saw the read finish: finished, without a question to the card");
+        }
+    }
+
     // 9 (here: the device is still alive for part 8 below; this part needs no device)
     {
         GifArbiter inl;                                 // no GS worker
@@ -479,6 +647,30 @@ void run()
         a->saveRunState(*value);
         b->loadRunState(*value);
         check(stateOf(*a) == stateOf(*b), "8. VU1's state as a value is what a save state holds of it");
+    }
+
+    // 13
+    {
+        using ps2x::gs::Memory;
+        int asked = 0;
+        const auto wouldWait = [&asked] { ++asked; return true; };
+        const auto wouldNot = [&asked] { ++asked; return false; };
+        check(!ps2x::gs::holdFrameContext(Memory::Game, false, wouldWait) && asked == 0,
+              "13. the game's memory moves on when no other memory has work open, whatever the card is doing; the card is not asked");
+        asked = 0;
+        check(ps2x::gs::holdFrameContext(Memory::Game, true, wouldNot) && asked == 0,
+              "13. the game's memory leaves the frame context alone while another memory has work open");
+        asked = 0;
+        check(ps2x::gs::holdFrameContext(Memory::Pictures, true, wouldNot) && asked == 0,
+              "13. so does the pictures' memory, and the card is not asked then (the question would wait for that work)");
+        asked = 0;
+        check(ps2x::gs::holdFrameContext(Memory::Pictures, false, wouldWait),
+              "13. the pictures' memory leaves the move for a later flush when moving on would wait for the card");
+        check(asked == 1, "13. it asked the card once for that");
+        asked = 0;
+        check(!ps2x::gs::holdFrameContext(Memory::Pictures, false, wouldNot),
+              "13. the pictures' memory moves on when that does not wait");
+        check(asked == 1, "13. it asked the card once for that too");
     }
 }
 } // namespace
