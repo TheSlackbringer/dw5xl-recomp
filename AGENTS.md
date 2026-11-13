@@ -15,6 +15,14 @@ Ghidra, PCSX2, record/replay, pitfalls): "Reference" at the end of this file. Hi
 - **No timing workarounds:** no delays, sleeps or knobs tuned to one game routine or one machine. Fix the root cause.
 - **Every claimed result names its log** (`notes/issues/tests/out/...`). "Passes" means the run has finished.
 - **Only the user approves a spec.** Write "approved" only after the user said so, with the date.
+- **Long test series only on the user's yes (2026-11-13).** After a change a session runs only the unit tests,
+  the go (`run.py go`) and the issue's short check: at most 3 game runs and 10 minutes together. Anything longer is a long
+  series, whatever a spec calls it. If you think one is worth running (usually at a milestone that changes
+  behaviour, not one that only removes or tidies code), ask in one line: what it would show that the short checks
+  do not, how many runs and minutes, and whether you recommend it. Run it only when the user answers yes, that one
+  time. Without a yes, skip it: write "full series not run" in the report and carry on; it blocks no commit. Never
+  start, queue or wait for the PC for a long series before that yes, and add no repeats beyond what was agreed.
+  This wins over every spec's test plan, approved ones included.
 - **Pushing requires permission:** push only after the user agreed to that push.
 - Changes to `notes/` are tracked in its own local git repo (`git -C notes log`); commit your notes changes there.
 - Before relying on the game files, `notes/tools/check_game_files.sh` must pass (they must match the player's disc).
