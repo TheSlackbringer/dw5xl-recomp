@@ -118,6 +118,7 @@ void consumeSlot(Vulkan::Device &device, VulkanGsScanoutState &state, VulkanGsSc
     read.frameFields = slot.frameFields;
     read.fieldMode = slot.fieldMode;
     read.fieldTarget = slot.fieldTarget;
+    read.afterHandover = slot.afterHandover;
     state.staged.push_back(std::move(read));
 
     slot.buf.reset();
@@ -312,6 +313,80 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     if (output.image->get_create_info().format != VK_FORMAT_R8G8B8A8_UNORM)
         throw std::runtime_error("ParallelGS GPU scanout returned an unexpected pixel format");
 
+    const uint32_t outputShift = output.high_resolution_scanout ? output.high_resolution_scale_log2 : 0u;
+    const uint32_t outputShiftX = output.high_resolution_scanout ? output.high_resolution_scale_x_log2 : 0u;
+    const auto &nativeCircuit = first.enabled ? first : second;
+    const uint32_t displayFbp = first.enabled ? first.framebuffer.FBP : second.framebuffer.FBP;
+    const uint32_t displayWidth = width >> outputShiftX;
+    const uint32_t displayHeight = frameFields ? nativeCircuit.height * 2u :
+                                   fieldMode ? nativeCircuit.height :
+                                   height >> outputShift;
+
+    // Issue 049 (amendment v3.12 step 3): a presenter's hand-over is switched on. A picture the weaver would leave
+    // as it is (ReusableFieldWeaver::Mode::Progressive below) is copied on the graphics card into one of the
+    // hand-over's images and is the presenter's from there; it is read back too only when pixels are wanted in
+    // main memory. Every other picture is read back as without a presenter, and so is one the hand-over has no
+    // place for (the presenter holds every place): it is not lost.
+    VulkanGsHandover *const handover = state.handover && state.handover->started() ? state.handover.get() : nullptr;
+    const bool whole = output.high_resolution_scanout || (!frameFields && !fieldMode);
+    struct HandoverTarget
+    {
+        VulkanGsHandover *owner = nullptr;
+        VulkanGsHandover::Target target;
+        ~HandoverTarget()
+        {
+            if (owner && target) // not finished: the read below threw
+                owner->abandon(target);
+        }
+    } handed;
+    if (handover && whole)
+    {
+        handed.target = handover->begin(device, width, height); // empty: the presenter holds every place
+        handed.owner = handover;
+    }
+    const bool handing = static_cast<bool>(handed.target);
+    const bool alsoRead = handing && handover->pixelsWanted();
+    const auto recordHandover = [&](CommandBuffer &cmd)
+    {
+        // What the image held before is dropped; the barrier's first half waits for the presenter's last sampling
+        // of it and for a copy out of it.
+        cmd.image_barrier(*handed.target.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT, 0,
+                          VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        cmd.copy_image(*handed.target.image, *output.image);
+        // Complete for everything sent to the queue after this command buffer, the presenter's device object's
+        // command buffers included (they go to the same queue).
+        cmd.image_barrier(*handed.target.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    };
+    const auto finishHandover = [&]
+    {
+        HandedPicture picture;
+        picture.displayWidth = displayWidth;
+        picture.displayHeight = displayHeight;
+        picture.displayFbp = displayFbp;
+        picture.sourceFbp = displayFbp;
+        picture.field = request.vsyncTick;
+        picture.tag = request.pictureTag;
+        picture.fieldTarget = request.fieldTarget;
+        handover->finish(handed.target, std::move(picture), alsoRead);
+        handed.target = {};
+    };
+    if (handing && !alsoRead)
+    {
+        auto command = device.request_command_buffer();
+        recordHandover(*command);
+        // Asking for a fence sends the command buffer to the queue now (the library keeps others back until the
+        // frame context ends): the picture must be in the queue before the presenter's use of it.
+        Fence sent;
+        device.submit(command, &sent);
+        finishHandover();
+        state.handedSinceRead = true;
+        return;
+    }
+
     static const bool s_sync = []() {
         const char *e = std::getenv("PS2X_GS_SYNCREADBACK");
         return e && *e && *e != '0';
@@ -384,29 +459,30 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     }
     const uint64_t holdSubmit = holdTimed ? ps2x::hold::nowNs() : 0u;
 
-    curSlot.displayFbp = first.enabled ? first.framebuffer.FBP : second.framebuffer.FBP;
+    curSlot.displayFbp = displayFbp;
     curSlot.sourceFbp = curSlot.displayFbp;
     curSlot.vsyncTick = request.vsyncTick;
     curSlot.tag = request.pictureTag;
     curSlot.highResolution = output.high_resolution_scanout;
-    const uint32_t outputShift = output.high_resolution_scanout ? output.high_resolution_scale_log2 : 0u;
-    const uint32_t outputShiftX = output.high_resolution_scanout ? output.high_resolution_scale_x_log2 : 0u;
-    curSlot.displayWidth = width >> outputShiftX;
-    const auto &nativeCircuit = first.enabled ? first : second;
-    curSlot.displayHeight = frameFields ? nativeCircuit.height * 2u :
-                           fieldMode ? nativeCircuit.height :
-                           height >> outputShift;
+    curSlot.displayWidth = displayWidth;
+    curSlot.displayHeight = displayHeight;
     curSlot.frameFields = frameFields;
     curSlot.fieldMode = fieldMode;
     curSlot.fieldTarget = request.fieldTarget;
+    curSlot.afterHandover = state.handedSinceRead;
+    state.handedSinceRead = false;
 
     auto command = device.request_command_buffer();
+    if (handing)
+        recordHandover(*command); // issue 049: handed over and read (pixels are wanted too), in one command buffer
     command->copy_image_to_buffer(*curSlot.buf, *output.image, 0, {}, {width, height, 1},
                                  0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
     command->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                      VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
     Fence fence;
     device.submit(command, &fence);
+    if (handing)
+        finishHandover();
 
     curSlot.fence = std::move(fence);
     // The fence keeps itself alive in the function; the device outlives every reader (the window stops its
@@ -580,6 +656,12 @@ bool finishVulkanGsPresentInto(Vulkan::Device &device, VulkanGsScanoutState &sta
         if (weaver)
         {
             const bool oddField = (read.vsyncTick & 1ull) != 0ull;
+            // Issue 049 (amendment v3.12 step 3): the pictures before this one were handed over on the graphics
+            // card and never came here. They needed no weaving, and the weaver is told what it is told about such
+            // a picture when it is read: it starts over.
+            if (read.afterHandover)
+                weaver->present(frame.pixels, frame.width, frame.height, read.w * 4u, read.vsyncTick, oddField,
+                                ReusableFieldWeaver::Mode::Progressive);
             // paraLLEl high-res output already reconstructs field-aware vertical
             // samples. Applying our half-height weave would double it again.
             const auto weaveMode = read.highResolution ? ReusableFieldWeaver::Mode::Progressive :

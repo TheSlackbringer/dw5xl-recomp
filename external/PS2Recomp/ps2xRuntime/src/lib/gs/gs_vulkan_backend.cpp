@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "runtime/gs/gs_vulkan_backend.h"
 #include "gs_vulkan_scanout.h"
+#include "gs_vulkan_handover.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_frame_context.h"
 #include "runtime/gs/ps2_gs_memory.h"
@@ -49,6 +50,10 @@ struct GSVulkanDevice
     // makes a device object of its own on it (issue 049, amendment v3.12; measured in the work log, "M4-1": with a
     // device object of its own the presenter never waits for this one's open command buffers).
     Vulkan::ContextHandle context;
+    // One lock for the queues (issue 049, amendment v3.12 step 3): a presenter's device object on the same context
+    // sends to the same queues, and Vulkan lets one thread at a time use a queue. Declared before the device: the
+    // device still sends when it goes.
+    std::shared_ptr<std::mutex> queues = std::make_shared<std::mutex>();
     Vulkan::Device device;
     // Issue 049 (amendment v3.12 step 2): made with the system's surface extensions and the swap chain extension.
     bool windowSupport = false;
@@ -152,6 +157,7 @@ struct GSVulkanDevice
         if (!s_said.exchange(true))
             std::fprintf(stderr, "[gs] Vulkan device made %s window support%s\n", windowSupport ? "with" : "without", why);
         device.set_context(*context);
+        device.set_queue_lock([lock = queues] { lock->lock(); }, [lock = queues] { lock->unlock(); });
         // Keep enough Granite PerFrame contexts that a multi-flush field + 3-slot
         // async readback ring never wraps and blocks inside per_frame->begin() while
         // holding the GS device mutex.
@@ -163,6 +169,8 @@ struct GSVulkanBackend::Impl
 {
     // Declaration order ensures the interface dies before the device (which lives as long as any of its memories).
     std::shared_ptr<GSVulkanDevice> shared;
+    // Issue 049 (amendment v3.12 step 3): what a presenter got from this memory (PresenterLink), made when asked for.
+    std::shared_ptr<GSVulkanPresenterLink> link;
     Vulkan::Device &device;
     ParallelGS::GSInterface gs;
     std::mutex &mutex;
@@ -456,6 +464,27 @@ struct GSVulkanBackend::Impl
 GSVulkanBackend::GSVulkanBackend() : m_impl(std::make_unique<Impl>()) {}
 GSVulkanBackend::GSVulkanBackend(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
 bool GSVulkanBackend::WindowSupport() const { return m_impl->shared->windowSupport; }
+
+// DW5XL (issue 049, amendment v3.12 step 3).
+std::shared_ptr<GSVulkanPresenterLink> GSVulkanBackend::PresenterLink()
+{
+    auto lock = m_impl->access();
+    auto &p = *m_impl;
+    if (!p.link)
+    {
+        auto link = std::make_shared<GSVulkanPresenterLink>();
+        link->renderer = p.shared;
+        link->context = p.shared->context;
+        link->queues = p.shared->queues;
+        link->windowSupport = p.shared->windowSupport;
+        // Three places: the picture the presenter shows, the next one it takes before it lets the first go, and
+        // one for the renderer to write. With those the renderer always has a place.
+        link->fields = std::make_shared<VulkanGsHandover>(p.shared, 3u);
+        p.scanoutState.handover = link->fields; // read by every scan-out of the game's fields (presentVulkanGs)
+        p.link = std::move(link);
+    }
+    return p.link;
+}
 
 // DW5XL (issue 049, fact-finding 2026-11-11): a second GS memory on this renderer's device.
 std::unique_ptr<GSRasterBackend> GSVulkanBackend::MakeSecondMemory()

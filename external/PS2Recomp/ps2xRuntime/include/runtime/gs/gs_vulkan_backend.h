@@ -3,6 +3,8 @@
 #include "runtime/gs/gs_backend.h"
 #include <memory>
 
+struct GSVulkanPresenterLink;
+
 // GS rasterization and texture/VRAM operations execute in paraLLEl-GS Vulkan
 // compute shaders. The native EE/IOP runtime and frontend remain in place.
 class GSVulkanBackend final : public GSRasterBackend
@@ -18,6 +20,11 @@ public:
     // support (the system's surface extensions and the swap chain extension), so that a presenter can show its
     // pictures without reading them back.
     bool WindowSupport() const;
+    // DW5XL (issue 049, amendment v3.12 step 3): what a presenter needs to show this renderer's pictures without
+    // reading them back: the Vulkan context to make a device object of its own on, the lock for the queues, and
+    // the hand-over where the game's fields arrive on the graphics card once the presenter switches it on. The type
+    // is in a header of the runtime's own (src/lib/gs/gs_vulkan_handover.h). The same link for every caller.
+    std::shared_ptr<GSVulkanPresenterLink> PresenterLink();
     bool CopyPagesFrom(GSRasterBackend &source, const std::bitset<512> &pages) override;
     bool SubmitPictureRead(const GSPresentationRequest &) override;
     bool CollectPictureReads(std::vector<GSPictureRead> &) override;

@@ -582,9 +582,10 @@ if(DW5XL_BUILD_TESTS)
     # shaders out right before timed runs (tests/test_one_program.h).
     add_executable(dw5xl_gs_renderer_tests tests/gs_renderer_tests_main.cpp
         tests/gs_picture_reads_test.cpp tests/gs_window_support_test.cpp tests/gs_second_memory_test.cpp
-        tests/gs_turns_test.cpp tests/gs_picture_sync_test.cpp)
+        tests/gs_turns_test.cpp tests/gs_picture_sync_test.cpp tests/gs_picture_handover_test.cpp)
     target_compile_definitions(dw5xl_gs_renderer_tests PRIVATE DW5XL_ONE_TEST_PROGRAM)
-    target_link_libraries(dw5xl_gs_renderer_tests PRIVATE ps2_runtime)
+    # parallel-gs: the hand-over test is a stand-in presenter with a device object of its own (the library's headers).
+    target_link_libraries(dw5xl_gs_renderer_tests PRIVATE ps2_runtime parallel-gs)
     target_include_directories(dw5xl_gs_renderer_tests PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
     add_test(NAME gs_picture_reads COMMAND dw5xl_gs_renderer_tests gs_picture_reads)
     # DW5XL-TEST issue 049 (amendment v3.12 step 2): the renderer's device is made with window support where the
@@ -598,6 +599,14 @@ if(DW5XL_BUILD_TESTS)
     # DW5XL-TEST issue 049 v3.7: the picture GS follows the game's GS through a state load, a change of scale or
     # samples and a direct write (the GS front end's list of written pages; skipped without a Vulkan device).
     add_test(NAME gs_picture_sync COMMAND dw5xl_gs_renderer_tests gs_picture_sync)
+    # DW5XL-TEST issue 049 (amendment v3.12 step 3): the renderer hands its pictures to a presenter on the graphics
+    # card instead of reading them back (skipped without a Vulkan device).
+    add_test(NAME gs_picture_handover COMMAND dw5xl_gs_renderer_tests gs_picture_handover)
+    # DW5XL-TEST issue 049 (amendment v3.12 step 3): the places of handed-over pictures, who may use which when; no
+    # graphics card and no game data.
+    add_executable(dw5xl_gs_handover_places_test tests/gs_handover_places_test.cpp)
+    target_include_directories(dw5xl_gs_handover_places_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME gs_handover_places COMMAND dw5xl_gs_handover_places_test)
     # DW5XL-TEST issue 049 P2.4: a frame's command list as our own data (stream, map, matrix tags); no game data.
     add_executable(dw5xl_smooth_list_test tests/smooth_list_test.cpp src/dw5xl_smooth_list.cpp)
     target_include_directories(dw5xl_smooth_list_test PRIVATE src)
@@ -620,6 +629,7 @@ if(DW5XL_BUILD_TESTS)
     set_tests_properties(gs_window_support PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     set_tests_properties(gs_second_memory PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
     set_tests_properties(gs_picture_sync PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+    set_tests_properties(gs_picture_handover PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
     set_tests_properties(gs_turns PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
     if(NOT WIN32) # drives the tools through a POSIX shell (env -u, quoting, wait status)
     add_executable(dw5xl_gsreplay_test tests/gsreplay_test.cpp)

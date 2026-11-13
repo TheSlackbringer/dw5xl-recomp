@@ -3,6 +3,7 @@
 
 #include "runtime/gs/gs_read_ring.h"
 #include "runtime/gs/gs_types.h"
+#include "gs_vulkan_handover.h"
 #include "buffer.hpp"
 #include "fence.hpp"
 #include "image.hpp"
@@ -49,6 +50,7 @@ struct VulkanGsScanoutState
         bool frameFields = false;
         bool fieldMode = false;
         int8_t fieldTarget = -1; // issue 023 step 2K: the field the picture was drawn for, -1 if not known
+        bool afterHandover = false; // issue 049: the pictures before this one were handed over, not read
         bool pending = false;
     };
     std::array<RbSlot, 3> slots{};
@@ -71,6 +73,7 @@ struct VulkanGsScanoutState
         bool frameFields = false;
         bool fieldMode = false;
         int8_t fieldTarget = -1; // issue 023 step 2K: the field the picture was drawn for, -1 if not known
+        bool afterHandover = false; // issue 049: the pictures before this one were handed over, not read
     };
     std::vector<StagedRead> staged;
     // Copied reads keep their buffers until the next presentation releases them under the device lock.
@@ -101,6 +104,13 @@ struct VulkanGsScanoutState
         }
         freeBuffers.push_back(std::move(buffer));
     }
+    // Issue 049 (amendment v3.12 step 3): a presenter's hand-over. While it is switched on, a picture that needs no
+    // work in main memory is copied into one of its images on the graphics card and not read back (unless pixels
+    // are wanted too). Null: every picture is read back.
+    std::shared_ptr<VulkanGsHandover> handover;
+    // Pictures were handed over without a read since the last read: the next read says so (afterHandover), and
+    // the weaver starts over with it, as it does after a picture that needs no weaving.
+    bool handedSinceRead = false;
     // Guards lastFrame between finishVulkanGsPresent (no device lock) and reset() (device lock held).
     std::mutex frameMutex;
     PresentationFrame lastFrame{};
@@ -129,6 +139,9 @@ struct VulkanGsScanoutState
             slot.h = 0;
         }
         ringIndex = 0;
+        if (handover)
+            handover->forget(); // the hand-over itself stays: it is the presenter's too
+        handedSinceRead = false;
         staged.clear();
         retired.clear();
         freeBuffers.clear();
