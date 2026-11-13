@@ -45,9 +45,13 @@ uint32_t transferBits(uint8_t psm)
 // game's, and one for extra pictures), so that pages are copied between them on the graphics card.
 struct GSVulkanDevice
 {
-    // Declaration order ensures the device dies before the context.
-    Vulkan::Context context;
+    // Declaration order ensures the device dies before the context. The context is held by a handle: a presenter
+    // makes a device object of its own on it (issue 049, amendment v3.12; measured in the work log, "M4-1": with a
+    // device object of its own the presenter never waits for this one's open command buffers).
+    Vulkan::ContextHandle context;
     Vulkan::Device device;
+    // Issue 049 (amendment v3.12 step 2): made with the system's surface extensions and the swap chain extension.
+    bool windowSupport = false;
     std::mutex mutex;
     // The GS memories of this device (Impl registers its own). They draw in turns, and each keeps its work open
     // while another one draws: where the turns fall must not show in a picture (issue 049 v3.7), and what
@@ -69,17 +73,85 @@ struct GSVulkanDevice
             memory->flush();
     }
 
+    // The surface extensions this system has: VK_KHR_surface with every window system's own. Empty when the loader
+    // offers no window system. Asked after the loader is up and before any instance exists.
+    static std::vector<const char *> systemSurfaceExtensions()
+    {
+        uint32_t count = 0;
+        if (vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr) != VK_SUCCESS || !count)
+            return {};
+        std::vector<VkExtensionProperties> offered(count);
+        if (vkEnumerateInstanceExtensionProperties(nullptr, &count, offered.data()) < 0)
+            return {};
+        offered.resize(count);
+        const auto has = [&](const char *name)
+        {
+            for (const auto &extension : offered)
+                if (std::strcmp(extension.extensionName, name) == 0)
+                    return true;
+            return false;
+        };
+        std::vector<const char *> list;
+        if (!has("VK_KHR_surface"))
+            return list;
+        static const char *const windowSystems[] = {"VK_KHR_win32_surface", "VK_KHR_xcb_surface",
+                                                    "VK_KHR_xlib_surface", "VK_KHR_wayland_surface"};
+        for (const char *name : windowSystems)
+            if (has(name))
+                list.push_back(name);
+        if (!list.empty())
+            list.insert(list.begin(), "VK_KHR_surface");
+        return list;
+    }
+
     GSVulkanDevice()
     {
         if (!Vulkan::Context::init_loader(nullptr))
             throw std::runtime_error("Vulkan loader is unavailable");
-        context.set_num_thread_indices(1);
-        if (!context.init_instance_and_device(nullptr, 0, nullptr, 0,
-            Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT |
-            Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT |
-            Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT))
-            throw std::runtime_error("Vulkan device creation failed");
-        device.set_context(context);
+        constexpr Vulkan::ContextCreationFlags flags = Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT |
+                                                       Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT |
+                                                       Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT;
+        // Issue 049 (amendment v3.12 step 2): the device is made so that it can present to a window: with the
+        // system's surface extensions, the swap chain extension and the library's flag for the present extensions.
+        // None of them can be added to a made device. A system that lacks them gets the device as it was.
+        // DW5XL-DEBUG PS2X_GS_WINDOW_SUPPORT=0: the device as it was, for comparing.
+        static const bool s_wanted = []
+        {
+            const char *e = std::getenv("PS2X_GS_WINDOW_SUPPORT");
+            return !(e && *e == '0');
+        }();
+        const char *why = "";
+        const std::vector<const char *> surfaces = s_wanted ? systemSurfaceExtensions() : std::vector<const char *>();
+        if (!s_wanted)
+            why = " (switched off by PS2X_GS_WINDOW_SUPPORT=0)";
+        else if (surfaces.empty())
+            why = " (the system offers no window system's surfaces)";
+        else
+        {
+            static const char *const swapChain[] = {"VK_KHR_swapchain"};
+            auto made = Util::make_handle<Vulkan::Context>();
+            made->set_num_thread_indices(1);
+            if (made->init_instance_and_device(surfaces.data(), static_cast<uint32_t>(surfaces.size()), swapChain, 1u,
+                                               flags | Vulkan::CONTEXT_CREATION_ENABLE_ADVANCED_WSI_BIT))
+            {
+                context = std::move(made);
+                windowSupport = true;
+            }
+            else
+                why = " (no device could be made with the swap chain extension)";
+        }
+        if (!context)
+        {
+            auto made = Util::make_handle<Vulkan::Context>();
+            made->set_num_thread_indices(1);
+            if (!made->init_instance_and_device(nullptr, 0, nullptr, 0, flags))
+                throw std::runtime_error("Vulkan device creation failed");
+            context = std::move(made);
+        }
+        static std::atomic<bool> s_said{false};
+        if (!s_said.exchange(true))
+            std::fprintf(stderr, "[gs] Vulkan device made %s window support%s\n", windowSupport ? "with" : "without", why);
+        device.set_context(*context);
         // Keep enough Granite PerFrame contexts that a multi-flush field + 3-slot
         // async readback ring never wraps and blocks inside per_frame->begin() while
         // holding the GS device mutex.
@@ -383,6 +455,7 @@ struct GSVulkanBackend::Impl
 
 GSVulkanBackend::GSVulkanBackend() : m_impl(std::make_unique<Impl>()) {}
 GSVulkanBackend::GSVulkanBackend(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
+bool GSVulkanBackend::WindowSupport() const { return m_impl->shared->windowSupport; }
 
 // DW5XL (issue 049, fact-finding 2026-11-11): a second GS memory on this renderer's device.
 std::unique_ptr<GSRasterBackend> GSVulkanBackend::MakeSecondMemory()

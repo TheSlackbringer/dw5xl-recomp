@@ -14,6 +14,10 @@ public:
     void Reset() override;
     void SerializeState(ps2x::StateArchive &archive) override; // DW5XL (issue 027)
     std::unique_ptr<GSRasterBackend> MakeSecondMemory() override; // DW5XL (issue 049, fact-finding)
+    // DW5XL (issue 049, amendment v3.12 step 2): whether this renderer's graphics device was made with window
+    // support (the system's surface extensions and the swap chain extension), so that a presenter can show its
+    // pictures without reading them back.
+    bool WindowSupport() const;
     bool CopyPagesFrom(GSRasterBackend &source, const std::bitset<512> &pages) override;
     bool SubmitPictureRead(const GSPresentationRequest &) override;
     bool CollectPictureReads(std::vector<GSPictureRead> &) override;
