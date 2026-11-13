@@ -9,6 +9,7 @@
 //   4. the field reads after them are not disturbed: the first draws again give the first picture.
 // Exit code 77: no Vulkan device (skipped).
 #include "runtime/gs/gs_vulkan_backend.h"
+#include "test_one_program.h"
 
 #include <algorithm>
 #include <chrono>
@@ -184,7 +185,7 @@ void run(uint32_t scale)
 }
 } // namespace
 
-int main()
+int DW5XL_TEST_MAIN(gs_picture_reads)()
 {
     try
     {

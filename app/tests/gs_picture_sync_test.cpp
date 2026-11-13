@@ -12,6 +12,7 @@
 // "Equal" compares the single-rate GS memory (4 MB) of both, read back from the renderer.
 // Exit code 77: no Vulkan device (skipped).
 #include "ps2_runtime.h"
+#include "test_one_program.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/state_archive.h"
@@ -135,7 +136,7 @@ void run()
 }
 } // namespace
 
-int main()
+int DW5XL_TEST_MAIN(gs_picture_sync)()
 {
 #ifdef _WIN32
     _putenv_s("PS2X_GS_BACKEND", "vulkan");

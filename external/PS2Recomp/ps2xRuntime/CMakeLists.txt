@@ -410,6 +410,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_device_queue.cpp
     src/lib/ps2_picture_device.cpp
     src/lib/ps2_pad.cpp
+    src/lib/ps2_host_devices.cpp
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp

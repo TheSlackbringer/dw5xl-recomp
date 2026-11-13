@@ -15,6 +15,7 @@
 // a page are proved by game pictures at 4x (notes, issue 049).
 // Exit code 77: no Vulkan device (skipped).
 #include "runtime/gs/gs_vulkan_backend.h"
+#include "test_one_program.h"
 
 #include <algorithm>
 #include <bitset>
@@ -202,7 +203,7 @@ void run(uint32_t scale)
 }
 } // namespace
 
-int main()
+int DW5XL_TEST_MAIN(gs_second_memory)()
 {
     try
     {

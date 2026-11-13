@@ -294,6 +294,10 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_host_input_field_sample_test tests/host_input_field_sample_test.cpp)
     target_link_libraries(dw5xl_host_input_field_sample_test PRIVATE ps2_runtime)
     add_test(NAME host_input_field_sample COMMAND dw5xl_host_input_field_sample_test)
+    # DW5XL-TEST issue 049 (amendment v3.12 step 3): keys and pads reach the game through one interface.
+    add_executable(dw5xl_host_devices_test tests/host_devices_test.cpp)
+    target_link_libraries(dw5xl_host_devices_test PRIVATE ps2_runtime)
+    add_test(NAME host_devices COMMAND dw5xl_host_devices_test)
     # Save-state archive (issue 027): save -> load -> save identity, refusal of damaged files.
     add_executable(dw5xl_state_archive_test tests/state_archive_test.cpp)
     target_link_libraries(dw5xl_state_archive_test PRIVATE ps2_runtime)
@@ -572,33 +576,28 @@ if(DW5XL_BUILD_TESTS)
     target_include_directories(dw5xl_vif1_replay PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${DW5XL_GSREPLAY_DIR}")
     target_compile_options(dw5xl_vif1_replay PRIVATE ${DW5XL_ARCH_FLAGS})
     # DW5XL-TEST issue 049: the reads of in-between pictures on the Vulkan renderer (skipped without a Vulkan device).
-    add_executable(dw5xl_gs_picture_reads_test tests/gs_picture_reads_test.cpp)
-    target_link_libraries(dw5xl_gs_picture_reads_test PRIVATE ps2_runtime)
-    target_include_directories(dw5xl_gs_picture_reads_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
-    add_test(NAME gs_picture_reads COMMAND dw5xl_gs_picture_reads_test)
+    # DW5XL-TEST issue 049 (2026-11-13): the renderer's unit tests are one program, each still a CTest of its own name
+    # and exit code. The graphics driver keeps a shader cache file for every program that draws with the renderer:
+    # as five programs these tests wrote 412 MB into a folder that holds 1 GB and pushed the game's own compiled
+    # shaders out right before timed runs (tests/test_one_program.h).
+    add_executable(dw5xl_gs_renderer_tests tests/gs_renderer_tests_main.cpp
+        tests/gs_picture_reads_test.cpp tests/gs_window_support_test.cpp tests/gs_second_memory_test.cpp
+        tests/gs_turns_test.cpp tests/gs_picture_sync_test.cpp)
+    target_compile_definitions(dw5xl_gs_renderer_tests PRIVATE DW5XL_ONE_TEST_PROGRAM)
+    target_link_libraries(dw5xl_gs_renderer_tests PRIVATE ps2_runtime)
+    target_include_directories(dw5xl_gs_renderer_tests PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME gs_picture_reads COMMAND dw5xl_gs_renderer_tests gs_picture_reads)
     # DW5XL-TEST issue 049 (amendment v3.12 step 2): the renderer's device is made with window support where the
     # system offers it (skipped without a Vulkan device).
-    add_executable(dw5xl_gs_window_support_test tests/gs_window_support_test.cpp)
-    target_link_libraries(dw5xl_gs_window_support_test PRIVATE ps2_runtime)
-    target_include_directories(dw5xl_gs_window_support_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
-    add_test(NAME gs_window_support COMMAND dw5xl_gs_window_support_test)
+    add_test(NAME gs_window_support COMMAND dw5xl_gs_renderer_tests gs_window_support)
     # DW5XL-TEST issue 049 (fact-finding): a second GS memory on the same Vulkan device (skipped without a device).
-    add_executable(dw5xl_gs_second_memory_test tests/gs_second_memory_test.cpp)
-    target_link_libraries(dw5xl_gs_second_memory_test PRIVATE ps2_runtime)
-    target_include_directories(dw5xl_gs_second_memory_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
-    add_test(NAME gs_second_memory COMMAND dw5xl_gs_second_memory_test)
+    add_test(NAME gs_second_memory COMMAND dw5xl_gs_renderer_tests gs_second_memory)
     # DW5XL-TEST issue 049 v3.7 (P2.6b-3): the two GS memories draw in turns and neither's work ends at a turn
     # (skipped without a Vulkan device).
-    add_executable(dw5xl_gs_turns_test tests/gs_turns_test.cpp)
-    target_link_libraries(dw5xl_gs_turns_test PRIVATE ps2_runtime)
-    target_include_directories(dw5xl_gs_turns_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
-    add_test(NAME gs_turns COMMAND dw5xl_gs_turns_test)
+    add_test(NAME gs_turns COMMAND dw5xl_gs_renderer_tests gs_turns)
     # DW5XL-TEST issue 049 v3.7: the picture GS follows the game's GS through a state load, a change of scale or
     # samples and a direct write (the GS front end's list of written pages; skipped without a Vulkan device).
-    add_executable(dw5xl_gs_picture_sync_test tests/gs_picture_sync_test.cpp)
-    target_link_libraries(dw5xl_gs_picture_sync_test PRIVATE ps2_runtime)
-    target_include_directories(dw5xl_gs_picture_sync_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
-    add_test(NAME gs_picture_sync COMMAND dw5xl_gs_picture_sync_test)
+    add_test(NAME gs_picture_sync COMMAND dw5xl_gs_renderer_tests gs_picture_sync)
     # DW5XL-TEST issue 049 P2.4: a frame's command list as our own data (stream, map, matrix tags); no game data.
     add_executable(dw5xl_smooth_list_test tests/smooth_list_test.cpp src/dw5xl_smooth_list.cpp)
     target_include_directories(dw5xl_smooth_list_test PRIVATE src)
@@ -613,6 +612,10 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_display_clock_test tests/display_clock_test.cpp "${PS2RECOMP_DIR}/ps2xRuntime/src/lib/ps2_display_clock.cpp")
     target_include_directories(dw5xl_display_clock_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
     add_test(NAME display_clock COMMAND dw5xl_display_clock_test)
+    # DW5XL-TEST issue 049 (amendment v3.12 step 3): where the picture lies in the window, one function for every window.
+    add_executable(dw5xl_picture_rect_test tests/picture_rect_test.cpp)
+    target_include_directories(dw5xl_picture_rect_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME picture_rect COMMAND dw5xl_picture_rect_test)
     set_tests_properties(gs_picture_reads PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     set_tests_properties(gs_window_support PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     set_tests_properties(gs_second_memory PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)

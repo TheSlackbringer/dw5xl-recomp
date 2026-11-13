@@ -49,6 +49,8 @@
 #include "runtime/hotkeys.h"
 #include "runtime/ps2_present_feedback.h"
 #include "runtime/ps2_display_clock.h"
+#include "runtime/picture_rect.h"
+#include "runtime/host_devices.h"
 
 namespace ps2_stubs
 {
@@ -4597,22 +4599,15 @@ void PS2Runtime::run()
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
-        // Letterbox by the logical display size, not the stored image size.
-        const float aspectHeight = static_cast<float>(std::max<uint32_t>(1u, displayHeight));
-        const float pictureShape = s_pictureShape.load(std::memory_order_relaxed);   // DW5XL issue 047
-        const float aspectWidth = pictureShape > 0.0f ? aspectHeight * pictureShape : static_cast<float>(std::max<uint32_t>(1u, displayWidth));
+        // Letterbox by the logical display size, not the stored image size, to the picture's shape (DW5XL issue 047).
         // DW5XL issue 047: the real window. GetScreenWidth() already holds a size asked for, which the window manager may refuse.
         const float screenWidth = static_cast<float>(GetRenderWidth());
         const float screenHeight = static_cast<float>(GetRenderHeight());
-        const float scale = std::min(screenWidth / aspectWidth, screenHeight / aspectHeight);
-        const float dstWidth = aspectWidth * scale;
-        const float dstHeight = aspectHeight * scale;
+        // DW5XL issue 049 (amendment v3.12 step 3): one function for every window that shows the picture.
+        const ps2x::PictureRect placed = ps2x::pictureRectInWindow(
+            displayWidth, displayHeight, s_pictureShape.load(std::memory_order_relaxed), screenWidth, screenHeight);
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
-        const Rectangle dstRect{
-            (screenWidth - dstWidth) * 0.5f,
-            (screenHeight - dstHeight) * 0.5f,
-            dstWidth,
-            dstHeight};
+        const Rectangle dstRect{placed.x, placed.y, placed.width, placed.height};
         // DW5XL-DEBUG issue 023: PS2X_WEAVE_TRACE=1 logs the window size and the picture rectangle whenever they change.
         {
             static const bool s_rectTrace = [] { const char *v = std::getenv("PS2X_WEAVE_TRACE"); return v && *v && *v != '0'; }();
@@ -4653,7 +4648,7 @@ void PS2Runtime::run()
         // with F2 too; PS2X_FPS=1 turns it on for a run.
         static const bool s_showFpsInit = [this]() { m_showFps.store(loadShowFpsSetting(), std::memory_order_relaxed); return true; }();
         (void)s_showFpsInit;
-        if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::FpsOverlay)))
+        if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::FpsOverlay)))
         {
             setShowFps(!showFps());
             ps2x::settings::saveText("show_fps", showFps() ? "on" : "off");
@@ -4661,7 +4656,7 @@ void PS2Runtime::run()
         const bool s_showFpsOverlay = showFps();
         // F8: build ID and game tick, to match screenshots with logs (off by default).
         static bool s_showBuildOverlay = false;
-        if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::BuildOverlay)))
+        if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::BuildOverlay)))
         {
             s_showBuildOverlay = !s_showBuildOverlay;
         }
@@ -4671,7 +4666,7 @@ void PS2Runtime::run()
         // DW5XL-DEBUG (issue 049, M2): a scripted press, "<tick>:F4:1" in PS2X_HOST_INPUT, as F5 and F9 have one:
         // the output scale changed while the game runs, for hidden tests.
         const bool scriptedScale = m_eeScheduler && ps2_host_input::scriptedKeyPress("F4", eeScheduler().currentVSyncTick());
-        if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::OutputScale)) || scriptedScale)
+        if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::OutputScale)) || scriptedScale)
         {
             const uint32_t current = m_gs.getResolutionScale();
             m_gs.setResolutionScale(current == 1u ? 2u : current == 2u ? 4u : 1u);
@@ -4679,7 +4674,7 @@ void PS2Runtime::run()
                 m_gs.setResolutionScale(1u);
             saveIniValue("resolution_scale", m_gs.getResolutionScale());
         }
-        if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::AntiAliasing)))
+        if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::AntiAliasing)))
         {
             s_aaChoice = s_aaChoice >= 16u ? 1u : s_aaChoice * 2u;
             m_gs.setAASamples(s_aaChoice);
@@ -4691,10 +4686,10 @@ void PS2Runtime::run()
         {
             static const std::filesystem::path s_stateDir = stateDirectory();
             const uint64_t tick = eeScheduler().currentVSyncTick();
-            const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
-            const bool loadKey = IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::LoadState));
+            const bool shift = ps2x::host::devices().keyDown(KEY_LEFT_SHIFT) || ps2x::host::devices().keyDown(KEY_RIGHT_SHIFT);
+            const bool loadKey = ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::LoadState));
             const std::string quick = (s_stateDir / "quick.state").string(), backup = (s_stateDir / "before-load.state").string();
-            if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::SaveState)) || ps2_host_input::scriptedKeyPress("F5", tick))
+            if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::SaveState)) || ps2_host_input::scriptedKeyPress("F5", tick))
                 requestStateWithPicture(true, quick);
             else if ((loadKey && shift) || ps2_host_input::scriptedKeyPress("SHIFT+F9", tick))
                 eeScheduler().requestState(EeScheduler::StateRequestKind::Load, backup);

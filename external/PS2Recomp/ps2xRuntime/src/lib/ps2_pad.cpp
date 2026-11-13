@@ -1,5 +1,6 @@
 #include "runtime/ps2_pad.h"
 #include "runtime/host_input.h"
+#include "runtime/host_devices.h"
 #include "runtime/back_button.h"
 #include "ps2_host_backend.h"
 
@@ -182,7 +183,7 @@ namespace ps2_host_input
     void hideGameButtonsUntilRelease(uint16_t mask) { gHideUntilRelease.fetch_or(mask); }
     void tapGameButtons(uint16_t mask)
     {
-        const double now = IsWindowReady() ? GetTime() : 0.0;
+        const double now = ps2x::host::devices().ready() ? ps2x::host::devices().seconds() : 0.0;
         std::lock_guard<std::mutex> sampleLock(gSampleMutex);   // a script reads the inputs on the game's thread
         for (unsigned bit = 0; bit < 16; ++bit)
             if (mask & (1u << bit)) gTapUntil[bit] = now + 0.1;
@@ -266,7 +267,9 @@ namespace ps2_host_input
     static void readInputs(uint64_t vsyncTick)
     {
         initScript();
-        if (!IsWindowReady() && !gScripted) return;
+        // DW5XL issue 049 (amendment v3.12 step 3): the devices of whichever window shows the game.
+        ps2x::host::Devices &host = ps2x::host::devices();
+        if (!host.ready() && !gScripted) return;
         bool verdite, gameplay, captured;
         {
             std::lock_guard<std::mutex> lock(gMutex);
@@ -274,12 +277,12 @@ namespace ps2_host_input
             gameplay = gState.gameplay;
             captured = gState.captured;
         }
-        const bool focused = gScripted || (IsWindowReady() && IsWindowFocused());
-        const double now = IsWindowReady() ? GetTime() : 0.0;
+        const bool focused = gScripted || (host.ready() && host.focused());
+        const double now = host.ready() ? host.seconds() : 0.0;
         uint16_t pressed = 0;
         std::array<uint8_t, 4> sticks{128, 128, 128, 128};
         auto key = [&](int code, const char *name) {
-            return focused && (gScripted ? scriptedDown(name, vsyncTick) : (IsWindowReady() && IsKeyDown(code)));
+            return focused && (gScripted ? scriptedDown(name, vsyncTick) : (host.ready() && host.keyDown(code)));
         };
         auto bind = [&](bool down, uint16_t mask) { if (down) pressed |= mask; };
         bind(key(KEY_UP, "UP") || key(KEY_W, "W"), PAD_UP);
@@ -317,7 +320,7 @@ namespace ps2_host_input
         if (focused && !gScripted)
         {
             for (int index = 0; index < 4; ++index)
-                if (IsGamepadAvailable(index)) { gamepad = index; break; }
+                if (host.padAvailable(index)) { gamepad = index; break; }
         }
         if (gamepad >= 0)
         {
@@ -331,12 +334,12 @@ namespace ps2_host_input
                 {GAMEPAD_BUTTON_MIDDLE_RIGHT, PAD_START},
                 {GAMEPAD_BUTTON_LEFT_THUMB, PAD_L3}, {GAMEPAD_BUTTON_RIGHT_THUMB, PAD_R3}
             };
-            for (const auto &button : buttons) bind(IsGamepadButtonDown(gamepad, button.first), button.second);
-            padBack = IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_LEFT);
-            sticks[0] = stickByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X));
-            sticks[1] = stickByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y));
-            sticks[2] = stickByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X));
-            sticks[3] = stickByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y));
+            for (const auto &button : buttons) bind(host.padButtonDown(gamepad, button.first), button.second);
+            padBack = host.padButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_LEFT);
+            sticks[0] = stickByte(host.padAxis(gamepad, GAMEPAD_AXIS_RIGHT_X));
+            sticks[1] = stickByte(host.padAxis(gamepad, GAMEPAD_AXIS_RIGHT_Y));
+            sticks[2] = stickByte(host.padAxis(gamepad, GAMEPAD_AXIS_LEFT_X));
+            sticks[3] = stickByte(host.padAxis(gamepad, GAMEPAD_AXIS_LEFT_Y));
         }
         else if (gScripted)   // issue 058: the pad's Back and Start in a script, through the same rule as a real pad
         {
@@ -360,7 +363,7 @@ namespace ps2_host_input
         std::array<bool, 3> mouse{};
         const char *mouseNames[] = {"MOUSELEFT", "MOUSERIGHT", "MOUSEMIDDLE"};
         for (int index = 0; index < 3; ++index)
-            mouse[index] = focused && (gScripted ? scriptedDown(mouseNames[index], vsyncTick) : IsMouseButtonDown(index));
+            mouse[index] = focused && (gScripted ? scriptedDown(mouseNames[index], vsyncTick) : host.mouseButtonDown(index));
         const bool wasCaptured = captured;
         bool discardMotion = focused != gPreviousFocus || gameplay != gPreviousGameplay;
         if (!focused)
@@ -410,7 +413,7 @@ namespace ps2_host_input
                 bind(mouse[0] && !gSwallowedMouse[0], PAD_CROSS);
                 bind(mouse[1] && !gSwallowedMouse[1], PAD_CIRCLE);
                 bind(mouse[2] && !gSwallowedMouse[2], PAD_CROSS);
-                const float wheel = gScripted ? 0.0f : GetMouseWheelMove();
+                const float wheel = gScripted ? 0.0f : host.mouseWheel();
                 bind(wheel > 0.0f, PAD_UP);
                 bind(wheel < 0.0f, PAD_DOWN);
             }
@@ -418,10 +421,11 @@ namespace ps2_host_input
         if (captured != wasCaptured) discardMotion = true;
         if (!gScripted && captured != gCursorDisabled)
         {
-            if (captured) DisableCursor(); else EnableCursor();
+            host.captureMouse(captured);
             gCursorDisabled = captured;
         }
-        Vector2 delta = gScripted ? Vector2{0.0f, 0.0f} : GetMouseDelta();
+        Vector2 delta{0.0f, 0.0f};
+        if (!gScripted) host.mouseDelta(delta.x, delta.y);
         for (Event &event : gEvents)
         {
             if (event.name == "MOUSE" && !event.consumed && vsyncTick >= event.tick)

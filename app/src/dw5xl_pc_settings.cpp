@@ -20,6 +20,7 @@
 #include "raylib.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/host_input.h"
+#include "runtime/host_devices.h"
 #include "runtime/ps2_settings.h"
 #include "ps2x/iop/spu2_sound.h"
 
@@ -901,21 +902,21 @@ Presses readPresses()
 {
     Presses p;
     if (ps2_host_input::scripted()) return p;         // a scripted run: only the screen's own script steps
-    auto key = [](int k) { return IsKeyPressed(k) || IsKeyPressedRepeat(k); };
+    auto key = [](int k) { return ps2x::host::devices().keyPressed(k) || ps2x::host::devices().keyPressedRepeat(k); };
     p.up = key(KEY_UP) || key(KEY_W); p.down = key(KEY_DOWN) || key(KEY_S);
     p.left = key(KEY_LEFT) || key(KEY_A); p.right = key(KEY_RIGHT) || key(KEY_D);
-    p.cross = IsKeyPressed(KEY_X) || IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_ENTER);
-    p.back = IsKeyPressed(KEY_V) || IsKeyPressed(KEY_KP_1);
+    p.cross = ps2x::host::devices().keyPressed(KEY_X) || ps2x::host::devices().keyPressed(KEY_SPACE) || ps2x::host::devices().keyPressed(KEY_ENTER);
+    p.back = ps2x::host::devices().keyPressed(KEY_V) || ps2x::host::devices().keyPressed(KEY_KP_1);
     for (int pad = 0; pad < 4; ++pad) {
-        if (!IsGamepadAvailable(pad)) continue;
-        p.up |= IsGamepadButtonPressed(pad, GAMEPAD_BUTTON_LEFT_FACE_UP);
-        p.down |= IsGamepadButtonPressed(pad, GAMEPAD_BUTTON_LEFT_FACE_DOWN);
-        p.left |= IsGamepadButtonPressed(pad, GAMEPAD_BUTTON_LEFT_FACE_LEFT);
-        p.right |= IsGamepadButtonPressed(pad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT);
-        p.cross |= IsGamepadButtonPressed(pad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
-        p.back |= IsGamepadButtonPressed(pad, GAMEPAD_BUTTON_RIGHT_FACE_UP);
+        if (!ps2x::host::devices().padAvailable(pad)) continue;
+        p.up |= ps2x::host::devices().padButtonPressed(pad, GAMEPAD_BUTTON_LEFT_FACE_UP);
+        p.down |= ps2x::host::devices().padButtonPressed(pad, GAMEPAD_BUTTON_LEFT_FACE_DOWN);
+        p.left |= ps2x::host::devices().padButtonPressed(pad, GAMEPAD_BUTTON_LEFT_FACE_LEFT);
+        p.right |= ps2x::host::devices().padButtonPressed(pad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT);
+        p.cross |= ps2x::host::devices().padButtonPressed(pad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
+        p.back |= ps2x::host::devices().padButtonPressed(pad, GAMEPAD_BUTTON_RIGHT_FACE_UP);
         static int s_stick = 0;                       // 0 centred, else the direction already counted
-        const float x = GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_X), y = GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_Y);
+        const float x = ps2x::host::devices().padAxis(pad, GAMEPAD_AXIS_LEFT_X), y = ps2x::host::devices().padAxis(pad, GAMEPAD_AXIS_LEFT_Y);
         const int dir = y < -0.5f ? 1 : y > 0.5f ? 2 : x < -0.5f ? 3 : x > 0.5f ? 4 : 0;
         if (dir != s_stick && dir) { p.up |= dir == 1; p.down |= dir == 2; p.left |= dir == 3; p.right |= dir == 4; }
         s_stick = dir;
@@ -1020,7 +1021,7 @@ bool frame(bool allowOpen)
     const std::string script = scriptAction();
     std::string shot;
     if (script.rfind("shot=", 0) == 0) shot = script.substr(5);
-    const bool esc = (IsKeyPressed(KEY_ESCAPE) && !ps2_host_input::scripted()) || script == "esc";
+    const bool esc = (ps2x::host::devices().keyPressed(KEY_ESCAPE) && !ps2_host_input::scripted()) || script == "esc";
     const bool held = g_backHeld.exchange(false, std::memory_order_acq_rel) || script == "hold";
     const Mode mode = snapshot().mode;
     Presses p;
@@ -1029,7 +1030,7 @@ bool frame(bool allowOpen)
         p.up |= script == "up"; p.down |= script == "down"; p.left |= script == "left"; p.right |= script == "right";
         p.cross |= script == "cross"; p.back |= script == "back";
     } else if (mode == Mode::Options) {               // the game's routine does not use Cross; its Back leaves the screen
-        p.cross = IsKeyPressed(KEY_X) || IsKeyPressed(KEY_SPACE) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN) || script == "cross";
+        p.cross = ps2x::host::devices().keyPressed(KEY_X) || ps2x::host::devices().keyPressed(KEY_SPACE) || ps2x::host::devices().padButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN) || script == "cross";
         p.back = readPresses().back || script == "back";
     }
     if (mode == Mode::Closed && (esc || held) && allowOpen) openInPlay(held && !esc);

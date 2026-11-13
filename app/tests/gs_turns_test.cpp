@@ -12,6 +12,7 @@
 //      a reset of the second and the second memory's end while the first has open work: nothing hangs.
 // Exit code 77: no Vulkan device (skipped).
 #include "runtime/gs/gs_vulkan_backend.h"
+#include "test_one_program.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -206,7 +207,7 @@ void run(uint32_t scale)
 }
 } // namespace
 
-int main()
+int DW5XL_TEST_MAIN(gs_turns)()
 {
     try
     {

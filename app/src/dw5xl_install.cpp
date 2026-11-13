@@ -29,6 +29,7 @@
 #include <memory>
 #include <string>
 #include "runtime/hotkeys.h"
+#include "runtime/host_devices.h"
 
 namespace fs = std::filesystem;
 using namespace dw5xl::setup;
@@ -208,7 +209,7 @@ const DiscSpec &dw5Disc() { return kSupportedDiscs[1]; }
 
 bool overlayWanted()
 {
-    if (IsKeyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::Discs)))
+    if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::Discs)))
         g_discsWindow = !g_discsWindow;
     return g_discWait.waiting() || g_discsWindow || (g_panel && g_panel->running());
 }

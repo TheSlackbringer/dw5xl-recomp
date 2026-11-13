@@ -10,6 +10,7 @@
 // surfaces (the renderer then falls back to a device without window support, and check 2 would fail).
 // Exit code 77: no Vulkan device (skipped).
 #include "runtime/gs/gs_vulkan_backend.h"
+#include "test_one_program.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -78,7 +79,7 @@ int loaderOffersWindows()
 }
 } // namespace
 
-int main()
+int DW5XL_TEST_MAIN(gs_window_support)()
 {
     std::unique_ptr<GSVulkanBackend> renderer;
     try

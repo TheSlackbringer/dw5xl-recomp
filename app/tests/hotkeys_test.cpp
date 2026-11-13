@@ -62,7 +62,8 @@ int main()
         bound.insert(b.name);
     check(documented == bound, "README.md key table lists exactly the bound keys");
 
-    // The handlers take their keys from the table: no hard-coded IsKeyPressed(KEY_Fn) left.
+    // The handlers take their keys from the table: no hard-coded IsKeyPressed(KEY_Fn) left, nor the same through
+    // the devices interface (issue 049, amendment v3.12: the handlers ask ps2x::host::devices().keyPressed).
     for (const char *source : {"/external/PS2Recomp/ps2xRuntime/src/lib/ps2_runtime.cpp",
                                "/external/PS2Recomp/ps2xRuntime/src/lib/ps2_debug_panel.cpp",
                                "/app/src/dw5xl_install.cpp"})
@@ -70,7 +71,7 @@ int main()
         std::ifstream file(std::string(DW5XL_SOURCE_DIR) + source);
         std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         check(!text.empty(), std::string(source) + " found");
-        check(!std::regex_search(text, std::regex(R"(IsKeyPressed\(\s*KEY_F[0-9])")),
+        check(!std::regex_search(text, std::regex(R"((IsKeyPressed|keyPressed)\(\s*KEY_F[0-9])")),
               std::string(source) + " reads its function keys from the table");
     }
 
