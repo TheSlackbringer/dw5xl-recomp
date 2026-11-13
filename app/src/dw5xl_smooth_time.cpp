@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <utility>
 
 namespace dw5xl::smooth
 {
@@ -19,66 +20,6 @@ namespace dw5xl::smooth
         m_haveEnd = false;
         m_haveHead = false;
         m_haveRefresh = false;
-    }
-
-    void PictureBudget::prune(Window &window, double nowMs)
-    {
-        while (!window.empty() && window.front().first < nowMs - kWindowMs)
-            window.pop_front();
-    }
-
-    void PictureBudget::add(Window &window, double nowMs, double value)
-    {
-        prune(window, nowMs);
-        while (!window.empty() && window.back().second <= value)
-            window.pop_back();
-        window.emplace_back(nowMs, value);
-    }
-
-    void PictureBudget::measured(double nowMs, double pictureMs, bool first)
-    {
-        if (!(pictureMs > 0.0))
-            return;
-        add(first ? m_costs : m_next, nowMs, pictureMs);
-        if (first)
-            m_probing = false;
-    }
-
-    void PictureBudget::gameTook(double nowMs, double ms)
-    {
-        if (ms > 0.0)
-            add(m_game, nowMs, ms);
-    }
-
-    void PictureBudget::frame(double nowMs, double instantMs, double fieldMs, double reserveMs)
-    {
-        prune(m_costs, nowMs);
-        prune(m_next, nowMs);
-        prune(m_game, nowMs);
-        m_allowance = m_game.empty() ? 0.0 : std::max(0.0, fieldMs - m_game.front().second - reserveMs);
-        m_latest = instantMs + m_allowance;
-        m_busyUntil = nowMs;
-        m_admitted = 0;
-    }
-
-    bool PictureBudget::admit(double nowMs)
-    {
-        const double start = std::max(nowMs, m_busyUntil);
-        const double takes = m_admitted == 0 ? cost() : nextCost();
-        if (!known())
-        {
-            if (m_admitted != 0 || start >= m_latest || (m_probing && nowMs < m_probeUntil))
-                return false;
-            m_probing = true;
-            m_probeUntil = nowMs + kProbeMs;
-        }
-        else if (start + takes > m_latest)
-        {
-            return false;
-        }
-        m_busyUntil = start + takes;
-        ++m_admitted;
-        return true;
     }
 
     FinishedFrames::Coming FinishedFrames::finished(uint32_t list, uint64_t hash, uint64_t lastField, double lastStart,
@@ -274,14 +215,13 @@ namespace dw5xl::smooth
         m_leastRoom = std::min(m_leastRoom, frame.room);
         m_leastSpare = std::min(m_leastSpare, frame.spare);
 
-        // Down: the game was held up, or pictures were cut off (v3.8), repeatedly in the last frames. A picture
-        // kept out before it could hold the game up (v3.6, noRoom) counts among the frames, not as a moment.
+        // Down: the game was held up, or pictures were cut off (v3.8), repeatedly in the last frames.
         int heldUp = 0, moments = 0;
         bool before = false;
         for (const Frame &f : m_frames)
         {
             const bool trouble = f.heldUp || f.cutOff;
-            heldUp += trouble || f.noRoom ? 1 : 0;
+            heldUp += trouble ? 1 : 0;
             moments += trouble && !before ? 1 : 0;
             before = trouble;
         }

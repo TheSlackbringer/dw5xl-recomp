@@ -1426,53 +1426,10 @@ namespace ps2x::device
         return true;
     }
 
-    namespace
-    {
-        std::atomic<uint64_t> g_detachedNs{0}, g_detachedCount{0};
-    }
-
-    void detachedVif1Totals(uint64_t &nanoseconds, uint64_t &count)
-    {
-        nanoseconds = g_detachedNs.load(std::memory_order_relaxed);
-        count = g_detachedCount.load(std::memory_order_relaxed);
-    }
-
-    bool submitDetachedVif1(PS2Memory &mem, std::vector<uint8_t> stream, std::function<void()> gsBefore,
-                            std::function<void()> gsAfter)
-    {
-        // A GsCall, not a Transfer: workerCheckpointVif1Input() leaves it alone (no pause or cancel part-way) and no
-        // DMA completion is applied for it. The GS-side calls go through the arbiter from this (its producer) thread,
-        // so they sit exactly between the GIF packets submitted before, during and after the stream.
-        PS2Memory *m = &mem;
-        return submitGsCall(mem, [m, data = std::move(stream), before = std::move(gsBefore), after = std::move(gsAfter)]
-                            {
-                                if (before)
-                                {
-                                    if (m->m_gifArbiter)
-                                        m->m_gifArbiter->submitCall(before);
-                                    else
-                                        before();
-                                }
-                                const auto started = std::chrono::steady_clock::now();
-                                m->processVIF1Data(data.data(), static_cast<uint32_t>(data.size()));
-                                if (m->m_gifArbiter)
-                                    m->m_gifArbiter->drain();
-                                g_detachedNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                           std::chrono::steady_clock::now() - started).count()),
-                                                       std::memory_order_relaxed);
-                                g_detachedCount.fetch_add(1u, std::memory_order_relaxed);
-                                if (after)
-                                {
-                                    if (m->m_gifArbiter)
-                                        m->m_gifArbiter->submitCall(after);
-                                    else
-                                        after();
-                                }
-                            });
-    }
-
     bool submitGsSideCall(PS2Memory &mem, std::function<void()> gsCall)
     {
+        // The call goes through the arbiter from the device's (its producer) thread, so it sits exactly between the
+        // GIF packets submitted before and after it.
         PS2Memory *m = &mem;
         return submitGsCall(mem, [m, call = std::move(gsCall)]
                             {

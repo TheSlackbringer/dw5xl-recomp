@@ -1,0 +1,230 @@
+A second GS memory on the same device: pages copied from the first, and the two drawing in turns
+
+A second GS memory (DW5XL issue 049, fact-finding 2026-11-11): GSInterface::copy_pages_from(source, pages)
+copies pages of another GSInterface on the same device into this one's VRAM on the GPU (every slice in use,
+each page's flag, the current CLUT), so extra pictures can be drawn apart from the game's GS.
+
+Two GS memories drawing in turns (DW5XL issue 049, amendment v3.7): each keeps its own work open while the
+other draws, so that where the turns fall does not show in a picture (what a render pass draws depends on where
+it ends). Granite waits for every open command buffer of the device when a frame context ends, and
+GSRenderer::flush_submit ends one. With GSInterface::set_frame_context_hold(hold) a flush leaves the frame
+context alone while `hold` says true; the caller makes it say so while another GS memory of the device has open
+command buffers (GSInterface::has_open_command_buffers). The frame context is only where the device frees
+things.
+
+The page tracker says and sets whether a page's memory may hold super-sampled content
+(PageTracker::page_may_super_sample, set_page_may_super_sample): that is each page's flag, copied with the page.
+
+The rollback point of the earlier version of this patch was removed on 2026-11-13 (DW5XL issue 049, M3).
+
+Applies on top of 0001-0006.
+
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -4271,6 +4271,57 @@ const void *GSInterface::map_vram_read(size_t offset, size_t size)
+ 	return static_cast<const uint8_t *>(renderer.begin_host_vram_access()) + offset;
+ }
+ 
++// DW5XL issue 049: pages copied from a second GS memory on the same device (gs_interface.hpp).
++bool GSInterface::copy_pages_from(GSInterface &source, const uint32_t *pages, size_t num_pages)
++{
++	if (&source == this || source.vram_size != vram_size)
++		return false;
++
++	// What either side has submitted lands first: the source's pages are as they are after its work so far, and
++	// this GS's own work on those pages is done before they are overwritten.
++	source.flush();
++	flush();
++
++	std::vector<uint32_t> list(pages, pages + num_pages);
++	std::sort(list.begin(), list.end());
++	list.erase(std::unique(list.begin(), list.end()), list.end());
++	std::vector<std::pair<VkDeviceSize, VkDeviceSize>> ranges;
++	for (uint32_t page : list)
++	{
++		VkDeviceSize offset = VkDeviceSize(page) * PageSize;
++		if (!ranges.empty() && ranges.back().first + ranges.back().second == offset)
++			ranges.back().second += PageSize;
++		else
++			ranges.emplace_back(offset, VkDeviceSize(PageSize));
++	}
++
++	// With different sampling rates only the single-rate slice means the same on both sides.
++	uint32_t sample_rate_log2 = sampling_rate_x_log2 + sampling_rate_y_log2;
++	bool same_rate = sample_rate_log2 == source.sampling_rate_x_log2 + source.sampling_rate_y_log2;
++	uint32_t num_slices = same_rate && sample_rate_log2 ? 2u + (1u << sample_rate_log2) : 1u;
++	uint32_t clut_instance = (render_pass.clut_instance + 1) % CLUTInstances;
++	renderer.copy_pages_from(source.renderer, ranges, num_slices, source.render_pass.clut_instance, clut_instance);
++
++	for (uint32_t page : list)
++	{
++		PageRect rect = {};
++		rect.base_page = page;
++		rect.page_width = 1;
++		rect.page_height = 1;
++		rect.block_mask = UINT32_MAX;
++		rect.write_mask = UINT32_MAX;
++		tracker.mark_external_write(rect);
++		tracker.set_page_may_super_sample(page, same_rate && source.tracker.page_may_super_sample(page));
++	}
++
++	render_pass.clut_instance = clut_instance;
++	render_pass.latest_clut_instance = clut_instance;
++	renderer.rewind_clut_instance(clut_instance);
++	render_pass.num_memoized_palettes = 0;
++	mark_texture_state_dirty();
++	return true;
++}
++
+ void GSInterface::flush()
+ {
+ 	flush_pending_transfer(true);
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -299,6 +299,17 @@ public:
+ 	void end_vram_write(size_t offset, size_t size);
+ 	const void *map_vram_read(size_t offset, size_t size);
+ 
++	// DW5XL issue 049: a second GS memory on the same device (extra pictures drawn apart from the game's GS).
++	// Copies the given pages of `source` into this GS's VRAM on the GPU (every slice in use, each page's
++	// super-sample flag) and its current CLUT; textures cached from those pages are invalidated here. Both are
++	// flushed first. The registers are the caller's. False when the two differ in memory size.
++	bool copy_pages_from(GSInterface &source, const uint32_t *pages, size_t num_pages);
++	// DW5XL issue 049: two GS memories of one device draw in turns, each with its own work left open meanwhile
++	// (see GSRenderer::set_frame_context_hold). `hold` says true while another memory of the device has open
++	// command buffers.
++	void set_frame_context_hold(std::function<bool()> hold) { renderer.set_frame_context_hold(std::move(hold)); }
++	bool has_open_command_buffers() const { return renderer.has_open_command_buffers(); }
++
+ 	void flush();
+ 
+ 	void clobber_register_state();
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -357,6 +357,41 @@ void GSRenderer::set_field_aware_super_sampling(bool enable)
+ 	field_aware_super_sampling = enable;
+ }
+ 
++// DW5XL issue 049: a second GS memory on the same device, page copy and drawing in turns (gs_renderer.hpp).
++void GSRenderer::copy_pages_from(GSRenderer &source, const std::vector<std::pair<VkDeviceSize, VkDeviceSize>> &ranges,
++                                 uint32_t num_slices, uint32_t source_clut, uint32_t clut_instance)
++{
++	auto cmd = device->request_command_buffer();
++	cmd->begin_region("copy-pages-from");
++	cmd->barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
++	             VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
++	num_slices = std::min<uint32_t>(num_slices, uint32_t(buffers.gpu->get_create_info().size / 2 / vram_size));
++	for (uint32_t slice = 0; slice < num_slices; slice++)
++	{
++		for (auto &range : ranges)
++		{
++			VkDeviceSize vram = VkDeviceSize(vram_size) * slice + range.first;
++			cmd->copy_buffer(*buffers.gpu, vram, *source.buffers.gpu, vram, range.second);
++		}
++	}
++	cmd->copy_buffer(*buffers.clut, VkDeviceSize(clut_instance) * CLUTSize,
++	                 *source.buffers.clut, VkDeviceSize(source_clut) * CLUTSize, CLUTSize);
++	cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++	             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
++	cmd->end_region();
++	device->submit(cmd);
++}
++
++void GSRenderer::set_frame_context_hold(std::function<bool()> hold)
++{
++	frame_context_hold = std::move(hold);
++}
++
++bool GSRenderer::has_open_command_buffers() const
++{
++	return direct_cmd || async_transfer_cmd || triangle_setup_cmd || clear_cmd || heuristic_cmd || binning_cmd;
++}
++
+ void GSRenderer::init_vram(const GSOptions &options)
+ {
+ 	Vulkan::BufferCreateInfo info = {};
+@@ -1212,7 +1247,9 @@ void GSRenderer::flush_submit(uint64_t value)
+ 
+ 	// If we have a timeline trace, we'd like it to be somewhat readable.
+ 	// Only do garbage collection at frame boundaries.
+-	if (!device->get_system_handles().timeline_trace_file)
++	// DW5XL issue 049: and not while another renderer of the device has open command buffers (the device
++	// would wait for them).
++	if (!device->get_system_handles().timeline_trace_file && !(frame_context_hold && frame_context_hold()))
+ 		device->next_frame_context();
+ 
+ 	log_timestamps();
+diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
+--- a/gs/gs_renderer.hpp
++++ b/gs/gs_renderer.hpp
+@@ -12,6 +12,7 @@
+ #include "page_tracker.hpp"
+ #include "shaders/data_structures.h"
+ #include "shaders/slangmosh_iface.hpp"
++#include <functional>
+ #include <queue>
+ #include <future>
+ #include <atomic>
+@@ -326,7 +327,21 @@ public:
+ 
+ 	void set_field_aware_super_sampling(bool enable);
+ 
++	// DW5XL issue 049: page ranges of another renderer's VRAM (on the same device) copied into this one's, in
++	// `num_slices` slices, and its CLUT instance `source_clut` into this one's `clut_instance`. Both callers
++	// have flushed first.
++	void copy_pages_from(GSRenderer &source, const std::vector<std::pair<VkDeviceSize, VkDeviceSize>> &ranges,
++	                     uint32_t num_slices, uint32_t source_clut, uint32_t clut_instance);
++	// DW5XL issue 049: more than one renderer on the same device, each with work of its own left open while
++	// another one draws. A flush ends the device's frame context, and the device then waits for every open
++	// command buffer, whoever holds it. So with `hold` set, a flush leaves the frame context alone while `hold`
++	// says true (another renderer of the device has open command buffers). The frame context is only where the
++	// device frees things: nothing drawn depends on where it ends.
++	void set_frame_context_hold(std::function<bool()> hold);
++	bool has_open_command_buffers() const;
++
+ private:
++	std::function<bool()> frame_context_hold;
+ 	PageTracker &tracker;
+ 	Vulkan::Device *device = nullptr;
+ 	Vulkan::CommandBufferHandle direct_cmd;
+diff --git a/gs/page_tracker.cpp b/gs/page_tracker.cpp
+--- a/gs/page_tracker.cpp
++++ b/gs/page_tracker.cpp
+@@ -144,6 +144,20 @@ void PageTracker::mark_external_write(const PageRect &rect)
+ 	invalidate_texture_cache(UINT32_MAX);
+ }
+ 
++bool PageTracker::page_may_super_sample(uint32_t page) const
++{
++	return (page_state[page & page_state_mask].flags & PAGE_STATE_MAY_SUPER_SAMPLE_BIT) != 0;
++}
++
++void PageTracker::set_page_may_super_sample(uint32_t page, bool enable)
++{
++	auto &state = page_state[page & page_state_mask];
++	if (enable)
++		state.flags |= PAGE_STATE_MAY_SUPER_SAMPLE_BIT;
++	else
++		state.flags &= ~PAGE_STATE_MAY_SUPER_SAMPLE_BIT;
++}
++
+ bool PageTracker::texture_may_super_sample(const PageRect &rect) const
+ {
+ 	// Only check the base page since otherwise we may easily get false positives
+diff --git a/gs/page_tracker.hpp b/gs/page_tracker.hpp
+--- a/gs/page_tracker.hpp
++++ b/gs/page_tracker.hpp
+@@ -201,6 +201,10 @@ public:
+ 
+ 	bool texture_may_super_sample(const PageRect &rect) const;
+ 
++	// DW5XL issue 049: whether a page's memory may hold super-sampled content, to copy along with the page.
++	bool page_may_super_sample(uint32_t page) const;
++	void set_page_may_super_sample(uint32_t page, bool enable);
++
+ 	bool page_has_fb_read_write(const PageRect &rect) const;
+ 	bool page_has_fb_write(const PageRect &rect) const;
+ 	bool page_is_copy_cached_sensitive(const PageRect &rect) const;

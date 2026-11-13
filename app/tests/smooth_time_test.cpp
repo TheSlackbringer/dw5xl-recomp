@@ -531,27 +531,6 @@ int main()
               "frames are numbered in the order they are finished or sent, with or without a frame end");
     }
 
-    // Amendment v3.6, change 3: a picture that did not fit before the game's field harms nobody (one refresh keeps
-    // its picture). Now and then it changes nothing; in one frame in ten the rate does not fit.
-    {
-        RateChoice choice;
-        choice.configure(false, 1000.0 / 60.0, kField, 3);
-        RateChoice::Frame fine;
-        fine.room = 3.0;
-        fine.spare = 12.0;
-        fine.reserve = 5.0;
-        fine.cost = 6.0;
-        RateChoice::Frame tight = fine;
-        tight.noRoom = true;
-        for (int i = 0; i < 300; ++i)
-            choice.frame(i % 40 == 0 ? tight : fine);   // 2 or 3 of every hundred frames
-        const bool stays = choice.on();
-        for (int i = 0; i < 100 && choice.on(); ++i)
-            choice.frame(i % 5 == 0 ? tight : fine);    // every fifth frame
-        check(stays && !choice.on(),
-              "pictures that do not fit now and then change nothing; in ten frames of a hundred the rate goes down");
-    }
-
     // Amendment v3.8, change 3 (approved 2026-11-12): on the pictures' own device "did not fit" is a frame with a
     // picture that was cut off (still being drawn when the next frame's pictures needed the device). The rate goes
     // down one level when that happened in two separate moments, or in ten frames, of the last hundred; at the
@@ -626,91 +605,6 @@ int main()
             before = choice.level();
         }
         check(!down && choice.on(), "pictures that ran to their end, however late, do not bring the rate down");
-    }
-
-    // Amendment v3.6, change 3: a frame's pictures are drawn before the field in which the game sends its own list.
-    {
-        PictureBudget budget;
-        // Nothing measured yet: one picture is let through, to learn what a picture costs, and no other until
-        // that one is measured.
-        budget.frame(1000.0, 1013.0, kField, 5.0);
-        const bool first = budget.admit(1000.5), second = budget.admit(1001.0);
-        budget.frame(1020.0, 1033.0, kField, 5.0);
-        const bool next = budget.admit(1020.5);
-        check(!budget.known() && first && !second && !next, "what a picture costs is not known yet: one picture, no more");
-
-        // A picture took 5 ms at most: two fit into 13 ms, a third would run past the field's start.
-        budget.measured(1030.0, 5.0);
-        budget.frame(1040.0, 1053.0, kField, 5.0);
-        const bool a = budget.admit(1040.5), b = budget.admit(1041.0), c = budget.admit(1041.5);
-        check(budget.known() && std::fabs(budget.cost() - 5.0) < 1e-9 && a && b && !c,
-              "pictures are let through while the last of them leaves the device before the game's field begins");
-
-        // A frame's first picture takes longer than those after it (it may wait for the device): 8 ms and 5 ms. Two
-        // fit into 13 ms; with 8 ms each only one would.
-        {
-            PictureBudget two;
-            two.measured(1030.0, 8.0, true);
-            two.measured(1030.0, 5.0, false);
-            two.frame(1040.0, 1053.0, kField, 5.0);
-            check(two.admit(1040.0) && two.admit(1040.0) && !two.admit(1040.0),
-                  "a frame's first picture and those after it are measured apart");
-        }
-
-        // The game finished late in its field: 4 ms are left, a picture takes 5: none is started.
-        budget.frame(1076.0, 1080.0, kField, 5.0);
-        check(!budget.admit(1076.2), "a frame finished too late for a picture gets none: the game's own list is not held up");
-
-        // The game needs 8 ms from its field's start to the end of its next frame and is to keep 5 ms to spare: its
-        // own list may wait 7 ms. Three pictures of 5 ms fit into 13 + 7 ms, a fourth does not.
-        budget.gameTook(1090.0, 8.0);
-        budget.frame(1100.0, 1113.0, kField, 5.0);
-        const bool three = budget.admit(1100.5) && budget.admit(1101.0) && budget.admit(1101.5), four = budget.admit(1102.0);
-        // A heavy moment: the game took 17 ms. Nothing may run past its field's start while that is in the window.
-        budget.gameTook(1200.0, 17.0);
-        budget.frame(1220.0, 1233.0, kField, 5.0);
-        const bool heavy = budget.admit(1220.5) && budget.admit(1221.0) && !budget.admit(1221.5);
-        check(std::fabs(budget.allowance() - 0.0) < 1e-9 && three && !four && heavy,
-              "the game's own list may wait while the game still keeps its reserve by the longest it took lately");
-
-        // The longest of the last five seconds counts: one slow picture keeps the others out until it is that old.
-        budget.measured(2000.0, 9.0);
-        budget.measured(3000.0, 4.0);
-        budget.frame(4000.0, 4013.0, kField, 5.0);
-        const bool one = budget.admit(4000.5), two = budget.admit(4001.0);
-        budget.measured(7100.0, 4.0);
-        budget.frame(7200.0, 7213.0, kField, 5.0);
-        const bool again = budget.admit(7200.5) && budget.admit(7201.0) && budget.admit(7201.5) && !budget.admit(7202.0);
-        check(std::fabs(budget.cost() - 4.0) < 1e-9 && one && !two && again,
-              "the cost is the longest picture of the last five seconds");
-
-        // Nothing measured for five seconds (no pictures were made): the cost is unknown again, and one is tried;
-        // if that one is never reported, another is tried half a second later.
-        budget.frame(20000.0, 20013.0, kField, 5.0);
-        const bool tried = budget.admit(20000.5) && !budget.admit(20001.0);
-        budget.frame(20020.0, 20033.0, kField, 5.0);
-        const bool waits = !budget.admit(20020.5);
-        budget.frame(20600.0, 20613.0, kField, 5.0);
-        check(!budget.known() && tried && waits && budget.admit(20600.5),
-              "without a measurement for five seconds one picture is tried again");
-    }
-
-    {
-        // Amendment v3.7 (P2.6a): the picture that was let through to learn the cost came back and is not to be
-        // counted (the first one after the time line started again: its caches were cold). The next frame tries one
-        // again at once, not after half a second.
-        PictureBudget budget;
-        budget.frame(1000.0, 1013.0, kField, 5.0);
-        const bool tried = budget.admit(1000.5) && !budget.admit(1001.0);
-        budget.frame(1020.0, 1033.0, kField, 5.0);
-        const bool waits = !budget.admit(1020.5);
-        budget.probeDone();
-        budget.frame(1040.0, 1053.0, kField, 5.0);
-        const bool again = budget.admit(1040.5) && !budget.admit(1041.0);
-        budget.measured(1045.0, 4.0);
-        budget.frame(1060.0, 1073.0, kField, 5.0);
-        check(tried && waits && again && budget.known() && budget.admit(1060.5),
-              "a trial picture that is not counted lets the next frame try one at once");
     }
 
     // (Amendment v3.7, change 4, the forecast for the pictures' own device: replaced by amendment v3.8, change 1,

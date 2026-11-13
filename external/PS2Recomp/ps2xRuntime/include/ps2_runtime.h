@@ -557,14 +557,12 @@ public:
     // on either side since the last call (`everything`: all pages), with palette and registers. False when the
     // renderer has no second memory. `pages`: how many were copied. `differ` (when not null): the two single-rate
     // memories are compared afterwards, and it gets the number of pages that differ.
-    // setGifToPictureGs() (GS side): the next GIF packets go to the picture GS.
     inline GS &pictureGs()
     {
         GS *picture = m_pictureGsPtr.load(std::memory_order_acquire);
         return picture ? *picture : m_gs;
     }
     bool syncPictureGs(bool everything, uint32_t *pages = nullptr, uint32_t *differ = nullptr);
-    void setGifToPictureGs(bool on) { m_gifToPictureGs = on; }
     // Issue 049 (amendment v3.7, changes 2 and 3): the pictures' own VIF1/VU1 device, on a thread of its own
     // (runtime/ps2_picture_device.h). Made on first use, before the game runs; the GS thread reads its packets into
     // the picture GS between the game's own (GifArbiter's side stream).
@@ -647,7 +645,6 @@ private:
     std::vector<uint8_t> m_pictureVram;         // issue 049 (fact-finding): see pictureGs()
     std::unique_ptr<GS> m_pictureGs;            // after m_gs: it goes first
     std::atomic<GS *> m_pictureGsPtr{nullptr};
-    bool m_gifToPictureGs = false;              // GS side only
     std::unique_ptr<ps2x::PictureDevice> m_pictureDevice; // after the two GS: it goes first
     std::function<void()> m_pictureReadSubmitted;
     std::mutex m_pictureReadSubmittedMutex;

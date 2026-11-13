@@ -186,13 +186,12 @@ std::bitset<512> GS::takeWrittenPages()
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     std::bitset<512> pages;
     const bool all = m_allPagesChanged.exchange(false, std::memory_order_acq_rel);
-    if (m_collectWritePages && m_writeSetUploads && !all)
+    if (m_collectWritePages && !all)
         pages = m_writePages;
     else
         pages.set(); // nothing was collected so far, or the memory changed otherwise: any page may have changed
     m_writePages.reset();
     m_writeSetFrameKey = m_writeSetScissorKey = ~0ull;
-    m_writeSetUploads = true;
     m_collectWritePages = true;
     return pages;
 }
@@ -715,60 +714,19 @@ void GS::noteDisplayWriteUnlocked(uint32_t basePage, uint32_t fbw, uint8_t psm, 
         ++m_displayWritesSinceRead;
 }
 
-void GS::noteRollbackWriteUnlocked(uint32_t basePage, uint32_t fbw, uint8_t psm, uint32_t x0, uint32_t y0,
-                                   uint32_t x1, uint32_t y1)
+void GS::noteWrittenPagesUnlocked(uint32_t basePage, uint32_t fbw, uint8_t psm, uint32_t x0, uint32_t y0,
+                                  uint32_t x1, uint32_t y1)
 {
-    if (m_collectWritePages)
-    {
-        forEachGsPage(basePage, fbw, psm, x0, y0, x1, y1, [this](uint32_t page) { m_writePages.set(page); });
-        return;
-    }
-    // Behind the rollback point: a page that is not in the saved set is kept now, before this write (v3.6: a
-    // picture drawn before the game's own list can write a page the frame before did not, a new texture for one).
-    // This runs before the write is handed to the renderer, so the page is kept as it is after everything
-    // submitted so far. A renderer that cannot add pages leaves it out: counted, and the rollback will not put it back.
-    std::bitset<512> missing;
-    forEachGsPage(basePage, fbw, psm, x0, y0, x1, y1, [this, &missing](uint32_t page)
-    {
-        if (page < m_writePages.size() && !m_writePages.test(page))
-            missing.set(page);
-    });
-    if (missing.none())
-        return;
-    uint32_t added = 0;
-    if (m_backend)
-    {
-        m_backend->Flush();
-        added = m_backend->AddRollbackPages(missing);
-    }
-    if (added == missing.count())
-    {
-        m_writePages |= missing;
-        m_rollback.pages += added;
-        m_rollbackAdded.fetch_add(added, std::memory_order_relaxed);
-        return;
-    }
-    if (m_rollbackOutside.fetch_add(missing.count(), std::memory_order_relaxed) == 0u)
-        std::fprintf(stderr, "[gs:rollback] a write behind the rollback point reaches %zu pages that are not in the saved "
-                     "set and could not be added: the rollback will not put them back\n", missing.count());
-}
-
-void GS::beginRollbackWriteSet(bool uploads)
-{
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    m_writeSetUploads = uploads;
-    m_writePages.reset();
-    m_writeSetFrameKey = m_writeSetScissorKey = ~0ull;
-    m_collectWritePages = true;
+    // Issue 049 v3.7: for takeWrittenPages(). The callers ask m_collectWritePages first.
+    forEachGsPage(basePage, fbw, psm, x0, y0, x1, y1, [this](uint32_t page) { m_writePages.set(page); });
 }
 
 void GS::noteDrawWriteUnlocked(const GSContext &context, const GSPrimitiveBatch *draw)
 {
-    if (m_collectWritePages || m_rollback.set)
+    if (m_collectWritePages)
     {
-        // Issue 049 v3.2: the pages this run of draws can write (frame and depth buffer inside the scissor). While the
-        // game's frame is collected they go into the set; behind the rollback point (the in-between pictures) they
-        // must all be in it already, or the rollback would leave them changed: counted as writes outside the set.
+        // Issue 049 v3.7: the pages this run of draws can write (frame and depth buffer inside the scissor) are
+        // noted for takeWrittenPages(), once for each frame buffer and scissor in a row.
         const GSFrameReg &f = context.frame;
         const GSScissorReg &s = context.scissor;
         const uint64_t frameKey = uint64_t(f.fbp) | (uint64_t(f.fbw) << 9) | (uint64_t(f.psm) << 15) |
@@ -780,9 +738,9 @@ void GS::noteDrawWriteUnlocked(const GSContext &context, const GSPrimitiveBatch 
         {
             m_writeSetFrameKey = frameKey;
             m_writeSetScissorKey = scissorKey;
-            noteRollbackWriteUnlocked(f.fbp, f.fbw, f.psm, s.x0, s.y0, s.x1, s.y1);
+            noteWrittenPagesUnlocked(f.fbp, f.fbw, f.psm, s.x0, s.y0, s.x1, s.y1);
             if (!context.zbuf.zmask)
-                noteRollbackWriteUnlocked(context.zbuf.zbp, f.fbw, context.zbuf.psm, s.x0, s.y0, s.x1, s.y1);
+                noteWrittenPagesUnlocked(context.zbuf.zbp, f.fbw, context.zbuf.psm, s.x0, s.y0, s.x1, s.y1);
         }
     }
     // Issue 023 step 2K: a game that draws each picture for one interlaced field offsets it by half a line
@@ -2010,13 +1968,13 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             m_pictureTarget[page & 0x1FFu] = 0u; // issue 023 step 2K: not drawn for a field
             if (m_bitbltbuf.dbp % 32u != 0u)
                 noteDisplayWriteUnlocked(page + 1u, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, x0, y0, x1, y1);
-            if ((m_collectWritePages || m_rollback.set) && (m_trxdir == 2u || m_writeSetUploads))
+            if (m_collectWritePages)
             {
-                // Issue 049 v3.2: a local copy's destination depends on what was drawn (an upload's does not).
-                // v3.6: pictures drawn before the game's own list make its uploads early: those count too.
-                noteRollbackWriteUnlocked(page, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, x0, y0, x1, y1);
+                // Issue 049 v3.7: the pages a local copy or an upload writes are noted for takeWrittenPages() (the
+                // picture GS needs both).
+                noteWrittenPagesUnlocked(page, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, x0, y0, x1, y1);
                 if (m_bitbltbuf.dbp % 32u != 0u)
-                    noteRollbackWriteUnlocked(page + 1u, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, x0, y0, x1, y1);
+                    noteWrittenPagesUnlocked(page + 1u, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, x0, y0, x1, y1);
             }
         }
 

@@ -109,19 +109,6 @@ struct GSVulkanBackend::Impl
     std::vector<uint8_t> uploadTail;
     std::vector<uint8_t> fifo;
     size_t fifoRead = 0;
-    // Issue 049 v3.2: what a rollback puts back beside the renderer's pages and palette.
-    struct RollbackPoint
-    {
-        bool set = false;
-        ParallelGS::RegisterState regs{};
-        std::array<uint64_t, 128> state{};
-        std::array<bool, 128> valid{};
-        GSTransferCommand transfer{};
-        GSTransferSnapshot transferState{};
-        uint64_t uploadedBytes = 0;
-        std::vector<uint8_t> uploadTail, fifo;
-        size_t fifoRead = 0;
-    } rollback;
     bool initialized = false;
     bool dirty = false;
     uint64_t draws = 0;
@@ -562,79 +549,6 @@ void GSVulkanBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32
     p.gs.end_vram_write(0, vramBytes);
     p.dirty = true;
 }
-// DW5XL (issue 049 v3.2): the rollback point. paraLLEl-GS keeps the pages (every slice), their super-sample flags and
-// the palette (runtime patch 0007); the register state and this backend's own shadows are kept here.
-bool GSVulkanBackend::SaveRollback(const std::bitset<512> &pages)
-{
-    auto lock = m_impl->access();
-    auto &p = *m_impl;
-    std::vector<uint32_t> list;
-    for (uint32_t page = 0; page < 512u; ++page)
-        if (pages.test(page))
-            list.push_back(page);
-    if (list.empty())
-        return false;
-    p.gs.rollback_save(list.data(), list.size()); // flushes first
-    p.dirty = false;
-    auto &r = p.rollback;
-    r.regs = p.gs.get_register_state();
-    r.state = p.state;
-    r.valid = p.valid;
-    r.transfer = p.transfer;
-    r.transferState = p.transferState;
-    r.uploadedBytes = p.uploadedBytes;
-    r.uploadTail = p.uploadTail;
-    r.fifo = p.fifo;
-    r.fifoRead = p.fifoRead;
-    r.set = true;
-    return true;
-}
-
-uint32_t GSVulkanBackend::AddRollbackPages(const std::bitset<512> &pages)
-{
-    auto lock = m_impl->access();
-    auto &p = *m_impl;
-    if (!p.rollback.set)
-        return 0;
-    std::vector<uint32_t> list;
-    for (uint32_t page = 0; page < 512u; ++page)
-        if (pages.test(page))
-            list.push_back(page);
-    if (list.empty())
-        return 0;
-    return static_cast<uint32_t>(p.gs.rollback_add(list.data(), list.size())); // flushes first
-}
-
-bool GSVulkanBackend::Rollback()
-{
-    auto lock = m_impl->access();
-    auto &p = *m_impl;
-    auto &r = p.rollback;
-    if (!r.set)
-        return false;
-    r.set = false;
-    if (!p.gs.rollback_restore()) // flushes first
-        return false;
-    p.gs.get_register_state() = r.regs;
-    p.gs.clobber_register_state();
-    p.state = r.state;
-    p.valid = r.valid;
-    p.transfer = r.transfer;
-    p.transferState = r.transferState;
-    p.uploadedBytes = r.uploadedBytes;
-    p.uploadTail = r.uploadTail;
-    p.fifo = r.fifo;
-    p.fifoRead = r.fifoRead;
-    p.dirty = true; // the copies back are submitted with the next flush
-    return true;
-}
-
-uint64_t GSVulkanBackend::RollbackBytes() const
-{
-    auto lock = m_impl->access();
-    return m_impl->gs.rollback_bytes();
-}
-
 // DW5XL (issue 049 v3.2): the read of an in-between picture is a field's read with a queue of its own.
 bool GSVulkanBackend::SubmitPictureRead(const GSPresentationRequest &request)
 {

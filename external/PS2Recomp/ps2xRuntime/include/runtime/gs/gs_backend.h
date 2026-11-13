@@ -64,25 +64,6 @@ public:
     // Called on the EE executor at a quiet point after a flush. Renderers without support refuse.
     virtual void SerializeState(ps2x::StateArchive &archive);
 
-    // Issue 049 v3.2: a rollback point for extra pictures drawn between two of the game's. SaveRollback keeps the
-    // given VRAM pages (one bit per 8 KB page), the renderer's registers and the palette as they are after
-    // everything submitted so far; Rollback puts them back after everything submitted since. GS side, in stream
-    // order. Renderers without it return false (then no extra pictures are drawn).
-    virtual bool SaveRollback(const std::bitset<512> &pages)
-    {
-        (void)pages;
-        return false;
-    }
-    virtual bool Rollback() { return false; }
-    // Pages that are about to be written behind the rollback point and are not kept yet: keeps them too, as they
-    // are after everything submitted so far. Returns the pages added (0: none, or no rollback point).
-    virtual uint32_t AddRollbackPages(const std::bitset<512> &pages)
-    {
-        (void)pages;
-        return 0;
-    }
-    // Bytes the last SaveRollback copied (0: none).
-    virtual uint64_t RollbackBytes() const { return 0; }
     // Issue 049 (fact-finding 2026-11-11): a second GS memory inside the same renderer, on the same graphics
     // device, with registers and VRAM of its own: what is drawn there never touches this one. Its output scale is
     // this one's. It must be destroyed before this one. Renderers without it return nothing.

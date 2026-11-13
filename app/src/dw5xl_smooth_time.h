@@ -17,7 +17,6 @@
 
 #include <cstdint>
 #include <deque>
-#include <utility>
 #include <vector>
 
 namespace dw5xl::smooth
@@ -152,8 +151,6 @@ namespace dw5xl::smooth
     //    game held up does: two separate moments, or ten frames, bring the rate down one level. At the fewest
     //    pictures they pause ("off") and are tried again after the wait. Nothing foretold counts: a picture that
     //    ran to its end, however late, is the head start's matter.
-    //  - Pictures through the game's device (v3.6): a frame with a picture that PictureBudget kept out, because it
-    //    did not fit before the game's field (so nobody was harmed), counts among the kHeldUpFrames, not as a moment.
     //  - After every change the next kSettle frames are not judged (the game needs a few frames to recover).
     //  - A level that did not fit is tried again only after a wait that doubles each time.
     class RateChoice
@@ -171,7 +168,6 @@ namespace dw5xl::smooth
         struct Frame
         {
             bool heldUp = false; // the game finished its next frame with less than its reserve to spare, or missed its field
-            bool noRoom = false; // a picture the level asked for was not started: it did not fit before the game's field
             bool cutOff = false; // v3.8, the pictures' own device: a picture of the frame was cut off (it was still
                                  // being drawn when the next frame's pictures needed the device)
             double spare = 0.0;  // the game's spare time in that frame
@@ -206,58 +202,6 @@ namespace dw5xl::smooth
         int64_t m_count = 0;             // frames seen
         std::vector<int64_t> m_notBefore; // per level: not tried again before this frame count
         std::vector<int> m_wait;         // per level: the wait its next failure gets
-    };
-
-    // Amendment v3.6, change 3: a frame's pictures are drawn before the field in which the game sends its own list
-    // ("never slower"). RateChoice finds the rate that fits by what happened; this keeps a single frame from
-    // holding the game up before that is known. (Measured 2026-11-11 without it: at 4x the game lost about 110
-    // fields in the seven seconds before the rate choice reacted.)
-    //  - A picture is started only when it will have left the device in time, by the longest a picture took in
-    //    the last kWindowMs (from the moment the device could start it until it had left the device). A frame's
-    //    first picture is measured apart from those after it: it may have to wait for the device, they do not.
-    //  - "In time" is the start of the game's field plus what the game can spare: its own list may wait as long
-    //    as the game still finishes its next frame with its reserve to spare, by the longest the game took lately
-    //    from its field's start to the end of its next frame. Not known, or a heavy moment: nothing may wait.
-    //  - While a picture's cost is not known, one picture is let through to learn it, and no other until that one
-    //    is reported (or kProbeMs have passed).
-    // Amendment v3.8, change 1: this guard is for pictures that run through the game's device. On the pictures' own
-    // device nothing is foretold and every picture the time line asks for is started (v3.7's forecast for that
-    // device, frameOwn() and admitBy(), is gone: measured 2026-11-12, it showed the pictures 2-4 ms later and
-    // switched them off for 20 seconds at a time).
-    class PictureBudget
-    {
-      public:
-        static constexpr double kWindowMs = 5000.0;
-        static constexpr double kProbeMs = 500.0;
-        // A picture: how long it took from the moment the device could start it (it was queued, or the picture
-        // before it had left) until it had left the device. `first`: it was its frame's first picture.
-        void measured(double nowMs, double pictureMs, bool first = true);
-        // The picture let through to learn the cost came back and is not to be counted (amendment v3.7: the first
-        // one after the time line started again, drawn with caches that had to be filled): the next one is tried.
-        void probeDone() { m_probing = false; }
-        // The game: how long it took from the moment the device was free for it at its field (the field's start,
-        // or later when pictures ran past it) to the end of its next frame.
-        void gameTook(double nowMs, double ms);
-        bool known() const { return !m_costs.empty(); }
-        double cost() const { return m_costs.empty() ? 0.0 : m_costs.front().second; }               // a frame's first picture
-        double nextCost() const { return m_next.empty() ? cost() : m_next.front().second; }         // one after it
-        // A frame's pictures may use the device from now on; the game's field begins at `instantMs`, a field is
-        // `fieldMs` long and the game is to keep `reserveMs` to spare.
-        void frame(double nowMs, double instantMs, double fieldMs, double reserveMs);
-        // How long the game's own list may wait in this frame (0: not at all).
-        double allowance() const { return m_allowance; }
-        // One more picture of this frame: true when it fits, and it then counts as started.
-        bool admit(double nowMs);
-
-      private:
-        using Window = std::deque<std::pair<double, double>>; // (time, value), values falling: the front is the largest
-        static void add(Window &window, double nowMs, double value);
-        static void prune(Window &window, double nowMs);
-        Window m_costs, m_next, m_game;
-        double m_latest = 0.0, m_busyUntil = 0.0, m_allowance = 0.0;
-        int m_admitted = 0;
-        bool m_probing = false;
-        double m_probeUntil = 0.0;
     };
 
     // Amendment v3.7 (P2.6a): a break in the game's own clock between two frames. The PS2 field clock shows it: a

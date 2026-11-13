@@ -1,24 +1,16 @@
-// DW5XL-TEST issue 049 (amendment v3.2): the GS rollback point on the Vulkan renderer
-// (GSRasterBackend::SaveRollback / Rollback; paraLLEl-GS runtime patch 0007). No game data.
+// DW5XL-TEST issue 049: the reads of in-between pictures on the Vulkan renderer
+// (GSRasterBackend::SubmitPictureRead / CollectPictureReads). No game data.
 // At render scale 1 and 4:
-//   1. a patterned GS memory; two buffers (a display buffer at page 0 and a second buffer at page 64) cleared and
-//      drawn with a triangle;
-//   2. the picture and the whole single-rate memory are kept;
-//   3. SaveRollback for the two buffers' pages; both are drawn over with other colours and another triangle; the
-//      picture and the memory must now differ;
-//   4. Rollback: the picture and the whole single-rate memory must equal the kept ones, byte for byte; a second
-//      Rollback has nothing to put back; the same draws again give the same picture.
-// Picture reads (P2.3b, GSRasterBackend::SubmitPictureRead / CollectPictureReads): between 3 and 4 the drawn-over
-// state is read out twice as an in-between picture. Both must come out, one by one and in order, with their tags
-// and field, each equal to the field's read of the same state; the field reads after them are not disturbed.
-// What it does not prove: the picture read here comes from the single-rate copy (control 2026-11-10: restoring only
-// that copy also passed, restoring nothing failed). The reference and sample copies are proved by the game-level
-// check at 4x (issue 049 criterion 6a, notes) and its control.
+//   1. a patterned GS memory; two buffers (a display buffer at page 0 and a second buffer at page 64, which no read
+//      shows) cleared and drawn with a triangle; the picture is kept (a field's read);
+//   2. both buffers are drawn over with other colours and another triangle; the field's read must now differ;
+//   3. that state is read out twice as an in-between picture. Both must come out, one by one and in order, with their
+//      tags and field, each equal to the field's read of the same state;
+//   4. the field reads after them are not disturbed: the first draws again give the first picture.
 // Exit code 77: no Vulkan device (skipped).
 #include "runtime/gs/gs_vulkan_backend.h"
 
 #include <algorithm>
-#include <bitset>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -126,8 +118,6 @@ void run(uint32_t scale)
     draw(backend, second, 0x80806040u, 3.0f, 2.0f);
     backend.Flush();
     const std::vector<uint8_t> pictureBefore = picture(backend, 1u);
-    std::vector<uint8_t> memoryBefore;
-    backend.SnapshotVram(memoryBefore);
     check(!pictureBefore.empty(), "a picture is read", scale);
     {
         // The triangle must be in the picture: more than the clear colour.
@@ -149,23 +139,13 @@ void run(uint32_t scale)
         check(colours.size() >= 2u, "the triangle is in the picture", scale);
     }
 
-    std::bitset<512> pages;
-    for (uint32_t page = 0; page < 120u; ++page) // the display buffer (64 pages) and the second buffer (56 pages)
-        pages.set(page);
-    check(backend.SaveRollback(pages), "SaveRollback accepts the pages", scale);
-    check(backend.RollbackBytes() != 0u, "the rollback point holds bytes", scale);
-
     draw(backend, display, 0x80F0E0D0u, 150.4f, 20.2f);
     draw(backend, second, 0x80102030u, 90.9f, 11.3f);
     backend.Flush();
     const std::vector<uint8_t> pictureBetween = picture(backend, 2u);
-    std::vector<uint8_t> memoryBetween;
-    backend.SnapshotVram(memoryBetween);
     check(pictureBetween != pictureBefore, "the picture changed after drawing over the buffers", scale);
-    check(memoryBetween != memoryBefore, "the memory changed after drawing over the buffers", scale);
 
-    // P2.3b: the drawn-over state read out as two in-between pictures of the frame sent in field 8 (they belong to
-    // field 9), before the rollback.
+    // The drawn-over state read out as two in-between pictures of the frame sent in field 8 (they belong to field 9).
     {
         GSPresentationRequest r = request();
         r.vsyncTick = 9u;
@@ -196,19 +176,11 @@ void run(uint32_t scale)
         check(!backend.CollectPictureReads(none) && none.empty(), "no picture is left afterwards", scale);
     }
 
-    check(backend.Rollback(), "Rollback puts the point back", scale);
-    const std::vector<uint8_t> pictureAfter = picture(backend, 3u);
-    std::vector<uint8_t> memoryAfter;
-    backend.SnapshotVram(memoryAfter);
-    check(pictureAfter == pictureBefore, "the picture after the rollback equals the picture before", scale);
-    check(memoryAfter == memoryBefore, "the whole single-rate memory after the rollback equals the memory before", scale);
-    check(!backend.Rollback(), "a second Rollback has nothing to put back", scale);
-
-    // Drawing goes on from the restored state: the same draws give the same picture as the first time.
+    // Drawing and the field reads go on undisturbed: the first draws again give the first picture.
     draw(backend, display, 0x80204060u, 0.0f, 0.0f);
     draw(backend, second, 0x80806040u, 3.0f, 2.0f);
     backend.Flush();
-    check(picture(backend, 4u) == pictureBefore, "the same draws after the rollback give the same picture", scale);
+    check(picture(backend, 3u) == pictureBefore, "the first draws again give the first picture", scale);
 }
 } // namespace
 

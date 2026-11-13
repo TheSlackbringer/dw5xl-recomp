@@ -2294,13 +2294,7 @@ bool PS2Runtime::syncCoreSubsystems()
     ps2x::device::detach(m_memory);
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    {
-                                        // Issue 049 (fact-finding): a picture's packets go to the picture GS.
-                                        if (m_gifToPictureGs && m_pictureGs)
-                                            m_pictureGs->processGIFPacket(data, size);
-                                        else
-                                            m_gs.processGIFPacket(data, size);
-                                    });
+                                    { m_gs.processGIFPacket(data, size); });
     m_gifArbiter.setWorkerEnabled(GifArbiter::workerRequestedByEnv());
     // Issue 049 v3.7: the packets of the pictures' device (the side stream) go to the picture GS, never to the
     // game's: without a picture GS (the renderer has no second memory) they are dropped.

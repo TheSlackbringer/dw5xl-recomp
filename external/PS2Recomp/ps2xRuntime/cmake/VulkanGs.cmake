@@ -18,12 +18,12 @@ if(PS2X_ENABLE_VULKAN_GS)
     string(FIND "${PS2X_PARALLEL_GS_UBERSHADER}" "issue 009 v4.3" PS2X_PARALLEL_GS_CLAMP_PATCHED)
     # DW5XL: and pictures at the output scale (issue 047).
     string(FIND "${PS2X_PARALLEL_GS_INTERFACE}" "set_smooth_sprites" PS2X_PARALLEL_GS_SMOOTH_PATCHED)
-    # DW5XL: and the rollback point for pictures drawn between the game's, with pages added to it, pages copied
-    # from a second GS memory and the two memories drawing in turns (issue 049; patch 0007 as of 2026-11-11, v3.7).
-    string(FIND "${PS2X_PARALLEL_GS_INTERFACE}" "set_frame_context_hold" PS2X_PARALLEL_GS_ROLLBACK_PATCHED)
+    # DW5XL: and a second GS memory for pictures drawn between the game's: pages copied into it and the two memories
+    # drawing in turns (issue 049; patch 0007. Its rollback point was removed on 2026-11-13, issue 049 M3).
+    string(FIND "${PS2X_PARALLEL_GS_INTERFACE}" "set_frame_context_hold" PS2X_PARALLEL_GS_SECOND_MEMORY_PATCHED)
     if(PS2X_PARALLEL_GS_PATCHED EQUAL -1 OR PS2X_PARALLEL_GS_SPRITE_PATCHED EQUAL -1 OR
        PS2X_PARALLEL_GS_FIELDS_PATCHED EQUAL -1 OR PS2X_PARALLEL_GS_CLAMP_PATCHED EQUAL -1 OR
-       PS2X_PARALLEL_GS_SMOOTH_PATCHED EQUAL -1 OR PS2X_PARALLEL_GS_ROLLBACK_PATCHED EQUAL -1)
+       PS2X_PARALLEL_GS_SMOOTH_PATCHED EQUAL -1 OR PS2X_PARALLEL_GS_SECOND_MEMORY_PATCHED EQUAL -1)
         message(FATAL_ERROR "paraLLEl-GS checkout lacks vendor/parallel-gs-patches; apply them with: git -C <checkout> apply <repo>/vendor/parallel-gs-patches/*.patch")
     endif()
     set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
