@@ -2470,20 +2470,26 @@ bool PS2Runtime::syncCoreSubsystems()
     return true;
 }
 
-// DW5XL-DEBUG (issue 049, amendment v3.12 step 3 part 4) PS2X_WINDOW=vulkan: the game is shown by the window the
-// renderer draws itself (runtime/gs/gs_game_window.h) instead of today's raylib window. Behind this switch until
-// it has passed the owner's look (step 6). It shows the game's pictures: those finished on the graphics card
-// straight from there, those that only exist in main memory uploaded (part 5); frame dumps and the pictures of
-// saved states read the shown picture when they need it. With a renderer that does not draw with Vulkan (the CPU
-// renderer) the window makes a Vulkan device of its own. Not yet: the overlays and pages (step 4), the in-between
-// pictures shown (step 5), SHARPEN, fullscreen.
-// True: that window is open, and its keys, mouse and pads are the ones the game reads.
+// DW5XL (issue 049, amendment v3.12): the game is shown by the window the renderer draws itself
+// (runtime/gs/gs_game_window.h), a Vulkan swap chain without OpenGL. The default since step 6 (owner 2026-11-14,
+// after the owner's look). It shows the game's pictures: those finished on the graphics card straight from there,
+// those that only exist in main memory uploaded; frame dumps and the pictures of saved states read the shown
+// picture when they need it; the pages and overlays, SHARPEN and fullscreen are drawn by it. With a renderer that
+// does not draw with Vulkan (the CPU renderer) the window makes a Vulkan device of its own.
+// DW5XL-DEBUG PS2X_WINDOW=opengl: today's raylib window instead, until it goes (step 7). It is also what the game
+// falls back to where the new window cannot be opened (the log says why).
+// True: the renderer's own window is open, and its keys, mouse and pads are the ones the game reads.
 static bool openRendererWindow(const std::shared_ptr<GSVulkanPresenterLink> &link, const char *title)
 {
 #ifdef PS2X_HAS_GAME_WINDOW
     const char *wanted = std::getenv("PS2X_WINDOW");
-    if (!wanted || std::strcmp(wanted, "vulkan") != 0)
+    if (wanted && std::strcmp(wanted, "opengl") == 0)
+    {
+        std::fprintf(stderr, "[window] today's window (PS2X_WINDOW=opengl)\n");
         return false;
+    }
+    if (wanted && *wanted && std::strcmp(wanted, "vulkan") != 0)
+        std::fprintf(stderr, "[window] PS2X_WINDOW=%s is not known (vulkan, opengl): the renderer's own window is used\n", wanted);
     const char *hidden = std::getenv("PS2X_HIDDEN");
     const char *vsyncSource = "default";
     ps2x::gs::GameWindowOptions options;
@@ -2495,14 +2501,14 @@ static bool openRendererWindow(const std::shared_ptr<GSVulkanPresenterLink> &lin
     s_gameWindow = ps2x::gs::GameWindow::open(link, options, why);
     if (!s_gameWindow)
     {
-        std::fprintf(stderr, "[window] PS2X_WINDOW=vulkan: %s; today's window is used\n", why.c_str());
+        std::fprintf(stderr, "[window] the renderer's window could not be opened: %s; today's window is used\n", why.c_str());
         return false;
     }
     ps2x::host::setDevices(&s_gameWindow->devices());
     ps2x::host::setWindow(&s_gameWindow->control());
     if (loadFullscreenSetting() && !s_gameWindow->hidden()) // issue 023 3S: display=fullscreen (borderless)
         s_gameWindow->control().setFullscreen(true);
-    std::fprintf(stderr, "[window] the renderer's own window (PS2X_WINDOW=vulkan)%s%s\n", options.hidden ? ", hidden" : "",
+    std::fprintf(stderr, "[window] the renderer's own window%s%s\n", options.hidden ? ", hidden" : "",
                  link ? "" : ", on a graphics device of its own (the renderer does not draw with Vulkan)");
     return true;
 #else
@@ -2549,7 +2555,7 @@ bool PS2Runtime::initialize(const char *title)
                            (vsyncOn ? FLAG_VSYNC_HINT : 0));
             std::fprintf(stderr, "[window] vsync %s (%s)\n", vsyncOn ? "on" : "off", vsyncSource);
         }
-        if (!openRendererWindow(gs().presenterLink(), title)) // DW5XL-DEBUG issue 049: PS2X_WINDOW=vulkan
+        if (!openRendererWindow(gs().presenterLink(), title)) // issue 049: the default; PS2X_WINDOW=opengl for today's
         {
             int firstWidth = 0, firstHeight = 0;
             firstWindowSize(firstWidth, firstHeight);
