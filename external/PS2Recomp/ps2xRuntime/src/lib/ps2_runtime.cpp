@@ -50,6 +50,7 @@
 #include "runtime/hotkeys.h"
 #include "runtime/ps2_present_feedback.h"
 #include "runtime/ps2_display_clock.h"
+#include "runtime/gs/gs_shader_store.h"
 #include "runtime/picture_rect.h"
 #include "runtime/host_devices.h"
 #include "runtime/gs/gs_game_window.h"
@@ -1115,6 +1116,7 @@ namespace ps2x_dev
                 {
                     std::cerr << "[dev] quit at tick " << tick << std::endl;
                     ps2x::device::quiesceAll(std::chrono::milliseconds(2000));
+                    ps2x::gs::shader_store::writeNow(); // issue 066: _Exit skips the renderer's end
                     ps2prof::flush(); // DW5XL-DEBUG issue 025: _Exit skips atexit
                     GSTrace::shutdown();
                     if (runtime) runtime->audioBackend().stopPcmStream();
@@ -1286,6 +1288,7 @@ namespace ps2x_dev
                 else
                     std::cerr << "[dev] exit tick " << exitTick << " reached (window at " << tick << ")" << std::endl;
                 ps2x::device::quiesceAll(std::chrono::milliseconds(2000));
+                ps2x::gs::shader_store::writeNow(); // issue 066: _Exit skips the renderer's end
                 ps2prof::flush(); // DW5XL-DEBUG issue 025: _Exit skips atexit
                 GSTrace::shutdown();
                 if (runtime) runtime->audioBackend().stopPcmStream();
@@ -2330,6 +2333,8 @@ bool PS2Runtime::syncCoreSubsystems()
 
     // Re-binding replaces the GS/VU1 state the device worker drives: stop it first.
     ps2x::device::detach(m_memory);
+    // Issue 066: the Vulkan renderer keeps its compiled shader programs in a file beside the settings file.
+    ps2x::gs::shader_store::setPath((std::filesystem::path(iniPath()).parent_path() / "shaders.bin").string());
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });

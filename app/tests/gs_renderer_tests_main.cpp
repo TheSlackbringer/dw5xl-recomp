@@ -11,6 +11,7 @@ int dw5xl_test_main_gs_turns();
 int dw5xl_test_main_gs_picture_sync();
 int dw5xl_test_main_gs_picture_handover();
 int dw5xl_test_main_gs_game_window();
+int dw5xl_test_main_gs_shader_store();
 
 int main(int argc, char **argv)
 {
@@ -26,6 +27,7 @@ int main(int argc, char **argv)
         {"gs_picture_sync", dw5xl_test_main_gs_picture_sync},
         {"gs_picture_handover", dw5xl_test_main_gs_picture_handover},
         {"gs_game_window", dw5xl_test_main_gs_game_window},
+        {"gs_shader_store", dw5xl_test_main_gs_shader_store},
     };
     if (argc == 2)
         for (const auto &test : tests)

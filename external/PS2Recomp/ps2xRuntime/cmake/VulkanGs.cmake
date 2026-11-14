@@ -35,6 +35,13 @@ if(PS2X_ENABLE_VULKAN_GS)
         set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
     endif()
     add_subdirectory("${PS2X_PARALLEL_GS_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/parallel-gs" EXCLUDE_FROM_ALL)
+    # DW5XL issue 066: the shader store counts the library's warnings of compiles that held the renderer up; it
+    # knows them by their text.
+    file(READ "${PS2X_PARALLEL_GS_SOURCE_DIR}/Granite/vulkan/command_buffer.cpp" PS2X_GRANITE_COMMAND_BUFFER)
+    string(FIND "${PS2X_GRANITE_COMMAND_BUFFER}" "LOGW(\"Stalled compile (" PS2X_GRANITE_STALL_WARNING)
+    if(PS2X_GRANITE_STALL_WARNING EQUAL -1)
+        message(FATAL_ERROR "the renderer library no longer warns with \"Stalled compile (\": the shader store (issue 066, gs_vulkan_backend.cpp) counts that warning and would never be written")
+    endif()
     target_sources(ps2_runtime PRIVATE src/lib/gs/gs_vulkan_backend.cpp src/lib/gs/gs_vulkan_scanout.cpp
         src/lib/gs/gs_vulkan_handover.cpp)
     target_link_libraries(ps2_runtime PRIVATE parallel-gs)

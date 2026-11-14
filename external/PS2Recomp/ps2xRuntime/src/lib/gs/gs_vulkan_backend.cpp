@@ -7,9 +7,14 @@
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/ps2_hold_trace.h"
 #include "runtime/state_archive.h"
+#include "runtime/gs/gs_shader_store.h"
 #include "gs_interface.hpp"
 #include "context.hpp"
 #include "thread_id.hpp"
+#include "logging.hpp"
+#include "hash.hpp"
+#include "shaders/slangmosh_iface.hpp"
+#include "shaders/slangmosh.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -17,9 +22,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
+#include <cstdarg>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
 
 namespace
 {
@@ -46,6 +56,18 @@ uint32_t transferBits(uint8_t psm)
 // game's, and one for extra pictures), so that pages are copied between them on the graphics card.
 struct GSVulkanDevice
 {
+    // Issue 066: the game's own store of compiled shader programs (the file: runtime/gs/gs_shader_store.h). Read
+    // when this device is made. Written when it goes, or when the game says so where it leaves without the
+    // renderer's end (ps2x::gs::shader_store::writeNow), and only after a compile held a renderer up since the
+    // store was read or last written: what the driver hands back grows with every run even when nothing was
+    // compiled (measured 2026-11-14, about 4 MB a run), so a store written every time would grow without end.
+    std::string storePath;
+    bool storeTaken = false;
+    uint64_t storeReadBytes = 0;
+    uint64_t storeStalledAtWrite = 0;
+    void loadShaderStore();
+    void writeShaderStore(bool always);
+    ~GSVulkanDevice();
     // Declaration order ensures the device dies before the context. The context is held by a handle: a presenter
     // makes a device object of its own on it (issue 049, amendment v3.12; measured in the work log, "M4-1": with a
     // device object of its own the presenter never waits for this one's open command buffers).
@@ -158,12 +180,186 @@ struct GSVulkanDevice
             std::fprintf(stderr, "[gs] Vulkan device made %s window support%s\n", windowSupport ? "with" : "without", why);
         device.set_context(*context);
         device.set_queue_lock([lock = queues] { lock->lock(); }, [lock = queues] { lock->unlock(); });
+        loadShaderStore();
         // Keep enough Granite PerFrame contexts that a multi-flush field + 3-slot
         // async readback ring never wraps and blocks inside per_frame->begin() while
         // holding the GS device mutex.
         device.init_frame_contexts(16);
     }
 };
+
+// ---- Issue 066: the store of compiled shader programs ----
+namespace
+{
+// Compiles that held a renderer up: the library warns of each ("Stalled compile", 5 ms or more on the renderer's
+// own thread). Its logging hook lets this code see the warning before it is printed; the build checks that the
+// library still has that text (cmake/VulkanGs.cmake).
+std::atomic<uint64_t> g_stalledCompiles{0};
+std::atomic<uint64_t> g_storeWrites{0}, g_storeWrittenBytes{0};
+struct StallCounter final : Util::LoggingInterface
+{
+    bool log(const char *, const char *format, va_list) override
+    {
+        if (format && std::strncmp(format, "Stalled compile", 15) == 0)
+            g_stalledCompiles.fetch_add(1, std::memory_order_relaxed);
+        return false; // printed as before
+    }
+} g_stallCounter;
+
+std::mutex g_storeDevicesMutex;
+std::vector<GSVulkanDevice *> g_storeDevices;
+
+// The renderer's own shaders as one number: a store written by a program with other shaders is of no use.
+uint64_t shadersMark()
+{
+    static const uint64_t mark = ps2x::gs::shader_store::markOf(ParallelGS::spirv_bank, sizeof(ParallelGS::spirv_bank));
+    return mark;
+}
+
+void writeEveryShaderStore(bool always)
+{
+    std::lock_guard<std::mutex> lock(g_storeDevicesMutex);
+    for (GSVulkanDevice *device : g_storeDevices)
+        device->writeShaderStore(always);
+}
+}
+
+void GSVulkanDevice::loadShaderStore()
+{
+    namespace store = ps2x::gs::shader_store;
+    {
+        std::lock_guard<std::mutex> lock(g_storeDevicesMutex);
+        g_storeDevices.push_back(this);
+    }
+    store::setWriter(&writeEveryShaderStore);
+    storePath = store::path();
+    if (storePath.empty())
+        return;
+    const auto readFrom = std::chrono::steady_clock::now();
+    std::vector<uint8_t> content;
+    const store::Read result = store::read(storePath, shadersMark(), content);
+    const char *said = store::said(result);
+    // The library's plain store begins with the graphics card's and driver's mark; one for another card or
+    // driver is left out here, so that the log can say so (the library would drop it silently).
+    if (result == store::Read::Taken && !device.get_device_features().pipeline_binary_features.pipelineBinaries)
+    {
+        const auto &uuid = device.get_gpu_properties().pipelineCacheUUID;
+        if (content.size() < sizeof(uuid) || std::memcmp(content.data(), uuid, sizeof(uuid)) != 0)
+        {
+            content.clear();
+            said = "it was written for another graphics card or driver; it is left out";
+        }
+    }
+    storeTaken = !content.empty() && device.init_pipeline_cache(content.data(), content.size());
+    if (!storeTaken)
+        device.init_pipeline_cache(nullptr, 0);
+    storeReadBytes = storeTaken ? content.size() : 0u;
+    storeStalledAtWrite = g_stalledCompiles.load(std::memory_order_relaxed);
+    if (storeTaken)
+        std::fprintf(stderr, "[gs] shader store %s: read, %zu bytes, in %.0f ms\n", storePath.c_str(), content.size(),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readFrom).count());
+    else
+        std::fprintf(stderr, "[gs] shader store %s: %s\n", storePath.c_str(), said);
+}
+
+void GSVulkanDevice::writeShaderStore(bool always)
+{
+    if (storePath.empty())
+        return;
+    const uint64_t stalled = g_stalledCompiles.load(std::memory_order_relaxed);
+    if (!always && stalled == storeStalledAtWrite)
+        return; // no compile held a renderer up: nothing worth adding, and the file does not grow
+    // The device's own lock, without waiting for ever: where the game leaves at once a renderer thread may be held.
+    std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
+    for (int tries = 0; !lock.owns_lock() && tries < 2000; ++tries)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        lock.try_lock();
+    }
+    if (!lock.owns_lock())
+    {
+        std::fprintf(stderr, "[gs] shader store: not written, the renderer is busy\n");
+        return;
+    }
+    // The library asks the driver for the store's size and then for exactly that many bytes. The driver goes on
+    // working on programs in the background for seconds after they were made and adds to its store all the while
+    // (measured 2026-11-14 on an NVIDIA driver: about 25 KB a millisecond for more than a second after one small
+    // drawing), so the two never agree while it does, and the library hands nothing out. The store is therefore
+    // taken into room with spare at its end. How much the driver filled, the library does not say; its check sum
+    // does: it covers exactly what the driver handed out (Util::Hasher over those bytes, kept after the card's
+    // mark), so the store ends where the running sum equals it.
+    const bool plain = !device.get_device_features().pipeline_binary_features.pipelineBinaries;
+    size_t size = 0u;
+    std::vector<uint8_t> content;
+    bool taken = false;
+    for (int tries = 0; tries < 4 && !taken; ++tries)
+    {
+        const size_t asked = device.get_pipeline_cache_size();
+        if (asked == 0u)
+            break;
+        content.assign(asked + (plain ? asked / 2u + (size_t(1) << 20) : 0u), 0u);
+        if (!device.get_pipeline_cache_data(content.data(), content.size()))
+            continue; // more was added than the spare room: once more, from the new size
+        size = content.size();
+        if (plain)
+        {
+            const size_t head = sizeof(device.get_gpu_properties().pipelineCacheUUID) + sizeof(Util::Hash);
+            Util::Hash wanted = 0u;
+            std::memcpy(&wanted, content.data() + head - sizeof(Util::Hash), sizeof(wanted));
+            const uint8_t *bytes = content.data() + head;
+            const size_t room = content.size() - head;
+            // The driver's store does not shrink: it holds at least what it held when its size was asked for.
+            size_t end = std::min(room, asked > head ? asked - head : size_t(0));
+            Util::Hasher sum;
+            sum.data(bytes, end);
+            while (sum.get() != wanted && end < room)
+                sum.data(bytes + end++, 1u);
+            if (sum.get() != wanted)
+                continue;
+            size = head + end;
+            content.resize(size);
+        }
+        taken = true;
+    }
+    if (!taken)
+    {
+        std::fprintf(stderr, "[gs] shader store %s: not written, the renderer library handed nothing out\n", storePath.c_str());
+        return;
+    }
+    if (!ps2x::gs::shader_store::write(storePath, shadersMark(), content.data(), content.size()))
+    {
+        std::fprintf(stderr, "[gs] shader store %s: the file could not be written\n", storePath.c_str());
+        return;
+    }
+    std::fprintf(stderr, "[gs] shader store %s: written, %zu bytes, after %llu compiles that held the renderer up\n",
+                 storePath.c_str(), size, static_cast<unsigned long long>(stalled - storeStalledAtWrite));
+    storeStalledAtWrite = stalled;
+    g_storeWrites.fetch_add(1, std::memory_order_relaxed);
+    g_storeWrittenBytes.store(size, std::memory_order_relaxed);
+}
+
+GSVulkanDevice::~GSVulkanDevice()
+{
+    writeShaderStore(false);
+    std::lock_guard<std::mutex> lock(g_storeDevicesMutex);
+    g_storeDevices.erase(std::remove(g_storeDevices.begin(), g_storeDevices.end(), this), g_storeDevices.end());
+}
+
+ps2x::gs::ShaderStoreState ps2x::gs::shaderStoreState()
+{
+    ShaderStoreState state;
+    state.stalled = g_stalledCompiles.load(std::memory_order_relaxed);
+    state.writes = g_storeWrites.load(std::memory_order_relaxed);
+    state.writtenBytes = g_storeWrittenBytes.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_storeDevicesMutex);
+    for (const GSVulkanDevice *device : g_storeDevices)
+    {
+        state.inUse = state.inUse || !device->storePath.empty();
+        state.taken = state.taken || device->storeTaken;
+        state.readBytes += device->storeReadBytes;
+    }
+    return state;
+}
 
 struct GSVulkanBackend::Impl
 {
@@ -373,6 +569,7 @@ struct GSVulkanBackend::Impl
         // Granite requires a thread-local index even with one command pool.
         Access lock(mutex);
         Util::register_thread_index(0);
+        Util::set_thread_logging_interface(&g_stallCounter); // issue 066: this thread's compiles are counted
         return lock;
     }
 

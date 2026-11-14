@@ -237,7 +237,9 @@ VU1 exactness/speed: `PS2X_VU1_LIFT_VERIFY=1` (every native VU1 run repeated by 
 local only). Translator: `DW5XL_VU1_STATIC=all|none|<segments>` (static timing, default all);
 `dw5xl_vu1lift --find-range <census image> <entry pc> <name> [disc files]` prints the `vu1_inputs.h` entries that add
 a VU1 program to the lift from a local census image.
-Graphics: `PS2X_GS_SCALE` / `PS2X_GS_SSAA` · `PS2X_NO_WEAVE` · `PS2X_GS_SYNCREADBACK` · `PS2X_GS_TRACE=<file>` +
+Graphics: `PS2X_GS_SCALE` / `PS2X_GS_SSAA` · `PS2X_SHADER_STORE=<file>|off` (issue 066: the Vulkan renderer's own
+store of compiled shader programs; the game's is `shaders.bin` beside `dw5xl.ini`, test runs use `shaders-test.bin`
+in the build folder; `[gs] shader store` lines say what was read and written) · `PS2X_NO_WEAVE` · `PS2X_GS_SYNCREADBACK` · `PS2X_GS_TRACE=<file>` +
 `_FROM/_TO` · `PS2X_GS_RECORD=<file>` + `_FROM/_TO` · `PS2X_VRAM_DUMP=<file>` (decode: `tools/debug/gs_vram_ct32.py`) ·
 `PS2X_XGKICK_CAPTURE=<prefix>` + `_FROM/_TO` · `PS2X_DEBUG_ZALWAYS`, `PS2X_ZWATCH` (experiments only).
 Window/presentation (issue 023): `PS2X_HOST_FPS=field` (one window frame per PS2 field) · `PS2X_PRESENT_STATS` (window

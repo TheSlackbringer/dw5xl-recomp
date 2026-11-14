@@ -5,6 +5,22 @@
 
 struct GSVulkanPresenterLink;
 
+// DW5XL issue 066: how the Vulkan renderer's store of compiled shader programs fares (the file and where it lies:
+// runtime/gs/gs_shader_store.h). For the log and the tests.
+namespace ps2x::gs
+{
+    struct ShaderStoreState
+    {
+        bool inUse = false;        // a renderer's device has a store file
+        bool taken = false;        // the file's content was handed to the renderer library
+        uint64_t readBytes = 0;    // its size
+        uint64_t stalled = 0;      // compiles that held a renderer up so far (the library's "Stalled compile")
+        uint64_t writes = 0;       // times a store was written
+        uint64_t writtenBytes = 0; // the last one's size
+    };
+    ShaderStoreState shaderStoreState();
+}
+
 // GS rasterization and texture/VRAM operations execute in paraLLEl-GS Vulkan
 // compute shaders. The native EE/IOP runtime and frontend remain in place.
 class GSVulkanBackend final : public GSRasterBackend

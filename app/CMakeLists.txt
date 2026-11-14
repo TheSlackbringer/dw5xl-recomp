@@ -583,7 +583,7 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_gs_renderer_tests tests/gs_renderer_tests_main.cpp
         tests/gs_picture_reads_test.cpp tests/gs_window_support_test.cpp tests/gs_second_memory_test.cpp
         tests/gs_turns_test.cpp tests/gs_picture_sync_test.cpp tests/gs_picture_handover_test.cpp
-        tests/gs_game_window_test.cpp)
+        tests/gs_game_window_test.cpp tests/gs_shader_store_device_test.cpp)
     target_compile_definitions(dw5xl_gs_renderer_tests PRIVATE DW5XL_ONE_TEST_PROGRAM)
     # parallel-gs: the hand-over test is a stand-in presenter with a device object of its own (the library's headers).
     target_link_libraries(dw5xl_gs_renderer_tests PRIVATE ps2_runtime parallel-gs)
@@ -611,6 +611,14 @@ if(DW5XL_BUILD_TESTS)
     # DW5XL-TEST issue 049 (amendment v3.12 step 3 part 4): the game's window drawn by the renderer itself, made
     # hidden (skipped without a Vulkan device or without Vulkan windows).
     add_test(NAME gs_game_window COMMAND dw5xl_gs_renderer_tests gs_game_window)
+    # DW5XL-TEST issue 066: the renderer's own store of compiled shader programs: taken, left out when it is for
+    # another card or damaged, written only after a compile held the renderer up (skipped without a Vulkan device).
+    add_test(NAME gs_shader_store_device COMMAND dw5xl_gs_renderer_tests gs_shader_store)
+    # DW5XL-TEST issue 066: the store's file: written whole, read back, refused when it is not this program's; no
+    # graphics card and no game data.
+    add_executable(dw5xl_gs_shader_store_test tests/gs_shader_store_test.cpp "${PS2RECOMP_DIR}/ps2xRuntime/src/lib/gs/gs_shader_store.cpp")
+    target_include_directories(dw5xl_gs_shader_store_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME gs_shader_store COMMAND dw5xl_gs_shader_store_test "${CMAKE_CURRENT_BINARY_DIR}")
     # DW5XL-TEST issue 049 (amendment v3.12 step 3): the places of handed-over pictures, who may use which when; no
     # graphics card and no game data.
     add_executable(dw5xl_gs_handover_places_test tests/gs_handover_places_test.cpp)
