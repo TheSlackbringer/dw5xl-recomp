@@ -9,6 +9,7 @@
 #include <vector>
 
 namespace ps2x { class StateArchive; }
+struct GSVulkanPresenterLink;
 
 class GSRasterBackend
 {
@@ -104,6 +105,10 @@ public:
         return {};
     }
 
+    // Issue 049 (amendment v3.12 step 3): what a window that presents by itself needs from the renderer (its
+    // graphics device, a lock for the queues, the finished pictures on the graphics card). Renderers that cannot
+    // give it return nothing, and the game keeps the window that reads pictures back.
+    virtual std::shared_ptr<GSVulkanPresenterLink> PresenterLink() { return nullptr; }
     virtual void SetResolutionScale(uint32_t scale) { (void)scale; }
     virtual uint32_t GetResolutionScale() const { return 1; }
     // Anti-aliasing samples per output pixel, independent of the output scale.

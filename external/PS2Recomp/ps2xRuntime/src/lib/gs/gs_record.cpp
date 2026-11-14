@@ -252,6 +252,10 @@ namespace
             return m_inner->GetTransferSnapshot();
         }
 
+        std::shared_ptr<GSVulkanPresenterLink> PresenterLink() override
+        {
+            return m_inner->PresenterLink(); // presenting is not part of a recording
+        }
         void SetResolutionScale(uint32_t scale) override
         {
             m_inner->SetResolutionScale(scale);

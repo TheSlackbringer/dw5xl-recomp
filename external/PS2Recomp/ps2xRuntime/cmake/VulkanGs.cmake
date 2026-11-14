@@ -39,4 +39,13 @@ if(PS2X_ENABLE_VULKAN_GS)
         src/lib/gs/gs_vulkan_handover.cpp)
     target_link_libraries(ps2_runtime PRIVATE parallel-gs)
     target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_VULKAN_GS=1)
+    # DW5XL (issue 049, amendment v3.12 step 3 part 4): the game's window drawn by the renderer is a GLFW window
+    # without OpenGL. GLFW is in the build already (raylib's library contains it, Vulkan part included); only its
+    # header is needed here. Without raylib's own GLFW sources (a system GLFW, a platform without one) the window
+    # is not built and the game keeps today's window.
+    if(DEFINED raylib_SOURCE_DIR AND EXISTS "${raylib_SOURCE_DIR}/src/external/glfw/include/GLFW/glfw3.h")
+        target_sources(ps2_runtime PRIVATE src/lib/gs/gs_vulkan_window.cpp)
+        target_include_directories(ps2_runtime PRIVATE "${raylib_SOURCE_DIR}/src/external/glfw/include")
+        target_compile_definitions(ps2_runtime PUBLIC PS2X_HAS_GAME_WINDOW=1)
+    endif()
 endif()

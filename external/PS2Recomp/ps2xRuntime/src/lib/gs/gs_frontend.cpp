@@ -963,6 +963,12 @@ void GS::setPictureReadSubmitted(std::function<void()> submitted)
     m_pictureReadSubmitted = std::move(submitted);
 }
 
+std::shared_ptr<GSVulkanPresenterLink> GS::presenterLink()
+{
+    std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+    return m_backend ? m_backend->PresenterLink() : nullptr;
+}
+
 bool GS::collectPictureReads(std::vector<GSPictureRead> &out)
 {
     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);

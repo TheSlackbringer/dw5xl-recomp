@@ -10,6 +10,7 @@ int dw5xl_test_main_gs_second_memory();
 int dw5xl_test_main_gs_turns();
 int dw5xl_test_main_gs_picture_sync();
 int dw5xl_test_main_gs_picture_handover();
+int dw5xl_test_main_gs_game_window();
 
 int main(int argc, char **argv)
 {
@@ -24,6 +25,7 @@ int main(int argc, char **argv)
         {"gs_turns", dw5xl_test_main_gs_turns},
         {"gs_picture_sync", dw5xl_test_main_gs_picture_sync},
         {"gs_picture_handover", dw5xl_test_main_gs_picture_handover},
+        {"gs_game_window", dw5xl_test_main_gs_game_window},
     };
     if (argc == 2)
         for (const auto &test : tests)

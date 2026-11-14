@@ -51,6 +51,7 @@
 #include "runtime/ps2_display_clock.h"
 #include "runtime/picture_rect.h"
 #include "runtime/host_devices.h"
+#include "runtime/gs/gs_game_window.h"
 
 namespace ps2_stubs
 {
@@ -444,6 +445,14 @@ namespace
 static std::atomic<float> s_pictureShape{0.0f};
 // DW5XL issue 047: PC SETTINGS' SHARPEN, contrast-adaptive sharpening of the picture as the window draws it (above 1x).
 static std::atomic<bool> s_presentSharpen{false};
+// DW5XL (issue 049, amendment v3.12 step 3 part 4): the game's window drawn by the renderer itself, when the switch
+// asks for it and the renderer can present (openRendererWindow). Empty: today's window.
+#ifdef PS2X_HAS_GAME_WINDOW
+static std::unique_ptr<ps2x::gs::GameWindow> s_gameWindow;
+static bool rendererWindowOpen() { return static_cast<bool>(s_gameWindow); }
+#else
+static bool rendererWindowOpen() { return false; }
+#endif
 static const char *const kPresentSharpenShader = R"(#version 330
 in vec2 fragTexCoord; in vec4 fragColor; out vec4 finalColor; uniform sampler2D texture0; uniform vec2 texel;
 void main() {
@@ -2415,6 +2424,44 @@ bool PS2Runtime::syncCoreSubsystems()
     return true;
 }
 
+// DW5XL-DEBUG (issue 049, amendment v3.12 step 3 part 4) PS2X_WINDOW=vulkan: the game is shown by the window the
+// renderer draws itself (runtime/gs/gs_game_window.h) instead of today's raylib window. Behind this switch until
+// it has passed the owner's look (step 6). So far it shows the game's pictures that are finished on the graphics
+// card. Not yet: pictures that only exist in main memory, frame dumps and the pictures of saved states (part 5),
+// the overlays and pages (step 4), the in-between pictures (step 5), SHARPEN, fullscreen.
+// True: that window is open, and its keys, mouse and pads are the ones the game reads.
+static bool openRendererWindow(const std::shared_ptr<GSVulkanPresenterLink> &link, const char *title)
+{
+#ifdef PS2X_HAS_GAME_WINDOW
+    const char *wanted = std::getenv("PS2X_WINDOW");
+    if (!wanted || std::strcmp(wanted, "vulkan") != 0)
+        return false;
+    const char *hidden = std::getenv("PS2X_HIDDEN");
+    const char *vsyncSource = "default";
+    ps2x::gs::GameWindowOptions options;
+    options.width = HOST_WINDOW_WIDTH;
+    options.height = HOST_WINDOW_HEIGHT;
+    options.title = title ? title : "";
+    options.hidden = hidden && *hidden && *hidden != '0';
+    options.vsync = loadVsyncSetting(vsyncSource);
+    std::string why = "the renderer cannot present (it is not the Vulkan renderer)";
+    if (link)
+        s_gameWindow = ps2x::gs::GameWindow::open(link, options, why);
+    if (!s_gameWindow)
+    {
+        std::fprintf(stderr, "[window] PS2X_WINDOW=vulkan: %s; today's window is used\n", why.c_str());
+        return false;
+    }
+    ps2x::host::setDevices(&s_gameWindow->devices());
+    std::fprintf(stderr, "[window] the renderer's own window (PS2X_WINDOW=vulkan)%s\n", options.hidden ? ", hidden" : "");
+    return true;
+#else
+    (void)link;
+    (void)title;
+    return false;
+#endif
+}
+
 bool PS2Runtime::initialize(const char *title)
 {
     try
@@ -2447,10 +2494,13 @@ bool PS2Runtime::initialize(const char *title)
                            (vsyncOn ? FLAG_VSYNC_HINT : 0));
             std::fprintf(stderr, "[window] vsync %s (%s)\n", vsyncOn ? "on" : "off", vsyncSource);
         }
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
-        ps2x::present_feedback::start(GetWindowHandle()); // DW5XL-DEBUG issue 023 3S: PS2X_PRESENT_LOG
-        if (loadFullscreenSetting() && !IsWindowHidden())   // issue 023 3S: display=fullscreen (borderless)
-            ToggleBorderlessWindowed();
+        if (!openRendererWindow(gs().presenterLink(), title)) // DW5XL-DEBUG issue 049: PS2X_WINDOW=vulkan
+        {
+            InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+            ps2x::present_feedback::start(GetWindowHandle()); // DW5XL-DEBUG issue 023 3S: PS2X_PRESENT_LOG
+            if (loadFullscreenSetting() && !IsWindowHidden())   // issue 023 3S: display=fullscreen (borderless)
+                ToggleBorderlessWindowed();
+        }
         InitAudioDevice();
         // DW5XL-DEBUG (issue 025): PS2X_MUTE=1 silences the output for test runs where no silent sink exists
         // (Windows); the audio device and stream keep running exactly as in normal play, only the volume is 0.
@@ -2459,8 +2509,11 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         m_audioBackend.startPcmStream();
 #endif
-        SetTargetFPS(configuredHostTargetFps());
-        if (m_debugUiInitCallback)
+        // The renderer's own window (issue 049) has no OpenGL: raylib's frame limiter and the overlays' start-up
+        // (rlImGui) belong to today's window.
+        if (!rendererWindowOpen())
+            SetTargetFPS(configuredHostTargetFps());
+        if (m_debugUiInitCallback && !rendererWindowOpen())
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
             m_debugUiInitialized = true;
@@ -4331,14 +4384,21 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
-    // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
-    Texture2D frameTex = LoadTextureFromImage(blank);
-    UnloadImage(blank);
+    // DW5XL (issue 049, amendment v3.12 step 3 part 4): the renderer's own window has no OpenGL; nothing of
+    // raylib's window is touched then.
+    const bool ownWindow = rendererWindowOpen();
+    Texture2D frameTex{};
+    if (!ownWindow)
+    {
+        // A blank image to use as a framebuffer
+        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+        frameTex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
 
-    // Escape belongs to the game's menu controls. Close the native window with
-    // its close button or Alt+F4 instead of Raylib's default Escape shortcut.
-    SetExitKey(KEY_NULL);
+        // Escape belongs to the game's menu controls. Close the native window with
+        // its close button or Alt+F4 instead of Raylib's default Escape shortcut.
+        SetExitKey(KEY_NULL);
+    }
     ps2_host_input::poll();
     std::atomic<bool> gameThreadFinished{false};
 
@@ -4399,7 +4459,7 @@ void PS2Runtime::run()
             std::fprintf(stderr, "[window] test display: fixed rate, %.4f ms per refresh (%.3f Hz)\n", displayGrid.periodMs,
                          1000.0 / displayGrid.periodMs);
     }
-    const bool timedMode = s_smoothShow && haveDisplay && hostFpsOverride == 0 && m_eeScheduler;
+    const bool timedMode = !ownWindow && s_smoothShow && haveDisplay && hostFpsOverride == 0 && m_eeScheduler;
     ps2x_dev::PictureReader pictureReader;
     if (timedMode)
     {
@@ -4413,7 +4473,239 @@ void PS2Runtime::run()
     size_t turnAt = 0u;
     uint32_t presentWidth = FB_WIDTH, presentHeight = DEFAULT_DISPLAY_HEIGHT;
     uint32_t displayWidth = FB_WIDTH, displayHeight = DEFAULT_DISPLAY_HEIGHT;
-    while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+    // DW5XL (issue 049, amendment v3.12 step 3 part 4): what both windows do alike, as one code: the function keys
+    // of the output and of the saved states, and the F2 numbers ([hud]).
+    const auto outputAndStateKeys = [this]()
+    {
+        // F4 cycles native/2x/4x output; F3 cycles the anti-aliasing choice (1-16 samples
+        // per output pixel). The two are independent: 2x/4x use 4/16 samples to build the
+        // larger image and AA multiplies that, up to the 16-sample limit (4x: no extra AA).
+        // DW5XL-DEBUG (issue 049, M2): a scripted press, "<tick>:F4:1" in PS2X_HOST_INPUT, as F5 and F9 have one:
+        // the output scale changed while the game runs, for hidden tests.
+        const bool scriptedScale = m_eeScheduler && ps2_host_input::scriptedKeyPress("F4", eeScheduler().currentVSyncTick());
+        if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::OutputScale)) || scriptedScale)
+        {
+            const uint32_t current = m_gs.getResolutionScale();
+            m_gs.setResolutionScale(current == 1u ? 2u : current == 2u ? 4u : 1u);
+            if (m_gs.getResolutionScale() == current)
+                m_gs.setResolutionScale(1u);
+            saveIniValue("resolution_scale", m_gs.getResolutionScale());
+        }
+        if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::AntiAliasing)))
+        {
+            s_aaChoice = s_aaChoice >= 16u ? 1u : s_aaChoice * 2u;
+            m_gs.setAASamples(s_aaChoice);
+            saveIniValue("aa_samples", s_aaChoice);
+        }
+        // Issue 027 v3: F5 saves the game to the quick slot; F9 loads it, keeping the running game in before-load.state
+        // first; Shift+F9 goes back to that. The scheduler carries them out at its next quiet point, in the states
+        // folder (stateDirectory). Issue 027 v4: each saved state gets a picture of the game (the states menu).
+        {
+            static const std::filesystem::path s_stateDir = stateDirectory();
+            const uint64_t tick = eeScheduler().currentVSyncTick();
+            const bool shift = ps2x::host::devices().keyDown(KEY_LEFT_SHIFT) || ps2x::host::devices().keyDown(KEY_RIGHT_SHIFT);
+            const bool loadKey = ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::LoadState));
+            const std::string quick = (s_stateDir / "quick.state").string(), backup = (s_stateDir / "before-load.state").string();
+            if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::SaveState)) || ps2_host_input::scriptedKeyPress("F5", tick))
+                requestStateWithPicture(true, quick);
+            else if ((loadKey && shift) || ps2_host_input::scriptedKeyPress("SHIFT+F9", tick))
+                eeScheduler().requestState(EeScheduler::StateRequestKind::Load, backup);
+            else if (loadKey || ps2_host_input::scriptedKeyPress("F9", tick))
+                requestStateWithPicture(false, quick, backup);
+            writeSavedStatePictures();
+        }
+    };
+    float hudGameFps = 0.0f, hudVsyncRate = 0.0f;
+    const auto hudNumbers = [this, &hudGameFps, &hudVsyncRate](float frameMs, uint64_t currentVsync)
+    {
+        static auto s_lastFpsTime = std::chrono::steady_clock::now();
+        static uint64_t s_lastVsyncTick = 0;
+        static int64_t s_lastVsyncNs = 0;
+        static uint64_t s_lastGameFrames = 0;
+        static uint64_t s_lastMoviePictures = 0;
+        static float s_vsyncRate = 0.0f;
+        static float s_gameFps = 0.0f;
+        static float s_maxFrameMs = 0.0f; // worst host frame in the HUD window
+        s_maxFrameMs = std::max(s_maxFrameMs, frameMs);
+
+        const auto nowFps = std::chrono::steady_clock::now();
+        const float elapsedFps = std::chrono::duration<float>(nowFps - s_lastFpsTime).count();
+        if (elapsedFps >= 1.0f)
+        {
+            auto &gsRegs = m_memory.gs();
+            uint64_t tick = 0;
+            int64_t tickNs = 0;
+            do
+            {
+                tick = gsRegs.vsyncTick.load(std::memory_order_acquire);
+                tickNs = m_memory.vsyncTickNs().load(std::memory_order_relaxed);
+            } while (tick != gsRegs.vsyncTick.load(std::memory_order_acquire));
+            const uint64_t gameFrames = ps2x::device::gameFrameCount();
+            const uint64_t moviePictures = ps2_stubs::moviePictureCount();
+            // DW5XL (issue 027): a state load jumps the field number, and this window played none of those fields;
+            // the numbers start again from the next window.
+            static uint64_t s_stateLoads = 0;
+            const uint64_t stateLoads = stateLoadCount();
+            if (stateLoads == s_stateLoads)
+            {
+                const double frames = static_cast<double>(std::max(gameFrames - s_lastGameFrames, moviePictures - s_lastMoviePictures));
+                const int64_t spanNs = tickNs - s_lastVsyncNs;
+                if (s_lastVsyncNs != 0 && tick > s_lastVsyncTick && spanNs > 0)
+                {
+                    const double span = static_cast<double>(spanNs) * 1e-9;
+                    s_vsyncRate = static_cast<float>(static_cast<double>(tick - s_lastVsyncTick) / span);
+                    // A screen shows at most one frame per field: frames are counted at the sample moments, not
+                    // exactly on field boundaries, so clamp the +-1 slack.
+                    s_gameFps = std::min(s_vsyncRate, static_cast<float>(frames / span));
+                }
+                else
+                {
+                    s_vsyncRate = 0.0f; // no new field: the guest clock is stalled
+                    s_gameFps = static_cast<float>(frames / elapsedFps);
+                }
+                // PS2X_HUD_LOG=1 logs the F2 overlay numbers (game FPS, guest VSync, worst host frame) for unattended runs.
+                static const bool s_hudLog = [] { const char *v = std::getenv("PS2X_HUD_LOG"); return v && *v && *v != '0'; }();
+                if (s_hudLog)
+                    std::fprintf(stderr, "[hud] tick=%llu fps=%.1f vsync=%.1f frameMs=%.1f maxFrameMs=%.1f\n",
+                                 static_cast<unsigned long long>(currentVsync), s_gameFps, s_vsyncRate, frameMs, s_maxFrameMs);
+            }
+            s_stateLoads = stateLoads;
+            s_lastVsyncTick = tick;
+            s_lastVsyncNs = tickNs;
+            s_lastGameFrames = gameFrames;
+            s_lastMoviePictures = moviePictures;
+            s_lastFpsTime = nowFps;
+            s_maxFrameMs = 0.0f;
+        }
+        hudGameFps = s_gameFps;
+        hudVsyncRate = s_vsyncRate;
+    };
+#ifdef PS2X_HAS_GAME_WINDOW
+    if (ownWindow)
+    {
+        // The renderer's own window: one window frame per PS2 field, the field's picture taken on the graphics card.
+        ps2x::gs::GameWindow &window = *s_gameWindow;
+        if (hostFpsOverride != 0)
+            std::fprintf(stderr, "[window] PS2X_HOST_FPS is not used by the renderer's own window: one window frame per PS2 field\n");
+        if (s_smoothShow)
+            std::fprintf(stderr, "[window] the renderer's own window shows the game's fields only so far (in-between pictures: step 5)\n");
+        static const bool s_stats = [] { const char *v = std::getenv("PS2X_PRESENT_STATS"); return v && *v && *v != '0'; }();
+        auto lastTurn = std::chrono::steady_clock::now(), statsSince = lastTurn;
+        uint64_t statFrames = 0u, statNew = 0u, statFailed = 0u, statSlow = 0u, statReadBack = 0u;
+        uint64_t lastReadGeneration = gs().hostPresentationGeneration();
+        double statMaxMs = 0.0;
+        bool sharpenSaid = false;
+        while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+        {
+            // Issue 027: a state load sets the field number back; the loaded game's fields are new to the window.
+            if (const uint64_t loads = stateLoadCount(); loads != shownLoads)
+            {
+                shownLoads = loads;
+                lastShownField = ps2x::presentation::kNoField;
+            }
+            const EeScheduler::PresentationField paced = m_eeScheduler->waitForPresentationField(lastShownField);
+            if (paced.fresh)
+                lastShownField = paced.field;
+            m_audioBackend.updatePcmStream();
+            devHarness.step(m_eeScheduler->currentVSyncTick());
+            window.poll();
+            ps2_host_input::poll(m_eeScheduler->currentVSyncTick());
+            if (paced.fresh)
+            {
+                // As today's window: wait until the GS side has finished this field, and collect what it read back
+                // (a picture that only exists in main memory; such pictures are shown from part 5 on).
+                gs().latchHostPresentationFrame(paced.field, paced.field);
+                s_windowFrameField = paced.field;
+            }
+            ps2x::gs::GameWindowLook look;
+            look.shape = s_pictureShape.load(std::memory_order_relaxed);
+            look.smooth = m_gs.getResolutionScale() > 1u; // issue 047: above 1x the picture is scaled smoothly
+            if (!sharpenSaid && s_presentSharpen.load(std::memory_order_relaxed) && look.smooth)
+            {
+                sharpenSaid = true;
+                std::fprintf(stderr, "[window] SHARPEN is not drawn by the renderer's own window yet\n");
+            }
+            const ps2x::gs::GameWindowShown shown = window.show(paced.field, look);
+            s_windowFrameNewPicture = shown.newPicture;
+            if (shown.have)
+            {
+                m_pictureRect[0] = shown.x; m_pictureRect[1] = shown.y;
+                m_pictureRect[2] = shown.rectWidth; m_pictureRect[3] = shown.rectHeight;
+            }
+            // Function keys: one table, runtime/hotkeys.h. F2 changes the saved setting; its line is an overlay (step 4).
+            if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::FpsOverlay)))
+            {
+                setShowFps(!showFps());
+                ps2x::settings::saveText("show_fps", showFps() ? "on" : "off");
+            }
+            outputAndStateKeys();
+            const auto now = std::chrono::steady_clock::now();
+            const double turnMs = std::chrono::duration<double, std::milli>(now - lastTurn).count();
+            lastTurn = now;
+            hudNumbers(static_cast<float>(turnMs), eeScheduler().currentVSyncTick());
+            // DW5XL-DEBUG issue 023 3S: PS2X_WINDOW_SHOT=<field>:<path.png>, as today's window has it: what the window
+            // shows on the first frame at or after that field, drawn once more into a picture of the window's size
+            // and saved (the frame dumps hold only the game picture; this window has none before part 5).
+            {
+                static uint64_t s_shotTick = 0; static std::string s_shotPath; static bool s_shotInit = false;
+                if (!s_shotInit) {
+                    s_shotInit = true;
+                    if (const char *v = std::getenv("PS2X_WINDOW_SHOT"); v && std::strchr(v, ':')) {
+                        s_shotTick = std::strtoull(v, nullptr, 10); s_shotPath = std::strchr(v, ':') + 1;
+                    }
+                }
+                if (!m_windowShotRequest.empty() && s_shotPath.empty()) { s_shotPath = m_windowShotRequest; s_shotTick = 0; m_windowShotRequest.clear(); }
+                if (const uint64_t fieldNow = eeScheduler().currentVSyncTick(); !s_shotPath.empty() && fieldNow >= s_shotTick) {
+                    std::vector<uint8_t> rgba;
+                    uint32_t shotWidth = 0u, shotHeight = 0u;
+                    bool saved = false;
+                    if (window.picture(look, rgba, shotWidth, shotHeight)) {
+                        ::Image shot{rgba.data(), static_cast<int>(shotWidth), static_cast<int>(shotHeight), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+                        saved = ExportImage(shot, s_shotPath.c_str());
+                    }
+                    std::fprintf(stderr, "[window:shot] field %llu (the picture of field %llu) -> %s%s\n", static_cast<unsigned long long>(fieldNow),
+                                 static_cast<unsigned long long>(shown.field), s_shotPath.c_str(), saved ? "" : " (not saved)");
+                    s_shotPath.clear();
+                }
+            }
+            // DW5XL-DEBUG PS2X_PRESENT_STATS=1: one line a second, as today's window has one ([present:stats]):
+            // window frames, the game's new pictures taken on the graphics card, pictures the renderer read back
+            // instead (not shown before part 5), reads copied into main memory, frames that could not be presented.
+            if (s_stats)
+            {
+                ++statFrames;
+                statNew += shown.newPicture ? 1u : 0u;
+                statFailed += shown.presented ? 0u : 1u;
+                statSlow += turnMs > 25.0 ? 1u : 0u;
+                statMaxMs = std::max(statMaxMs, turnMs);
+                if (const uint64_t generation = gs().hostPresentationGeneration(); generation != lastReadGeneration)
+                {
+                    lastReadGeneration = generation;
+                    ++statReadBack;
+                }
+                if (now - statsSince >= std::chrono::seconds(1))
+                {
+                    std::fprintf(stderr, "[present:own] tick=%llu frames=%llu newPictures=%llu readBack=%llu readsCopied=%llu notPresented=%llu slow=%llu maxMs=%.1f\n",
+                                 static_cast<unsigned long long>(m_eeScheduler->currentVSyncTick()),
+                                 static_cast<unsigned long long>(statFrames), static_cast<unsigned long long>(statNew),
+                                 static_cast<unsigned long long>(statReadBack),
+                                 static_cast<unsigned long long>(g_dw5xlReadsCopied.exchange(0u)),
+                                 static_cast<unsigned long long>(statFailed), static_cast<unsigned long long>(statSlow), statMaxMs);
+                    statFrames = statNew = statFailed = statSlow = statReadBack = 0u;
+                    statMaxMs = 0.0;
+                    statsSince = now;
+                }
+            }
+            if (window.closeAsked())
+            {
+                RUNTIME_LOG("[run] window close requested, breaking out of loop");
+                requestStop();
+                break;
+            }
+        }
+    }
+#endif
+    while (!ownWindow && !isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         const bool fieldPaced = hostFpsOverride == 0 && m_eeScheduler;
         EeScheduler::PresentationField paced{};
@@ -4660,109 +4952,16 @@ void PS2Runtime::run()
         {
             s_showBuildOverlay = !s_showBuildOverlay;
         }
-        // F4 cycles native/2x/4x output; F3 cycles the anti-aliasing choice (1-16 samples
-        // per output pixel). The two are independent: 2x/4x use 4/16 samples to build the
-        // larger image and AA multiplies that, up to the 16-sample limit (4x: no extra AA).
-        // DW5XL-DEBUG (issue 049, M2): a scripted press, "<tick>:F4:1" in PS2X_HOST_INPUT, as F5 and F9 have one:
-        // the output scale changed while the game runs, for hidden tests.
-        const bool scriptedScale = m_eeScheduler && ps2_host_input::scriptedKeyPress("F4", eeScheduler().currentVSyncTick());
-        if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::OutputScale)) || scriptedScale)
-        {
-            const uint32_t current = m_gs.getResolutionScale();
-            m_gs.setResolutionScale(current == 1u ? 2u : current == 2u ? 4u : 1u);
-            if (m_gs.getResolutionScale() == current)
-                m_gs.setResolutionScale(1u);
-            saveIniValue("resolution_scale", m_gs.getResolutionScale());
-        }
-        if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::AntiAliasing)))
-        {
-            s_aaChoice = s_aaChoice >= 16u ? 1u : s_aaChoice * 2u;
-            m_gs.setAASamples(s_aaChoice);
-            saveIniValue("aa_samples", s_aaChoice);
-        }
-        // Issue 027 v3: F5 saves the game to the quick slot; F9 loads it, keeping the running game in before-load.state
-        // first; Shift+F9 goes back to that. The scheduler carries them out at its next quiet point, in the states
-        // folder (stateDirectory). Issue 027 v4: each saved state gets a picture of the game (the states menu).
-        {
-            static const std::filesystem::path s_stateDir = stateDirectory();
-            const uint64_t tick = eeScheduler().currentVSyncTick();
-            const bool shift = ps2x::host::devices().keyDown(KEY_LEFT_SHIFT) || ps2x::host::devices().keyDown(KEY_RIGHT_SHIFT);
-            const bool loadKey = ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::LoadState));
-            const std::string quick = (s_stateDir / "quick.state").string(), backup = (s_stateDir / "before-load.state").string();
-            if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::SaveState)) || ps2_host_input::scriptedKeyPress("F5", tick))
-                requestStateWithPicture(true, quick);
-            else if ((loadKey && shift) || ps2_host_input::scriptedKeyPress("SHIFT+F9", tick))
-                eeScheduler().requestState(EeScheduler::StateRequestKind::Load, backup);
-            else if (loadKey || ps2_host_input::scriptedKeyPress("F9", tick))
-                requestStateWithPicture(false, quick, backup);
-            writeSavedStatePictures();
-        }
+        outputAndStateKeys();
 
         // F2 overlay numbers (issue 014), about once a second. VSync = guest fields per second, timed by the fields'
         // own emission times (so a steady 50 reads 50.0, not 49/51 from where the window falls). FPS = the
         // game's frame rate over the same span: fields in which it finished a frame (ps2x::device::gameFrameCount)
         // or, during movies, the pictures the movie decoder handed to the game (its frame syncs do not always
         // have device work), whichever is higher. The host window loop itself is paced by VBlankEnd (50 Hz) and is not shown.
-        static auto s_lastFpsTime = std::chrono::steady_clock::now();
-        static uint64_t s_lastVsyncTick = 0;
-        static int64_t s_lastVsyncNs = 0;
-        static uint64_t s_lastGameFrames = 0;
-        static uint64_t s_lastMoviePictures = 0;
-        static float s_vsyncRate = 0.0f;
-        static float s_gameFps = 0.0f;
-        static float s_maxFrameMs = 0.0f; // worst host frame in the HUD window
-        s_maxFrameMs = std::max(s_maxFrameMs, GetFrameTime() * 1000.0f);
-
-        const auto nowFps = std::chrono::steady_clock::now();
-        const float elapsedFps = std::chrono::duration<float>(nowFps - s_lastFpsTime).count();
         const uint64_t currentVsync = eeScheduler().currentVSyncTick();
-        if (elapsedFps >= 1.0f)
-        {
-            auto &gsRegs = m_memory.gs();
-            uint64_t tick = 0;
-            int64_t tickNs = 0;
-            do
-            {
-                tick = gsRegs.vsyncTick.load(std::memory_order_acquire);
-                tickNs = m_memory.vsyncTickNs().load(std::memory_order_relaxed);
-            } while (tick != gsRegs.vsyncTick.load(std::memory_order_acquire));
-            const uint64_t gameFrames = ps2x::device::gameFrameCount();
-            const uint64_t moviePictures = ps2_stubs::moviePictureCount();
-            // DW5XL (issue 027): a state load jumps the field number, and this window played none of those fields;
-            // the numbers start again from the next window.
-            static uint64_t s_stateLoads = 0;
-            const uint64_t stateLoads = stateLoadCount();
-            if (stateLoads == s_stateLoads)
-            {
-                const double frames = static_cast<double>(std::max(gameFrames - s_lastGameFrames, moviePictures - s_lastMoviePictures));
-                const int64_t spanNs = tickNs - s_lastVsyncNs;
-                if (s_lastVsyncNs != 0 && tick > s_lastVsyncTick && spanNs > 0)
-                {
-                    const double span = static_cast<double>(spanNs) * 1e-9;
-                    s_vsyncRate = static_cast<float>(static_cast<double>(tick - s_lastVsyncTick) / span);
-                    // A screen shows at most one frame per field: frames are counted at the sample moments, not
-                    // exactly on field boundaries, so clamp the +-1 slack.
-                    s_gameFps = std::min(s_vsyncRate, static_cast<float>(frames / span));
-                }
-                else
-                {
-                    s_vsyncRate = 0.0f; // no new field: the guest clock is stalled
-                    s_gameFps = static_cast<float>(frames / elapsedFps);
-                }
-                // PS2X_HUD_LOG=1 logs the F2 overlay numbers (game FPS, guest VSync, worst host frame) for unattended runs.
-                static const bool s_hudLog = [] { const char *v = std::getenv("PS2X_HUD_LOG"); return v && *v && *v != '0'; }();
-                if (s_hudLog)
-                    std::fprintf(stderr, "[hud] tick=%llu fps=%.1f vsync=%.1f frameMs=%.1f maxFrameMs=%.1f\n",
-                                 static_cast<unsigned long long>(currentVsync), s_gameFps, s_vsyncRate, GetFrameTime() * 1000.0f, s_maxFrameMs);
-            }
-            s_stateLoads = stateLoads;
-            s_lastVsyncTick = tick;
-            s_lastVsyncNs = tickNs;
-            s_lastGameFrames = gameFrames;
-            s_lastMoviePictures = moviePictures;
-            s_lastFpsTime = nowFps;
-            s_maxFrameMs = 0.0f;
-        }
+        hudNumbers(GetFrameTime() * 1000.0f, currentVsync);
+        const float s_gameFps = hudGameFps, s_vsyncRate = hudVsyncRate;
 
         if (s_showFpsOverlay && !IsWindowHidden())
         {
@@ -4882,8 +5081,18 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
-    UnloadTexture(frameTex);
-    CloseWindow();
+    if (ownWindow)
+    {
+#ifdef PS2X_HAS_GAME_WINDOW
+        ps2x::host::setDevices(nullptr);
+        s_gameWindow.reset();
+#endif
+    }
+    else
+    {
+        UnloadTexture(frameTex);
+        CloseWindow();
+    }
 
     RUNTIME_LOG("[run] exiting loop");
 }

@@ -205,6 +205,9 @@ public:
 
     void setResolutionScale(uint32_t scale);
     uint32_t getResolutionScale() const;
+    // Issue 049 (amendment v3.12 step 3): the renderer's link for a window that presents by itself; nothing when
+    // the renderer has none (GSRasterBackend::PresenterLink).
+    std::shared_ptr<GSVulkanPresenterLink> presenterLink();
     void setAASamples(uint32_t samples);
     uint32_t getAASamples() const;
     void SetResolutionScale(uint32_t scale) { setResolutionScale(scale); }

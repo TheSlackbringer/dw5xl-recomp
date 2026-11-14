@@ -1,0 +1,495 @@
+// DW5XL-TEST issue 049 (amendment v3.12 step 3 part 4): the game's window drawn by the renderer itself
+// (runtime/gs/gs_game_window.h). The window is made hidden: nothing appears on the screen. No game data.
+// At render scale 1 and 4, with two drawings A and B read back the old way as the yardstick:
+//   The drawing alone (VulkanPictureDrawer, into a picture of a device object of the test's own):
+//   1. a handed picture drawn one to one is the read picture pixel for pixel;
+//   2. drawn with room left and right: black there, the picture between pixel for pixel;
+//   3. drawn to twice its size by the nearest pixel: every pixel four times;
+//   4. drawn smooth to twice and to half its size: the bilinear value, within one step of 255.
+//   The window:
+//   5. it opens hidden on the renderer's link, has the size asked for, a swap chain, and devices that answer;
+//   6. with no picture yet it presents black;
+//   7. a field of A: the window presents it as a new picture with its field and sizes, the renderer does not
+//      read it back, and what the window draws is A letterboxed by the one function every window uses
+//      (at 1x by the nearest pixel, above 1x smooth);
+//   8. shown again without a new field: presented, not new, the same picture;
+//   9. 60 fields of A and B in turn: every one presented as a new picture of its field, none refused a place;
+//  10. two fields finished, the older one asked for: that one is shown, then the newer;
+//  11. another window size: a new swap chain, the picture letterboxed anew (bars left and right);
+//  12. the output's scale changes: the window shows the picture at its new size;
+//  13. the renderer goes first: the window still presents the picture it holds; then the window goes.
+//  14. the window goes first while it holds a picture: the renderer reads pictures back again.
+// Exit code 77: no Vulkan device, or no Vulkan windows on this system (skipped).
+#include "runtime/gs/gs_game_window.h"
+#include "runtime/gs/gs_vulkan_backend.h"
+#include "runtime/host_devices.h"
+#include "runtime/picture_rect.h"
+#include "gs/gs_vulkan_handover.h"
+#include "gs/gs_vulkan_window.h"
+#include "gs_test_pictures.h"
+#include "test_one_program.h"
+
+#include "device.hpp"
+#include "context.hpp"
+#include "thread_id.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using namespace gs_test;
+
+namespace
+{
+int g_failures = 0;
+
+void check(bool ok, const std::string &what, uint32_t scale)
+{
+    std::printf("%s  scale %ux: %s\n", ok ? "ok  " : "FAIL", scale, what.c_str());
+    if (!ok)
+        ++g_failures;
+}
+
+struct Picture
+{
+    std::vector<uint8_t> rgba;
+    uint32_t width = 0u, height = 0u;
+};
+
+// What a window of width x height shows of `source` placed at the rectangle, computed here: black outside the
+// rectangle (by pixel centres), inside the nearest pixel or the bilinear value with the edge pixels repeated.
+Picture expected(const Picture &source, uint32_t width, uint32_t height, const ps2x::PictureRect &rect, bool smooth)
+{
+    Picture out;
+    out.width = width;
+    out.height = height;
+    out.rgba.assign(static_cast<size_t>(width) * height * 4u, 0u);
+    const auto texel = [&](int x, int y, int channel) {
+        x = std::clamp(x, 0, static_cast<int>(source.width) - 1);
+        y = std::clamp(y, 0, static_cast<int>(source.height) - 1);
+        return static_cast<double>(source.rgba[(static_cast<size_t>(y) * source.width + static_cast<size_t>(x)) * 4u + static_cast<size_t>(channel)]);
+    };
+    for (uint32_t py = 0; py < height; ++py)
+        for (uint32_t px = 0; px < width; ++px)
+        {
+            uint8_t *o = &out.rgba[(static_cast<size_t>(py) * width + px) * 4u];
+            o[3] = 0xFFu;
+            const double cx = px + 0.5, cy = py + 0.5;
+            if (cx < rect.x || cx >= rect.x + rect.width || cy < rect.y || cy >= rect.y + rect.height)
+                continue;
+            const double u = (cx - rect.x) / rect.width * source.width, v = (cy - rect.y) / rect.height * source.height;
+            for (int c = 0; c < 3; ++c)
+            {
+                if (!smooth)
+                {
+                    o[c] = static_cast<uint8_t>(texel(static_cast<int>(std::floor(u)), static_cast<int>(std::floor(v)), c));
+                    continue;
+                }
+                const double tu = u - 0.5, tv = v - 0.5;
+                const int x0 = static_cast<int>(std::floor(tu)), y0 = static_cast<int>(std::floor(tv));
+                const double fx = tu - x0, fy = tv - y0;
+                const double top = texel(x0, y0, c) * (1.0 - fx) + texel(x0 + 1, y0, c) * fx;
+                const double bottom = texel(x0, y0 + 1, c) * (1.0 - fx) + texel(x0 + 1, y0 + 1, c) * fx;
+                o[c] = static_cast<uint8_t>(std::lround(top * (1.0 - fy) + bottom * fy));
+            }
+        }
+    return out;
+}
+
+// The largest difference of a colour between two pictures of one size; 256 when they are not of one size.
+int largestDifference(const Picture &a, const Picture &b)
+{
+    if (a.width != b.width || a.height != b.height || a.rgba.size() != b.rgba.size() || a.rgba.empty())
+        return 256;
+    int largest = 0;
+    for (size_t i = 0; i + 4u <= a.rgba.size(); i += 4u)
+        for (size_t c = 0; c < 3u; ++c)
+            largest = std::max(largest, std::abs(static_cast<int>(a.rgba[i + c]) - static_cast<int>(b.rgba[i + c])));
+    return largest;
+}
+
+Picture asPicture(const PresentationFrame &frame)
+{
+    Picture p;
+    p.width = frame.width;
+    p.height = frame.height;
+    p.rgba = frame.pixels;
+    return p;
+}
+
+// A device object of the test's own on the renderer's context, to draw with the drawer alone.
+struct OwnDevice
+{
+    std::shared_ptr<GSVulkanPresenterLink> link; // declared first: it goes last
+    Vulkan::Device device;
+    std::unique_ptr<ps2x::gs::VulkanPictureDrawer> drawer;
+    HandedPictureViews views;
+    static constexpr unsigned kFrameContexts = 4;
+
+    explicit OwnDevice(std::shared_ptr<GSVulkanPresenterLink> from) : link(std::move(from)), views(device, kFrameContexts + 1u)
+    {
+        Util::register_thread_index(0);
+        device.set_context(*link->context);
+        device.init_frame_contexts(kFrameContexts);
+        device.set_queue_lock([lock = link->queues] { lock->lock(); }, [lock = link->queues] { lock->unlock(); });
+        drawer = std::make_unique<ps2x::gs::VulkanPictureDrawer>(device);
+    }
+    ~OwnDevice()
+    {
+        device.wait_idle();
+        views.clear();
+    }
+
+    // The picture drawn at the rectangle into a black picture of width x height, and that one read.
+    Picture drawn(const HandedPicture &picture, uint32_t width, uint32_t height, const ps2x::PictureRect &rect, bool smooth)
+    {
+        Util::register_thread_index(0);
+        Picture out;
+        const Vulkan::ImageView *view = views.view(picture);
+        if (!view)
+            return out;
+        auto info = Vulkan::ImageCreateInfo::render_target(width, height, VK_FORMAT_R8G8B8A8_UNORM);
+        info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        Vulkan::ImageHandle target = device.create_image(info);
+        Vulkan::BufferCreateInfo bufferInfo{};
+        bufferInfo.size = static_cast<VkDeviceSize>(width) * height * 4u;
+        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufferInfo.domain = Vulkan::BufferDomain::CachedHost;
+        Vulkan::BufferHandle read = device.create_buffer(bufferInfo);
+        if (!target || !read)
+            return out;
+        auto cmd = device.request_command_buffer();
+        cmd->image_barrier(*target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        Vulkan::RenderPassInfo pass;
+        pass.num_color_attachments = 1;
+        pass.color_attachments[0] = &target->get_view();
+        pass.clear_attachments = 1u;
+        pass.store_attachments = 1u;
+        pass.clear_color[0].float32[3] = 1.0f;
+        cmd->begin_render_pass(pass);
+        drawer->draw(*cmd, *view, rect.x, rect.y, rect.width, rect.height, smooth);
+        cmd->end_render_pass();
+        cmd->image_barrier(*target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        cmd->copy_image_to_buffer(*read, *target, 0, {}, {width, height, 1}, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
+        cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
+                     VK_ACCESS_2_HOST_READ_BIT);
+        Vulkan::Fence fence;
+        device.submit(cmd, &fence);
+        fence->wait();
+        const void *mapped = device.map_host_buffer(*read, Vulkan::MEMORY_ACCESS_READ_BIT);
+        if (!mapped)
+            return out;
+        out.width = width;
+        out.height = height;
+        out.rgba.resize(static_cast<size_t>(width) * height * 4u);
+        std::memcpy(out.rgba.data(), mapped, out.rgba.size());
+        device.unmap_host_buffer(*read, Vulkan::MEMORY_ACCESS_READ_BIT);
+        device.next_frame_context();
+        views.nextFrame();
+        return out;
+    }
+};
+
+Picture windowPicture(ps2x::gs::GameWindow &window, const ps2x::gs::GameWindowLook &look)
+{
+    Picture p;
+    if (!window.picture(look, p.rgba, p.width, p.height))
+        p = {};
+    return p;
+}
+
+// 0: skipped (no renderer); 1: ran; 2: skipped (no Vulkan windows).
+int run(uint32_t wantedScale)
+{
+    std::unique_ptr<GSVulkanBackend> backend;
+    try
+    {
+        backend = std::make_unique<GSVulkanBackend>(); // throws without a Vulkan device
+    }
+    catch (const std::exception &error)
+    {
+        std::printf("SKIPPED: no Vulkan GS renderer here (%s)\n", error.what());
+        return 0;
+    }
+    std::vector<uint8_t> vram(4u << 20, 0u);
+    backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+    backend->SetResolutionScale(wantedScale);
+    const uint32_t scale = backend->GetResolutionScale();
+    if (scale != wantedScale) // a GPU without 16 samples gives 2x for 4x: tested at what it gives
+        std::printf("note  scale %ux: this GPU renders at %ux\n", wantedScale, scale);
+    const bool smooth = scale > 1u; // as the game's window asks: by the nearest pixel at 1x, smooth above
+    uint64_t tick = 10u;
+
+    std::shared_ptr<GSVulkanPresenterLink> link = backend->PresenterLink();
+    if (!link || !link->windowSupport)
+    {
+        std::printf("SKIPPED: the renderer's graphics device has no window support here\n");
+        return 2;
+    }
+    VulkanGsHandover &fields = *link->fields;
+
+    // The yardstick: A and B read back the old way (the hand-over is off).
+    drawA(*backend);
+    const PresentationFrame readA = readBack(*backend, ++tick);
+    drawB(*backend);
+    const PresentationFrame readB = readBack(*backend, ++tick);
+    check(readA && readB && readA.pixels != readB.pixels && readA.pixels.size() == static_cast<size_t>(readA.width) * readA.height * 4u,
+          "the yardstick: A and B are read back, differ, and are whole pictures", scale);
+    if (!readA || !readB)
+        return 1;
+    const Picture a = asPicture(readA), b = asPicture(readB);
+    const uint32_t displayWidth = readA.displayWidth ? readA.displayWidth : readA.width;
+    const uint32_t displayHeight = readA.displayHeight ? readA.displayHeight : readA.height;
+
+    // --- The drawing alone.
+    {
+        OwnDevice own(link);
+        fields.start();
+        drawA(*backend);
+        check(backend->SubmitFieldScanout(request(++tick)), "a field of A is scanned out", scale);
+        HandedPicture held = fields.takeNewest();
+        check(static_cast<bool>(held) && held.width == a.width && held.height == a.height, "A's picture is handed over", scale);
+        if (held)
+        {
+            const uint32_t w = a.width, h = a.height;
+            // 1. One to one.
+            const ps2x::PictureRect whole{0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h)};
+            check(largestDifference(own.drawn(held, w, h, whole, false), a) == 0, "drawn one to one it is the read picture pixel for pixel", scale);
+            // 2. Room left and right.
+            const ps2x::PictureRect middle{94.0f, 0.0f, static_cast<float>(w), static_cast<float>(h)};
+            check(largestDifference(own.drawn(held, w + 188u, h, middle, false), expected(a, w + 188u, h, middle, false)) == 0,
+                  "drawn with room left and right: black there, the picture between pixel for pixel", scale);
+            if (scale == 1u)
+            {
+                // 3. Twice the size by the nearest pixel.
+                const ps2x::PictureRect twice{0.0f, 0.0f, static_cast<float>(w * 2u), static_cast<float>(h * 2u)};
+                check(largestDifference(own.drawn(held, w * 2u, h * 2u, twice, false), expected(a, w * 2u, h * 2u, twice, false)) == 0,
+                      "drawn to twice its size by the nearest pixel: every pixel four times", scale);
+                // 4. Smooth to twice the size.
+                const int up = largestDifference(own.drawn(held, w * 2u, h * 2u, twice, true), expected(a, w * 2u, h * 2u, twice, true));
+                std::printf("note  scale %ux: smooth to twice the size, largest difference from the bilinear value: %d of 255\n", scale, up);
+                check(up <= 1, "drawn smooth to twice its size: the bilinear value within one step of 255", scale);
+            }
+            // 4. Smooth to half the size.
+            const ps2x::PictureRect half{0.0f, 0.0f, static_cast<float>(w / 2u), static_cast<float>(h / 2u)};
+            const int down = largestDifference(own.drawn(held, w / 2u, h / 2u, half, true), expected(a, w / 2u, h / 2u, half, true));
+            std::printf("note  scale %ux: smooth to half the size, largest difference from the bilinear value: %d of 255\n", scale, down);
+            check(down <= 1, "drawn smooth to half its size: the bilinear value within one step of 255", scale);
+            fields.release(held);
+        }
+        fields.stop();
+    }
+
+    // --- The window. Twice the display's width and room above and below: the picture lies at a whole rectangle.
+    ps2x::gs::GameWindowOptions options;
+    options.width = static_cast<int>(displayWidth * 2u);
+    options.height = static_cast<int>(displayHeight * 2u + 88u);
+    options.title = "DW5XL test window (hidden)";
+    options.hidden = true;
+    options.vsync = false;
+    std::string why;
+    std::unique_ptr<ps2x::gs::GameWindow> window = ps2x::gs::GameWindow::open(link, options, why);
+    if (!window)
+    {
+        std::printf("SKIPPED: no window here (%s)\n", why.c_str());
+        return 2;
+    }
+    ps2x::gs::GameWindowLook look;
+    look.shape = 0.0f;
+    look.smooth = smooth;
+
+    // 5. Opened.
+    uint32_t winW = 0u, winH = 0u;
+    window->drawableSize(winW, winH);
+    check(window->hidden() && winW == static_cast<uint32_t>(options.width) && winH == static_cast<uint32_t>(options.height),
+          "the window is hidden and has the size asked for", scale);
+    check(fields.started(), "opening the window switches the hand-over on", scale);
+    window->poll();
+    {
+        ps2x::host::Devices &devices = window->devices();
+        float dx = 1.0f, dy = 1.0f;
+        devices.mouseDelta(dx, dy);
+        check(devices.ready() && !devices.keyDown(32) && !devices.keyPressed(257) && !devices.mouseButtonDown(0) && dx == 0.0f && dy == 0.0f &&
+                  devices.seconds() >= 0.0,
+              "its devices answer: ready, no key or mouse button down, the mouse not moved", scale);
+    }
+    const ps2x::PictureRect placed = ps2x::pictureRectInWindow(displayWidth, displayHeight, look.shape, static_cast<float>(winW), static_cast<float>(winH));
+
+    // 6. No picture yet.
+    {
+        const ps2x::gs::GameWindowShown shown = window->show(tick, look);
+        check(shown.presented && !shown.have && !shown.newPicture, "with no picture yet the window presents", scale);
+        const Picture p = windowPicture(*window, look);
+        bool black = !p.rgba.empty();
+        for (size_t i = 0; i + 4u <= p.rgba.size(); i += 4u)
+            black = black && p.rgba[i] == 0u && p.rgba[i + 1u] == 0u && p.rgba[i + 2u] == 0u;
+        check(black && p.width == winW && p.height == winH, "and what it draws is black", scale);
+        check(window->counts().swapChains == 1u, "one swap chain was made", scale);
+    }
+
+    // 7. A field of A.
+    drawA(*backend);
+    check(backend->SubmitFieldScanout(request(++tick)), "a field of A is scanned out", scale);
+    {
+        const ps2x::gs::GameWindowShown shown = window->show(tick, look);
+        check(shown.presented && shown.have && shown.newPicture && shown.field == tick, "the window presents it as a new picture of its field", scale);
+        check(shown.width == a.width && shown.height == a.height && shown.displayWidth == displayWidth && shown.displayHeight == displayHeight,
+              "with the read picture's sizes", scale);
+        check(shown.x == placed.x && shown.y == placed.y && shown.rectWidth == placed.width && shown.rectHeight == placed.height,
+              "placed by the one function every window uses", scale);
+        check(!readArrives(*backend, tick), "the renderer did not read it back", scale);
+        const int difference = largestDifference(windowPicture(*window, look), expected(a, winW, winH, placed, smooth));
+        std::printf("note  scale %ux: the window's picture of A, largest difference from the expected one: %d of 255\n", scale, difference);
+        check(difference <= (smooth ? 1 : 0), smooth ? "what the window draws is A letterboxed, smooth, within one step of 255"
+                                                     : "what the window draws is A letterboxed, pixel for pixel",
+              scale);
+    }
+
+    // 8. Shown again without a new field.
+    {
+        const ps2x::gs::GameWindowShown shown = window->show(tick, look);
+        check(shown.presented && shown.have && !shown.newPicture && shown.field == tick, "shown again without a new field: presented, not new, the same field", scale);
+    }
+
+    // 9. 60 fields of A and B in turn.
+    {
+        const ps2x::gs::GameWindowCounts before = window->counts();
+        const VulkanGsHandover::Counts handedBefore = fields.counts();
+        bool allNew = true, allPresented = true, allScanned = true;
+        for (int i = 0; i < 60; ++i)
+        {
+            if (i % 2 == 0)
+                drawB(*backend);
+            else
+                drawA(*backend);
+            allScanned = backend->SubmitFieldScanout(request(++tick)) && allScanned;
+            window->poll();
+            const ps2x::gs::GameWindowShown shown = window->show(tick, look);
+            allPresented = shown.presented && allPresented;
+            allNew = shown.newPicture && shown.field == tick && allNew;
+        }
+        const ps2x::gs::GameWindowCounts after = window->counts();
+        const VulkanGsHandover::Counts handedAfter = fields.counts();
+        check(allScanned && allPresented && allNew, "60 fields of A and B in turn: every one presented as a new picture of its field", scale);
+        check(after.presented - before.presented == 60u && after.newPictures - before.newPictures == 60u && after.notPresented == before.notPresented,
+              "the window counted 60 presents, 60 new pictures and none that failed", scale);
+        check(handedAfter.noPlace == handedBefore.noPlace && handedAfter.givenUp == handedBefore.givenUp && handedAfter.images <= 3u,
+              "the renderer was never refused a place, gave up no picture and made no more than three images", scale);
+        const int difference = largestDifference(windowPicture(*window, look), expected(a, winW, winH, placed, smooth)); // the last field was A
+        check(difference <= (smooth ? 1 : 0), "the last field's picture is what the window draws", scale);
+    }
+
+    // 10. Two fields finished, the older asked for first.
+    {
+        drawB(*backend);
+        check(backend->SubmitFieldScanout(request(++tick)), "a field of B is scanned out", scale);
+        const uint64_t older = tick;
+        drawA(*backend);
+        check(backend->SubmitFieldScanout(request(++tick)), "and a field of A after it", scale);
+        ps2x::gs::GameWindowShown shown = window->show(older, look);
+        check(shown.newPicture && shown.field == older, "asked for the older field, the window shows that one", scale);
+        check(largestDifference(windowPicture(*window, look), expected(b, winW, winH, placed, smooth)) <= (smooth ? 1 : 0), "which is B", scale);
+        shown = window->show(tick, look);
+        check(shown.newPicture && shown.field == tick, "then the newer one", scale);
+    }
+
+    // 11. Another window size: bars left and right.
+    {
+        const uint64_t chains = window->counts().swapChains;
+        window->resize(static_cast<int>(displayWidth * 2u + 188u), static_cast<int>(displayHeight * 2u));
+        window->poll();
+        uint32_t w = 0u, h = 0u;
+        window->drawableSize(w, h);
+        check(w == displayWidth * 2u + 188u && h == displayHeight * 2u, "the window takes another size", scale);
+        const ps2x::gs::GameWindowShown shown = window->show(tick, look);
+        const ps2x::PictureRect now = ps2x::pictureRectInWindow(displayWidth, displayHeight, look.shape, static_cast<float>(w), static_cast<float>(h));
+        check(shown.presented && window->counts().swapChains == chains + 1u, "and presents through a new swap chain", scale);
+        check(shown.x == now.x && shown.rectWidth == now.width && now.x == 94.0f, "the picture is letterboxed anew, bars left and right", scale);
+        check(largestDifference(windowPicture(*window, look), expected(a, w, h, now, smooth)) <= (smooth ? 1 : 0), "and is still A", scale);
+    }
+
+    // 12. The output's scale changes.
+    {
+        const uint32_t other = scale == 1u ? 2u : 1u;
+        backend->SetResolutionScale(other);
+        const uint32_t got = backend->GetResolutionScale();
+        drawA(*backend);
+        check(backend->SubmitFieldScanout(request(++tick)), "a field of A at another output scale is scanned out", scale);
+        const ps2x::gs::GameWindowShown shown = window->show(tick, look);
+        check(shown.presented && shown.newPicture && shown.width == a.width / scale * got && shown.displayWidth == displayWidth,
+              "the window shows the picture at its new size, in the same place", scale);
+        backend->SetResolutionScale(scale);
+        drawB(*backend);
+        check(backend->SubmitFieldScanout(request(++tick)), "and a field of B at the first scale again", scale);
+        const ps2x::gs::GameWindowShown back = window->show(tick, look);
+        check(back.presented && back.newPicture && back.width == a.width, "which the window shows", scale);
+    }
+
+    // 13. The renderer goes first.
+    {
+        uint32_t w = 0u, h = 0u;
+        window->drawableSize(w, h);
+        const ps2x::PictureRect now = ps2x::pictureRectInWindow(displayWidth, displayHeight, look.shape, static_cast<float>(w), static_cast<float>(h));
+        backend.reset();
+        const ps2x::gs::GameWindowShown shown = window->show(tick + 100u, look);
+        check(shown.presented && shown.have && !shown.newPicture, "the renderer is gone: the window still presents the picture it holds", scale);
+        check(largestDifference(windowPicture(*window, look), expected(b, w, h, now, smooth)) <= (smooth ? 1 : 0), "which is still B", scale);
+        window.reset();
+        check(true, "then the window goes", scale);
+    }
+    return 1;
+}
+
+// 14. The window goes first while it holds a picture.
+void windowGoesFirst()
+{
+    const uint32_t scale = 1u;
+    std::unique_ptr<GSVulkanBackend> backend = std::make_unique<GSVulkanBackend>();
+    std::vector<uint8_t> vram(4u << 20, 0u);
+    backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+    backend->SetResolutionScale(scale);
+    uint64_t tick = 10u;
+    std::shared_ptr<GSVulkanPresenterLink> link = backend->PresenterLink();
+    ps2x::gs::GameWindowOptions options;
+    options.hidden = true;
+    options.vsync = false;
+    options.title = "DW5XL test window (hidden)";
+    std::string why;
+    std::unique_ptr<ps2x::gs::GameWindow> window = ps2x::gs::GameWindow::open(link, options, why);
+    check(static_cast<bool>(window), "a second window opens after the first is gone", scale);
+    if (!window)
+        return;
+    drawA(*backend);
+    check(backend->SubmitFieldScanout(request(++tick)), "a field of A is scanned out", scale);
+    const ps2x::gs::GameWindowShown shown = window->show(tick, {});
+    check(shown.presented && shown.newPicture, "the window shows it", scale);
+    window.reset();
+    check(!link->fields->started(), "the window is gone: the hand-over is off", scale);
+    drawB(*backend);
+    const PresentationFrame read = readBack(*backend, ++tick);
+    check(static_cast<bool>(read), "and the renderer reads pictures back again", scale);
+}
+} // namespace
+
+int DW5XL_TEST_MAIN(gs_game_window)()
+{
+    const int first = run(1u);
+    if (first != 1)
+        return 77;
+    run(4u);
+    windowGoesFirst();
+    std::printf(g_failures ? "FAILED: %d check(s)\n" : "PASSED\n", g_failures);
+    return g_failures ? 1 : 0;
+}
