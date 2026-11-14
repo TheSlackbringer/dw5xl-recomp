@@ -443,6 +443,9 @@ int run(uint32_t wantedScale)
         Picture none;
         check(!window->shownPixels(none.rgba, none.width, none.height), "it has no picture's pixels to give", scale);
         check(window->counts().swapChains == 1u, "one swap chain was made", scale);
+        // As today's window and the PS2's picture: eight bits a colour (ten only where the system offers no other).
+        std::printf("note  scale %ux: the swap chain has %u bits a colour\n", scale, window->counts().colourBits);
+        check(window->counts().colourBits == 8u, "the swap chain has eight bits a colour, as today's window", scale);
     }
 
     // 7. A field of A.

@@ -106,6 +106,8 @@ namespace ps2x::gs
         uint64_t olderNotShown = 0u; // pictures not shown: a picture finished later was shown already
         uint64_t notPresented = 0u; // times nothing could be presented (no size, no swap chain image)
         uint64_t swapChains = 0u;  // swap chains made (the first one, and one for every change of size)
+        uint32_t colourBits = 0u;  // bits a colour of the swap chain in use: 8, as today's window and the PS2's
+                                   // picture; 10 only where the system offers no 8-bit one; 0: none made yet
     };
 
     class GameWindow

@@ -141,6 +141,7 @@ namespace
     {
         GLFWwindow *window = nullptr;
         uint64_t chains = 0u;
+        uint32_t colourBits = 0u;
 
         VkSurfaceKHR create_surface(VkInstance instance, VkPhysicalDevice) override
         {
@@ -201,6 +202,7 @@ namespace
             Vulkan::WSIPlatform::event_swapchain_created(device, swapchain, width, height, aspect, images, format, space,
                                                          rotate);
             ++chains;
+            colourBits = format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 ? 10u : 8u;
         }
 
         void sizeChanged()
@@ -302,7 +304,13 @@ namespace
             Util::register_thread_index(0);
             m_wsi.set_platform(&m_platform);
             m_wsi.set_present_mode(options.vsync ? Vulkan::PresentMode::SyncToVBlank : Vulkan::PresentMode::UnlockedMaybeTear);
-            m_wsi.set_backbuffer_format(Vulkan::BackbufferFormat::UNORM); // the picture's bytes as they are
+            // The picture's bytes as they are, in a swap chain of eight bits a colour: what today's window has and
+            // what the PS2's picture has. The library's own choice takes the first format the driver lists, which
+            // was one of ten bits a colour on the test PC (seen 2026-11-14 in the owner's window); the system shows
+            // such a window by another path, and ten bits add nothing to an eight-bit picture. Where the driver has
+            // no such format the library falls back to its own choice.
+            m_wsi.set_custom_backbuffer_format({VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR});
+            m_wsi.set_backbuffer_format(Vulkan::BackbufferFormat::Custom);
             if (link)
             {
                 if (!m_wsi.init_from_existing_context(link->context) || !m_wsi.init_device())
@@ -873,6 +881,7 @@ namespace
         {
             GameWindowCounts counts = m_counts;
             counts.swapChains = m_platform.chains;
+            counts.colourBits = m_platform.colourBits;
             return counts;
         }
 

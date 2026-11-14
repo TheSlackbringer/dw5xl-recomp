@@ -78,6 +78,19 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
 static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
 static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
 #endif
+// DW5XL-DEBUG PS2X_WINDOW_SIZE=<width>x<height>: the window's first size, for window pictures of hidden runs at the
+// size a player's window has (issue 049: SHARPEN compared between the two windows at 2560x1440). Either window.
+static void firstWindowSize(int &width, int &height)
+{
+    width = HOST_WINDOW_WIDTH;
+    height = HOST_WINDOW_HEIGHT;
+    int w = 0, h = 0;
+    if (const char *v = std::getenv("PS2X_WINDOW_SIZE"); v && std::sscanf(v, "%dx%d", &w, &h) == 2 && w >= 64 && h >= 64 && w <= 16384 && h <= 16384)
+    {
+        width = w;
+        height = h;
+    }
+}
 struct ElfHeader
 {
     uint32_t magic;
@@ -2473,8 +2486,7 @@ static bool openRendererWindow(const std::shared_ptr<GSVulkanPresenterLink> &lin
     const char *hidden = std::getenv("PS2X_HIDDEN");
     const char *vsyncSource = "default";
     ps2x::gs::GameWindowOptions options;
-    options.width = HOST_WINDOW_WIDTH;
-    options.height = HOST_WINDOW_HEIGHT;
+    firstWindowSize(options.width, options.height);
     options.title = title ? title : "";
     options.hidden = hidden && *hidden && *hidden != '0';
     options.vsync = loadVsyncSetting(vsyncSource);
@@ -2533,7 +2545,9 @@ bool PS2Runtime::initialize(const char *title)
         }
         if (!openRendererWindow(gs().presenterLink(), title)) // DW5XL-DEBUG issue 049: PS2X_WINDOW=vulkan
         {
-            InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+            int firstWidth = 0, firstHeight = 0;
+            firstWindowSize(firstWidth, firstHeight);
+            InitWindow(firstWidth, firstHeight, title);
             ps2x::present_feedback::start(GetWindowHandle()); // DW5XL-DEBUG issue 023 3S: PS2X_PRESENT_LOG
             if (loadFullscreenSetting() && !IsWindowHidden())   // issue 023 3S: display=fullscreen (borderless)
                 ToggleBorderlessWindowed();
