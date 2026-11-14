@@ -40,12 +40,25 @@ namespace ps2x::gs::shader_store
         std::mutex g_mutex;
         std::string g_path;
         void (*g_writer)(bool) = nullptr;
+        void (*g_named)() = nullptr;
     }
 
     void setPath(const std::string &path)
     {
+        void (*named)() = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_path = path;
+            named = g_named;
+        }
+        if (named)
+            named();
+    }
+
+    void setNamed(void (*named)())
+    {
         std::lock_guard<std::mutex> lock(g_mutex);
-        g_path = path;
+        g_named = named;
     }
 
     std::string path()

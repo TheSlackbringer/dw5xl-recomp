@@ -8,6 +8,8 @@
 //   4. A store for another graphics card or driver (the card's mark in it changed), and a damaged one: left out,
 //      the renderer starts as always and draws the same picture.
 //   5. PS2X_SHADER_STORE=off: no store is used and none is written.
+//   6. A renderer made before the store is named (the game makes its renderer first and names the store when it
+//      starts its GS) takes the store when it is named.
 // Exit code 77: no Vulkan device (skipped).
 #include "runtime/gs/gs_shader_store.h"
 #include "runtime/gs/gs_vulkan_backend.h"
@@ -186,6 +188,27 @@ int DW5XL_TEST_MAIN(gs_shader_store)()
         backend.reset();
         check(!std::filesystem::exists(path), "... and none is written");
         setSwitch(nullptr);
+        // For step 6: a store on the disk again (a renderer with the file named, written on demand).
+        const std::vector<uint8_t> again = pictureOfNewRenderer(backend, vram, 55u);
+        store::writeNow(true);
+        backend.reset();
+        check(!again.empty() && std::filesystem::exists(path), "a store is written again for the next step");
+    }
+
+    // 6. The store of step 4's last renderer is there again (written at its end). No file is named now.
+    {
+        store::setPath(std::string());
+        backend = std::make_unique<GSVulkanBackend>();
+        backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+        check(!ps2x::gs::shaderStoreState().inUse, "a renderer made with no store named has none");
+        store::setPath(path);
+        state = ps2x::gs::shaderStoreState();
+        check(state.inUse, "named afterwards: the renderer has its store file");
+        check(std::filesystem::exists(path) ? state.taken : !state.taken, "... and takes the store that is there");
+        drawA(*backend);
+        const std::vector<uint8_t> sixth = readBack(*backend, 6u).pixels;
+        check(!sixth.empty() && sameColours(sixth, first), "... and draws the same picture");
+        backend.reset();
     }
 
     store::setPath(std::string());

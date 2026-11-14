@@ -47,6 +47,9 @@ namespace ps2x::gs::shader_store
     std::string path();
     // The renderer says how its stores are written (`always`: even when no compile held it up; for tests).
     void setWriter(void (*writer)(bool always));
+    // The renderer asks to be told when the game names the store: a renderer made before that (the game makes its
+    // renderer first and names the store when it starts its GS) reads it then.
+    void setNamed(void (*named)());
     // Writes the stores now. The renderer writes them itself when it ends; this is for where the game leaves
     // without the renderer's end (a test's last field, the developer's quit).
     void writeNow(bool always = false);

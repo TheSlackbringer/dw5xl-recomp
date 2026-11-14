@@ -66,6 +66,7 @@ struct GSVulkanDevice
     uint64_t storeReadBytes = 0;
     uint64_t storeStalledAtWrite = 0;
     void loadShaderStore();
+    void readShaderStore();
     void writeShaderStore(bool always);
     ~GSVulkanDevice();
     // Declaration order ensures the device dies before the context. The context is held by a handle: a presenter
@@ -222,6 +223,20 @@ void writeEveryShaderStore(bool always)
     for (GSVulkanDevice *device : g_storeDevices)
         device->writeShaderStore(always);
 }
+
+// The game named its store (or took the name back). A device made before that has none yet and reads it now: the
+// game makes its renderer before it starts its GS, where the store is named (found 2026-11-14 in the owner's
+// window: the store was in use in every test run, which names it by the switch, and in no real start).
+void readEveryShaderStore()
+{
+    std::lock_guard<std::mutex> lock(g_storeDevicesMutex);
+    for (GSVulkanDevice *device : g_storeDevices)
+    {
+        std::lock_guard<std::mutex> own(device->mutex);
+        if (device->storePath.empty())
+            device->readShaderStore();
+    }
+}
 }
 
 void GSVulkanDevice::loadShaderStore()
@@ -232,6 +247,13 @@ void GSVulkanDevice::loadShaderStore()
         g_storeDevices.push_back(this);
     }
     store::setWriter(&writeEveryShaderStore);
+    store::setNamed(&readEveryShaderStore);
+    readShaderStore();
+}
+
+void GSVulkanDevice::readShaderStore()
+{
+    namespace store = ps2x::gs::shader_store;
     storePath = store::path();
     if (storePath.empty())
         return;
