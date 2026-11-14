@@ -79,6 +79,9 @@ public:
     bool pixelsWanted() const { return m_pixels.load(std::memory_order_acquire); }
     // The newest picture of a field up to `maxField`, or an empty one. Older untaken pictures are given up.
     HandedPicture takeNewest(uint64_t maxField = UINT64_MAX);
+    // For a presenter that needs every picture (the in-between pictures): the oldest picture not taken yet, or an
+    // empty one. No picture is given up by being passed over.
+    HandedPicture takeOldest();
     // Done with a picture. Call it after the last command buffer that uses the picture was sent to the queue: the
     // renderer may copy the next picture into the image from then on.
     void release(HandedPicture &picture);
@@ -131,6 +134,9 @@ struct GSVulkanPresenterLink
     std::shared_ptr<std::mutex> queues;
     // The game's fields. Switched off until start().
     std::shared_ptr<VulkanGsHandover> fields;
+    // The in-between pictures (picture reads, issue 049 v3.2), each with its tag, taken oldest first (takeOldest).
+    // Switched off until start(); a picture it has no place for is given up or not handed over, never waited for.
+    std::shared_ptr<VulkanGsHandover> pictures;
     // Whether the renderer's device was made with window support (a swap chain can be made on it).
     bool windowSupport = false;
 };

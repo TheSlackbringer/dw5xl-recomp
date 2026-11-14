@@ -5,7 +5,9 @@
 //  - the presenter gets the newest picture up to the field it asks for; the older ones become free, a newer one
 //    of a later field stays;
 //  - a picture being written is not handed out; one not made after all leaves its place free;
-//  - a made-up renderer and presenter taking turns at random for 200,000 steps never break these rules.
+//  - a made-up renderer and presenter taking turns at random for 200,000 steps never break these rules;
+//  - a presenter that needs every picture (the in-between pictures, step 5) takes them oldest first; with no
+//    free place the oldest one it has not taken is given up.
 #include "runtime/gs/gs_handover_places.h"
 
 #include <cstdint>
@@ -189,6 +191,27 @@ int main()
         check(!tookOld, "at random: the presenter always got the newest picture there was");
         check(!refusedWithFree, "at random: the renderer was refused only when the presenter held every place");
         check(taken > 1000u && lost > 1000u, "at random: pictures were taken and pictures were given up");
+    }
+    {
+        HandoverPlaces places(4);
+        check(places.takeOldest() == kNone, "in order: nothing to take when nothing was made");
+        const uint32_t a = make(places, 10), b = make(places, 10), c = make(places, 11);
+        const uint32_t first = places.takeOldest();
+        check(first == a && places.state(a) == State::Held && places.state(b) == State::Ready && places.state(c) == State::Ready,
+              "in order: the oldest picture is taken, the later ones stay ready (two of one field among them)");
+        const uint32_t second = places.takeOldest(), third = places.takeOldest();
+        check(second == b && third == c && places.takeOldest() == kNone, "in order: then the next, then the last, then nothing");
+        places.release(a);
+        bool gaveUp = true;
+        const uint32_t d = make(places, 12, &gaveUp);
+        check(d != kNone && d != b && d != c && !gaveUp && places.state(d) == State::Ready, "in order: a new picture gets a place nobody holds");
+        const uint32_t e = make(places, 13, &gaveUp);
+        check(e != kNone && e != b && e != c && e != d && !gaveUp, "in order: and the next one the last free place");
+        const uint32_t f = make(places, 14, &gaveUp);
+        check(f == d && gaveUp, "in order: with no free place the oldest picture not taken is given up");
+        const uint32_t next = places.takeOldest();
+        check(next == e && places.field(next) == 13u, "in order: the presenter then gets the oldest one that is left");
+        check(places.takeOldest() == f && places.takeOldest() == kNone, "in order: and after it the newest");
     }
     std::printf(failures ? "FAILED: %d check(s)\n" : "PASSED\n", failures);
     return failures ? 1 : 0;

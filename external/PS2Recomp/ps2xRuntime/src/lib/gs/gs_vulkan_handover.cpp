@@ -26,6 +26,16 @@ HandedPicture VulkanGsHandover::takeNewest(uint64_t maxField)
     return std::move(m_places[place].picture);
 }
 
+HandedPicture VulkanGsHandover::takeOldest()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const uint32_t place = m_rules.takeOldest();
+    if (place == ps2x::gs::HandoverPlaces::kNone)
+        return {};
+    ++m_counts.taken;
+    return std::move(m_places[place].picture);
+}
+
 void VulkanGsHandover::release(HandedPicture &picture)
 {
     {

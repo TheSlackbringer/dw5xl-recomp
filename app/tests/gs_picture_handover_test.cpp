@@ -232,6 +232,58 @@ bool run(uint32_t wantedScale)
     fields.release(alsoHanded);
     fields.wantPixels(false);
 
+    // 5b. In-between pictures (picture reads): with their hand-over switched on they are handed over in the order
+    // they were made, each with its tag, and not read back; the fields' hand-over is another one.
+    {
+        check(static_cast<bool>(link->pictures) && link->pictures != link->fields && !link->pictures->started(),
+              "the link has a hand-over of its own for in-between pictures, switched off", scale);
+        VulkanGsHandover &pictures = *link->pictures;
+        pictures.start();
+        const uint64_t tags[3] = {gsPictureTag(tick, 1u, 3u), gsPictureTag(tick, 2u, 3u), gsPictureTag(tick, 3u, 3u)};
+        bool submitted = true;
+        for (int i = 0; i < 3; ++i)
+        {
+            if (i == 1)
+                drawB(*backend);
+            else
+                drawA(*backend);
+            GSPresentationRequest r = request(tick);
+            r.pictureTag = tags[i];
+            submitted = backend->SubmitPictureRead(r) && submitted;
+        }
+        check(submitted, "three in-between pictures are submitted", scale);
+        std::vector<GSPictureRead> read;
+        check(!backend->CollectPictureReads(read) && read.empty(), "none of them is read back", scale);
+        check(!fields.takeNewest(), "and none went to the fields' hand-over", scale);
+        HandedPicture one = pictures.takeOldest(), two = pictures.takeOldest(), three = pictures.takeOldest();
+        HandedPicture none = pictures.takeOldest();
+        check(one && two && three && !none, "three pictures can be taken, and no fourth", scale);
+        if (one && two && three)
+        {
+            check(one.tag == tags[0] && two.tag == tags[1] && three.tag == tags[2] && one.order < two.order && two.order < three.order,
+                  "oldest first, each with its tag", scale);
+            check(sameColours(presenter.pixels(one), readA.pixels) && sameColours(presenter.pixels(two), readB.pixels) &&
+                      sameColours(presenter.pixels(three), readA.pixels),
+                  "and they are A, B and A", scale);
+        }
+        pictures.release(one);
+        pictures.release(two);
+        pictures.release(three);
+        pictures.stop();
+        drawB(*backend);
+        GSPresentationRequest r = request(tick);
+        r.pictureTag = gsPictureTag(tick, 1u, 1u);
+        check(backend->SubmitPictureRead(r), "switched off again, an in-between picture is submitted", scale);
+        bool arrived = false;
+        for (int attempt = 0; attempt < 2000 && !arrived; ++attempt)
+        {
+            arrived = backend->CollectPictureReads(read) && !read.empty();
+            if (!arrived)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        check(arrived && !pictures.takeOldest(), "and read back as before", scale);
+    }
+
     // 6. A picture that needs the CPU's weave is read back, and the weave after handed pictures is as after read ones.
     if (scale == 1u)
     {

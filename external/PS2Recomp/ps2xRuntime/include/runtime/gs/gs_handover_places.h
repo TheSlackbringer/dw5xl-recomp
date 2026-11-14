@@ -9,7 +9,9 @@
 //    not taken yet (that picture is given up), and with every place held by the presenter the new picture is not
 //    handed over;
 //  - a picture the presenter holds is never written to;
-//  - the presenter gets the newest picture; the older ones it did not take become free.
+//  - the presenter gets the newest picture; the older ones it did not take become free;
+//  - or, where it needs every picture (the in-between pictures, step 5), it takes them oldest first and none
+//    becomes free by being passed over.
 // The callers keep one lock around every call (VulkanGsHandover's).
 
 #include <cstdint>
@@ -102,6 +104,18 @@ namespace ps2x::gs
                 }
             }
             m_places[chosen].state = State::Held;
+            return chosen;
+        }
+
+        // The presenter that needs every picture: the oldest ready one, from now on Held. kNone when there is none.
+        uint32_t takeOldest()
+        {
+            uint32_t chosen = kNone;
+            for (uint32_t i = 0; i < count(); ++i)
+                if (m_places[i].state == State::Ready && (chosen == kNone || m_places[i].order < m_places[chosen].order))
+                    chosen = i;
+            if (chosen != kNone)
+                m_places[chosen].state = State::Held;
             return chosen;
         }
 

@@ -481,6 +481,11 @@ std::shared_ptr<GSVulkanPresenterLink> GSVulkanBackend::PresenterLink()
         // one for the renderer to write. With those the renderer always has a place.
         link->fields = std::make_shared<VulkanGsHandover>(p.shared, 3u);
         p.scanoutState.handover = link->fields; // read by every scan-out of the game's fields (presentVulkanGs)
+        // Step 5: the in-between pictures. A presenter holds the ones of the next few display refreshes, the
+        // one it shows and the one it showed before; twelve places are the pictures of two game frames at five
+        // pictures a frame, and those. Images are made as places are first used.
+        link->pictures = std::make_shared<VulkanGsHandover>(p.shared, 12u);
+        p.pictureScanout.handover = link->pictures; // read by every picture read (SubmitPictureRead)
         p.link = std::move(link);
     }
     return p.link;
