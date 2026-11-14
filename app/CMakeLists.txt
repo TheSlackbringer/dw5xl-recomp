@@ -655,6 +655,11 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_picture_rect_test tests/picture_rect_test.cpp)
     target_include_directories(dw5xl_picture_rect_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
     add_test(NAME picture_rect COMMAND dw5xl_picture_rect_test)
+    # DW5XL-TEST issue 049 (amendment v3.12 step 7a): the picture trace's row profile and fingerprints, which the
+    # renderer's own window writes for every picture it shows (PS2X_WEAVE_TRACE=1).
+    add_executable(dw5xl_picture_trace_test tests/picture_trace_test.cpp)
+    target_include_directories(dw5xl_picture_trace_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    add_test(NAME picture_trace COMMAND dw5xl_picture_trace_test)
     set_tests_properties(gs_picture_reads PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     set_tests_properties(gs_window_support PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     set_tests_properties(gs_second_memory PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)

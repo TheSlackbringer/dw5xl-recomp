@@ -245,15 +245,17 @@ in the build folder; `[gs] shader store` lines say what was read and written) ·
 Window/presentation (issue 023): `PS2X_HOST_FPS=field` (one window frame per PS2 field) · `PS2X_PRESENT_STATS` (window
 frames, new pictures, skipped fields per second; cheap) · `PS2X_FIELD_SCANOUT=0` (old window-time field read, A/B) ·
 `PS2X_WEAVE_TRACE` (per picture: weave, fingerprint, row profile `[upload:rows]` used by the 023 test; costs ~30 ms
-per 4x frame, never for timing) · `PS2X_VBL_DRAW_TRACE` (display-buffer draws per VBlank edge) · `PS2X_LATCH_TRACE` ·
+per 4x frame, never for timing; the renderer's own window writes the same lines for every picture it shows, reading
+it from the graphics card for them: `[upload:hash]`, `[upload:rows]`, `[weave:out]` with `kind=card`, and
+`[draw:rect]` when the picture's place in the window changes) · `PS2X_VBL_DRAW_TRACE` (display-buffer draws per VBlank edge) · `PS2X_LATCH_TRACE` ·
 `PS2X_VSYNC=1` (swap-interval experiment) · `PS2X_SCREEN_ON_HIDDEN=1` (issue 067: a hidden window counts as shown
 for the rule that keeps the screen on while the game is played; `[display]` lines say when the screen is asked for
 and let go, the screen's state at the start and every switch of the screen the system tells the game of, with its
 field: the go plays a timed run again, once, when one fell inside what the run judges) · `PS2X_WINDOW=opengl` (issue 049: the old raylib/OpenGL window instead of the window the renderer
 draws itself, which is the default since 2026-11-14: a Vulkan swap chain without OpenGL that shows the game's
 pictures from the graphics card, the pages and overlays (ImGui by a renderer of ours), SHARPEN, and the CPU
-renderer's pictures; the old window stays until 049's step 7, and the 009, 023, 047 and 049 tests that read its
-own log lines run on it (`dw5test.TODAYS_WINDOW`). In the new window: `[present:own]` per second and
+renderer's pictures; the old window stays until 049's step 7, and the tests that still read its own log lines
+run on it (`dw5test.TODAYS_WINDOW`, shrinking as step 7 gives the new window their lines). In the new window: `[present:own]` per second and
 `[present:own:slow]` for a turn over 25 ms with `PS2X_PRESENT_STATS` (the old one writes `[present:stats]`);
 `PS2X_HOST_FPS` belongs to the old window (the new one shows one window frame per PS2 field); in-between pictures
 are shown from the graphics card in the test mode (`PS2X_SMOOTH_SHOW=1`) on a test display, or in a shown window by

@@ -53,6 +53,7 @@
 #include "runtime/ps2_screen_on.h"
 #include "runtime/gs/gs_shader_store.h"
 #include "runtime/picture_rect.h"
+#include "runtime/picture_trace.h"
 #include "runtime/host_devices.h"
 #include "runtime/gs/gs_game_window.h"
 #include "runtime/host_window.h"
@@ -4787,6 +4788,8 @@ void PS2Runtime::run()
                                                                                                     : "the game has no field clock");
         }
         static const bool s_stats = [] { const char *v = std::getenv("PS2X_PRESENT_STATS"); return v && *v && *v != '0'; }();
+        // DW5XL-DEBUG issue 023 / 049 step 7a: the picture trace, as today's window writes it (see below).
+        static const bool s_weaveTrace = [] { const char *v = std::getenv("PS2X_WEAVE_TRACE"); return v && *v && *v != '0'; }();
         auto lastTurn = std::chrono::steady_clock::now(), statsSince = lastTurn;
         uint64_t statFrames = 0u, statNew = 0u, statFailed = 0u, statSlow = 0u, statFromMemory = 0u, statFetched = 0u;
         uint64_t lastReadGeneration = gs().hostPresentationGeneration();
@@ -5095,6 +5098,23 @@ void PS2Runtime::run()
             {
                 m_pictureRect[0] = shown.x; m_pictureRect[1] = shown.y;
                 m_pictureRect[2] = shown.rectWidth; m_pictureRect[3] = shown.rectHeight;
+                // DW5XL-DEBUG issue 023 / 049 step 7a: PS2X_WEAVE_TRACE=1 logs the window's size and the picture's
+                // rectangle whenever they change, as today's window does (issue 047's window-place test reads it).
+                if (s_weaveTrace)
+                {
+                    static float s_lastRect[6] = {};
+                    uint32_t screenWidth = 0u, screenHeight = 0u;
+                    window.drawableSize(screenWidth, screenHeight);
+                    const float rect[6] = {static_cast<float>(screenWidth), static_cast<float>(screenHeight), shown.x, shown.y,
+                                           shown.rectWidth, shown.rectHeight};
+                    if (std::memcmp(rect, s_lastRect, sizeof(rect)) != 0)
+                    {
+                        std::fprintf(stderr, "[draw:rect] tick=%llu screen=%ux%u dst=%.1f,%.1f %.1fx%.1f src=%ux%u\n",
+                                     static_cast<unsigned long long>(m_eeScheduler->currentVSyncTick()), screenWidth, screenHeight,
+                                     shown.x, shown.y, shown.rectWidth, shown.rectHeight, shown.width, shown.height);
+                        std::memcpy(s_lastRect, rect, sizeof(rect));
+                    }
+                }
             }
             // The overlays, in today's order: the mouse-capture mark under the pages, the pages (and the debugger),
             // then the F2 and F8 lines and the state message over them.
@@ -5187,6 +5207,44 @@ void PS2Runtime::run()
                              shown.fromMemory ? 1 : 0);
             lastTurn = now;
             hudNumbers(static_cast<float>(turnMs), eeScheduler().currentVSyncTick());
+            // DW5XL-DEBUG issue 023 / 049 step 7a: PS2X_WEAVE_TRACE=1, the lines today's window writes for its
+            // pictures, so that the tests that follow the window's pictures read the same from this window. For
+            // every new picture this window has shown: its fingerprints and row profile ([upload:hash],
+            // [upload:rows]; columns from PS2X_WEAVE_TRACE_COLS). For one taken on the graphics card also the line
+            // of a window picture, [weave:out] with kind=card and the field it was made for (the renderer writes
+            // that line itself for a picture it read back into main memory, which is how every picture reached
+            // today's window). The picture is read from the card for it, after the present; the lines are made on
+            // the log helper from a copy. Never for timing: a read waits for the card.
+            if (s_weaveTrace && !inBetween && shown.have && shown.newPicture)
+            {
+                ps2x_dev::fetchShownPicture();
+                const uint32_t traceWidth = ps2x_dev::s_lastFrameW, traceHeight = ps2x_dev::s_lastFrameH;
+                const size_t stride = ps2x_dev::s_lastFrame.size() / std::max<size_t>(1u, ps2x_dev::s_lastFrameRows);
+                if (traceWidth != 0u && traceHeight != 0u && stride >= static_cast<size_t>(traceWidth) * 4u &&
+                    ps2x_dev::s_lastFrame.size() >= stride * traceHeight)
+                {
+                    static const std::pair<uint32_t, uint32_t> s_cols = ps2x::picture_trace::columns(std::getenv("PS2X_WEAVE_TRACE_COLS"));
+                    std::vector<uint8_t> copy(ps2x_dev::s_lastFrame.begin(),
+                                              ps2x_dev::s_lastFrame.begin() + static_cast<std::ptrdiff_t>(stride * traceHeight));
+                    const size_t copyBytes = copy.size();
+                    ps2x::stdio_pump::postDeferred([pixels = std::move(copy), stride, w = traceWidth, h = traceHeight, cols = s_cols,
+                                                    windowField = s_windowFrameField, field = shown.field, card = !shown.fromMemory]
+                    {
+                        namespace trace = ps2x::picture_trace;
+                        const std::string rows = trace::rowProfile(pixels.data(), stride, w, h, cols.first, cols.second);
+                        std::fprintf(stderr, "[upload:hash] tick=%llu all=%016llx top=%016llx bottom=%016llx h=%u\n",
+                                     static_cast<unsigned long long>(windowField),
+                                     static_cast<unsigned long long>(trace::fingerprint(pixels.data(), stride, w, 0u, h)),
+                                     static_cast<unsigned long long>(trace::fingerprint(pixels.data(), stride, w, 0u, h / 2u)),
+                                     static_cast<unsigned long long>(trace::fingerprint(pixels.data(), stride, w, h / 2u, h)), h);
+                        std::fprintf(stderr, "[upload:rows] tick=%llu w=%u h=%u %s\n", static_cast<unsigned long long>(windowField), w, h,
+                                     rows.c_str());
+                        if (card)
+                            std::fprintf(stderr, "[weave:out] tick=%llu odd=%d kind=card h=%u %s target=-1\n",
+                                         static_cast<unsigned long long>(field), static_cast<int>(field & 1ull), h, rows.c_str());
+                    }, copyBytes);
+                }
+            }
             // DW5XL-DEBUG issue 023 3S: PS2X_WINDOW_SHOT=<field>:<path.png>, as today's window has it: what the window
             // shows on the first frame at or after that field, drawn once more into a picture of the window's size
             // and saved (the frame dumps hold only the game picture, at its own size).
