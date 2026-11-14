@@ -4640,10 +4640,17 @@ void PS2Runtime::run()
             const EeScheduler::PresentationField paced = m_eeScheduler->waitForPresentationField(lastShownField);
             if (paced.fresh)
                 lastShownField = paced.field;
+            // DW5XL-DEBUG PS2X_PRESENT_STATS=1: where a turn spends its time (the [present:own:slow] line below).
+            using TurnClock = std::chrono::steady_clock;
+            const auto partMs = [](TurnClock::time_point from, TurnClock::time_point to) {
+                return std::chrono::duration<double, std::milli>(to - from).count();
+            };
+            const TurnClock::time_point waited = s_stats ? TurnClock::now() : TurnClock::time_point{};
             m_audioBackend.updatePcmStream();
             devHarness.step(m_eeScheduler->currentVSyncTick());
             window.poll();
             ps2_host_input::poll(m_eeScheduler->currentVSyncTick());
+            const TurnClock::time_point polled = s_stats ? TurnClock::now() : TurnClock::time_point{};
             // As today's window (UploadFrame): a fresh field is waited for until the GS side has finished it, and
             // what the GS side read back is collected in every turn, so that a read finished between two fields
             // does not wait for the next field. A renderer read at window time is read once per fresh field.
@@ -4654,6 +4661,7 @@ void PS2Runtime::run()
             }
             if (paced.fresh)
                 s_windowFrameField = paced.field;
+            const TurnClock::time_point latched = s_stats ? TurnClock::now() : TurnClock::time_point{};
             // Issue 049 v3.2 (P2.3b): in-between pictures read out on the GS side are collected as with today's
             // window (kept, counted, saved with a dumped field). This window shows them from step 5 on.
             if (pictureGs().pictureReadsActive())
@@ -4690,7 +4698,9 @@ void PS2Runtime::run()
                 sharpenSaid = true;
                 std::fprintf(stderr, "[window] SHARPEN is not drawn by the renderer's own window yet\n");
             }
+            const TurnClock::time_point given = s_stats ? TurnClock::now() : TurnClock::time_point{};
             const ps2x::gs::GameWindowShown shown = window.show(paced.field, look);
+            const TurnClock::time_point showed = s_stats ? TurnClock::now() : TurnClock::time_point{};
             shownHave = shown.have;
             shownOrder = shown.order;
             s_windowFrameNewPicture = shown.newPicture;
@@ -4717,6 +4727,18 @@ void PS2Runtime::run()
             outputAndStateKeys();
             const auto now = std::chrono::steady_clock::now();
             const double turnMs = std::chrono::duration<double, std::milli>(now - lastTurn).count();
+            // DW5XL-DEBUG PS2X_PRESENT_STATS=1: a turn over 25 ms with its parts, in milliseconds. `before`: the
+            // end of the turn before (a window picture, the stats line); `wait`: for the next field; `step`:
+            // sound, the test harness, the window's events; `collect`: the wait for the field's picture on the GS
+            // side and the collecting of reads; `memory`: a picture from main memory copied; `show`: the window
+            // (its own parts in brackets); `after`: a frame dump, the keys.
+            if (s_stats && turnMs > 25.0)
+                std::fprintf(stderr, "[present:own:slow] field=%llu fresh=%d turn=%.1f before+wait=%.1f step=%.1f collect=%.1f memory=%.1f "
+                                     "show=%.1f (acquire=%.1f draw=%.1f present=%.1f) after=%.1f new=%d fromMemory=%d\n",
+                             static_cast<unsigned long long>(paced.field), paced.fresh ? 1 : 0, turnMs, partMs(lastTurn, waited),
+                             partMs(waited, polled), partMs(polled, latched), partMs(latched, given), partMs(given, showed),
+                             shown.acquireMs, shown.drawMs, shown.presentMs, partMs(showed, now), shown.newPicture ? 1 : 0,
+                             shown.fromMemory ? 1 : 0);
             lastTurn = now;
             hudNumbers(static_cast<float>(turnMs), eeScheduler().currentVSyncTick());
             // DW5XL-DEBUG issue 023 3S: PS2X_WINDOW_SHOT=<field>:<path.png>, as today's window has it: what the window
@@ -4747,7 +4769,10 @@ void PS2Runtime::run()
             // DW5XL-DEBUG PS2X_PRESENT_STATS=1: one line a second, as today's window has one ([present:stats]):
             // window frames, the game's new pictures shown, of them the ones that came from main memory (uploaded),
             // reads the renderer copied into main memory, shown pictures read from the graphics card on request
-            // (a frame dump, a saved state's picture), frames that could not be presented.
+            // (a frame dump, a saved state's picture), frames that could not be presented. `slow` and `maxMs` are
+            // taken from one turn's end to the next, as the [hud] frame time is; today's [present:stats] reads its
+            // clock at a turn's start, before the wait for the field's picture, so its `slow` does not count that
+            // wait and the two are not one measure (issue 049 work log, part 6).
             if (s_stats)
             {
                 ++statFrames;

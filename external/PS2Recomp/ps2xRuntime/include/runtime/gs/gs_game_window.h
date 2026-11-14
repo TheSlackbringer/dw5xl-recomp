@@ -64,6 +64,9 @@ namespace ps2x::gs
         uint32_t width = 0u, height = 0u;               // its size as stored (grows with the output scale)
         uint32_t displayWidth = 0u, displayHeight = 0u; // the PS2 display's logical size
         float x = 0.0f, y = 0.0f, rectWidth = 0.0f, rectHeight = 0.0f; // where it lies in the window
+        // What this call spent, in milliseconds: until the swap chain gave an image to draw on, drawing (an
+        // upload included) up to the send to the graphics card, and handing the image to the display.
+        float acquireMs = 0.0f, drawMs = 0.0f, presentMs = 0.0f;
     };
 
     struct GameWindowCounts

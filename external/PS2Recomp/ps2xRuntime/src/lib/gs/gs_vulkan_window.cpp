@@ -24,6 +24,7 @@
 #include <GLFW/glfw3.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -366,12 +367,17 @@ namespace
 
             uint32_t width = 0u, height = 0u;
             drawableSize(width, height);
+            const auto started = std::chrono::steady_clock::now();
+            const auto msSince = [](std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) {
+                return std::chrono::duration<float, std::milli>(to - from).count();
+            };
             if (width == 0u || height == 0u || !m_wsi.begin_frame())
             {
                 // No size (minimised) or no swap chain image: nothing is presented; the game goes on.
                 ++m_counts.notPresented;
                 return shown;
             }
+            const auto acquired = std::chrono::steady_clock::now();
             Vulkan::Device &device = m_wsi.get_device();
             auto cmd = device.request_command_buffer();
             uploadMemory(*cmd);
@@ -386,7 +392,11 @@ namespace
             drawPicture(*cmd, look, targetWidth, targetHeight, shown);
             cmd->end_render_pass();
             device.submit(cmd);
+            const auto drawn = std::chrono::steady_clock::now();
             shown.presented = m_wsi.end_frame();
+            shown.acquireMs = msSince(started, acquired);
+            shown.drawMs = msSince(acquired, drawn);
+            shown.presentMs = msSince(drawn, std::chrono::steady_clock::now());
             m_views->nextFrame();
             if (shown.presented)
                 ++m_counts.presented;
