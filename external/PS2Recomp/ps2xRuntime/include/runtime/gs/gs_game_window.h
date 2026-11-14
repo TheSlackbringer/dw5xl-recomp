@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -64,6 +65,7 @@ namespace ps2x::gs
         uint64_t order = 0u; // its place among all finished pictures (ps2x::gs::nextPictureOrder)
         uint32_t width = 0u, height = 0u;
         uint32_t displayWidth = 0u, displayHeight = 0u;
+        double finishedMs = 0.0; // when the graphics card had finished it (milliseconds on the PC's steady clock)
     };
 
     // What the graphics driver reports of a presented picture (issue 049 v3.12 step 5): when the window handed
@@ -144,9 +146,14 @@ namespace ps2x::gs
         // `link`: the link of the renderer memory that draws them. From now on its picture reads stay on the
         // graphics card and come to this window. Null: no more; the ones the window holds go back.
         virtual void attachTimedPictures(const std::shared_ptr<GSVulkanPresenterLink> &link) = 0;
-        // The pictures handed over since the last call, oldest first, added to `fresh`. Each is the window's until
-        // it is dropped, or until another picture has been presented after it.
+        // The pictures the graphics card has finished since the last call, oldest first, added to `fresh`, each
+        // with the time it was finished. (A picture is handed over when it is sent to the card; the card may still
+        // be drawing it, and a present that uses it would wait for that.) Each is the window's until it is dropped,
+        // or until another picture has been presented after it.
         virtual void takeTimed(std::vector<GameWindowTimed> &fresh) = 0;
+        // Called from a thread of the window's own whenever the card has finished a picture that takeTimed will
+        // give out: for waking the loop that calls takeTimed. Empty: nobody is told.
+        virtual void onTimedFinished(std::function<void()> finished) = 0;
         virtual void dropTimed(uint64_t id) = 0; // not presented: it goes back to the renderer
         // As take(), with the in-between picture `id` as the one present() draws. `have` is false when the window
         // does not hold it. The field's own picture the window holds is untouched (shownPixels gives that one).

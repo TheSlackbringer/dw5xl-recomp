@@ -36,9 +36,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <utility>
 #include <vector>
@@ -217,6 +220,14 @@ namespace
             {
                 Util::register_thread_index(0);
                 attachTimedPictures(nullptr);
+                {
+                    std::lock_guard<std::mutex> lock(m_finishMutex);
+                    m_finishStop = true;
+                    m_onTimedFinished = nullptr;
+                }
+                m_finishWake.notify_one();
+                if (m_finishThread.joinable())
+                    m_finishThread.join();
                 if (m_link)
                 {
                     if (m_current)
@@ -675,6 +686,17 @@ namespace
                 m_pictureLink->pictures->release(m_timedNext);
                 m_pictureLink->pictures->release(m_timedShown);
             }
+            if (m_pictureLink && m_pictureLink->pictures)
+                for (TimedWaiting &waiting : m_timedWaiting)
+                    m_pictureLink->pictures->release(waiting.picture);
+            m_timedWaiting.clear();
+            {
+                // What the waiting thread still holds or finishes belongs to the hand-over before: not counted.
+                std::lock_guard<std::mutex> lock(m_finishMutex);
+                m_finishQueue.clear();
+                m_finished.clear();
+                ++m_finishEpoch;
+            }
             m_timed.clear();
             m_timedNext = {};
             m_timedShown = {};
@@ -685,22 +707,58 @@ namespace
                 m_pictureLink->pictures->start();
         }
 
+        void onTimedFinished(std::function<void()> finished) override
+        {
+            std::lock_guard<std::mutex> lock(m_finishMutex);
+            m_onTimedFinished = std::move(finished);
+        }
+
         void takeTimed(std::vector<GameWindowTimed> &fresh) override
         {
             if (!m_pictureLink)
                 return;
+            // Handed over: the window holds it, and a thread of the window's own waits for the card to finish it.
             while (HandedPicture picture = m_pictureLink->pictures->takeOldest())
             {
-                GameWindowTimed timed;
-                timed.id = m_nextTimedId++;
-                timed.tag = picture.tag;
-                timed.order = picture.order;
-                timed.width = picture.width;
-                timed.height = picture.height;
-                timed.displayWidth = picture.displayWidth ? picture.displayWidth : picture.width;
-                timed.displayHeight = picture.displayHeight ? picture.displayHeight : picture.height;
-                fresh.push_back(timed);
-                m_timed.push_back(TimedHeld{timed.id, std::move(picture)});
+                TimedWaiting waiting;
+                waiting.timed.id = m_nextTimedId++;
+                waiting.timed.tag = picture.tag;
+                waiting.timed.order = picture.order;
+                waiting.timed.width = picture.width;
+                waiting.timed.height = picture.height;
+                waiting.timed.displayWidth = picture.displayWidth ? picture.displayWidth : picture.width;
+                waiting.timed.displayHeight = picture.displayHeight ? picture.displayHeight : picture.height;
+                {
+                    std::lock_guard<std::mutex> lock(m_finishMutex);
+                    if (picture.done)
+                        m_finishQueue.push_back(FinishWait{picture.renderer, waiting.timed.id, m_finishEpoch, picture.done});
+                    else
+                        m_finished.push_back({waiting.timed.id, steadyMs()}); // no signal: taken as finished
+                    if (!m_finishThread.joinable())
+                        m_finishThread = std::thread([this] { waitForFinished(); });
+                }
+                m_finishWake.notify_one();
+                waiting.picture = std::move(picture);
+                m_timedWaiting.push_back(std::move(waiting));
+            }
+            // Finished since the last call, oldest first: the caller's from here on.
+            std::deque<std::pair<uint64_t, double>> finished;
+            {
+                std::lock_guard<std::mutex> lock(m_finishMutex);
+                finished.swap(m_finished);
+            }
+            for (const auto &done : finished)
+            {
+                for (size_t i = 0; i < m_timedWaiting.size(); ++i)
+                {
+                    if (m_timedWaiting[i].timed.id != done.first)
+                        continue;
+                    m_timedWaiting[i].timed.finishedMs = done.second;
+                    fresh.push_back(m_timedWaiting[i].timed);
+                    m_timed.push_back(TimedHeld{done.first, std::move(m_timedWaiting[i].picture)});
+                    m_timedWaiting.erase(m_timedWaiting.begin() + static_cast<std::ptrdiff_t>(i));
+                    break;
+                }
             }
         }
 
@@ -1347,6 +1405,56 @@ namespace
             uint64_t id = 0u;
             HandedPicture picture;
         };
+        // Handed over, the graphics card not finished with it yet (takeTimed gives it out when it is).
+        struct TimedWaiting
+        {
+            GameWindowTimed timed;
+            HandedPicture picture;
+        };
+        std::vector<TimedWaiting> m_timedWaiting;
+        // The thread that waits for the card, one picture after the other (they finish in the order they were
+        // sent), notes the time and tells the caller (onTimedFinished).
+        struct FinishWait
+        {
+            std::shared_ptr<void> renderer; // the device object the signal belongs to (declared first: it goes last)
+            uint64_t id = 0u;
+            uint64_t epoch = 0u;
+            Vulkan::Fence done;
+        };
+        void waitForFinished()
+        {
+            std::unique_lock<std::mutex> lock(m_finishMutex);
+            for (;;)
+            {
+                m_finishWake.wait(lock, [this] { return m_finishStop || !m_finishQueue.empty(); });
+                if (m_finishStop)
+                    return;
+                FinishWait next = std::move(m_finishQueue.front());
+                m_finishQueue.pop_front();
+                lock.unlock();
+                next.done->wait();
+                const double when = steadyMs();
+                next.done.reset();
+                next.renderer.reset();
+                lock.lock();
+                if (next.epoch != m_finishEpoch)
+                    continue; // of a hand-over the window has left
+                m_finished.push_back({next.id, when});
+                const std::function<void()> tell = m_onTimedFinished;
+                lock.unlock();
+                if (tell)
+                    tell();
+                lock.lock();
+            }
+        }
+        std::mutex m_finishMutex;
+        std::condition_variable m_finishWake;
+        std::deque<FinishWait> m_finishQueue;
+        std::deque<std::pair<uint64_t, double>> m_finished; // a picture's number and when the card had finished it
+        std::function<void()> m_onTimedFinished;
+        std::thread m_finishThread;
+        uint64_t m_finishEpoch = 0u;
+        bool m_finishStop = false;
         std::shared_ptr<GSVulkanPresenterLink> m_pictureLink;
         std::vector<TimedHeld> m_timed;
         HandedPicture m_timedNext, m_timedShown;

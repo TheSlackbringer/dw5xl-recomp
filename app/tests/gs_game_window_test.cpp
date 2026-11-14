@@ -55,6 +55,8 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -63,6 +65,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace gs_test;
@@ -83,6 +86,12 @@ struct Picture
     std::vector<uint8_t> rgba;
     uint32_t width = 0u, height = 0u;
 };
+
+// Milliseconds on the PC's steady clock, as the window gives its times.
+double steadyNowMs()
+{
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 // What a window of width x height shows of `source` placed at the rectangle, computed here: black outside the
 // rectangle (by pixel centres), inside the nearest pixel or the bilinear value with the edge pixels repeated.
@@ -792,6 +801,9 @@ int run(uint32_t wantedScale)
         const VulkanGsHandover::Counts before = pictures.counts();
         window->attachTimedPictures(link);
         check(pictures.started(), "attached: the in-between pictures' hand-over is switched on", scale);
+        std::atomic<int> timedFinished{0};
+        window->onTimedFinished([&timedFinished] { timedFinished.fetch_add(1); });
+        const double beforeTimedMs = steadyNowMs();
         const uint64_t tags[3] = {gsPictureTag(tick, 1u, 3u), gsPictureTag(tick, 2u, 3u), gsPictureTag(tick, 3u, 3u)};
         bool submitted = true;
         for (int i = 0; i < 3; ++i)
@@ -804,11 +816,27 @@ int run(uint32_t wantedScale)
             r.pictureTag = tags[i];
             submitted = backend->SubmitPictureRead(r) && submitted;
         }
+        // A picture comes to the window's caller when the graphics card has finished it, with the time of that; the
+        // window says so from a thread of its own (the caller's loop is woken by it).
         std::vector<ps2x::gs::GameWindowTimed> fresh;
-        window->takeTimed(fresh);
+        const auto waitUntil = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (fresh.size() < 3u && std::chrono::steady_clock::now() < waitUntil)
+        {
+            window->takeTimed(fresh);
+            if (fresh.size() < 3u)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const double afterMs = steadyNowMs();
         check(submitted && fresh.size() == 3u, "three in-between pictures come to the window", scale);
         if (fresh.size() == 3u)
         {
+            check(fresh[0].finishedMs >= beforeTimedMs && fresh[0].finishedMs <= fresh[1].finishedMs &&
+                      fresh[1].finishedMs <= fresh[2].finishedMs && fresh[2].finishedMs <= afterMs,
+                  "each with the time the graphics card had finished it, in their order, between the hand-over and now", scale);
+            // The telling may come a moment after the picture can be taken.
+            for (int tries = 0; tries < 2000 && timedFinished.load() < 3; ++tries)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            check(timedFinished.load() == 3, "and the window told its caller of each one", scale);
             check(fresh[0].tag == tags[0] && fresh[1].tag == tags[1] && fresh[2].tag == tags[2] && fresh[0].order < fresh[1].order &&
                       fresh[1].order < fresh[2].order && fresh[0].id != fresh[1].id && fresh[0].width == a.width && fresh[0].displayWidth == displayWidth,
                   "oldest first, each with its tag, a number of its own and its sizes", scale);
@@ -851,6 +879,7 @@ int run(uint32_t wantedScale)
               "the renderer handed all three over, was never refused a place and gave none up", scale);
         std::vector<GSPictureRead> read;
         check(!backend->CollectPictureReads(read) && read.empty(), "none was read back", scale);
+        window->onTimedFinished({});
         window->attachTimedPictures(nullptr);
         check(!pictures.started(), "detached: the hand-over is switched off", scale);
         // Every place is free again: twelve more pictures find one each.

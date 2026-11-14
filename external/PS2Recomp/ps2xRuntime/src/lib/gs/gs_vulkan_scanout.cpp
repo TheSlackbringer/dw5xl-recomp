@@ -364,9 +364,10 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     };
-    const auto finishHandover = [&]
+    const auto finishHandover = [&](Fence done)
     {
         HandedPicture picture;
+        picture.done = std::move(done);
         picture.displayWidth = displayWidth;
         picture.displayHeight = displayHeight;
         picture.displayFbp = displayFbp;
@@ -386,7 +387,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
         // frame context ends): the picture must be in the queue before the presenter's use of it.
         Fence sent;
         device.submit(command, &sent);
-        finishHandover();
+        finishHandover(std::move(sent));
         state.handedSinceRead = true;
         return;
     }
@@ -487,7 +488,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     Fence fence;
     device.submit(command, &fence);
     if (handing)
-        finishHandover();
+        finishHandover(fence);
 
     curSlot.fence = std::move(fence);
     // The fence keeps itself alive in the function; the device outlives every reader (the window stops its

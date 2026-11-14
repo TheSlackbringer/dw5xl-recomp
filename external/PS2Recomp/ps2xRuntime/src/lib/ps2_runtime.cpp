@@ -4714,6 +4714,7 @@ void PS2Runtime::run()
                 }
                 m_eeScheduler->wakePresentationWait();
             });
+            window.onTimedFinished([this] { m_eeScheduler->wakePresentationWait(); });
             std::fprintf(stderr, "[window] in-between pictures are taken on the graphics card and shown at their instants\n");
         }
         else if (s_smoothShow)
@@ -4851,7 +4852,9 @@ void PS2Runtime::run()
                         if (!timedStartedAt.empty())
                             timedStartedAt.pop_front();
                     }
-                    picture.readyMs = picture.startedMs; // handed over: the window can draw it from then on
+                    // Ready when the graphics card had finished it (the window waits for that on a thread of its
+                    // own): what was sent to the card is not drawn yet, and the head start has to cover the drawing.
+                    picture.readyMs = std::max(picture.startedMs, handed.finishedMs);
                     if (queue.addTimed(picture, handed.id) != ps2x_dev::InBetweenQueue::Added::Timed)
                         window.dropTimed(handed.id); // its time line moved on, or no instant was announced for it
                 }
@@ -5203,6 +5206,7 @@ void PS2Runtime::run()
         if (timedOwn)
         {
             setPictureReadSubmitted({});
+            window.onTimedFinished({});
             ps2x_dev::s_inBetween.dropWindowPicture = nullptr;
             window.attachTimedPictures(nullptr);
         }

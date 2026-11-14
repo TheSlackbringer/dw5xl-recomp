@@ -47,6 +47,10 @@ struct HandedPicture
     uint64_t order = 0;      // ps2x::gs::nextPictureOrder() at the scan-out: which of two pictures is the newer
     uint64_t tag = 0;        // an in-between picture's tag, 0 for a field's picture
     int8_t fieldTarget = -1; // the field the picture was drawn for, -1 if not known
+    // Signalled when the graphics card has finished the picture: the copy into its image, which comes after
+    // everything that drew it. It can be waited for on any thread. (Issue 049 v3.12 step 5: a picture sent to the
+    // card is not yet a picture the card has drawn; found on the real display 2026-11-14.)
+    Vulkan::Fence done;
 
     explicit operator bool() const { return static_cast<bool>(image); }
 };
