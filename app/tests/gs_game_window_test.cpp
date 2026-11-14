@@ -86,7 +86,9 @@ struct Picture
 
 // What a window of width x height shows of `source` placed at the rectangle, computed here: black outside the
 // rectangle (by pixel centres), inside the nearest pixel or the bilinear value with the edge pixels repeated.
-Picture expected(const Picture &source, uint32_t width, uint32_t height, const ps2x::PictureRect &rect, bool smooth)
+// `sharpen` (with smooth): SHARPEN's sum (issue 047) of the bilinear value and its four neighbours one picture pixel away.
+Picture expected(const Picture &source, uint32_t width, uint32_t height, const ps2x::PictureRect &rect, bool smooth,
+                 bool sharpen = false)
 {
     Picture out;
     out.width = width;
@@ -96,6 +98,15 @@ Picture expected(const Picture &source, uint32_t width, uint32_t height, const p
         x = std::clamp(x, 0, static_cast<int>(source.width) - 1);
         y = std::clamp(y, 0, static_cast<int>(source.height) - 1);
         return static_cast<double>(source.rgba[(static_cast<size_t>(y) * source.width + static_cast<size_t>(x)) * 4u + static_cast<size_t>(channel)]);
+    };
+    // The bilinear value at (u, v) in picture pixels, 0 to 255.
+    const auto bilinear = [&](double u, double v, int channel) {
+        const double tu = u - 0.5, tv = v - 0.5;
+        const int x0 = static_cast<int>(std::floor(tu)), y0 = static_cast<int>(std::floor(tv));
+        const double fx = tu - x0, fy = tv - y0;
+        const double top = texel(x0, y0, channel) * (1.0 - fx) + texel(x0 + 1, y0, channel) * fx;
+        const double bottom = texel(x0, y0 + 1, channel) * (1.0 - fx) + texel(x0 + 1, y0 + 1, channel) * fx;
+        return top * (1.0 - fy) + bottom * fy;
     };
     for (uint32_t py = 0; py < height; ++py)
         for (uint32_t px = 0; px < width; ++px)
@@ -113,12 +124,17 @@ Picture expected(const Picture &source, uint32_t width, uint32_t height, const p
                     o[c] = static_cast<uint8_t>(texel(static_cast<int>(std::floor(u)), static_cast<int>(std::floor(v)), c));
                     continue;
                 }
-                const double tu = u - 0.5, tv = v - 0.5;
-                const int x0 = static_cast<int>(std::floor(tu)), y0 = static_cast<int>(std::floor(tv));
-                const double fx = tu - x0, fy = tv - y0;
-                const double top = texel(x0, y0, c) * (1.0 - fx) + texel(x0 + 1, y0, c) * fx;
-                const double bottom = texel(x0, y0 + 1, c) * (1.0 - fx) + texel(x0 + 1, y0 + 1, c) * fx;
-                o[c] = static_cast<uint8_t>(std::lround(top * (1.0 - fy) + bottom * fy));
+                if (!sharpen)
+                {
+                    o[c] = static_cast<uint8_t>(std::lround(bilinear(u, v, c)));
+                    continue;
+                }
+                // SHARPEN as the window's shader works it out: the less contrast around a pixel, the stronger.
+                const double m = bilinear(u, v, c) / 255.0, n = bilinear(u, v - 1.0, c) / 255.0, e = bilinear(u + 1.0, v, c) / 255.0;
+                const double w = bilinear(u - 1.0, v, c) / 255.0, s = bilinear(u, v + 1.0, c) / 255.0;
+                const double lo = std::min({m, n, e, w, s}), hi = std::max({m, n, e, w, s});
+                const double a = std::clamp(std::min(lo, 1.0 - hi) / std::max(hi, 0.001), 0.0, 1.0), k = -std::sqrt(a) * 0.2;
+                o[c] = static_cast<uint8_t>(std::lround(std::clamp((m + (n + e + w + s) * k) / (1.0 + 4.0 * k), 0.0, 1.0) * 255.0));
             }
         }
     return out;
@@ -211,7 +227,8 @@ struct OwnDevice
     }
 
     // The picture drawn at the rectangle into a black picture of width x height, and that one read.
-    Picture drawn(const HandedPicture &picture, uint32_t width, uint32_t height, const ps2x::PictureRect &rect, bool smooth)
+    Picture drawn(const HandedPicture &picture, uint32_t width, uint32_t height, const ps2x::PictureRect &rect, bool smooth,
+                  bool sharpen = false)
     {
         Util::register_thread_index(0);
         Picture out;
@@ -240,7 +257,7 @@ struct OwnDevice
         pass.store_attachments = 1u;
         pass.clear_color[0].float32[3] = 1.0f;
         cmd->begin_render_pass(pass);
-        drawer->draw(*cmd, *view, rect.x, rect.y, rect.width, rect.height, smooth);
+        drawer->draw(*cmd, *view, rect.x, rect.y, rect.width, rect.height, smooth, sharpen);
         cmd->end_render_pass();
         cmd->image_barrier(*target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
@@ -352,6 +369,19 @@ int run(uint32_t wantedScale)
             const int down = largestDifference(own.drawn(held, w / 2u, h / 2u, half, true), expected(a, w / 2u, h / 2u, half, true));
             std::printf("note  scale %ux: smooth to half the size, largest difference from the bilinear value: %d of 255\n", scale, down);
             check(down <= 1, "drawn smooth to half its size: the bilinear value within one step of 255", scale);
+            // 4b. SHARPEN (PC SETTINGS, issue 047; in the game above 1x): one to one and to half the size, against
+            // the same sum worked out here; and it is not the unsharpened picture.
+            const Picture plain = own.drawn(held, w, h, whole, true);
+            const Picture sharp = own.drawn(held, w, h, whole, true, true);
+            const int sharpOne = largestDifference(sharp, expected(a, w, h, whole, true, true));
+            const int changed = largestDifference(sharp, plain);
+            std::printf("note  scale %ux: sharpened one to one, largest difference from the value worked out here: %d of 255; from "
+                        "the unsharpened picture: %d\n", scale, sharpOne, changed);
+            check(sharpOne <= 1, "drawn sharpened one to one: SHARPEN's value within one step of 255", scale);
+            check(changed > 1, "and it is not the unsharpened picture", scale);
+            const int sharpHalf = largestDifference(own.drawn(held, w / 2u, h / 2u, half, true, true), expected(a, w / 2u, h / 2u, half, true, true));
+            std::printf("note  scale %ux: sharpened to half the size, largest difference from the value worked out here: %d of 255\n", scale, sharpHalf);
+            check(sharpHalf <= 1, "drawn sharpened to half its size: SHARPEN's value within one step of 255", scale);
             fields.release(held);
         }
         fields.stop();
@@ -422,6 +452,15 @@ int run(uint32_t wantedScale)
         check(difference <= (smooth ? 1 : 0), smooth ? "what the window draws is A letterboxed, smooth, within one step of 255"
                                                      : "what the window draws is A letterboxed, pixel for pixel",
               scale);
+        if (smooth)
+        {
+            // SHARPEN through the window's look, as the game asks for it.
+            ps2x::gs::GameWindowLook sharpLook = look;
+            sharpLook.sharpen = true;
+            const int sharpened = largestDifference(windowPicture(*window, sharpLook), expected(a, winW, winH, placed, true, true));
+            std::printf("note  scale %ux: the window's picture of A with SHARPEN, largest difference from the expected one: %d of 255\n", scale, sharpened);
+            check(sharpened <= 1, "with SHARPEN the window draws A sharpened, within one step of 255", scale);
+        }
     }
 
     // 8. Shown again without a new field.

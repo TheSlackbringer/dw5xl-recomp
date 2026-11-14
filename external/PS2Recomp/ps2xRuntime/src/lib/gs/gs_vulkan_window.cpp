@@ -8,6 +8,7 @@
 
 #include "gs_vulkan_handover.h"
 #include "gs_vulkan_window.h"
+#include "gs_vulkan_window_shaders.h"
 #include "runtime/host_devices.h"
 #include "runtime/host_input_state.h"
 #include "runtime/host_window.h"
@@ -51,18 +52,38 @@ namespace ps2x::gs
         Vulkan::ResourceLayout layout;
         ParallelGS::Shaders<> suite(device, layout, 0);
         m_blit = device.request_program(suite.quad, suite.blit);
+        // SHARPEN's fragment shader is ours (shaders/picture_sharpen.frag, compiled in gs_vulkan_window_shaders.h),
+        // on the library's quad. The library is built without its reflection, so the shader's layout is written out
+        // here: vUV in, the colour out, the picture with its sampler at set 0 binding 0, and eight bytes of push
+        // constants (one picture pixel in vUV's units).
+        Vulkan::ResourceLayout sharpen;
+        sharpen.input_mask = 0x1u;
+        sharpen.output_mask = 0x1u;
+        sharpen.sets[0].sampled_image_mask = 0x1u;
+        sharpen.sets[0].fp_mask = 0x1u;
+        sharpen.sets[0].meta[0].array_size = 1;
+        sharpen.push_constant_size = 8u;
+        if (Vulkan::Shader *shader = device.request_shader(window_shaders::kPictureSharpen, sizeof(window_shaders::kPictureSharpen), &sharpen))
+            m_sharpen = device.request_program(suite.quad, shader);
     }
 
     void VulkanPictureDrawer::draw(Vulkan::CommandBuffer &cmd, const Vulkan::ImageView &picture, float x, float y,
-                                   float width, float height, bool smooth) const
+                                   float width, float height, bool smooth, bool sharpen) const
     {
         if (!m_blit || !(width > 0.0f) || !(height > 0.0f))
             return;
+        const bool sharp = sharpen && smooth && m_sharpen;
         cmd.set_opaque_state();
         cmd.set_depth_test(false, false);
         cmd.set_cull_mode(VK_CULL_MODE_NONE);
-        cmd.set_program(m_blit);
+        cmd.set_program(sharp ? m_sharpen : m_blit);
         cmd.set_texture(0, 0, picture, smooth ? Vulkan::StockSampler::LinearClamp : Vulkan::StockSampler::NearestClamp);
+        if (sharp)
+        {
+            const float texel[2] = {1.0f / static_cast<float>(picture.get_image().get_width()),
+                                    1.0f / static_cast<float>(picture.get_image().get_height())};
+            cmd.push_constants(texel, 0, sizeof(texel));
+        }
         // The quad covers the viewport and is cut at its edges, so the viewport is the picture's rectangle.
         cmd.set_viewport({x, y, width, height, 0.0f, 1.0f});
         cmd.draw(3);
@@ -1274,7 +1295,7 @@ namespace
             shown.y = placed.y;
             shown.rectWidth = placed.width;
             shown.rectHeight = placed.height;
-            m_drawer->draw(cmd, *view, placed.x, placed.y, placed.width, placed.height, look.smooth);
+            m_drawer->draw(cmd, *view, placed.x, placed.y, placed.width, placed.height, look.smooth, look.sharpen);
         }
 
         // The presenter keeps the newest report it found; a second one that came in the same turn is not seen

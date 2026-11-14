@@ -249,7 +249,7 @@ draws itself, a Vulkan swap chain without OpenGL, instead of today's; frame dump
 pictures work, the CPU renderer is shown too, the pages and overlays are drawn (ImGui by a renderer of ours), the
 in-between pictures are shown from the graphics card in the test mode (`PS2X_SMOOTH_SHOW=1`): on a test display, or
 in a shown window by the real display's clock, made from the driver's reports of shown pictures
-(`PS2X_DISPLAY_TRACE=1` logs them: `[display:report]`, `[display:timed]`); no SHARPEN yet; `[present:own]` per second and `[present:own:slow]` for a turn over
+(`PS2X_DISPLAY_TRACE=1` logs them: `[display:report]`, `[display:timed]`), SHARPEN is drawn; `[present:own]` per second and `[present:own:slow]` for a turn over
 25 ms with `PS2X_PRESENT_STATS`, `PS2X_WINDOW_SHOT` works) · `PS2X_OVERLAY_HIDDEN=1` (the F2 and F8 lines and the
 state message are drawn in a hidden window too, for window pictures of hidden runs).
 Sound/IOP: `PS2X_SPU2_TRACE` · `PS2X_LIBSD_TRACE` · `PS2X_KSNG_TRACE` / `PS2X_KSNH_TRACE` (sound RPCs) ·

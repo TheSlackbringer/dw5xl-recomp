@@ -41,6 +41,7 @@ namespace ps2x::gs
     {
         float shape = 0.0f;   // the picture's width over its height in the window; 0: the display's own size
         bool smooth = false;  // bilinear (above 1x, issue 047); off: the nearest pixel
+        bool sharpen = false; // with smooth: PC SETTINGS' SHARPEN (issue 047)
     };
 
     // A picture in main memory: RGBA, 4 bytes a pixel, rows `strideBytes` apart.

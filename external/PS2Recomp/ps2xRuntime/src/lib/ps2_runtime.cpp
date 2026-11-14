@@ -4728,7 +4728,6 @@ void PS2Runtime::run()
         uint64_t statFrames = 0u, statNew = 0u, statFailed = 0u, statSlow = 0u, statFromMemory = 0u, statFetched = 0u;
         uint64_t lastReadGeneration = gs().hostPresentationGeneration();
         double statMaxMs = 0.0;
-        bool sharpenSaid = false;
         bool latchedOnce = false;
         // Which picture s_lastFrame holds and which one the window shows, by their place among all finished
         // pictures (ps2x::gs::nextPictureOrder). A picture from main memory is in s_lastFrame from its arrival; one
@@ -4987,11 +4986,7 @@ void PS2Runtime::run()
             ps2x::gs::GameWindowLook look;
             look.shape = s_pictureShape.load(std::memory_order_relaxed);
             look.smooth = m_gs.getResolutionScale() > 1u; // issue 047: above 1x the picture is scaled smoothly
-            if (!sharpenSaid && s_presentSharpen.load(std::memory_order_relaxed) && look.smooth)
-            {
-                sharpenSaid = true;
-                std::fprintf(stderr, "[window] SHARPEN is not drawn by the renderer's own window yet\n");
-            }
+            look.sharpen = look.smooth && s_presentSharpen.load(std::memory_order_relaxed); // issue 047: SHARPEN, above 1x
             const TurnClock::time_point given = s_stats ? TurnClock::now() : TurnClock::time_point{};
             // The window's turn in two halves (step 4): the picture is chosen and placed, the overlays are drawn over
             // it by the code below, then the window is presented.
