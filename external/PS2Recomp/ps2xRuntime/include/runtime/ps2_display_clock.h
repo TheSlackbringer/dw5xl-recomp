@@ -63,6 +63,70 @@ namespace ps2x::display_clock
         double m_firstNumber = 0.0;
     };
 
+    // ---- A real display's clock from the driver's reports (issue 049 amendment v3.12, step 5) ----
+
+    // What the graphics driver reports of one presented picture.
+    struct ShownReport
+    {
+        uint64_t present = 0;  // the present's number (growing)
+        double calledMs = 0.0; // when the window handed the picture over (its present call)
+        double outMs = 0.0;    // when its first pixel left for the display
+        double meantMs = 0.0;  // above 0: the hand-over was aimed at a refresh; that refresh's instant on the grid
+    };
+
+    // The display the window presents on, worked out from those reports and the refresh time the driver names.
+    //  - Fixed: the reports lie on the driver's refresh grid. The grid handed out is the grid of hand-over
+    //    deadlines: the instant of refresh n is the latest time a picture can be handed over and still be shown by
+    //    refresh n. The refresh itself comes leadMs() later, the same for every picture.
+    //  - Follows: the reports follow the hand-overs and not a grid (variable refresh in effect, or no vsync where
+    //    the system shows a picture at once). The grid says `follows`, with the driver's refresh time as the
+    //    shortest time between two pictures.
+    //  - Unknown: no reports, or too few (a hidden window, a screen that is off, a driver that has none).
+    // On a display that follows, pictures handed over on whole refresh times look like a grid and are taken for
+    // one; the fixed-rate rule is right on both kinds (spec, change 3).
+    class RealDisplay
+    {
+      public:
+        enum class Kind { Unknown, Fixed, Follows };
+        // The driver's refresh time (0: not known). Another one (more than half a hundredth off) starts the clock
+        // anew; the driver's own small corrections of it do not (measured: 4.1666 to 4.1668 ms within one run).
+        void refresh(double periodMs);
+        void report(const ShownReport &report);
+        Kind kind() const { return m_kind; }
+        // False while the display is not known well enough to make pictures for it.
+        bool grid(Grid &out) const;
+        // Fixed: the time from a hand-over deadline to its refresh. A picture handed over at any time is shown
+        // between this lead and one refresh more after its hand-over, never sooner, and later only when the system
+        // was slow. So the lead is taken from the short end of the last such times: their 10th hundredth, less a
+        // tenth of a refresh (measured on a 240 Hz display: the times lie evenly between 4.7 and 8.9 ms). It is
+        // learned from pictures handed over at any time (the game's own, field by field). Pictures aimed at a
+        // refresh all come at one place between two deadlines and say nothing new about the lead, so they leave it
+        // alone, unless most of them are not shown by the refresh they were aimed at: then the lead is wrong (the
+        // window is shown another way now) and is taken from them: the middle of their times from the deadline
+        // they were aimed at to the refresh that showed them.
+        double leadMs() const { return m_leadMs; }
+        size_t reports() const { return m_latencies.size() + m_aimed.size(); }
+        // Of the last pictures aimed at a refresh (at most 32): how many another refresh showed.
+        size_t aimedMissed() const;
+        // Whether a picture aimed at the refresh of deadline `meantMs` was shown by that refresh.
+        bool madeItsRefresh(double meantMs, double outMs) const;
+        void reset();
+
+      private:
+        double m_nominalMs = 0.0;
+        Estimator m_line{1.0};
+        std::deque<double> m_offs;      // the last reports' distances from a whole number of refreshes, in refreshes
+        std::deque<double> m_latencies; // hand-over to refresh, of the last pictures handed over at any time
+        std::deque<double> m_aimed;     // of the last pictures aimed at a refresh: that refresh's deadline to the refresh that showed it
+        std::deque<bool> m_missed;      // ... and whether another refresh showed them
+        bool m_haveLead = false;
+        Kind m_kind = Kind::Unknown;
+        bool m_have = false;
+        uint64_t m_lastPresent = 0;
+        double m_lastOutMs = 0.0;
+        double m_leadMs = 0.0;
+    };
+
     // ---- Shared between the window and the code that decides which pictures to make (thread-safe) ----
 
     // Milliseconds on the PC's steady clock, as every time in this file.
@@ -73,6 +137,16 @@ namespace ps2x::display_clock
     // The display the window presents on (window thread); false until one is published.
     void publish(const Grid &grid);
     bool published(Grid &out);
+    // The display is not known any more (a real display whose reports stopped): nothing is published.
+    void withdraw();
+
+    // Where between two hand-over deadlines of a real fixed-rate display a picture is handed over: this part of a
+    // refresh before its own deadline, so a fifth of a refresh after the deadline before. After a hand-over the
+    // graphics card and the system can only add time, never take any away, so the picture gets as much room as
+    // the clock allows; the fifth is twice what the lead may be off (a tenth of a refresh, see leadMs).
+    // Measured 2026-11-14 (240 Hz display, normal window, light battle): handed over in the middle between two
+    // deadlines, 17 % of the in-between pictures were shown one refresh late.
+    constexpr double kAimBeforeDeadline = 0.8;
 
     // A timed picture: made for one instant on screen. The code that makes it announces it under the tag of its
     // picture read, before the read is started; the window takes it when the read arrives.

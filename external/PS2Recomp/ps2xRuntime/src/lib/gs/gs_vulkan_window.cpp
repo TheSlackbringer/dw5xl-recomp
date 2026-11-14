@@ -21,6 +21,7 @@
 #include "context.hpp"
 #include "device.hpp"
 #include "thread_id.hpp"
+#include "timer.hpp"
 #include "wsi.hpp"
 #include "shader.hpp"
 #include "shaders/slangmosh_iface.hpp"
@@ -35,6 +36,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -75,6 +77,13 @@ namespace
     using ps2x::gs::GameWindowPixels;
     using ps2x::gs::GameWindowShown;
     using ps2x::gs::GameWindowTimed;
+    using ps2x::gs::GameWindowReport;
+
+    // Milliseconds on the PC's steady clock (as ps2x::display_clock::nowMs).
+    double steadyMs()
+    {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
 
     // GLFW is started by the first window and ended by the last (the thread that owns the window events).
     int g_glfwUsers = 0;
@@ -421,6 +430,8 @@ namespace
                 ++m_counts.notPresented;
                 return;
             }
+            if (m_reportsOn)
+                collectReports(); // the presenter looked for new ones while it took the image
             const auto acquired = std::chrono::steady_clock::now();
             Vulkan::Device &device = m_wsi.get_device();
             auto cmd = device.request_command_buffer();
@@ -449,7 +460,18 @@ namespace
             m_lastPresentedTimed = m_presentTimed;
             m_presentTimed = false;
             const auto drawn = std::chrono::steady_clock::now();
+            const double calledMs = steadyMs();
             shown.presented = m_wsi.end_frame();
+            if (shown.presented)
+            {
+                shown.present = m_wsi.get_last_submitted_present_id();
+                if (m_reportsOn)
+                {
+                    m_called.push_back({shown.present, calledMs, 0.0, 0.0});
+                    while (m_called.size() > 64u)
+                        m_called.pop_front();
+                }
+            }
             shown.acquireMs = msSince(started, acquired);
             shown.drawMs = msSince(acquired, drawn);
             shown.presentMs = msSince(drawn, std::chrono::steady_clock::now());
@@ -729,6 +751,43 @@ namespace
         bool hidden() const override
         {
             return m_hidden;
+        }
+
+        bool askShownReports(bool on) override
+        {
+            on = on && !m_hidden;
+            if (on == m_reportsOn)
+                return on;
+            m_reportsOn = on;
+            m_wsi.set_enable_timing_feedback(on);
+            m_called.clear();
+            m_reports.clear();
+            if (on)
+            {
+                // The driver's times come on the library's clock: where that lies on the PC's steady clock (the
+                // closest of five looks at both).
+                double narrowest = DBL_MAX;
+                for (int look = 0; look < 5; ++look)
+                {
+                    const double before = steadyMs();
+                    const double library = static_cast<double>(Util::get_current_time_nsecs()) * 1e-6;
+                    const double after = steadyMs();
+                    if (after - before < narrowest)
+                    {
+                        narrowest = after - before;
+                        m_libraryClockMs = (before + after) * 0.5 - library;
+                    }
+                }
+            }
+            return on;
+        }
+
+        void takeShownReports(std::vector<GameWindowReport> &out, double &refreshMs, bool &saysFollows) override
+        {
+            out.assign(m_reports.begin(), m_reports.end());
+            m_reports.clear();
+            refreshMs = m_refreshMs;
+            saysFollows = m_saysFollows;
         }
 
         GameWindowCounts counts() const override
@@ -1218,6 +1277,33 @@ namespace
             m_drawer->draw(cmd, *view, placed.x, placed.y, placed.width, placed.height, look.smooth);
         }
 
+        // The presenter keeps the newest report it found; a second one that came in the same turn is not seen
+        // (the clock is made for reports with gaps).
+        void collectReports()
+        {
+            Vulkan::PresentationStats stats = {};
+            if (m_wsi.get_presentation_stats(stats) && stats.present_done_ts != 0u && stats.feedback_present_id != m_lastReported)
+            {
+                m_lastReported = stats.feedback_present_id;
+                while (!m_called.empty() && m_called.front().present < stats.feedback_present_id)
+                    m_called.pop_front();
+                if (!m_called.empty() && m_called.front().present == stats.feedback_present_id)
+                {
+                    GameWindowReport report = m_called.front();
+                    report.outMs = static_cast<double>(stats.present_done_ts) * 1e-6 + m_libraryClockMs;
+                    report.gpuDoneMs = stats.gpu_done_ts != 0u ? static_cast<double>(stats.gpu_done_ts) * 1e-6 + m_libraryClockMs : 0.0;
+                    m_reports.push_back(report);
+                    m_called.pop_front();
+                }
+            }
+            Vulkan::RefreshRateInfo info = {};
+            if (m_wsi.get_refresh_rate_info(info))
+            {
+                m_refreshMs = static_cast<double>(info.refresh_duration) * 1e-6;
+                m_saysFollows = info.mode == Vulkan::RefreshMode::VRR;
+            }
+        }
+
         std::shared_ptr<GSVulkanPresenterLink> m_link; // declared first: it goes last
         bool m_glfw = false;
         bool m_started = false;
@@ -1248,6 +1334,15 @@ namespace
         uint64_t m_nextTimedId = 1u;
         ps2x::host::InputState m_input;
         GameWindowCounts m_counts;
+        // The driver's reports of shown pictures (askShownReports): the presents not reported yet with the time
+        // of their hand-over, the reports not taken yet, and what the driver says of the display.
+        bool m_reportsOn = false;
+        std::deque<GameWindowReport> m_called;
+        std::deque<GameWindowReport> m_reports;
+        uint64_t m_lastReported = 0u;
+        double m_libraryClockMs = 0.0;
+        double m_refreshMs = 0.0;
+        bool m_saysFollows = false;
         // What the pages and overlays asked of the window.
         bool m_vsync = true;
         bool m_borderless = false;

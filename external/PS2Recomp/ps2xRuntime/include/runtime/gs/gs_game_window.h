@@ -65,9 +65,20 @@ namespace ps2x::gs
         uint32_t displayWidth = 0u, displayHeight = 0u;
     };
 
+    // What the graphics driver reports of a presented picture (issue 049 v3.12 step 5): when the window handed
+    // it over and when its first pixel left for the display, in milliseconds on the PC's steady clock.
+    struct GameWindowReport
+    {
+        uint64_t present = 0u; // GameWindowShown::present of the turn that presented it
+        double calledMs = 0.0;
+        double outMs = 0.0;
+        double gpuDoneMs = 0.0; // when the graphics card had finished everything the picture needed (0: not reported)
+    };
+
     struct GameWindowShown
     {
         bool presented = false;  // the window's content went to the swap chain this time
+        uint64_t present = 0u;   // then: this present's number, under which the driver reports it (askShownReports)
         bool newPicture = false; // a picture of the game the window had not shown before
         bool have = false;       // the window has a picture of the game
         bool fromMemory = false; // it was given from main memory (memoryPicture), not taken on the graphics card
@@ -149,6 +160,14 @@ namespace ps2x::gs
         // the window's size and read into main memory (RGBA, 4 bytes a pixel, opaque). For window pictures on
         // request; never part of showing.
         virtual bool picture(const GameWindowLook &look, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) = 0;
+
+        // The driver's reports of when presented pictures were shown (the display's clock is made from them).
+        // They are asked for only where pictures reach a display: never in a hidden window, whose reports do not
+        // come and hold the presenter up (step 1's finding). Returns whether they are asked for now.
+        virtual bool askShownReports(bool on) = 0;
+        // The reports that came since the last call, oldest first, and what the driver says of the display: its
+        // refresh time in milliseconds (0: not known) and whether it names it as one that follows the window.
+        virtual void takeShownReports(std::vector<GameWindowReport> &out, double &refreshMs, bool &saysFollows) = 0;
 
         virtual void drawableSize(uint32_t &width, uint32_t &height) const = 0;
         virtual void resize(int width, int height) = 0; // the window's content size, as the system allows

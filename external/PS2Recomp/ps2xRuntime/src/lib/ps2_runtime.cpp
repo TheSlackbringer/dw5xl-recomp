@@ -4674,7 +4674,26 @@ void PS2Runtime::run()
         // (PS2X_SMOOTH_SHOW=1 with a test display), each at the instant it was made for; here they stay on the
         // graphics card: the window is handed them (GameWindow::takeTimed), the queue of timed pictures keeps each
         // one's number with its instant, and the turn that presents one tells the window which.
-        const bool timedOwn = s_smoothShow && haveDisplay && hostFpsOverride == 0 && m_eeScheduler;
+        // Step 5, second half: the real display's clock. Without a test display, in a window that is shown, the
+        // display is learned from the driver's reports of when each presented picture left for the display
+        // (ps2x::display_clock::RealDisplay): a fixed-rate display's refresh grid, or that the display follows the
+        // window. A hidden window has no display and no reports; it shows in-between pictures on a test display.
+        // DW5XL-DEBUG PS2X_DISPLAY_TRACE=1: every report, and every in-between picture's present, as log lines
+        // ([display:report], [display:timed]); it asks for the reports without in-between pictures too.
+        static const bool s_displayTrace = [] { const char *v = std::getenv("PS2X_DISPLAY_TRACE"); return v && *v && *v != '0'; }();
+        const bool realDisplay = !haveDisplay && (s_smoothShow || s_displayTrace) && window.askShownReports(true);
+        dc::RealDisplay realClock;
+        std::vector<ps2x::gs::GameWindowReport> shownReports;
+        std::deque<std::pair<uint64_t, double>> aimedPresents; // presents of pictures aimed at a refresh: its instant
+        // Known and open (work log 2026-11-14): a picture handed over on the graphics card counts as ready when it
+        // was sent there, though the card may still be drawing it. The driver's report says when the card had
+        // finished everything a present needed (`gpu=` in the trace); it is only logged. Feeding it to the head
+        // start's measure made the head start run away on a display that follows the window (82 ms within half a
+        // minute): the card's other work delays a present too, and no head start changes that.
+        bool displayKnown = haveDisplay; // a test display, or the real one once its clock is known
+        int realSaid = -1;               // what the log last said of the real display
+        uint64_t realChains = 0u;        // the window's swap chains when the clock last started
+        const bool timedOwn = s_smoothShow && (haveDisplay || realDisplay) && hostFpsOverride == 0 && m_eeScheduler;
         // The renderer memory that draws the pictures is made when the game first makes one (syncPictureGs): the
         // window is attached to its hand-over in the turn after that.
         GS *timedFor = nullptr;
@@ -4700,7 +4719,8 @@ void PS2Runtime::run()
         else if (s_smoothShow)
         {
             std::fprintf(stderr, "[window] in-between pictures are not shown: %s\n",
-                         !haveDisplay ? "no test display (PS2X_TEST_DISPLAY)" : hostFpsOverride != 0 ? "PS2X_HOST_FPS is set"
+                         !(haveDisplay || realDisplay) ? "a hidden window has no display; it needs a test display (PS2X_TEST_DISPLAY)"
+                         : hostFpsOverride != 0 ? "PS2X_HOST_FPS is set"
                                                                                                     : "the game has no field clock");
         }
         static const bool s_stats = [] { const char *v = std::getenv("PS2X_PRESENT_STATS"); return v && *v && *v != '0'; }();
@@ -4741,6 +4761,73 @@ void PS2Runtime::run()
             bool wokeEarly = false;
             double turnStartMs = 0.0;
             auto timedWake = SmoothClock::time_point::max();
+            if (realDisplay)
+            {
+                double refreshMs = 0.0;
+                bool saysFollows = false;
+                window.takeShownReports(shownReports, refreshMs, saysFollows);
+                // A new swap chain (the window's size, fullscreen or vsync changed): the system may show the window
+                // another way from now on, so the clock starts anew.
+                if (const uint64_t chains = window.counts().swapChains; chains != realChains)
+                {
+                    realChains = chains;
+                    realClock.reset();
+                }
+                realClock.refresh(refreshMs);
+                for (const ps2x::gs::GameWindowReport &report : shownReports)
+                {
+                    dc::ShownReport shownReport;
+                    shownReport.present = report.present;
+                    shownReport.calledMs = report.calledMs;
+                    shownReport.outMs = report.outMs;
+                    while (!aimedPresents.empty() && aimedPresents.front().first < report.present)
+                        aimedPresents.pop_front();
+                    if (!aimedPresents.empty() && aimedPresents.front().first == report.present)
+                    {
+                        shownReport.meantMs = aimedPresents.front().second;
+                        aimedPresents.pop_front();
+                    }
+                    realClock.report(shownReport);
+                    if (s_displayTrace)
+                        std::fprintf(stderr, "[display:report] present=%llu called=%.3f out=%.3f meant=%.3f lead=%.3f kind=%d gpu=%.3f\n",
+                                     static_cast<unsigned long long>(report.present), report.calledMs, report.outMs, shownReport.meantMs,
+                                     realClock.leadMs(), static_cast<int>(realClock.kind()), report.gpuDoneMs);
+                }
+                dc::Grid real;
+                bool known = realClock.grid(real);
+                if (saysFollows && refreshMs > 0.0)
+                {
+                    // The driver itself names the display as one that follows the window.
+                    real = dc::Grid{};
+                    real.follows = true;
+                    real.periodMs = refreshMs;
+                    known = true;
+                }
+                if (known)
+                {
+                    displayGrid = real;
+                    dc::publish(real);
+                }
+                else if (displayKnown)
+                {
+                    dc::withdraw();
+                }
+                displayKnown = known;
+                const int says = !known ? 0 : real.follows ? 2 : 1;
+                if (says != realSaid)
+                {
+                    realSaid = says;
+                    if (says == 0)
+                        std::fprintf(stderr, "[window] the display's clock is not known (%zu reports from the driver so far)\n", realClock.reports());
+                    else if (says == 2)
+                        std::fprintf(stderr, "[window] the display follows the window%s; its shortest time between two pictures is %.4f ms\n",
+                                     saysFollows ? " (the driver says so)" : " (its reports follow the hand-overs)", real.periodMs);
+                    else
+                        std::fprintf(stderr, "[window] the display: fixed rate, %.4f ms per refresh (%.3f Hz); a picture is shown %.2f ms "
+                                             "after its hand-over deadline\n",
+                                     real.periodMs, 1000.0 / real.periodMs, realClock.leadMs());
+                }
+            }
             if (timedOwn)
             {
                 // Today's loop, step for step, with the pictures on the graphics card.
@@ -4797,8 +4884,13 @@ void PS2Runtime::run()
                 {
                     // Fixed rate: handed over in the refresh interval before its instant. Following display: presented
                     // at its instant; the turn starts as much earlier as a turn has lately taken up to its present.
+                    // A real fixed-rate display: its instants are hand-over deadlines, and the picture is handed over
+                    // soon after the deadline before its own (display_clock::kAimBeforeDeadline); the turn starts as
+                    // much earlier as a turn has lately taken.
                     const double at = queue.timed.front().info.atMs;
-                    const double lead = displayGrid.follows ? *std::max_element(turnTimes.begin(), turnTimes.end()) : displayGrid.periodMs;
+                    const double turnTakes = *std::max_element(turnTimes.begin(), turnTimes.end());
+                    const double lead = displayGrid.follows ? turnTakes
+                                        : realDisplay ? dc::kAimBeforeDeadline * displayGrid.periodMs + turnTakes : displayGrid.periodMs;
                     if (now >= at - lead)
                     {
                         inBetween = true;
@@ -4961,15 +5053,17 @@ void PS2Runtime::run()
             outputAndStateKeys();
             overlayLines(shown.width, shown.height, eeScheduler().currentVSyncTick());
             const TurnClock::time_point overlaid = s_stats ? TurnClock::now() : TurnClock::time_point{};
-            double handedMs = 0.0, handMs = 0.0;
+            double handedMs = 0.0, handMs = 0.0, aimedAtMs = 0.0;
             if (inBetween)
             {
                 handMs = dc::nowMs() - turnStartMs; // what this turn needed up to its present
                 turnTimes[turnAt++ % turnTimes.size()] = handMs;
-                if (displayGrid.follows)
+                aimedAtMs = ps2x_dev::s_inBetween.timed.front().info.atMs;
+                if (displayGrid.follows || realDisplay)
                 {
-                    // Presented at its instant: sleep close to it, then spin.
-                    const auto due = dc::fromMs(ps2x_dev::s_inBetween.timed.front().info.atMs);
+                    // A following display: presented at its instant. A real fixed-rate display: handed over soon
+                    // after the deadline before its own. Sleep close to that time, then spin.
+                    const auto due = dc::fromMs(aimedAtMs - (displayGrid.follows ? 0.0 : dc::kAimBeforeDeadline * displayGrid.periodMs));
                     if (due - SmoothClock::now() > std::chrono::milliseconds(2))
                         std::this_thread::sleep_until(due - std::chrono::milliseconds(1));
                     while (SmoothClock::now() < due)
@@ -4978,16 +5072,32 @@ void PS2Runtime::run()
                 handedMs = dc::nowMs();
             }
             window.present(shown, look);
+            if (inBetween && realDisplay && shown.presented)
+            {
+                if (!displayGrid.follows)
+                {
+                    aimedPresents.emplace_back(shown.present, aimedAtMs);
+                    while (aimedPresents.size() > 64u)
+                        aimedPresents.pop_front();
+                }
+                if (s_displayTrace)
+                    std::fprintf(stderr, "[display:timed] present=%llu at=%.3f handed=%.3f follows=%d period=%.4f\n",
+                                 static_cast<unsigned long long>(shown.present), aimedAtMs, handedMs, displayGrid.follows ? 1 : 0,
+                                 displayGrid.periodMs);
+            }
             if (inBetween)
             {
-                ps2x_dev::s_inBetween.shownFront(handedMs, handMs);
+                // A real fixed-rate display: the window needs the picture that long before its instant (the hand-over
+                // comes soon after the deadline before its own), which is part of what the head start has to cover.
+                const double aimLead = realDisplay && !displayGrid.follows ? dc::kAimBeforeDeadline * displayGrid.periodMs : 0.0;
+                ps2x_dev::s_inBetween.shownFront(handedMs, handMs + aimLead);
                 ++statTimed;
             }
             else if (paced.fresh && dc::logTimeline())
             {
                 // DW5XL-DEBUG issue 049 v3.5: PS2X_SMOOTH_TIMELINE=1: a field's own picture and the refresh that shows it.
                 const double presented = dc::nowMs();
-                if (haveDisplay && !displayGrid.follows)
+                if (displayKnown && !displayGrid.follows)
                 {
                     const int64_t refresh = dc::refreshAfter(displayGrid, presented);
                     std::fprintf(stderr, "[smooth:game] refresh=%lld at=%.3f field=%llu\n", static_cast<long long>(refresh),
@@ -5100,6 +5210,11 @@ void PS2Runtime::run()
             setPictureReadSubmitted({});
             ps2x_dev::s_inBetween.dropWindowPicture = nullptr;
             window.attachTimedPictures(nullptr);
+        }
+        if (realDisplay)
+        {
+            window.askShownReports(false);
+            dc::withdraw();
         }
     }
 #endif
