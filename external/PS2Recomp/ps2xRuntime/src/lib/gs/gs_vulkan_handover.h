@@ -44,6 +44,7 @@ struct HandedPicture
     uint32_t displayWidth = 0, displayHeight = 0; // the PS2 display's size it stands for (PresentationFrame's)
     uint32_t displayFbp = 0, sourceFbp = 0;
     uint64_t field = 0;      // the PS2 field it was scanned out for
+    uint64_t order = 0;      // ps2x::gs::nextPictureOrder() at the scan-out: which of two pictures is the newer
     uint64_t tag = 0;        // an in-between picture's tag, 0 for a field's picture
     int8_t fieldTarget = -1; // the field the picture was drawn for, -1 if not known
 

@@ -111,6 +111,7 @@ void consumeSlot(Vulkan::Device &device, VulkanGsScanoutState &state, VulkanGsSc
     read.displayFbp = slot.displayFbp;
     read.sourceFbp = slot.sourceFbp;
     read.vsyncTick = slot.vsyncTick;
+    read.order = slot.order;
     read.tag = slot.tag;
     read.displayWidth = slot.displayWidth;
     read.displayHeight = slot.displayHeight;
@@ -329,6 +330,8 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     // place for (the presenter holds every place): it is not lost.
     VulkanGsHandover *const handover = state.handover && state.handover->started() ? state.handover.get() : nullptr;
     const bool whole = output.high_resolution_scanout || (!frameFields && !fieldMode);
+    // Part 5: this picture's place among all finished pictures, whether it is handed over, read back or both.
+    const uint64_t pictureOrder = ps2x::gs::nextPictureOrder();
     struct HandoverTarget
     {
         VulkanGsHandover *owner = nullptr;
@@ -369,6 +372,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
         picture.displayFbp = displayFbp;
         picture.sourceFbp = displayFbp;
         picture.field = request.vsyncTick;
+        picture.order = pictureOrder;
         picture.tag = request.pictureTag;
         picture.fieldTarget = request.fieldTarget;
         handover->finish(handed.target, std::move(picture), alsoRead);
@@ -462,6 +466,7 @@ void presentVulkanGs(ParallelGS::GSInterface &gs, Vulkan::Device &device,
     curSlot.displayFbp = displayFbp;
     curSlot.sourceFbp = curSlot.displayFbp;
     curSlot.vsyncTick = request.vsyncTick;
+    curSlot.order = pictureOrder;
     curSlot.tag = request.pictureTag;
     curSlot.highResolution = output.high_resolution_scanout;
     curSlot.displayWidth = displayWidth;
@@ -595,6 +600,7 @@ bool finishVulkanGsPresentInto(Vulkan::Device &device, VulkanGsScanoutState &sta
         frame.displayWidth = read.displayWidth;
         frame.displayHeight = read.displayHeight;
         frame.field = read.vsyncTick;
+        frame.order = read.order;
         // Rows are contiguous (stride = width): one pass copies every RGBA pixel and forces alpha (the top byte
         // of the little-endian word) opaque. Every byte is overwritten, so a same-size buffer is not cleared first.
         const size_t pixelCount = static_cast<size_t>(read.w) * read.h;

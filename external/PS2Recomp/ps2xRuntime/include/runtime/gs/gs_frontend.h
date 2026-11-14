@@ -183,6 +183,9 @@ public:
     // The field the latched picture was read for. With GS-side field reads it is behind the field the window
     // announced whenever that field's read had not finished in time (issue 049).
     uint64_t hostPresentationField() const;
+    // The latched picture's place among all finished pictures (ps2x::gs::nextPictureOrder; issue 049 part 5): a
+    // window that also gets pictures on the graphics card shows whichever was finished last.
+    uint64_t hostPresentationOrder() const;
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
@@ -313,6 +316,7 @@ private:
     bool m_hasHostPresentationFrame = false;
     uint64_t m_hostPresentationGeneration = 0;
     uint64_t m_hostPresentationField = 0;
+    uint64_t m_hostPresentationOrder = 0;
     // Issue 023: field scanouts run on the GS side (false: the window reads at host time, e.g. the CPU renderer).
     std::atomic<bool> m_fieldScanouts{false};
     std::atomic<bool> m_pictureReads{false}; // issue 049: an in-between picture has been read out

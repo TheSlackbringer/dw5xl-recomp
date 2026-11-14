@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -294,6 +295,18 @@ struct GSPresentationRequest
     uint64_t pictureTag = 0;
 };
 
+// DW5XL (issue 049, amendment v3.12 step 3 part 5): one running number for every finished picture, whichever way
+// it leaves the renderer (read back into main memory, or handed over on the graphics card). Of two pictures the
+// one with the larger number was finished later. Field numbers cannot say that: a loaded state sets them back.
+namespace ps2x::gs
+{
+    inline uint64_t nextPictureOrder()
+    {
+        static std::atomic<uint64_t> s_last{0u};
+        return s_last.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    }
+} // namespace ps2x::gs
+
 struct PresentationFrame
 {
     std::vector<uint8_t> pixels;
@@ -311,6 +324,8 @@ struct PresentationFrame
     // The field this picture was read for (issue 049: when the GS is behind, the window still shows an earlier
     // field's picture under the field it announced).
     uint64_t field = 0;
+    // ps2x::gs::nextPictureOrder() when the picture was finished; 0: not numbered yet (the GS front end numbers it).
+    uint64_t order = 0;
 
     explicit operator bool() const
     {

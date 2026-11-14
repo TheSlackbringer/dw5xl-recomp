@@ -43,6 +43,7 @@ struct VulkanGsScanoutState
         uint32_t displayFbp = 0;
         uint32_t sourceFbp = 0;
         uint64_t vsyncTick = 0;
+        uint64_t order = 0; // issue 049: ps2x::gs::nextPictureOrder() at the scan-out
         uint64_t tag = 0; // issue 049: a picture read's tag, 0 for a field's read
         uint32_t displayWidth = 0;
         uint32_t displayHeight = 0;
@@ -66,6 +67,7 @@ struct VulkanGsScanoutState
         uint32_t displayFbp = 0;
         uint32_t sourceFbp = 0;
         uint64_t vsyncTick = 0;
+        uint64_t order = 0; // issue 049: ps2x::gs::nextPictureOrder() at the scan-out
         uint64_t tag = 0; // issue 049: a picture read's tag, 0 for a field's read
         uint32_t displayWidth = 0;
         uint32_t displayHeight = 0;

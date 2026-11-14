@@ -269,6 +269,7 @@ void GS::reset()
         m_hasHostPresentationFrame = false;
         m_hostPresentationGeneration = 0u;
         m_hostPresentationField = 0u;
+        m_hostPresentationOrder = 0u;
     }
 
     m_debugHistoryWrite = 0;
@@ -993,6 +994,7 @@ void GS::latchHostPresentationFrame(uint64_t waitForField, uint64_t maxField)
     }
 
     bool updated = false;
+    m_latchedFrame.order = 0u; // a renderer that numbers its pictures sets it; any other picture is numbered below
     if (m_fieldScanouts.load(std::memory_order_acquire) && !m_presentAfterLoad.exchange(false, std::memory_order_acq_rel))
     {
         // Issue 023: the fields are read on the GS side at the end of each field; the window only collects them.
@@ -1032,6 +1034,8 @@ void GS::latchHostPresentationFrame(uint64_t waitForField, uint64_t maxField)
 
     if (!updated)
         return;
+    if (m_latchedFrame.order == 0u)
+        m_latchedFrame.order = ps2x::gs::nextPictureOrder(); // read at window time: finished now
 
     const bool hasFrame = static_cast<bool>(m_latchedFrame);
     const uint32_t displayFbp = m_latchedFrame.displayFbp;
@@ -1052,6 +1056,7 @@ void GS::latchHostPresentationFrame(uint64_t waitForField, uint64_t maxField)
         m_hostPresentationUsedPreferred = usedPreferred;
         m_hasHostPresentationFrame = hasFrame;
         m_hostPresentationField = m_latchedFrame.field;
+        m_hostPresentationOrder = m_latchedFrame.order;
         ++m_hostPresentationGeneration;
     }
 
@@ -1072,6 +1077,12 @@ uint64_t GS::hostPresentationField() const
 {
     std::lock_guard<std::mutex> lock(m_presentationMutex);
     return m_hostPresentationField;
+}
+
+uint64_t GS::hostPresentationOrder() const
+{
+    std::lock_guard<std::mutex> lock(m_presentationMutex);
+    return m_hostPresentationOrder;
 }
 
 bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,

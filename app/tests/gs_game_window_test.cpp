@@ -1,4 +1,4 @@
-// DW5XL-TEST issue 049 (amendment v3.12 step 3 part 4): the game's window drawn by the renderer itself
+// DW5XL-TEST issue 049 (amendment v3.12 step 3 parts 4 and 5): the game's window drawn by the renderer itself
 // (runtime/gs/gs_game_window.h). The window is made hidden: nothing appears on the screen. No game data.
 // At render scale 1 and 4, with two drawings A and B read back the old way as the yardstick:
 //   The drawing alone (VulkanPictureDrawer, into a picture of a device object of the test's own):
@@ -19,6 +19,15 @@
 //  12. the output's scale changes: the window shows the picture at its new size;
 //  13. the renderer goes first: the window still presents the picture it holds; then the window goes.
 //  14. the window goes first while it holds a picture: the renderer reads pictures back again.
+//   Part 5 (between 12 and 13, and 20 before everything):
+//  15. the shown picture's pixels, asked for, are the read picture pixel for pixel, and asking makes no read-back;
+//  16. a picture from main memory, finished last, is shown, letterboxed, and its pixels come back as given;
+//  17. a field finished after it is shown instead;
+//  18. a picture from main memory that arrives late, finished before the shown one, is not shown;
+//  19. a field and a picture from main memory in one turn: the one finished later is shown, both ways round
+//      (the one from main memory with half the rows and rows further apart than their pixels);
+//  20. a window without a Vulkan renderer: a device of its own, pictures from main memory only.
+//   The renderer numbers its pictures in the order it finished them, read back or handed over.
 // Exit code 77: no Vulkan device, or no Vulkan windows on this system (skipped).
 #include "runtime/gs/gs_game_window.h"
 #include "runtime/gs/gs_vulkan_backend.h"
@@ -122,6 +131,48 @@ Picture asPicture(const PresentationFrame &frame)
     p.height = frame.height;
     p.rgba = frame.pixels;
     return p;
+}
+
+// A picture of the test's own: every pixel another colour, its alpha not opaque (a window draws it opaque).
+Picture patterned(uint32_t width, uint32_t height)
+{
+    Picture p;
+    p.width = width;
+    p.height = height;
+    p.rgba.resize(static_cast<size_t>(width) * height * 4u);
+    for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            uint8_t *o = &p.rgba[(static_cast<size_t>(y) * width + x) * 4u];
+            o[0] = static_cast<uint8_t>(x * 7u + y * 3u);
+            o[1] = static_cast<uint8_t>((x ^ y) * 5u + 11u);
+            o[2] = static_cast<uint8_t>(y * 13u + (x >> 2));
+            o[3] = 0x12u;
+        }
+    return p;
+}
+
+ps2x::gs::GameWindowPixels asPixels(const Picture &picture, uint32_t displayWidth, uint32_t displayHeight, uint64_t field, uint64_t order)
+{
+    ps2x::gs::GameWindowPixels pixels;
+    pixels.rgba = picture.rgba.data();
+    pixels.width = picture.width;
+    pixels.height = picture.height;
+    pixels.displayWidth = displayWidth;
+    pixels.displayHeight = displayHeight;
+    pixels.field = field;
+    pixels.order = order;
+    return pixels;
+}
+
+bool opaque(const Picture &picture)
+{
+    if (picture.rgba.empty())
+        return false;
+    for (size_t i = 3u; i < picture.rgba.size(); i += 4u)
+        if (picture.rgba[i] != 0xFFu)
+            return false;
+    return true;
 }
 
 // A device object of the test's own on the renderer's context, to draw with the drawer alone.
@@ -249,6 +300,7 @@ int run(uint32_t wantedScale)
           "the yardstick: A and B are read back, differ, and are whole pictures", scale);
     if (!readA || !readB)
         return 1;
+    check(readA.order != 0u && readB.order > readA.order, "the read pictures are numbered in the order they were finished", scale);
     const Picture a = asPicture(readA), b = asPicture(readB);
     const uint32_t displayWidth = readA.displayWidth ? readA.displayWidth : readA.width;
     const uint32_t displayHeight = readA.displayHeight ? readA.displayHeight : readA.height;
@@ -261,6 +313,7 @@ int run(uint32_t wantedScale)
         check(backend->SubmitFieldScanout(request(++tick)), "a field of A is scanned out", scale);
         HandedPicture held = fields.takeNewest();
         check(static_cast<bool>(held) && held.width == a.width && held.height == a.height, "A's picture is handed over", scale);
+        check(held.order > readB.order, "and numbered after the pictures read before it", scale);
         if (held)
         {
             const uint32_t w = a.width, h = a.height;
@@ -336,6 +389,8 @@ int run(uint32_t wantedScale)
         for (size_t i = 0; i + 4u <= p.rgba.size(); i += 4u)
             black = black && p.rgba[i] == 0u && p.rgba[i + 1u] == 0u && p.rgba[i + 2u] == 0u;
         check(black && p.width == winW && p.height == winH, "and what it draws is black", scale);
+        Picture none;
+        check(!window->shownPixels(none.rgba, none.width, none.height), "it has no picture's pixels to give", scale);
         check(window->counts().swapChains == 1u, "one swap chain was made", scale);
     }
 
@@ -437,6 +492,108 @@ int run(uint32_t wantedScale)
         check(back.presented && back.newPicture && back.width == a.width, "which the window shows", scale);
     }
 
+    // --- Part 5: the shown picture's pixels on request, pictures from main memory, and which picture is the newer.
+    {
+        uint32_t w = 0u, h = 0u;
+        window->drawableSize(w, h);
+        const ps2x::PictureRect now = ps2x::pictureRectInWindow(displayWidth, displayHeight, look.shape, static_cast<float>(w), static_cast<float>(h));
+        const int allowed = smooth ? 1 : 0;
+
+        // 15. The pixels of a picture on the graphics card (the window shows B, step 12's last field).
+        {
+            Picture got;
+            const bool have = window->shownPixels(got.rgba, got.width, got.height);
+            check(have && got.width == b.width && got.height == b.height && sameColours(got.rgba, b.rgba),
+                  "the shown picture's pixels, asked for: the read picture pixel for pixel", scale);
+            check(have && opaque(got), "and opaque", scale);
+            check(!readArrives(*backend, tick), "asking did not make the renderer read a picture back", scale);
+            const ps2x::gs::GameWindowShown shown = window->show(tick, look);
+            check(shown.presented && shown.have && !shown.newPicture, "the window still shows that picture afterwards", scale);
+            check(largestDifference(windowPicture(*window, look), expected(b, w, h, now, smooth)) <= allowed, "which is still B", scale);
+        }
+
+        // 16. A picture from main memory, finished after everything so far.
+        const Picture m = patterned(displayWidth, displayHeight);
+        ps2x::gs::GameWindowPixels given = asPixels(m, displayWidth, displayHeight, tick, ps2x::gs::nextPictureOrder());
+        {
+            const ps2x::gs::GameWindowCounts before = window->counts();
+            window->memoryPicture(given);
+            ps2x::gs::GameWindowShown shown = window->show(tick, look);
+            check(shown.presented && shown.have && shown.newPicture && shown.fromMemory && shown.order == given.order && shown.field == tick,
+                  "a picture from main memory, finished last: the window shows it as a new picture", scale);
+            check(shown.width == m.width && shown.height == m.height && shown.displayWidth == displayWidth && shown.displayHeight == displayHeight &&
+                      shown.x == now.x && shown.rectWidth == now.width,
+                  "with its sizes, in the picture's place", scale);
+            const int difference = largestDifference(windowPicture(*window, look), expected(m, w, h, now, smooth));
+            std::printf("note  scale %ux: the window's picture of the one from main memory, largest difference: %d of 255\n", scale, difference);
+            check(difference <= allowed, "what the window draws is that picture, letterboxed", scale);
+            const ps2x::gs::GameWindowCounts after = window->counts();
+            check(after.fromMemory == before.fromMemory + 1u && after.newPictures == before.newPictures + 1u, "counted as one new picture from main memory", scale);
+            Picture got;
+            check(window->shownPixels(got.rgba, got.width, got.height) && got.width == m.width && got.height == m.height && sameColours(got.rgba, m.rgba) && opaque(got),
+                  "its pixels, asked for, are the ones given, opaque", scale);
+            shown = window->show(tick, look);
+            check(shown.presented && shown.have && !shown.newPicture && shown.fromMemory, "shown again without anything new: presented, not new", scale);
+        }
+
+        // 17. A field finished after it.
+        {
+            drawA(*backend);
+            check(backend->SubmitFieldScanout(request(++tick)), "a field of A is scanned out", scale);
+            const ps2x::gs::GameWindowShown shown = window->show(tick, look);
+            check(shown.newPicture && !shown.fromMemory && shown.field == tick && shown.order > given.order,
+                  "a field finished after the picture from main memory: the window shows the field's picture", scale);
+            check(largestDifference(windowPicture(*window, look), expected(a, w, h, now, smooth)) <= allowed, "which is A", scale);
+        }
+
+        // 18. A picture from main memory that arrives late: finished before the picture the window shows.
+        {
+            const uint64_t early = ps2x::gs::nextPictureOrder();
+            drawB(*backend);
+            check(backend->SubmitFieldScanout(request(++tick)), "a field of B is scanned out", scale);
+            ps2x::gs::GameWindowShown shown = window->show(tick, look);
+            check(shown.newPicture && !shown.fromMemory && shown.order > early, "and shown", scale);
+            const ps2x::gs::GameWindowCounts before = window->counts();
+            window->memoryPicture(asPixels(m, displayWidth, displayHeight, tick - 1u, early));
+            shown = window->show(tick, look);
+            check(shown.presented && !shown.newPicture && !shown.fromMemory && shown.field == tick,
+                  "a picture from main memory finished before the shown one arrives late: not shown", scale);
+            check(window->counts().olderNotShown == before.olderNotShown + 1u && window->counts().newPictures == before.newPictures, "and counted as not shown", scale);
+            check(largestDifference(windowPicture(*window, look), expected(b, w, h, now, smooth)) <= allowed, "the window still draws B", scale);
+        }
+
+        // 19. A field and a picture from main memory in one turn: the one finished later is shown.
+        {
+            // Half the rows for the same display (two fields would fill it), and rows further apart than their pixels.
+            const Picture half = patterned(displayWidth, displayHeight / 2u);
+            const size_t stride = static_cast<size_t>(half.width) * 4u + 24u;
+            std::vector<uint8_t> apart(stride * half.height, 0xEEu);
+            for (uint32_t y = 0; y < half.height; ++y)
+                std::memcpy(apart.data() + stride * y, half.rgba.data() + static_cast<size_t>(y) * half.width * 4u, static_cast<size_t>(half.width) * 4u);
+            drawA(*backend);
+            check(backend->SubmitFieldScanout(request(++tick)), "a field of A is scanned out", scale);
+            ps2x::gs::GameWindowPixels later = asPixels(half, displayWidth, displayHeight, tick, ps2x::gs::nextPictureOrder());
+            later.rgba = apart.data();
+            later.strideBytes = stride;
+            window->memoryPicture(later);
+            ps2x::gs::GameWindowShown shown = window->show(tick, look);
+            check(shown.newPicture && shown.fromMemory && shown.order == later.order && shown.height == half.height && shown.displayHeight == displayHeight,
+                  "a field and then a picture from main memory in one turn: the one from main memory is shown", scale);
+            const int difference = largestDifference(windowPicture(*window, look), expected(half, w, h, now, smooth));
+            std::printf("note  scale %ux: half the rows drawn to the display's shape, largest difference: %d of 255\n", scale, difference);
+            check(difference <= allowed, "drawn to the display's shape from half the rows, its rows taken by their stride", scale);
+
+            const ps2x::gs::GameWindowPixels earlier = asPixels(m, displayWidth, displayHeight, tick + 1u, ps2x::gs::nextPictureOrder());
+            drawB(*backend);
+            check(backend->SubmitFieldScanout(request(++tick)), "a field of B is scanned out", scale);
+            window->memoryPicture(earlier);
+            shown = window->show(tick, look);
+            check(shown.newPicture && !shown.fromMemory && shown.field == tick && shown.order > earlier.order,
+                  "a picture from main memory and then a field in one turn: the field's picture is shown", scale);
+            check(largestDifference(windowPicture(*window, look), expected(b, w, h, now, smooth)) <= allowed, "which is B", scale);
+        }
+    }
+
     // 13. The renderer goes first.
     {
         uint32_t w = 0u, h = 0u;
@@ -481,13 +638,62 @@ void windowGoesFirst()
     const PresentationFrame read = readBack(*backend, ++tick);
     check(static_cast<bool>(read), "and the renderer reads pictures back again", scale);
 }
+
+// 20. A window without a Vulkan renderer (the CPU renderer's case): a Vulkan device of its own, pictures from main
+// memory only. Called before any renderer exists, so the window starts Vulkan itself. False: no window (the reason
+// in `why`), nothing checked.
+bool windowWithoutRenderer(std::string &why)
+{
+    const uint32_t scale = 1u;
+    ps2x::gs::GameWindowOptions options;
+    options.width = 640;
+    options.height = 480;
+    options.hidden = true;
+    options.vsync = false;
+    options.title = "DW5XL test window (hidden)";
+    std::unique_ptr<ps2x::gs::GameWindow> window = ps2x::gs::GameWindow::open(nullptr, options, why);
+    if (!window)
+        return false;
+    ps2x::gs::GameWindowLook look;
+    uint32_t w = 0u, h = 0u;
+    window->drawableSize(w, h);
+    window->poll();
+    ps2x::gs::GameWindowShown shown = window->show(1u, look);
+    Picture got;
+    check(shown.presented && !shown.have && !window->shownPixels(got.rgba, got.width, got.height),
+          "without a renderer: the window presents, and has no picture to give", scale);
+
+    const Picture m = patterned(640u, 448u);
+    window->memoryPicture(asPixels(m, 640u, 448u, 2u, ps2x::gs::nextPictureOrder()));
+    shown = window->show(2u, look);
+    const ps2x::PictureRect rect = ps2x::pictureRectInWindow(640u, 448u, look.shape, static_cast<float>(w), static_cast<float>(h));
+    check(shown.presented && shown.newPicture && shown.fromMemory && shown.field == 2u, "a picture from main memory is shown", scale);
+    check(largestDifference(windowPicture(*window, look), expected(m, w, h, rect, false)) == 0, "letterboxed, pixel for pixel", scale);
+    check(window->shownPixels(got.rgba, got.width, got.height) && got.width == m.width && got.height == m.height && sameColours(got.rgba, m.rgba),
+          "and its pixels are the ones given", scale);
+
+    // Another size for the same display: the window makes a new image for it.
+    const Picture small = patterned(320u, 224u);
+    window->memoryPicture(asPixels(small, 640u, 448u, 3u, ps2x::gs::nextPictureOrder()));
+    shown = window->show(3u, look);
+    check(shown.newPicture && shown.width == 320u && shown.displayWidth == 640u, "a picture of another size for the same display is shown", scale);
+    check(largestDifference(windowPicture(*window, look), expected(small, w, h, rect, false)) == 0, "in the same place, every pixel four times", scale);
+    for (int i = 0; i < 8; ++i) // more turns than the device has frame contexts: the pictures stay whole
+        shown = window->show(3u, look);
+    check(shown.presented && !shown.newPicture && largestDifference(windowPicture(*window, look), expected(small, w, h, rect, false)) == 0,
+          "and still after more turns", scale);
+    return true;
+}
 } // namespace
 
 int DW5XL_TEST_MAIN(gs_game_window)()
 {
+    std::string aloneWhy;
+    const bool alone = windowWithoutRenderer(aloneWhy);
     const int first = run(1u);
     if (first != 1)
         return 77;
+    check(alone, "a window opens without a Vulkan renderer, on a device of its own" + (alone ? std::string() : " (" + aloneWhy + ")"), 1u);
     run(4u);
     windowGoesFirst();
     std::printf(g_failures ? "FAILED: %d check(s)\n" : "PASSED\n", g_failures);

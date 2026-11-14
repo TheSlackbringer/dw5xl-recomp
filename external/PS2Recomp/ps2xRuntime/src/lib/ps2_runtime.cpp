@@ -27,6 +27,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <fstream>
+#include <functional>
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -479,6 +480,15 @@ namespace ps2x_dev
     static uint32_t s_lastFrameW = 0u;
     static uint32_t s_lastFrameH = 0u;
     static uint32_t s_lastFrameRows = 1u; // rows in s_lastFrame (FB_HEIGHT)
+    // DW5XL (issue 049, amendment v3.12 step 3 part 5): the renderer's own window keeps the game's picture on the
+    // graphics card. Whatever needs the shown picture in s_lastFrame (a frame dump, a saved state's picture) calls
+    // this first; that window's loop sets it. Empty with today's window, which copies every shown picture there.
+    static std::function<void()> s_fetchShownPicture;
+    static void fetchShownPicture()
+    {
+        if (s_fetchShownPicture)
+            s_fetchShownPicture();
+    }
 
     static uint32_t buttonMask(const std::string &nameIn)
     {
@@ -553,6 +563,7 @@ namespace ps2x_dev
 
     static bool writePng(const std::string &path)
     {
+        fetchShownPicture();
         if (s_lastFrame.empty() || s_lastFrameW == 0u || s_lastFrameH == 0u)
             return false;
         // s_lastFrame rows are FB_WIDTH (640) pixels apart
@@ -2133,6 +2144,8 @@ std::filesystem::path PS2Runtime::stateDirectory()
 void PS2Runtime::requestStateWithPicture(bool save, const std::string &path, const std::string &backup)
 {
     const std::string &target = save ? path : backup;
+    if (!target.empty())
+        ps2x_dev::fetchShownPicture(); // issue 049: the renderer's own window reads the shown picture from the card
     const uint32_t w = ps2x_dev::s_lastFrameW, h = ps2x_dev::s_lastFrameH;
     if (!target.empty() && w != 0u && h != 0u && !ps2x_dev::s_lastFrame.empty())
     {
@@ -2426,9 +2439,11 @@ bool PS2Runtime::syncCoreSubsystems()
 
 // DW5XL-DEBUG (issue 049, amendment v3.12 step 3 part 4) PS2X_WINDOW=vulkan: the game is shown by the window the
 // renderer draws itself (runtime/gs/gs_game_window.h) instead of today's raylib window. Behind this switch until
-// it has passed the owner's look (step 6). So far it shows the game's pictures that are finished on the graphics
-// card. Not yet: pictures that only exist in main memory, frame dumps and the pictures of saved states (part 5),
-// the overlays and pages (step 4), the in-between pictures (step 5), SHARPEN, fullscreen.
+// it has passed the owner's look (step 6). It shows the game's pictures: those finished on the graphics card
+// straight from there, those that only exist in main memory uploaded (part 5); frame dumps and the pictures of
+// saved states read the shown picture when they need it. With a renderer that does not draw with Vulkan (the CPU
+// renderer) the window makes a Vulkan device of its own. Not yet: the overlays and pages (step 4), the in-between
+// pictures shown (step 5), SHARPEN, fullscreen.
 // True: that window is open, and its keys, mouse and pads are the ones the game reads.
 static bool openRendererWindow(const std::shared_ptr<GSVulkanPresenterLink> &link, const char *title)
 {
@@ -2444,16 +2459,16 @@ static bool openRendererWindow(const std::shared_ptr<GSVulkanPresenterLink> &lin
     options.title = title ? title : "";
     options.hidden = hidden && *hidden && *hidden != '0';
     options.vsync = loadVsyncSetting(vsyncSource);
-    std::string why = "the renderer cannot present (it is not the Vulkan renderer)";
-    if (link)
-        s_gameWindow = ps2x::gs::GameWindow::open(link, options, why);
+    std::string why;
+    s_gameWindow = ps2x::gs::GameWindow::open(link, options, why);
     if (!s_gameWindow)
     {
         std::fprintf(stderr, "[window] PS2X_WINDOW=vulkan: %s; today's window is used\n", why.c_str());
         return false;
     }
     ps2x::host::setDevices(&s_gameWindow->devices());
-    std::fprintf(stderr, "[window] the renderer's own window (PS2X_WINDOW=vulkan)%s\n", options.hidden ? ", hidden" : "");
+    std::fprintf(stderr, "[window] the renderer's own window (PS2X_WINDOW=vulkan)%s%s\n", options.hidden ? ", hidden" : "",
+                 link ? "" : ", on a graphics device of its own (the renderer does not draw with Vulkan)");
     return true;
 #else
     (void)link;
@@ -4591,10 +4606,29 @@ void PS2Runtime::run()
             std::fprintf(stderr, "[window] the renderer's own window shows the game's fields only so far (in-between pictures: step 5)\n");
         static const bool s_stats = [] { const char *v = std::getenv("PS2X_PRESENT_STATS"); return v && *v && *v != '0'; }();
         auto lastTurn = std::chrono::steady_clock::now(), statsSince = lastTurn;
-        uint64_t statFrames = 0u, statNew = 0u, statFailed = 0u, statSlow = 0u, statReadBack = 0u;
+        uint64_t statFrames = 0u, statNew = 0u, statFailed = 0u, statSlow = 0u, statFromMemory = 0u, statFetched = 0u;
         uint64_t lastReadGeneration = gs().hostPresentationGeneration();
         double statMaxMs = 0.0;
         bool sharpenSaid = false;
+        bool latchedOnce = false;
+        // Which picture s_lastFrame holds and which one the window shows, by their place among all finished
+        // pictures (ps2x::gs::nextPictureOrder). A picture from main memory is in s_lastFrame from its arrival; one
+        // on the graphics card is read into it when something asks (ps2x_dev::fetchShownPicture).
+        uint64_t lastFrameOrder = 0u, shownOrder = 0u;
+        bool shownHave = false;
+        ps2x_dev::s_fetchShownPicture = [&window, &lastFrameOrder, &shownOrder, &shownHave, &statFetched]
+        {
+            if (!shownHave || lastFrameOrder == shownOrder)
+                return;
+            uint32_t width = 0u, height = 0u;
+            if (!window.shownPixels(ps2x_dev::s_lastFrame, width, height))
+                return;
+            ps2x_dev::s_lastFrameW = width;
+            ps2x_dev::s_lastFrameH = height;
+            ps2x_dev::s_lastFrameRows = height;
+            lastFrameOrder = shownOrder;
+            ++statFetched;
+        };
         while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
         {
             // Issue 027: a state load sets the field number back; the loaded game's fields are new to the window.
@@ -4610,12 +4644,43 @@ void PS2Runtime::run()
             devHarness.step(m_eeScheduler->currentVSyncTick());
             window.poll();
             ps2_host_input::poll(m_eeScheduler->currentVSyncTick());
-            if (paced.fresh)
+            // As today's window (UploadFrame): a fresh field is waited for until the GS side has finished it, and
+            // what the GS side read back is collected in every turn, so that a read finished between two fields
+            // does not wait for the next field. A renderer read at window time is read once per fresh field.
+            if (paced.fresh || !latchedOnce || gs().fieldScanoutsActive())
             {
-                // As today's window: wait until the GS side has finished this field, and collect what it read back
-                // (a picture that only exists in main memory; such pictures are shown from part 5 on).
-                gs().latchHostPresentationFrame(paced.field, paced.field);
+                gs().latchHostPresentationFrame(paced.fresh ? paced.field : std::numeric_limits<uint64_t>::max(), paced.field);
+                latchedOnce = true;
+            }
+            if (paced.fresh)
                 s_windowFrameField = paced.field;
+            // Issue 049 v3.2 (P2.3b): in-between pictures read out on the GS side are collected as with today's
+            // window (kept, counted, saved with a dumped field). This window shows them from step 5 on.
+            if (pictureGs().pictureReadsActive())
+                ps2x_dev::s_inBetween.collect(this, s_windowFrameField);
+            // A picture that only exists in main memory (two fields put together by the CPU at 1x, the CPU
+            // renderer): into s_lastFrame as today's window keeps it, and to the window, which uploads it.
+            if (const uint64_t generation = gs().hostPresentationGeneration(); generation != lastReadGeneration)
+            {
+                lastReadGeneration = generation;
+                uint32_t width = 0u, height = 0u, memoryDisplayWidth = 0u, memoryDisplayHeight = 0u;
+                if (gs().copyLatchedHostPresentationFrame(ps2x_dev::s_lastFrame, width, height, nullptr, nullptr, nullptr,
+                                                          &memoryDisplayWidth, &memoryDisplayHeight))
+                {
+                    ps2x_dev::s_lastFrameW = width;
+                    ps2x_dev::s_lastFrameH = height;
+                    ps2x_dev::s_lastFrameRows = height;
+                    lastFrameOrder = gs().hostPresentationOrder();
+                    ps2x::gs::GameWindowPixels pixels;
+                    pixels.rgba = ps2x_dev::s_lastFrame.data();
+                    pixels.width = width;
+                    pixels.height = height;
+                    pixels.displayWidth = memoryDisplayWidth;
+                    pixels.displayHeight = memoryDisplayHeight;
+                    pixels.field = gs().hostPresentationField();
+                    pixels.order = lastFrameOrder;
+                    window.memoryPicture(pixels);
+                }
             }
             ps2x::gs::GameWindowLook look;
             look.shape = s_pictureShape.load(std::memory_order_relaxed);
@@ -4626,7 +4691,18 @@ void PS2Runtime::run()
                 std::fprintf(stderr, "[window] SHARPEN is not drawn by the renderer's own window yet\n");
             }
             const ps2x::gs::GameWindowShown shown = window.show(paced.field, look);
+            shownHave = shown.have;
+            shownOrder = shown.order;
             s_windowFrameNewPicture = shown.newPicture;
+            // Issue 049: a frame dump holds the picture this window frame shows, named by the field it shows, as
+            // with today's window. The picture is read from the graphics card for it (fetchShownPicture).
+            const bool fieldDumped = devHarness.dumpPresented(s_windowFrameField);
+            if (pictureGs().pictureReadsActive())
+            {
+                if (fieldDumped)
+                    ps2x_dev::s_inBetween.dump(s_windowFrameField, shown.have ? shown.field : std::numeric_limits<uint64_t>::max());
+                ps2x_dev::s_inBetween.retire(s_windowFrameField);
+            }
             if (shown.have)
             {
                 m_pictureRect[0] = shown.x; m_pictureRect[1] = shown.y;
@@ -4645,7 +4721,7 @@ void PS2Runtime::run()
             hudNumbers(static_cast<float>(turnMs), eeScheduler().currentVSyncTick());
             // DW5XL-DEBUG issue 023 3S: PS2X_WINDOW_SHOT=<field>:<path.png>, as today's window has it: what the window
             // shows on the first frame at or after that field, drawn once more into a picture of the window's size
-            // and saved (the frame dumps hold only the game picture; this window has none before part 5).
+            // and saved (the frame dumps hold only the game picture, at its own size).
             {
                 static uint64_t s_shotTick = 0; static std::string s_shotPath; static bool s_shotInit = false;
                 if (!s_shotInit) {
@@ -4669,8 +4745,9 @@ void PS2Runtime::run()
                 }
             }
             // DW5XL-DEBUG PS2X_PRESENT_STATS=1: one line a second, as today's window has one ([present:stats]):
-            // window frames, the game's new pictures taken on the graphics card, pictures the renderer read back
-            // instead (not shown before part 5), reads copied into main memory, frames that could not be presented.
+            // window frames, the game's new pictures shown, of them the ones that came from main memory (uploaded),
+            // reads the renderer copied into main memory, shown pictures read from the graphics card on request
+            // (a frame dump, a saved state's picture), frames that could not be presented.
             if (s_stats)
             {
                 ++statFrames;
@@ -4678,20 +4755,17 @@ void PS2Runtime::run()
                 statFailed += shown.presented ? 0u : 1u;
                 statSlow += turnMs > 25.0 ? 1u : 0u;
                 statMaxMs = std::max(statMaxMs, turnMs);
-                if (const uint64_t generation = gs().hostPresentationGeneration(); generation != lastReadGeneration)
-                {
-                    lastReadGeneration = generation;
-                    ++statReadBack;
-                }
+                statFromMemory += shown.newPicture && shown.fromMemory ? 1u : 0u;
                 if (now - statsSince >= std::chrono::seconds(1))
                 {
-                    std::fprintf(stderr, "[present:own] tick=%llu frames=%llu newPictures=%llu readBack=%llu readsCopied=%llu notPresented=%llu slow=%llu maxMs=%.1f\n",
+                    std::fprintf(stderr, "[present:own] tick=%llu frames=%llu newPictures=%llu fromMemory=%llu readsCopied=%llu fetched=%llu notPresented=%llu slow=%llu maxMs=%.1f\n",
                                  static_cast<unsigned long long>(m_eeScheduler->currentVSyncTick()),
                                  static_cast<unsigned long long>(statFrames), static_cast<unsigned long long>(statNew),
-                                 static_cast<unsigned long long>(statReadBack),
+                                 static_cast<unsigned long long>(statFromMemory),
                                  static_cast<unsigned long long>(g_dw5xlReadsCopied.exchange(0u)),
+                                 static_cast<unsigned long long>(statFetched),
                                  static_cast<unsigned long long>(statFailed), static_cast<unsigned long long>(statSlow), statMaxMs);
-                    statFrames = statNew = statFailed = statSlow = statReadBack = 0u;
+                    statFrames = statNew = statFailed = statSlow = statFromMemory = statFetched = 0u;
                     statMaxMs = 0.0;
                     statsSince = now;
                 }
@@ -4703,6 +4777,7 @@ void PS2Runtime::run()
                 break;
             }
         }
+        ps2x_dev::s_fetchShownPicture = nullptr; // it refers to this block's variables
     }
 #endif
     while (!ownWindow && !isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
