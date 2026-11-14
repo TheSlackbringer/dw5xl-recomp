@@ -248,7 +248,8 @@ frames, new pictures, skipped fields per second; cheap) · `PS2X_FIELD_SCANOUT=0
 per 4x frame, never for timing) · `PS2X_VBL_DRAW_TRACE` (display-buffer draws per VBlank edge) · `PS2X_LATCH_TRACE` ·
 `PS2X_VSYNC=1` (swap-interval experiment) · `PS2X_SCREEN_ON_HIDDEN=1` (issue 067: a hidden window counts as shown
 for the rule that keeps the screen on while the game is played; `[display]` lines say when the screen is asked for
-and let go) · `PS2X_WINDOW=opengl` (issue 049: the old raylib/OpenGL window instead of the window the renderer
+and let go, the screen's state at the start and every switch of the screen the system tells the game of, with its
+field: the go plays a timed run again, once, when one fell inside what the run judges) · `PS2X_WINDOW=opengl` (issue 049: the old raylib/OpenGL window instead of the window the renderer
 draws itself, which is the default since 2026-11-14: a Vulkan swap chain without OpenGL that shows the game's
 pictures from the graphics card, the pages and overlays (ImGui by a renderer of ours), SHARPEN, and the CPU
 renderer's pictures; the old window stays until 049's step 7, and the 009, 023, 047 and 049 tests that read its

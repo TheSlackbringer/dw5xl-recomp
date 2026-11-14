@@ -1,7 +1,12 @@
 // DW5XL (issue 067): see runtime/ps2_screen_on.h. No window library in here: the system's own headers only.
 #include "runtime/ps2_screen_on.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <thread>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -128,6 +133,170 @@ namespace ps2x::screen_on
         };
 #endif
     } // namespace
+
+    // ---- Part 2: what the system says of the screen.
+    const char *said(Screen screen)
+    {
+        switch (screen)
+        {
+        case Screen::Off:
+            return "off";
+        case Screen::On:
+            return "on";
+        case Screen::Dim:
+            return "dim";
+        }
+        return "?";
+    }
+
+    std::string SwitchLog::report(Screen screen, uint64_t field)
+    {
+        if (!m_known)
+        {
+            m_known = true;
+            m_screen = screen;
+            return std::string("[display] the screen at the start: ") + said(screen);
+        }
+        if (screen == m_screen)
+            return std::string();
+        m_screen = screen;
+        ++m_switches;
+        return std::string("[display] the system switched the screen ") + said(screen) + " (field " + std::to_string(field) + ")";
+    }
+
+    namespace
+    {
+#ifdef _WIN32
+        // GUID_CONSOLE_DISPLAY_STATE: 0 the display is off, 1 on, 2 dimmed. Written out here so that no header
+        // order or library decides whether the name has a value.
+        const GUID kConsoleDisplayState = {0x6fe69556, 0x704a, 0x47a0, {0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47}};
+
+        // Windows sends power-setting changes to a window. The game's own windows belong to the window library,
+        // which does not hand such messages on; so the watch has a window of its own, never shown, with its own
+        // message loop on its own thread. Windows sends the state once at registration, then every change.
+        class DisplayWatch final : public Watch
+        {
+        public:
+            DisplayWatch()
+            {
+                m_thread = std::thread([this] { run(); });
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_ready.wait(lock, [this] { return m_started; }); // the window is there (or could not be made)
+            }
+            ~DisplayWatch() override
+            {
+                if (const HWND window = m_window.load(std::memory_order_acquire))
+                    PostMessageW(window, WM_CLOSE, 0, 0);
+                if (m_thread.joinable())
+                    m_thread.join();
+            }
+            void take(std::vector<Screen> &out) override
+            {
+                if (!m_pending.load(std::memory_order_acquire))
+                    return;
+                std::lock_guard<std::mutex> lock(m_mutex);
+                out.insert(out.end(), m_reports.begin(), m_reports.end());
+                m_reports.clear();
+                m_pending.store(false, std::memory_order_release);
+            }
+
+        private:
+            static LRESULT CALLBACK proc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+            {
+                auto *self = reinterpret_cast<DisplayWatch *>(GetWindowLongPtrW(window, GWLP_USERDATA));
+                if (message == WM_POWERBROADCAST)
+                {
+                    if (wParam == PBT_POWERSETTINGCHANGE && lParam && self)
+                    {
+                        const auto *setting = reinterpret_cast<const POWERBROADCAST_SETTING *>(lParam);
+                        if (std::memcmp(&setting->PowerSetting, &kConsoleDisplayState, sizeof(GUID)) == 0 &&
+                            setting->DataLength >= sizeof(DWORD))
+                        {
+                            DWORD value = 1u;
+                            std::memcpy(&value, setting->Data, sizeof(value));
+                            self->add(value == 0u ? Screen::Off : value == 2u ? Screen::Dim : Screen::On);
+                        }
+                    }
+                    return TRUE;
+                }
+                if (message == WM_CLOSE)
+                {
+                    if (self && self->m_notify)
+                    {
+                        UnregisterPowerSettingNotification(self->m_notify);
+                        self->m_notify = nullptr;
+                    }
+                    DestroyWindow(window);
+                    return 0;
+                }
+                if (message == WM_DESTROY)
+                {
+                    PostQuitMessage(0);
+                    return 0;
+                }
+                return DefWindowProcW(window, message, wParam, lParam);
+            }
+            void add(Screen screen)
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_reports.push_back(screen);
+                m_pending.store(true, std::memory_order_release);
+            }
+            void run()
+            {
+                const HINSTANCE instance = GetModuleHandleW(nullptr);
+                WNDCLASSEXW windowClass{};
+                windowClass.cbSize = sizeof(windowClass);
+                windowClass.lpfnWndProc = proc;
+                windowClass.hInstance = instance;
+                windowClass.lpszClassName = L"ps2x_screen_watch";
+                RegisterClassExW(&windowClass); // a second watch in the process finds the class there
+                const HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"", 0, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
+                if (window)
+                {
+                    SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+                    m_notify = RegisterPowerSettingNotification(window, &kConsoleDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_window.store(window, std::memory_order_release);
+                    m_started = true;
+                }
+                m_ready.notify_all();
+                if (!window)
+                    return;
+                MSG message;
+                while (GetMessageW(&message, nullptr, 0, 0) > 0)
+                    DispatchMessageW(&message);
+            }
+
+            std::thread m_thread;
+            std::mutex m_mutex;
+            std::condition_variable m_ready;
+            bool m_started = false;
+            std::atomic<HWND> m_window{nullptr};
+            HPOWERNOTIFY m_notify = nullptr; // the watch's thread only
+            std::vector<Screen> m_reports;
+            std::atomic<bool> m_pending{false};
+        };
+#else
+        // Issue 067's second step for Linux; nothing is reported until then.
+        class NoWatch final : public Watch
+        {
+        public:
+            void take(std::vector<Screen> &) override {}
+        };
+#endif
+    } // namespace
+
+    std::unique_ptr<Watch> makeWatch()
+    {
+#ifdef _WIN32
+        return std::make_unique<DisplayWatch>();
+#else
+        return std::make_unique<NoWatch>();
+#endif
+    }
 
     std::unique_ptr<System> makeSystem(const std::string &program)
     {

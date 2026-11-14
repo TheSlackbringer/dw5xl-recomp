@@ -4,12 +4,16 @@
 //  - the system is called once per change of the rule's answer, never once per turn of the window loop, and a
 //    refusal is not asked again until the answer changes;
 //  - Windows: while the request is held the system's own state reads "display required", and afterwards it reads
-//    what it read before the test. Read with CallNtPowerInformation, which needs no extra rights.
+//    what it read before the test. Read with CallNtPowerInformation, which needs no extra rights;
+//  - part 2: the log's words for the system's reports of the screen (the state at the start, then every switch
+//    with its field), and on Windows that the system does report when asked.
 #include "runtime/ps2_screen_on.h"
 
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -185,6 +189,50 @@ int main()
               "on this system the request is not built yet, and it says so (issue 067, step 2)");
     }
 #endif
+    {
+        // Part 2: the log's words for what the system says of the screen. The first report is the screen's state
+        // at the start, a later one that differs is a switch, with the field the game was at.
+        SwitchLog log;
+        const std::string start = log.report(Screen::On, 3u);
+        const std::string same = log.report(Screen::On, 50u);
+        const std::string dim = log.report(Screen::Dim, 4081u);
+        const std::string off = log.report(Screen::Off, 4300u);
+        const std::string offAgain = log.report(Screen::Off, 4301u);
+        const std::string on = log.report(Screen::On, 9000u);
+        check(start == "[display] the screen at the start: on", "the first report is the screen at the start: \"" + start + "\"");
+        check(same.empty() && offAgain.empty(), "the same state again says nothing");
+        check(dim == "[display] the system switched the screen dim (field 4081)" &&
+                  off == "[display] the system switched the screen off (field 4300)" &&
+                  on == "[display] the system switched the screen on (field 9000)",
+              "a switch is said with its state and the field: \"" + off + "\"");
+        check(log.switches() == 3u, "three switches counted, the start is none");
+        SwitchLog dark;
+        check(dark.report(Screen::Off, 0u) == "[display] the screen at the start: off" && dark.switches() == 0u,
+              "a game started with the screen off says so");
+    }
+    {
+        // The system's reports themselves. Every system has a watch; one that has nothing to report stays silent.
+        std::unique_ptr<Watch> watch = makeWatch();
+        std::vector<Screen> reports;
+        watch->take(reports);
+        check(watch != nullptr, "a watch for the system's word on the screen can be made");
+#ifdef _WIN32
+        // Windows tells the state once when it is asked to report changes.
+        for (int tries = 0; tries < 200 && reports.empty(); ++tries)
+        {
+            Sleep(10);
+            watch->take(reports);
+        }
+        check(!reports.empty(), "Windows reports the screen's state when the watch starts (within 2 s)");
+        if (!reports.empty())
+            std::printf("note  the screen is %s as this test runs\n", said(reports.front()));
+        std::vector<Screen> again;
+        watch->take(again);
+        check(again.empty(), "what was taken is not handed over twice");
+#endif
+        watch.reset(); // ends its thread; the test would hang here if it did not
+        check(true, "the watch ends when it is let go");
+    }
     std::printf("%s (%d failed)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

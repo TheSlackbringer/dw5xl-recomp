@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace ps2x::screen_on
 {
@@ -76,4 +77,45 @@ namespace ps2x::screen_on
         bool m_held = false;
         uint64_t m_calls = 0u;
     };
+
+    // ---- Part 2: what the system says of the screen.
+    // A switch of the screen, off or on, stalls a running game once (0.12 to 0.32 s measured on the Windows test
+    // PC, in a hidden window too). The game cannot prevent a switch from outside, but it can say when it was told
+    // of one, so that a timing run knows it was disturbed (the go, issue 065 amendment v4.3).
+    enum class Screen
+    {
+        Off,
+        On,
+        Dim,
+    };
+    const char *said(Screen screen);
+
+    // The log's words for the system's reports. The first report is the screen's state when the game started (a
+    // system tells it when it is asked to report changes); a later one that differs is a switch:
+    //   [display] the screen at the start: on
+    //   [display] the system switched the screen off (field 4081)
+    // The field is the one the game was at when it was told, not the field of the stall (which comes before).
+    class SwitchLog
+    {
+    public:
+        // The line for this report (without a line end), or "" when there is nothing to say.
+        std::string report(Screen screen, uint64_t field);
+        uint64_t switches() const { return m_switches; }
+
+    private:
+        bool m_known = false;
+        Screen m_screen = Screen::On;
+        uint64_t m_switches = 0u;
+    };
+
+    // The system's reports of the screen, collected on a thread of their own.
+    struct Watch
+    {
+        virtual ~Watch() = default;
+        // Hands over the reports since the last call, oldest first (appended to `out`). Cheap when there are none.
+        virtual void take(std::vector<Screen> &out) = 0;
+    };
+    // This system's reports; never null. Windows: the console display state (off, on, dim), asked for with a
+    // window of the watch's own, which a hidden game gets too. Other systems: nothing is reported yet.
+    std::unique_ptr<Watch> makeWatch();
 } // namespace ps2x::screen_on

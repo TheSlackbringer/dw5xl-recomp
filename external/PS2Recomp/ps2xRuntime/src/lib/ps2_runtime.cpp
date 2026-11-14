@@ -4702,7 +4702,13 @@ void PS2Runtime::run()
     static const bool s_screenOnHidden = [] { const char *v = std::getenv("PS2X_SCREEN_ON_HIDDEN"); return v && *v && *v != '0'; }();
     const std::unique_ptr<ps2x::screen_on::System> screenSystem = ps2x::screen_on::makeSystem(s_programTitle);
     ps2x::screen_on::Keeper screenOn(*screenSystem);
-    const auto keepScreenOn = [this, &screenOn](bool exiting)
+    // Part 2: a switch of the screen from outside stalls the game once, in a hidden window too. The game says in
+    // its log when the system told it of one, with the field it is at ("[display] the system switched the screen
+    // off (field N)"), so that a timing run knows it was disturbed (the go, issue 065 amendment v4.3).
+    const std::unique_ptr<ps2x::screen_on::Watch> screenWatch = ps2x::screen_on::makeWatch();
+    ps2x::screen_on::SwitchLog screenLog;
+    std::vector<ps2x::screen_on::Screen> screenReports;
+    const auto keepScreenOn = [this, &screenOn, &screenWatch, &screenLog, &screenReports](bool exiting)
     {
         ps2x::screen_on::State now;
         now.paused = m_eeScheduler && m_eeScheduler->hostPaused();
@@ -4710,6 +4716,14 @@ void PS2Runtime::run()
         now.minimized = ps2x::host::window().minimized();
         now.exiting = exiting;
         screenOn.update(now);
+        screenReports.clear();
+        screenWatch->take(screenReports);
+        for (const ps2x::screen_on::Screen report : screenReports)
+        {
+            const std::string line = screenLog.report(report, m_memory.gs().vsyncTick.load(std::memory_order_acquire));
+            if (!line.empty())
+                std::fprintf(stderr, "%s\n", line.c_str());
+        }
     };
 #ifdef PS2X_HAS_GAME_WINDOW
     if (ownWindow)
