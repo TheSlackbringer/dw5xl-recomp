@@ -45,6 +45,7 @@ namespace ps2x::host
         // --- The window itself.
         virtual bool hidden() const = 0;
         virtual bool maximized() const = 0;
+        virtual bool minimized() const = 0;
         virtual bool fullscreen() const = 0; // borderless, the size of its display
         virtual void setFullscreen(bool on) = 0;
         virtual bool vsync() const = 0;

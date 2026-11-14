@@ -1000,6 +1000,11 @@ namespace
             return glfwGetWindowAttrib(m_platform.window, GLFW_MAXIMIZED) == GLFW_TRUE;
         }
 
+        bool minimized() const override
+        {
+            return glfwGetWindowAttrib(m_platform.window, GLFW_ICONIFIED) == GLFW_TRUE;
+        }
+
         bool fullscreen() const override
         {
             return m_borderless;

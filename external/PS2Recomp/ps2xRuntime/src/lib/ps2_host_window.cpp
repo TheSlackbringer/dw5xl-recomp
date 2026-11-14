@@ -51,6 +51,7 @@ namespace
 
         bool hidden() const override { return IsWindowHidden(); }
         bool maximized() const override { return IsWindowMaximized(); }
+        bool minimized() const override { return IsWindowMinimized(); }
         bool fullscreen() const override { return IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE); }
         void setFullscreen(bool on) override
         {

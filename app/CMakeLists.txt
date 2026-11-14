@@ -643,6 +643,14 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_display_clock_test tests/display_clock_test.cpp "${PS2RECOMP_DIR}/ps2xRuntime/src/lib/ps2_display_clock.cpp")
     target_include_directories(dw5xl_display_clock_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
     add_test(NAME display_clock COMMAND dw5xl_display_clock_test)
+    # DW5XL-TEST issue 067: the game asks the system to keep the screen on while it is played (the rule, one call
+    # to the system per change, and on Windows the system's own state read back).
+    add_executable(dw5xl_screen_on_test tests/screen_on_test.cpp "${PS2RECOMP_DIR}/ps2xRuntime/src/lib/ps2_screen_on.cpp")
+    target_include_directories(dw5xl_screen_on_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    if(WIN32)
+        target_link_libraries(dw5xl_screen_on_test PRIVATE powrprof)
+    endif()
+    add_test(NAME screen_on COMMAND dw5xl_screen_on_test)
     # DW5XL-TEST issue 049 (amendment v3.12 step 3): where the picture lies in the window, one function for every window.
     add_executable(dw5xl_picture_rect_test tests/picture_rect_test.cpp)
     target_include_directories(dw5xl_picture_rect_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")

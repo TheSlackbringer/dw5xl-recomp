@@ -246,7 +246,9 @@ Window/presentation (issue 023): `PS2X_HOST_FPS=field` (one window frame per PS2
 frames, new pictures, skipped fields per second; cheap) · `PS2X_FIELD_SCANOUT=0` (old window-time field read, A/B) ·
 `PS2X_WEAVE_TRACE` (per picture: weave, fingerprint, row profile `[upload:rows]` used by the 023 test; costs ~30 ms
 per 4x frame, never for timing) · `PS2X_VBL_DRAW_TRACE` (display-buffer draws per VBlank edge) · `PS2X_LATCH_TRACE` ·
-`PS2X_VSYNC=1` (swap-interval experiment) · `PS2X_WINDOW=vulkan` (issue 049: the game in the window the renderer
+`PS2X_VSYNC=1` (swap-interval experiment) · `PS2X_SCREEN_ON_HIDDEN=1` (issue 067: a hidden window counts as shown
+for the rule that keeps the screen on while the game is played; `[display]` lines say when the screen is asked for
+and let go) · `PS2X_WINDOW=vulkan` (issue 049: the game in the window the renderer
 draws itself, a Vulkan swap chain without OpenGL, instead of today's; frame dumps, `final.png` and saved states'
 pictures work, the CPU renderer is shown too, the pages and overlays are drawn (ImGui by a renderer of ours), the
 in-between pictures are shown from the graphics card in the test mode (`PS2X_SMOOTH_SHOW=1`): on a test display, or

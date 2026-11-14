@@ -50,6 +50,7 @@
 #include "runtime/hotkeys.h"
 #include "runtime/ps2_present_feedback.h"
 #include "runtime/ps2_display_clock.h"
+#include "runtime/ps2_screen_on.h"
 #include "runtime/gs/gs_shader_store.h"
 #include "runtime/picture_rect.h"
 #include "runtime/host_devices.h"
@@ -2511,10 +2512,15 @@ static bool openRendererWindow(const std::shared_ptr<GSVulkanPresenterLink> &lin
 #endif
 }
 
+// Issue 067: the window's title, for the reason the system shows for the game's request to keep the screen on.
+static std::string s_programTitle = "The game";
+
 bool PS2Runtime::initialize(const char *title)
 {
     try
     {
+        if (title && *title)
+            s_programTitle = title;
         ps2prof::openFromEnv(); // DW5XL-DEBUG issue 025: PS2X_PROFILE_MARKERS=<file> (diagnostic builds only)
         if (!m_memory.initialize())
         {
@@ -4682,6 +4688,23 @@ void PS2Runtime::run()
             window.text(over, x, y, kFontSize, white, message.c_str());
         }
     };
+    // Issue 067 (rule A, owner 2026-11-14): the system is asked to keep the screen on while the game runs in a
+    // shown window; not while the port's MENU or a page holds the game, not hidden or minimised, not at exit. A
+    // controller does not count as input to the system, and a movie has none. Asked once per change
+    // (ps2x::screen_on::Keeper), by either window's loop at the start of its turn.
+    // DW5XL-DEBUG PS2X_SCREEN_ON_HIDDEN=1: a hidden window counts as shown, for the test (issue_067_screen_on.py).
+    static const bool s_screenOnHidden = [] { const char *v = std::getenv("PS2X_SCREEN_ON_HIDDEN"); return v && *v && *v != '0'; }();
+    const std::unique_ptr<ps2x::screen_on::System> screenSystem = ps2x::screen_on::makeSystem(s_programTitle);
+    ps2x::screen_on::Keeper screenOn(*screenSystem);
+    const auto keepScreenOn = [this, &screenOn](bool exiting)
+    {
+        ps2x::screen_on::State now;
+        now.paused = m_eeScheduler && m_eeScheduler->hostPaused();
+        now.hidden = !s_screenOnHidden && ps2x::host::window().hidden();
+        now.minimized = ps2x::host::window().minimized();
+        now.exiting = exiting;
+        screenOn.update(now);
+    };
 #ifdef PS2X_HAS_GAME_WINDOW
     if (ownWindow)
     {
@@ -4769,6 +4792,7 @@ void PS2Runtime::run()
         };
         while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
         {
+            keepScreenOn(false); // issue 067
             // Issue 027: a state load sets the field number back; the loaded game's fields are new to the window.
             if (const uint64_t loads = stateLoadCount(); loads != shownLoads)
             {
@@ -5238,6 +5262,7 @@ void PS2Runtime::run()
 #endif
     while (!ownWindow && !isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        keepScreenOn(false); // issue 067
         const bool fieldPaced = hostFpsOverride == 0 && m_eeScheduler;
         EeScheduler::PresentationField paced{};
         bool inBetween = false;                             // this turn shows a timed picture (the queue's front)
@@ -5561,6 +5586,7 @@ void PS2Runtime::run()
         }
     }
 
+    keepScreenOn(true); // issue 067: the game is closing, the screen is the system's again
     pictureReader.shutdown(); // issue 049 v3.5: before the GS goes
     requestStop();
     if (gameThread.joinable())
