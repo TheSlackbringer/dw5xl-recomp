@@ -473,6 +473,28 @@ int run(uint32_t wantedScale)
             std::printf("note  scale %ux: the window's picture of A with SHARPEN, largest difference from the expected one: %d of 255\n", scale, sharpened);
             check(sharpened <= 1, "with SHARPEN the window draws A sharpened, within one step of 255", scale);
         }
+        // The parts of a window picture (issue 049, criterion 9b at 4x: the picture and the pages judged apart).
+        // This window has no overlays: the picture alone is the whole window picture, and the overlays alone
+        // are the flat colour they are drawn over.
+        {
+            using Part = ps2x::gs::WindowPicturePart;
+            const auto flat = [&](const Picture &p, uint8_t level) {
+                bool all = p.width == winW && p.height == winH && p.rgba.size() == static_cast<size_t>(winW) * winH * 4u;
+                for (size_t i = 0; all && i + 4u <= p.rgba.size(); i += 4u)
+                    all = p.rgba[i] == level && p.rgba[i + 1u] == level && p.rgba[i + 2u] == level && p.rgba[i + 3u] == 255u;
+                return all;
+            };
+            Picture alone, onBlack, onWhite;
+            const bool gotAlone = window->picture(look, alone.rgba, alone.width, alone.height, Part::Picture);
+            const bool gotBlack = window->picture(look, onBlack.rgba, onBlack.width, onBlack.height, Part::PagesOnBlack);
+            const bool gotWhite = window->picture(look, onWhite.rgba, onWhite.width, onWhite.height, Part::PagesOnWhite);
+            check(gotAlone && alone.width == winW && alone.height == winH && largestDifference(alone, windowPicture(*window, look)) == 0,
+                  "the picture alone is the window picture when nothing lies over it", scale);
+            check(gotBlack && flat(onBlack, 0u), "the overlays alone over black: black, the game's picture not in it", scale);
+            check(gotWhite && flat(onWhite, 255u), "and over white: white", scale);
+            check(largestDifference(windowPicture(*window, look), expected(a, winW, winH, placed, smooth)) <= (smooth ? 1 : 0),
+                  "after the parts the window picture is A as before", scale);
+        }
     }
 
     // 8. Shown again without a new field.

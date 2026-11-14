@@ -102,6 +102,7 @@ namespace
     using ps2x::gs::GameWindowShown;
     using ps2x::gs::GameWindowTimed;
     using ps2x::gs::GameWindowReport;
+    using ps2x::gs::WindowPicturePart;
 
     // Milliseconds on the PC's steady clock (as ps2x::display_clock::nowMs).
     double steadyMs()
@@ -523,7 +524,8 @@ namespace
             m_counts.swapChains = m_platform.chains;
         }
 
-        bool picture(const GameWindowLook &look, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) override
+        bool picture(const GameWindowLook &look, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height,
+                     WindowPicturePart part) override
         {
             Util::register_thread_index(0);
             drawableSize(width, height);
@@ -556,21 +558,27 @@ namespace
             pass.clear_attachments = 1u;
             pass.store_attachments = 1u;
             pass.clear_color[0].float32[3] = 1.0f;
+            if (part == WindowPicturePart::PagesOnWhite)
+                pass.clear_color[0].float32[0] = pass.clear_color[0].float32[1] = pass.clear_color[0].float32[2] = 1.0f;
             cmd->begin_render_pass(pass);
-            GameWindowShown shown;
-            const HandedPicture *timed = m_lastPresentedTimed && m_timedShown ? &m_timedShown : nullptr;
-            if (timed)
+            if (part == WindowPicturePart::Shown || part == WindowPicturePart::Picture)
             {
-                shown.have = true;
-                shown.displayWidth = timed->displayWidth ? timed->displayWidth : timed->width;
-                shown.displayHeight = timed->displayHeight ? timed->displayHeight : timed->height;
+                GameWindowShown shown;
+                const HandedPicture *timed = m_lastPresentedTimed && m_timedShown ? &m_timedShown : nullptr;
+                if (timed)
+                {
+                    shown.have = true;
+                    shown.displayWidth = timed->displayWidth ? timed->displayWidth : timed->width;
+                    shown.displayHeight = timed->displayHeight ? timed->displayHeight : timed->height;
+                }
+                else
+                {
+                    describe(shown, look);
+                }
+                drawPicture(*cmd, look, static_cast<float>(width), static_cast<float>(height), shown, timed);
             }
-            else
-            {
-                describe(shown, look);
-            }
-            drawPicture(*cmd, look, static_cast<float>(width), static_cast<float>(height), shown, timed);
-            drawOverlays(*cmd, overlays);
+            if (part != WindowPicturePart::Picture)
+                drawOverlays(*cmd, overlays);
             cmd->end_render_pass();
             cmd->image_barrier(*target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,

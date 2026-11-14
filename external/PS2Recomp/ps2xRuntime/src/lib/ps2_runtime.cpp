@@ -5209,6 +5209,32 @@ void PS2Runtime::run()
                     }
                     std::fprintf(stderr, "[window:shot] field %llu (the picture of field %llu) -> %s%s\n", static_cast<unsigned long long>(fieldNow),
                                  static_cast<unsigned long long>(shown.field), s_shotPath.c_str(), saved ? "" : " (not saved)");
+                    // DW5XL-DEBUG issue 049 (criterion 9b at 4x) PS2X_WINDOW_SHOT_PARTS=1: with every window picture
+                    // its parts, beside it: <picture>.frame.png, the game's picture the window shows, as a frame dump
+                    // holds it; .picture.png, that picture alone as the window draws it; .black.png and .white.png,
+                    // what the port draws over it, over black and over white. A test works the window picture out
+                    // from the first and judges the window by it.
+                    static const bool s_shotParts = [] { const char *v = std::getenv("PS2X_WINDOW_SHOT_PARTS"); return v && *v && *v != '0'; }();
+                    if (s_shotParts && saved)
+                    {
+                        const std::string stem = s_shotPath.size() > 4u && s_shotPath.compare(s_shotPath.size() - 4u, 4u, ".png") == 0
+                                                     ? s_shotPath.substr(0, s_shotPath.size() - 4u) : s_shotPath;
+                        std::string made = ps2x_dev::writePng(stem + ".frame.png") ? " frame" : "";
+                        const std::pair<ps2x::gs::WindowPicturePart, const char *> parts[] = {
+                            {ps2x::gs::WindowPicturePart::Picture, "picture"},
+                            {ps2x::gs::WindowPicturePart::PagesOnBlack, "black"},
+                            {ps2x::gs::WindowPicturePart::PagesOnWhite, "white"}};
+                        for (const auto &[part, name] : parts)
+                        {
+                            if (!window.picture(look, rgba, shotWidth, shotHeight, part))
+                                continue;
+                            ::Image image{rgba.data(), static_cast<int>(shotWidth), static_cast<int>(shotHeight), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+                            if (ExportImage(image, (stem + "." + name + ".png").c_str()))
+                                made += std::string(" ") + name;
+                        }
+                        std::fprintf(stderr, "[window:shot] parts of the picture of field %llu saved:%s\n",
+                                     static_cast<unsigned long long>(shown.field), made.empty() ? " none" : made.c_str());
+                    }
                     s_shotPath.clear();
                 }
             }

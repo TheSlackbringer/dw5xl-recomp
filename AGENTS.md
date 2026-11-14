@@ -258,7 +258,9 @@ own log lines run on it (`dw5test.TODAYS_WINDOW`). In the new window: `[present:
 `PS2X_HOST_FPS` belongs to the old window (the new one shows one window frame per PS2 field); in-between pictures
 are shown from the graphics card in the test mode (`PS2X_SMOOTH_SHOW=1`) on a test display, or in a shown window by
 the real display's clock, made from the driver's reports of shown pictures (`PS2X_DISPLAY_TRACE=1` logs them:
-`[display:report]`, `[display:timed]`); `PS2X_WINDOW_SHOT` works) · `PS2X_OVERLAY_HIDDEN=1` (the F2 and F8 lines and the
+`[display:report]`, `[display:timed]`); `PS2X_WINDOW_SHOT` works, and with `PS2X_WINDOW_SHOT_PARTS=1` every window
+picture is saved with its parts beside it: `.frame.png` the game's picture it shows, `.picture.png` that picture
+alone as the window draws it, `.black.png` and `.white.png` what the port draws over it) · `PS2X_OVERLAY_HIDDEN=1` (the F2 and F8 lines and the
 state message are drawn in a hidden window too, for window pictures of hidden runs).
 Sound/IOP: `PS2X_SPU2_TRACE` · `PS2X_LIBSD_TRACE` · `PS2X_KSNG_TRACE` / `PS2X_KSNH_TRACE` (sound RPCs) ·
 `PS2X_AUDIO_DUMP=<wav>` (s16 stereo 48 kHz) · `PS2X_AUDIO_TRACE` · `PS2X_SIFAUDIO_TRACE` · `PS2X_MPEGAUDIO_TRACE` ·

@@ -45,6 +45,16 @@ namespace ps2x::gs
         bool sharpen = false; // with smooth: PC SETTINGS' SHARPEN (issue 047)
     };
 
+    // What a window picture on request holds (GameWindow::picture): the window as it was shown, or one part of
+    // it, for tests that judge the game's picture and what the port draws over it apart (issue 049, criterion 9b).
+    enum class WindowPicturePart
+    {
+        Shown,        // the picture and the overlays, as the window drew them
+        Picture,      // the game's picture alone, as the window draws it (shape, filter, SHARPEN)
+        PagesOnBlack, // the overlays alone, over black in the whole window
+        PagesOnWhite, // the overlays alone, over white in the whole window
+    };
+
     // A picture in main memory: RGBA, 4 bytes a pixel, rows `strideBytes` apart.
     struct GameWindowPixels
     {
@@ -168,8 +178,9 @@ namespace ps2x::gs
 
         // What the window drew last (the picture and the overlays of that turn), drawn once more into a picture of
         // the window's size and read into main memory (RGBA, 4 bytes a pixel, opaque). For window pictures on
-        // request; never part of showing.
-        virtual bool picture(const GameWindowLook &look, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) = 0;
+        // request; never part of showing. `part`: the whole of it, or one part (WindowPicturePart).
+        virtual bool picture(const GameWindowLook &look, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height,
+                             WindowPicturePart part = WindowPicturePart::Shown) = 0;
 
         // The driver's reports of when presented pictures were shown (the display's clock is made from them).
         // They are asked for only where pictures reach a display: never in a hidden window, whose reports do not
