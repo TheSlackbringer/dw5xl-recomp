@@ -1,6 +1,7 @@
 #include "runtime/ps2_pad.h"
 #include "runtime/host_input.h"
 #include "runtime/host_devices.h"
+#include "runtime/host_window.h"
 #include "runtime/back_button.h"
 #include "ps2_host_backend.h"
 
@@ -255,8 +256,10 @@ namespace ps2_host_input
                 {
                     if (glyph[row][column] != '#') continue;
                     if (!indicator.captured && (row - column == 4 || row - column == 5)) continue;
-                    DrawRectangle(originX + (column + offset) * cell,
-                                  originY + (row + offset) * cell, cell, cell, color);
+                    // Issue 049: drawn by the window that shows the game, under the pages.
+                    ps2x::host::window().fillRect(ps2x::host::Window::Layer::UnderPages, originX + (column + offset) * cell,
+                                                  originY + (row + offset) * cell, cell, cell,
+                                                  ps2x::host::Colour{color.r, color.g, color.b, color.a});
                 }
         };
         blit(1, shadow);

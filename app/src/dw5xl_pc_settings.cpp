@@ -21,6 +21,7 @@
 #include "runtime/ee_scheduler.h"
 #include "runtime/host_input.h"
 #include "runtime/host_devices.h"
+#include "runtime/host_window.h"
 #include "runtime/ps2_settings.h"
 #include "ps2x/iop/spu2_sound.h"
 
@@ -717,7 +718,7 @@ const char *kMenuHelp[kMenuRows] = {"Back to the game.", "Saves the game as it i
 const char *kMainMenuRefused = "Not here: the game can't return to its main menu from this screen.";
 const char *kMainMenuQuestion[2] = {"Return to the main menu?", "Progress since your last save will be lost."};
 const char *kScreenNames[4] = {"MENU", "PC SETTINGS", "SAVE STATE", "LOAD STATE"};
-struct SlotInfo { bool used = false; std::filesystem::file_time_type written{}; std::time_t time = 0; bool olderThanCard = false; Texture2D picture{}; };
+struct SlotInfo { bool used = false; std::filesystem::file_time_type written{}; std::time_t time = 0; bool olderThanCard = false; uint64_t picture = 0; };
 struct MenuState {
     Screen screen = Screen::Menu;
     int menuRow = 0, listRow = 0;
@@ -794,7 +795,7 @@ void refreshSlots(bool log)
     M.cardTime = M.cardWritten == std::filesystem::file_time_type::min() ? 0 : wallTime(M.cardWritten);
     for (int r = 0; r <= kSlots; ++r) {
         SlotInfo &slot = M.slots[size_t(r)];
-        if (slot.picture.id) { UnloadTexture(slot.picture); slot.picture = {}; }
+        if (slot.picture) { ps2x::host::window().dropTexture(slot.picture); slot.picture = 0; }
         slot.written = std::filesystem::last_write_time(slotPath(r), ec);
         slot.used = !ec;
         slot.time = slot.used ? wallTime(slot.written) : 0;
@@ -802,9 +803,13 @@ void refreshSlots(bool log)
         std::filesystem::path png = slotPath(r);
         png.replace_extension(".png");
         if (slot.used && std::filesystem::exists(png, ec)) {
-            slot.picture = LoadTexture(png.string().c_str());
-            SetTextureFilter(slot.picture, TEXTURE_FILTER_BILINEAR);
-            SetTextureWrap(slot.picture, TEXTURE_WRAP_CLAMP);
+            // The picture file into main memory (raylib), then to the window that shows the game (issue 049).
+            ::Image file = LoadImage(png.string().c_str());
+            if (file.data) {
+                ImageFormat(&file, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+                slot.picture = ps2x::host::window().makeTexture(static_cast<const uint8_t *>(file.data), file.width, file.height);
+                UnloadImage(file);
+            }
         }
     }
     if (!log) return;
@@ -1072,7 +1077,8 @@ const char *kHelp[kRows] = {"Waits for each display refresh: no tearing.", "How 
                             "The shape of the whole game. Choose your screen's shape; in battle you see more.", "How far you see in battle.", "Crisper edges, above 1X. Adds some grain.", "Restores this page's settings."};
 constexpr uint32_t kScales[3] = {1, 2, 4}, kSamples[5] = {1, 2, 4, 8, 16};
 
-struct Tex { Texture2D t{}; int w = 0, h = 0; };      // w, h: the picture's size in its source texels
+struct Tex { uint64_t id = 0; int w = 0, h = 0; };    // id: the window's picture (ps2x::host::Window::makeTexture);
+                                                      // w, h: the picture's size in its source texels
 struct Assets {
     bool tried = false, ok = false;
     Tex label[8], pageLabel[2], pageHelp[2], labelDefault, onOff[2][2];          // onOff[ON/OFF][white/yellow]
@@ -1092,11 +1098,9 @@ struct Assets {
 Tex upload(const MImage &img)
 {
     Tex t; t.w = img.w; t.h = img.h;
-    ::Image ri{const_cast<uint8_t *>(img.rgba.data()), img.w, img.h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
-    t.t = LoadTextureFromImage(ri);
-    SetTextureFilter(t.t, TEXTURE_FILTER_BILINEAR);
-    SetTextureWrap(t.t, TEXTURE_WRAP_CLAMP);          // filtering at an edge must not reach the opposite edge (027 v4:
-                                                      // a dark line at the ground picture's top in big windows)
+    // Smooth, and clamped: filtering at an edge must not reach the opposite edge (027 v4: a dark line at the ground
+    // picture's top in big windows). Made by the window that shows the game (issue 049).
+    t.id = ps2x::host::window().makeTexture(img.rgba.data(), img.w, img.h);
     return t;
 }
 MImage tinted(MImage img, const float k[3]) { for (size_t i = 0; i < img.rgba.size(); i += 4) for (int c = 0; c < 3; ++c) img.rgba[i + c] = uint8_t(std::min(255.0f, img.rgba[i + c] * k[c])); return img; }
@@ -1302,8 +1306,8 @@ void buildAssets()
 struct Map { float x, y, sx, sy; ImVec2 at(float gx, float gy) const { return ImVec2(x + gx * sx, y + gy * sy); } };
 void image(ImDrawList *dl, const Map &m, const Tex &t, float gx, float gy, float gw, float gh, ImU32 tint = IM_COL32_WHITE)
 {
-    if (!t.t.id) return;
-    dl->AddImage(ImTextureID(t.t.id), m.at(gx, gy), m.at(gx + gw, gy + gh), ImVec2(0, 0), ImVec2(1, 1), tint);
+    if (!t.id) return;
+    dl->AddImage(ImTextureID(t.id), m.at(gx, gy), m.at(gx + gw, gy + gh), ImVec2(0, 0), ImVec2(1, 1), tint);
 }
 void separator(ImDrawList *dl, const Map &m, float gy, float fullEnd, float fadeEnd)
 {
@@ -1439,8 +1443,8 @@ void drawList(ImDrawList *dl, const Map &m)
     }
     const SlotInfo &sel = M.slots[size_t(M.listRow)];
     dl->AddRectFilled(m.at(300, 96), m.at(500, 271), IM_COL32(0, 0, 0, 170));
-    if (sel.used && sel.picture.id)
-        dl->AddImage(ImTextureID(sel.picture.id), m.at(302, 98), m.at(498, 269));
+    if (sel.used && sel.picture)
+        dl->AddImage(ImTextureID(sel.picture), m.at(302, 98), m.at(498, 269));
     else if (sel.used) {                              // a state from before pictures were saved with states
         const Tex &none = smallTex("No picture");
         image(dl, m, none, 400 - float(none.w) * 0.375f, 174, float(none.w) * 0.75f, 20, kDim);
@@ -1470,10 +1474,11 @@ void applyChanges(const dw5xl::pcsettings::Snapshot &s)
     if (gs.getResolutionScale() != kScales[s.values.resolution]) ps2x::settings::setResolutionScale(gs, kScales[s.values.resolution]);
     if (gs.getAASamples() != kSamples[s.values.antiAliasing]) ps2x::settings::setAntiAliasing(gs, kSamples[s.values.antiAliasing]);
     const bool vsync = s.values.vsync == 0;
-    if (vsync != IsWindowState(FLAG_VSYNC_HINT)) { if (vsync) SetWindowState(FLAG_VSYNC_HINT); else ClearWindowState(FLAG_VSYNC_HINT); }
+    ps2x::host::Window &window = ps2x::host::window();
+    if (vsync != window.vsync()) window.setVsync(vsync);
     ps2x::settings::saveText("vsync", vsync ? "on" : "off");
-    const bool full = s.values.display == 1, isFull = IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE);
-    if (full != isFull && !IsWindowHidden()) ToggleBorderlessWindowed();
+    const bool full = s.values.display == 1, isFull = window.fullscreen();
+    if (full != isFull && !window.hidden()) window.setFullscreen(full);
     ps2x::settings::saveText("display", full ? "fullscreen" : "window");
     g_runtime->setShowFps(s.values.showFps == 0);
     ps2x::settings::saveText("show_fps", s.values.showFps == 0 ? "on" : "off");
@@ -1493,19 +1498,21 @@ namespace dw5xl::pcsettings {
 void sizeWindowForAspect()
 {
     static int sizedFor = -1, windowedHeight = 448;   // the height the window opens at
-    const bool full = IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE), maximized = IsWindowMaximized();
+    ps2x::host::Window &window = ps2x::host::window();
+    const bool full = window.fullscreen(), maximized = window.maximized();
     const int key = full ? -2 : maximized ? -3 : int(dw5xl::widescreen::aspect());
-    if (key == sizedFor) { if (key >= 0) windowedHeight = GetRenderHeight(); return; }
+    if (key == sizedFor) { if (key >= 0) { int w = 0; window.renderSize(w, windowedHeight); } return; }
     const bool wasNormal = sizedFor >= 0;
     sizedFor = key;
-    if (full || maximized || IsWindowHidden()) return;
+    if (full || maximized || window.hidden()) return;
     const float shape = dw5xl::widescreen::shape();
-    const int most = GetMonitorWidth(GetCurrentMonitor());
+    const int most = window.displayWidth();
     int height = windowedHeight, width = int(float(height) * shape + 0.5f);
     if (most > 0 && width > most) { width = most; height = int(float(width) / shape + 0.5f); }
-    const Vector2 place = GetWindowPosition();
-    SetWindowSize(width, height);
-    if (wasNormal) SetWindowPosition(int(place.x), int(place.y));
+    int placeX = 0, placeY = 0;
+    window.position(placeX, placeY);
+    window.setScreenSize(width, height);
+    if (wasNormal) window.setPosition(placeX, placeY);
 }
 
 void drawOverlay()
@@ -1515,10 +1522,10 @@ void drawOverlay()
     if (s.needsInit) {
         Values v;
         const uint32_t scale = g_runtime->gs().getResolutionScale(), samples = g_runtime->gs().getAASamples();
-        v.vsync = IsWindowState(FLAG_VSYNC_HINT) ? 0 : 1;
+        v.vsync = ps2x::host::window().vsync() ? 0 : 1;
         v.resolution = scale >= 4 ? 2 : scale >= 2 ? 1 : 0;
         v.antiAliasing = samples >= 16 ? 4 : samples >= 8 ? 3 : samples >= 4 ? 2 : samples >= 2 ? 1 : 0;
-        v.display = IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE) ? 1 : 0;
+        v.display = ps2x::host::window().fullscreen() ? 1 : 0;
         v.showFps = g_runtime->showFps() ? 0 : 1;
         v.aspect = dw5xl::widescreen::aspect();
         v.fov = (dw5xl::widescreen::fov() - 80) / 5;

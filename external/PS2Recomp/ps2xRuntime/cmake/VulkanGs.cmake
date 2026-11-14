@@ -47,5 +47,13 @@ if(PS2X_ENABLE_VULKAN_GS)
         target_sources(ps2_runtime PRIVATE src/lib/gs/gs_vulkan_window.cpp)
         target_include_directories(ps2_runtime PRIVATE "${raylib_SOURCE_DIR}/src/external/glfw/include")
         target_compile_definitions(ps2_runtime PUBLIC PS2X_HAS_GAME_WINDOW=1)
+        # Step 4: the overlays (Dear ImGui) drawn by that window: ImGui's own GLFW input backend and a renderer of
+        # ours on the library's device object. Only where the overlays are built at all (PS2X_ENABLE_DEBUG_UI).
+        if(TARGET imgui AND EXISTS "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_glfw.cpp")
+            target_sources(ps2_runtime PRIVATE src/lib/gs/gs_vulkan_ui.cpp
+                "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_glfw.cpp")
+            target_link_libraries(ps2_runtime PRIVATE imgui)
+            target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_WINDOW_UI=1)
+        endif()
     endif()
 endif()

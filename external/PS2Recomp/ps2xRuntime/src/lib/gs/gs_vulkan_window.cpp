@@ -10,7 +10,13 @@
 #include "gs_vulkan_window.h"
 #include "runtime/host_devices.h"
 #include "runtime/host_input_state.h"
+#include "runtime/host_window.h"
 #include "runtime/picture_rect.h"
+#ifdef PS2X_HAS_WINDOW_UI
+#include "gs_vulkan_ui.h"
+#include "imgui.h"
+#include "backends/imgui_impl_glfw.h"
+#endif
 
 #include "context.hpp"
 #include "device.hpp"
@@ -24,11 +30,15 @@
 #include <GLFW/glfw3.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace ps2x::gs
 {
@@ -165,7 +175,7 @@ namespace
         }
     };
 
-    class Window final : public ps2x::gs::GameWindow, public ps2x::host::Devices
+    class Window final : public ps2x::gs::GameWindow, public ps2x::host::Devices, public ps2x::host::Window
     {
     public:
         Window() = default;
@@ -181,6 +191,7 @@ namespace
                         m_link->fields->release(m_current);
                     m_link->fields->stop();
                 }
+                closeUi();
                 m_wsi.get_device().wait_idle();
                 m_views.reset();
                 m_drawer.reset();
@@ -218,6 +229,7 @@ namespace
             glfwWindowHint(GLFW_VISIBLE, options.hidden ? GLFW_FALSE : GLFW_TRUE);
             glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
             m_hidden = options.hidden;
+            m_vsync = options.vsync;
             m_platform.window = glfwCreateWindow(std::max(options.width, 1), std::max(options.height, 1),
                                                  options.title.c_str(), nullptr, nullptr);
             glfwDefaultWindowHints();
@@ -237,6 +249,10 @@ namespace
             glfwSetCursorPosCallback(m_platform.window, [](GLFWwindow *w, double x, double y) { self(w)->m_input.mouseMoved(x, y); });
             glfwSetScrollCallback(m_platform.window, [](GLFWwindow *w, double x, double y) { self(w)->m_input.scrolled(x, y); });
             glfwSetWindowFocusCallback(m_platform.window, [](GLFWwindow *w, int focused) { self(w)->m_input.focus(focused != 0); });
+            glfwSetDropCallback(m_platform.window, [](GLFWwindow *w, int count, const char **paths) {
+                for (int i = 0; i < count; ++i)
+                    self(w)->m_dropped.emplace_back(paths[i]);
+            });
 
             // The presenter: a device object of its own on the renderer's context, the queues shared through the
             // renderer's lock.
@@ -321,8 +337,16 @@ namespace
 
         GameWindowShown show(uint64_t maxField, const GameWindowLook &look) override
         {
+            GameWindowShown shown = take(maxField, look);
+            present(shown, look);
+            return shown;
+        }
+
+        GameWindowShown take(uint64_t maxField, const GameWindowLook &look) override
+        {
             Util::register_thread_index(0);
             GameWindowShown shown;
+            m_uiDrawn = false; // a new turn: the overlays of the turn before are no longer the window's content
             // The newest finished picture up to the field asked for, on the graphics card or given from main memory:
             // whichever was finished later, if it was finished after the one the window shows. A handed picture
             // shown until now goes back to the renderer: the last command buffer that used it was sent when the
@@ -364,6 +388,31 @@ namespace
                 ++m_counts.fromMemory;
             }
             describe(shown, look);
+            // Where the picture will lie, for overlays drawn before the window is presented.
+            uint32_t drawableWidth = 0u, drawableHeight = 0u;
+            drawableSize(drawableWidth, drawableHeight);
+            if (shown.have && drawableWidth != 0u && drawableHeight != 0u)
+            {
+                const ps2x::PictureRect placed = ps2x::pictureRectInWindow(shown.displayWidth, shown.displayHeight, look.shape,
+                                                                          static_cast<float>(drawableWidth),
+                                                                          static_cast<float>(drawableHeight));
+                shown.x = placed.x;
+                shown.y = placed.y;
+                shown.rectWidth = placed.width;
+                shown.rectHeight = placed.height;
+            }
+            // Once the overlays exist they get a frame in every turn: ImGui takes the window's events as they come,
+            // and a frame is what uses them up.
+            if (m_uiReady)
+                beginUiFrame();
+            return shown;
+        }
+
+        void present(GameWindowShown &shown, const GameWindowLook &look) override
+        {
+            Util::register_thread_index(0);
+            // The overlays drawn since take() are complete now, whether or not the window can be presented.
+            ImDrawData *overlays = endUiFrame();
 
             uint32_t width = 0u, height = 0u;
             drawableSize(width, height);
@@ -375,12 +424,13 @@ namespace
             {
                 // No size (minimised) or no swap chain image: nothing is presented; the game goes on.
                 ++m_counts.notPresented;
-                return shown;
+                return;
             }
             const auto acquired = std::chrono::steady_clock::now();
             Vulkan::Device &device = m_wsi.get_device();
             auto cmd = device.request_command_buffer();
             uploadMemory(*cmd);
+            prepareOverlays(*cmd, overlays);
             Vulkan::RenderPassInfo pass = device.get_swapchain_render_pass(Vulkan::SwapchainRenderPass::ColorOnly);
             pass.clear_color[0].float32[0] = 0.0f;
             pass.clear_color[0].float32[1] = 0.0f;
@@ -390,6 +440,7 @@ namespace
             const float targetWidth = static_cast<float>(device.get_swapchain_view().get_image().get_width());
             const float targetHeight = static_cast<float>(device.get_swapchain_view().get_image().get_height());
             drawPicture(*cmd, look, targetWidth, targetHeight, shown);
+            drawOverlays(*cmd, overlays);
             cmd->end_render_pass();
             device.submit(cmd);
             const auto drawn = std::chrono::steady_clock::now();
@@ -403,7 +454,6 @@ namespace
             else
                 ++m_counts.notPresented;
             m_counts.swapChains = m_platform.chains;
-            return shown;
         }
 
         bool picture(const GameWindowLook &look, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) override
@@ -426,8 +476,10 @@ namespace
             if (!target || !read)
                 return false;
 
+            ImDrawData *overlays = endUiFrame();
             auto cmd = device.request_command_buffer();
             uploadMemory(*cmd);
+            prepareOverlays(*cmd, overlays);
             cmd->image_barrier(*target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
@@ -441,6 +493,7 @@ namespace
             GameWindowShown shown;
             describe(shown, look);
             drawPicture(*cmd, look, static_cast<float>(width), static_cast<float>(height), shown);
+            drawOverlays(*cmd, overlays);
             cmd->end_render_pass();
             cmd->image_barrier(*target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
@@ -577,6 +630,214 @@ namespace
             return counts;
         }
 
+        // --- host::Window: what the pages and overlays ask of the window (runtime/host_window.h)
+        ps2x::host::Window &control() override
+        {
+            return *this;
+        }
+
+        bool uiSetup(bool dark) override
+        {
+#ifdef PS2X_HAS_WINDOW_UI
+            ensureUi();
+            if (dark)
+                ImGui::StyleColorsDark();
+            else
+                ImGui::StyleColorsLight();
+#else
+            (void)dark;
+#endif
+            return true;
+        }
+
+        bool uiShutdown() override
+        {
+            closeUi();
+            return true;
+        }
+
+        bool uiBegin() override
+        {
+            beginUiFrame();
+            return true;
+        }
+
+        // Nothing to do: the frame is closed and drawn when the window is presented.
+        bool uiEnd() override
+        {
+            return true;
+        }
+
+        uint64_t makeTexture(const uint8_t *rgba, int width, int height) override
+        {
+#ifdef PS2X_HAS_WINDOW_UI
+            ensureUi();
+            Util::register_thread_index(0);
+            return m_ui->makeTexture(rgba, width, height);
+#else
+            (void)rgba;
+            (void)width;
+            (void)height;
+            return 0u;
+#endif
+        }
+
+        void dropTexture(uint64_t texture) override
+        {
+#ifdef PS2X_HAS_WINDOW_UI
+            if (m_ui)
+                m_ui->dropTexture(texture);
+#else
+            (void)texture;
+#endif
+        }
+
+        // The lines over the picture are ImGui's too: under the pages on its background list, over them on its
+        // foreground list. Window pixels become ImGui's units by the display's scale.
+        void fillRect(Layer layer, int x, int y, int width, int height, ps2x::host::Colour colour) override
+        {
+#ifdef PS2X_HAS_WINDOW_UI
+            beginUiFrame();
+            const ImVec2 scale = ImGui::GetIO().DisplayFramebufferScale;
+            const float sx = scale.x > 0.0f ? 1.0f / scale.x : 1.0f, sy = scale.y > 0.0f ? 1.0f / scale.y : 1.0f;
+            list(layer)->AddRectFilled(ImVec2(static_cast<float>(x) * sx, static_cast<float>(y) * sy),
+                                       ImVec2(static_cast<float>(x + width) * sx, static_cast<float>(y + height) * sy),
+                                       IM_COL32(colour.r, colour.g, colour.b, colour.a));
+#else
+            (void)layer; (void)x; (void)y; (void)width; (void)height; (void)colour;
+#endif
+        }
+
+        void text(Layer layer, int x, int y, int size, ps2x::host::Colour colour, const char *text) override
+        {
+#ifdef PS2X_HAS_WINDOW_UI
+            if (!text || !*text)
+                return;
+            beginUiFrame();
+            const ImVec2 scale = ImGui::GetIO().DisplayFramebufferScale;
+            const float sx = scale.x > 0.0f ? 1.0f / scale.x : 1.0f, sy = scale.y > 0.0f ? 1.0f / scale.y : 1.0f;
+            list(layer)->AddText(ImGui::GetFont(), static_cast<float>(size) * sy,
+                                 ImVec2(static_cast<float>(x) * sx, static_cast<float>(y) * sy),
+                                 IM_COL32(colour.r, colour.g, colour.b, colour.a), text);
+#else
+            (void)layer; (void)x; (void)y; (void)size; (void)colour; (void)text;
+#endif
+        }
+
+        int textWidth(int size, const char *text) override
+        {
+#ifdef PS2X_HAS_WINDOW_UI
+            if (!text || !*text)
+                return 0;
+            beginUiFrame();
+            const ImVec2 scale = ImGui::GetIO().DisplayFramebufferScale;
+            const float sy = scale.y > 0.0f ? 1.0f / scale.y : 1.0f, toPixels = scale.x > 0.0f ? scale.x : 1.0f;
+            const float units = ImGui::GetFont()->CalcTextSizeA(static_cast<float>(size) * sy, FLT_MAX, 0.0f, text).x;
+            return static_cast<int>(std::ceil(units * toPixels));
+#else
+            (void)size; (void)text;
+            return 0;
+#endif
+        }
+
+        bool maximized() const override
+        {
+            return glfwGetWindowAttrib(m_platform.window, GLFW_MAXIMIZED) == GLFW_TRUE;
+        }
+
+        bool fullscreen() const override
+        {
+            return m_borderless;
+        }
+
+        // Borderless and the size of its display, by the steps raylib takes for today's window
+        // (ToggleBorderlessWindowed): no decoration, on top, at the display's corner with the display's size; back:
+        // decorated again, the size before, then the place before.
+        void setFullscreen(bool on) override
+        {
+            if (on == m_borderless)
+                return;
+            GLFWmonitor *monitor = currentMonitor();
+            const GLFWvidmode *mode = monitor ? glfwGetVideoMode(monitor) : nullptr;
+            if (!mode)
+                return;
+            if (on)
+            {
+                glfwGetWindowPos(m_platform.window, &m_before[0], &m_before[1]);
+                glfwGetWindowSize(m_platform.window, &m_before[2], &m_before[3]);
+                glfwSetWindowAttrib(m_platform.window, GLFW_DECORATED, GLFW_FALSE);
+                glfwSetWindowAttrib(m_platform.window, GLFW_FLOATING, GLFW_TRUE);
+                int x = 0, y = 0;
+                glfwGetMonitorPos(monitor, &x, &y);
+                glfwSetWindowPos(m_platform.window, x, y);
+                glfwSetWindowSize(m_platform.window, mode->width, mode->height);
+            }
+            else
+            {
+                glfwSetWindowAttrib(m_platform.window, GLFW_FLOATING, GLFW_FALSE);
+                glfwSetWindowAttrib(m_platform.window, GLFW_DECORATED, GLFW_TRUE);
+                glfwSetWindowSize(m_platform.window, m_before[2], m_before[3]);
+                glfwSetWindowPos(m_platform.window, m_before[0], m_before[1]);
+            }
+            if (!m_hidden) // a window nobody sees takes no focus from the one in use
+                glfwFocusWindow(m_platform.window);
+            m_borderless = on;
+        }
+
+        bool vsync() const override
+        {
+            return m_vsync;
+        }
+
+        // The swap chain is made again for the other way of presenting, between two frames.
+        void setVsync(bool on) override
+        {
+            if (on == m_vsync)
+                return;
+            m_vsync = on;
+            Util::register_thread_index(0);
+            m_wsi.set_present_mode(on ? Vulkan::PresentMode::SyncToVBlank : Vulkan::PresentMode::UnlockedMaybeTear);
+        }
+
+        void screenSize(int &width, int &height) const override
+        {
+            glfwGetWindowSize(m_platform.window, &width, &height);
+        }
+
+        void renderSize(int &width, int &height) const override
+        {
+            glfwGetFramebufferSize(m_platform.window, &width, &height);
+        }
+
+        void setScreenSize(int width, int height) override
+        {
+            glfwSetWindowSize(m_platform.window, std::max(width, 1), std::max(height, 1));
+        }
+
+        void position(int &x, int &y) const override
+        {
+            glfwGetWindowPos(m_platform.window, &x, &y);
+        }
+
+        void setPosition(int x, int y) override
+        {
+            glfwSetWindowPos(m_platform.window, x, y);
+        }
+
+        int displayWidth() const override
+        {
+            GLFWmonitor *monitor = currentMonitor();
+            const GLFWvidmode *mode = monitor ? glfwGetVideoMode(monitor) : nullptr;
+            return mode ? mode->width : 0;
+        }
+
+        std::vector<std::string> takeDroppedFiles() override
+        {
+            std::vector<std::string> files;
+            files.swap(m_dropped);
+            return files;
+        }
+
         // --- host::Devices: the answers raylib gives for its window, from this window's events (InputState)
         bool ready() const override { return true; }
         bool focused() const override { return m_input.focused(); }
@@ -605,6 +866,137 @@ namespace
         }
 
     private:
+        // The display the window's middle lies on (raylib's GetCurrentMonitor for a window that is not in exclusive
+        // fullscreen); the first display when it lies on none.
+        GLFWmonitor *currentMonitor() const
+        {
+            int count = 0;
+            GLFWmonitor **monitors = glfwGetMonitors(&count);
+            if (!monitors || count < 1)
+                return nullptr;
+            int x = 0, y = 0, w = 0, h = 0;
+            glfwGetWindowPos(m_platform.window, &x, &y);
+            glfwGetWindowSize(m_platform.window, &w, &h);
+            const int cx = x + w / 2, cy = y + h / 2;
+            for (int i = 0; i < count; ++i)
+            {
+                int mx = 0, my = 0;
+                glfwGetMonitorPos(monitors[i], &mx, &my);
+                const GLFWvidmode *mode = glfwGetVideoMode(monitors[i]);
+                if (mode && cx >= mx && cx <= mx + mode->width - 1 && cy >= my && cy <= my + mode->height - 1)
+                    return monitors[i];
+            }
+            return monitors[0];
+        }
+
+#ifdef PS2X_HAS_WINDOW_UI
+        // The overlays' context, fonts and renderer, made when something first asks for them. The default font as
+        // rlImGui sets it up for today's window: 13 pixels times the display's scale.
+        void ensureUi()
+        {
+            if (m_uiReady)
+                return;
+            Util::register_thread_index(0);
+            IMGUI_CHECKVERSION();
+            if (!ImGui::GetCurrentContext())
+            {
+                ImGui::CreateContext();
+                m_uiContextOwned = true;
+            }
+            ImGuiIO &io = ImGui::GetIO();
+            float scaleX = 1.0f, scaleY = 1.0f;
+            glfwGetWindowContentScale(m_platform.window, &scaleX, &scaleY);
+            if (!(scaleY > 0.0f))
+                scaleY = 1.0f;
+            ImFontConfig font;
+            font.SizePixels = std::ceil(13.0f * scaleY);
+            font.RasterizerMultiply = scaleY;
+            font.PixelSnapH = true;
+            io.Fonts->AddFontDefault(&font);
+            ImGui::StyleColorsDark();
+            // ImGui's own GLFW input: its callbacks are put before this window's and call them on.
+            ImGui_ImplGlfw_InitForVulkan(m_platform.window, true);
+            io.BackendRendererName = "dw5xl_window";
+            io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures | ImGuiBackendFlags_RendererHasVtxOffset;
+            m_ui = std::make_unique<ps2x::gs::VulkanUiRenderer>(m_wsi.get_device());
+            m_uiReady = true;
+        }
+
+        void beginUiFrame()
+        {
+            ensureUi();
+            if (m_uiFrame)
+                return;
+            ImGui_ImplGlfw_NewFrame();
+            ImGui::NewFrame();
+            m_uiFrame = true;
+        }
+
+        // Closes the frame if one is open. What to draw over the picture in this turn, or null.
+        ImDrawData *endUiFrame()
+        {
+            if (m_uiFrame)
+            {
+                ImGui::Render();
+                m_uiFrame = false;
+                m_uiDrawn = true;
+            }
+            return m_uiReady && m_uiDrawn ? ImGui::GetDrawData() : nullptr;
+        }
+
+        void closeUi()
+        {
+            if (!m_uiReady)
+                return;
+            Util::register_thread_index(0);
+            if (m_uiFrame)
+            {
+                ImGui::EndFrame();
+                m_uiFrame = false;
+            }
+            m_uiDrawn = false;
+            m_wsi.get_device().wait_idle();
+            m_ui.reset();
+            ImGui_ImplGlfw_Shutdown();
+            if (m_uiContextOwned)
+                ImGui::DestroyContext();
+            m_uiContextOwned = false;
+            m_uiReady = false;
+        }
+
+        static ImDrawList *list(Layer layer)
+        {
+            return layer == Layer::UnderPages ? ImGui::GetBackgroundDrawList() : ImGui::GetForegroundDrawList();
+        }
+#else
+        struct ImDrawData;
+        void beginUiFrame() {}
+        ImDrawData *endUiFrame() { return nullptr; }
+        void closeUi() {}
+#endif
+
+        void prepareOverlays(Vulkan::CommandBuffer &cmd, ImDrawData *overlays)
+        {
+#ifdef PS2X_HAS_WINDOW_UI
+            if (overlays && m_ui)
+                m_ui->prepare(cmd, overlays);
+#else
+            (void)cmd;
+            (void)overlays;
+#endif
+        }
+
+        void drawOverlays(Vulkan::CommandBuffer &cmd, ImDrawData *overlays)
+        {
+#ifdef PS2X_HAS_WINDOW_UI
+            if (overlays && m_ui)
+                m_ui->draw(cmd, overlays);
+#else
+            (void)cmd;
+            (void)overlays;
+#endif
+        }
+
         static Window *self(GLFWwindow *window)
         {
             return static_cast<Window *>(glfwGetWindowUserPointer(window));
@@ -716,6 +1108,18 @@ namespace
         uint64_t m_shownOrder = 0u; // the shown picture's place among all finished pictures
         ps2x::host::InputState m_input;
         GameWindowCounts m_counts;
+        // What the pages and overlays asked of the window.
+        bool m_vsync = true;
+        bool m_borderless = false;
+        int m_before[4] = {0, 0, 640, 480}; // the window's place and size before it went borderless
+        std::vector<std::string> m_dropped;
+        bool m_uiReady = false;        // the overlays' context and renderer exist
+        bool m_uiContextOwned = false;
+        bool m_uiFrame = false;        // a frame of overlays is open
+        bool m_uiDrawn = false;        // a frame of overlays was closed in this turn: it is part of the window's content
+#ifdef PS2X_HAS_WINDOW_UI
+        std::unique_ptr<ps2x::gs::VulkanUiRenderer> m_ui;
+#endif
     };
 } // namespace
 

@@ -53,6 +53,7 @@
 #include "runtime/picture_rect.h"
 #include "runtime/host_devices.h"
 #include "runtime/gs/gs_game_window.h"
+#include "runtime/host_window.h"
 
 namespace ps2_stubs
 {
@@ -2467,6 +2468,9 @@ static bool openRendererWindow(const std::shared_ptr<GSVulkanPresenterLink> &lin
         return false;
     }
     ps2x::host::setDevices(&s_gameWindow->devices());
+    ps2x::host::setWindow(&s_gameWindow->control());
+    if (loadFullscreenSetting() && !s_gameWindow->hidden()) // issue 023 3S: display=fullscreen (borderless)
+        s_gameWindow->control().setFullscreen(true);
     std::fprintf(stderr, "[window] the renderer's own window (PS2X_WINDOW=vulkan)%s%s\n", options.hidden ? ", hidden" : "",
                  link ? "" : ", on a graphics device of its own (the renderer does not draw with Vulkan)");
     return true;
@@ -2524,11 +2528,11 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         m_audioBackend.startPcmStream();
 #endif
-        // The renderer's own window (issue 049) has no OpenGL: raylib's frame limiter and the overlays' start-up
-        // (rlImGui) belong to today's window.
+        // The renderer's own window (issue 049) has no OpenGL: raylib's frame limiter belongs to today's window.
+        // The overlays start up with either window (the window that shows the game draws them, step 4).
         if (!rendererWindowOpen())
             SetTargetFPS(configuredHostTargetFps());
-        if (m_debugUiInitCallback && !rendererWindowOpen())
+        if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
             m_debugUiInitialized = true;
@@ -4595,6 +4599,57 @@ void PS2Runtime::run()
         hudGameFps = s_gameFps;
         hudVsyncRate = s_vsyncRate;
     };
+    // DW5XL (issue 049, amendment v3.12 step 4): the F2 and F8 lines and the state message, one code for both
+    // loops, drawn by whichever window shows the game (runtime/host_window.h): the same boxes, places, sizes and
+    // colours as raylib drew them (its Fade(BLACK, 0.75), GREEN, YELLOW, RED and WHITE). Not drawn in a hidden
+    // window, unless a test asks for them there (DW5XL-DEBUG PS2X_OVERLAY_HIDDEN=1: window pictures of hidden runs).
+    static const bool s_overlayHidden = [] { const char *v = std::getenv("PS2X_OVERLAY_HIDDEN"); return v && *v && *v != '0'; }();
+    bool showBuildOverlay = false; // F8: build ID and game tick, to match screenshots with logs (off by default)
+    const auto overlayLines = [this, &showBuildOverlay, &hudGameFps, &hudVsyncRate](uint32_t pictureWidth, uint32_t pictureHeight,
+                                                                                  uint64_t currentVsync)
+    {
+        using ps2x::host::Colour;
+        ps2x::host::Window &window = ps2x::host::window();
+        if (window.hidden() && !s_overlayHidden)
+            return;
+        const auto over = ps2x::host::Window::Layer::OverPages;
+        const Colour box{0, 0, 0, 191}, white{255, 255, 255, 255};
+        const bool showFpsOverlay = showFps();
+        if (showFpsOverlay)
+        {
+            const uint32_t aaNow = m_gs.getAASamples();
+            const char *fpsText = TextFormat("FPS: %.0f  |  VSync: %.1f  |  Output: %ux (%ux%u)  |  AA: %ux%s",
+                hudGameFps, hudVsyncRate, m_gs.getResolutionScale(), pictureWidth, pictureHeight, aaNow,
+                aaNow < s_aaChoice ? TextFormat(" (set %ux, max at this output)", s_aaChoice) : "");
+            constexpr int kFontSize = 18;
+            const int textW = window.textWidth(kFontSize, fpsText);
+            window.fillRect(over, 8, 8, textW + 16, kFontSize + 10, box);
+            const Colour statColor = (hudGameFps >= 45.0f && hudVsyncRate >= 45.0f) ? Colour{0, 228, 48, 255} :
+                                     (hudGameFps >= 25.0f && hudVsyncRate >= 25.0f) ? Colour{253, 249, 0, 255} : Colour{230, 41, 55, 255};
+            window.text(over, 16, 13, kFontSize, statColor, fpsText);
+        }
+        if (showBuildOverlay)
+        {
+            const char *buildText = TextFormat("Build: %s  |  Tick: %llu",
+                m_buildId.empty() ? "unknown" : m_buildId.c_str(), static_cast<unsigned long long>(currentVsync));
+            constexpr int kFontSize = 18;
+            const int y = showFpsOverlay ? 44 : 8;
+            window.fillRect(over, 8, y, window.textWidth(kFontSize, buildText) + 16, kFontSize + 10, box);
+            window.text(over, 16, y + 5, kFontSize, white, buildText);
+        }
+        // Issue 027 v3: the result of F5 / F9 for a few seconds, centred at the bottom of the window. While a host screen
+        // pauses the game (027 v4: the states menu), that screen shows it in its own help line.
+        if (const std::string message = stateMessage(); !message.empty() && !eeScheduler().hostPaused())
+        {
+            constexpr int kFontSize = 22;
+            const int textW = window.textWidth(kFontSize, message.c_str());
+            int renderWidth = 0, renderHeight = 0;
+            window.renderSize(renderWidth, renderHeight);
+            const int x = (renderWidth - textW) / 2, y = renderHeight - kFontSize - 40;
+            window.fillRect(over, x - 12, y - 7, textW + 24, kFontSize + 14, box);
+            window.text(over, x, y, kFontSize, white, message.c_str());
+        }
+    };
 #ifdef PS2X_HAS_GAME_WINDOW
     if (ownWindow)
     {
@@ -4699,8 +4754,9 @@ void PS2Runtime::run()
                 std::fprintf(stderr, "[window] SHARPEN is not drawn by the renderer's own window yet\n");
             }
             const TurnClock::time_point given = s_stats ? TurnClock::now() : TurnClock::time_point{};
-            const ps2x::gs::GameWindowShown shown = window.show(paced.field, look);
-            const TurnClock::time_point showed = s_stats ? TurnClock::now() : TurnClock::time_point{};
+            // The window's turn in two halves (step 4): the picture is chosen and placed, the overlays are drawn over
+            // it by the code below, then the window is presented.
+            ps2x::gs::GameWindowShown shown = window.take(paced.field, look);
             shownHave = shown.have;
             shownOrder = shown.order;
             s_windowFrameNewPicture = shown.newPicture;
@@ -4718,26 +4774,39 @@ void PS2Runtime::run()
                 m_pictureRect[0] = shown.x; m_pictureRect[1] = shown.y;
                 m_pictureRect[2] = shown.rectWidth; m_pictureRect[3] = shown.rectHeight;
             }
-            // Function keys: one table, runtime/hotkeys.h. F2 changes the saved setting; its line is an overlay (step 4).
+            // The overlays, in today's order: the mouse-capture mark under the pages, the pages (and the debugger),
+            // then the F2 and F8 lines and the state message over them.
+            ps2_host_input::drawMouseCaptureIndicator(shown.x, shown.y, shown.rectWidth, shown.rectHeight);
+            if (m_debugUiInitialized && m_debugUiDrawCallback)
+                m_debugUiDrawCallback(*this, m_debugUiUserData);
+            // Function keys: one table, runtime/hotkeys.h (F2 FPS, F8 build ID; F3, F4, F5, F9 in outputAndStateKeys).
+            static const bool s_showFpsInit = [this]() { m_showFps.store(loadShowFpsSetting(), std::memory_order_relaxed); return true; }();
+            (void)s_showFpsInit;
             if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::FpsOverlay)))
             {
                 setShowFps(!showFps());
                 ps2x::settings::saveText("show_fps", showFps() ? "on" : "off");
             }
+            if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::BuildOverlay)))
+                showBuildOverlay = !showBuildOverlay;
             outputAndStateKeys();
+            overlayLines(shown.width, shown.height, eeScheduler().currentVSyncTick());
+            const TurnClock::time_point overlaid = s_stats ? TurnClock::now() : TurnClock::time_point{};
+            window.present(shown, look);
             const auto now = std::chrono::steady_clock::now();
             const double turnMs = std::chrono::duration<double, std::milli>(now - lastTurn).count();
             // DW5XL-DEBUG PS2X_PRESENT_STATS=1: a turn over 25 ms with its parts, in milliseconds. `before`: the
             // end of the turn before (a window picture, the stats line); `wait`: for the next field; `step`:
             // sound, the test harness, the window's events; `collect`: the wait for the field's picture on the GS
-            // side and the collecting of reads; `memory`: a picture from main memory copied; `show`: the window
-            // (its own parts in brackets); `after`: a frame dump, the keys.
+            // side and the collecting of reads; `memory`: a picture from main memory copied; `overlays`: choosing
+            // the picture, a frame dump, the pages, the keys and the lines; `show`: the window presented (its own
+            // parts in brackets).
             if (s_stats && turnMs > 25.0)
                 std::fprintf(stderr, "[present:own:slow] field=%llu fresh=%d turn=%.1f before+wait=%.1f step=%.1f collect=%.1f memory=%.1f "
-                                     "show=%.1f (acquire=%.1f draw=%.1f present=%.1f) after=%.1f new=%d fromMemory=%d\n",
+                                     "overlays=%.1f show=%.1f (acquire=%.1f draw=%.1f present=%.1f) new=%d fromMemory=%d\n",
                              static_cast<unsigned long long>(paced.field), paced.fresh ? 1 : 0, turnMs, partMs(lastTurn, waited),
-                             partMs(waited, polled), partMs(polled, latched), partMs(latched, given), partMs(given, showed),
-                             shown.acquireMs, shown.drawMs, shown.presentMs, partMs(showed, now), shown.newPicture ? 1 : 0,
+                             partMs(waited, polled), partMs(polled, latched), partMs(latched, given), partMs(given, overlaid),
+                             partMs(overlaid, now), shown.acquireMs, shown.drawMs, shown.presentMs, shown.newPicture ? 1 : 0,
                              shown.fromMemory ? 1 : 0);
             lastTurn = now;
             hudNumbers(static_cast<float>(turnMs), eeScheduler().currentVSyncTick());
@@ -4765,6 +4834,22 @@ void PS2Runtime::run()
                                  static_cast<unsigned long long>(shown.field), s_shotPath.c_str(), saved ? "" : " (not saved)");
                     s_shotPath.clear();
                 }
+            }
+            // The control file's `hostshot`: the window as it was just presented, overlays included.
+            if (!devHarness.hostShots.empty())
+            {
+                std::vector<uint8_t> rgba;
+                uint32_t shotWidth = 0u, shotHeight = 0u;
+                const bool have = window.picture(look, rgba, shotWidth, shotHeight);
+                for (const std::string &path : devHarness.hostShots)
+                {
+                    ::Image shot{rgba.data(), static_cast<int>(shotWidth), static_cast<int>(shotHeight), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+                    const bool ok = have && ExportImage(shot, path.c_str());
+                    const auto indicator = ps2_host_input::mouseCaptureIndicator();
+                    std::cerr << "[dev] hostshot " << path << (ok ? " ok" : " FAILED")
+                              << " mouse=" << indicator.captured << " alpha=" << indicator.alpha << std::endl;
+                }
+                devHarness.hostShots.clear();
             }
             // DW5XL-DEBUG PS2X_PRESENT_STATS=1: one line a second, as today's window has one ([present:stats]):
             // window frames, the game's new pictures shown, of them the ones that came from main memory (uploaded),
@@ -5045,12 +5130,9 @@ void PS2Runtime::run()
             setShowFps(!showFps());
             ps2x::settings::saveText("show_fps", showFps() ? "on" : "off");
         }
-        const bool s_showFpsOverlay = showFps();
-        // F8: build ID and game tick, to match screenshots with logs (off by default).
-        static bool s_showBuildOverlay = false;
         if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::BuildOverlay)))
         {
-            s_showBuildOverlay = !s_showBuildOverlay;
+            showBuildOverlay = !showBuildOverlay;
         }
         outputAndStateKeys();
 
@@ -5061,40 +5143,7 @@ void PS2Runtime::run()
         // have device work), whichever is higher. The host window loop itself is paced by VBlankEnd (50 Hz) and is not shown.
         const uint64_t currentVsync = eeScheduler().currentVSyncTick();
         hudNumbers(GetFrameTime() * 1000.0f, currentVsync);
-        const float s_gameFps = hudGameFps, s_vsyncRate = hudVsyncRate;
-
-        if (s_showFpsOverlay && !IsWindowHidden())
-        {
-            const uint32_t aaNow = m_gs.getAASamples();
-            const char *fpsText = TextFormat("FPS: %.0f  |  VSync: %.1f  |  Output: %ux (%ux%u)  |  AA: %ux%s",
-                s_gameFps, s_vsyncRate, m_gs.getResolutionScale(), presentWidth, presentHeight, aaNow,
-                aaNow < s_aaChoice ? TextFormat(" (set %ux, max at this output)", s_aaChoice) : "");
-            constexpr int kFontSize = 18;
-            const int textW = MeasureText(fpsText, kFontSize);
-            DrawRectangle(8, 8, textW + 16, kFontSize + 10, Fade(BLACK, 0.75f));
-            const Color statColor = (s_gameFps >= 45.0f && s_vsyncRate >= 45.0f) ? GREEN :
-                                    (s_gameFps >= 25.0f && s_vsyncRate >= 25.0f) ? YELLOW : RED;
-            DrawText(fpsText, 16, 13, kFontSize, statColor);
-        }
-        if (s_showBuildOverlay && !IsWindowHidden())
-        {
-            const char *buildText = TextFormat("Build: %s  |  Tick: %llu",
-                m_buildId.empty() ? "unknown" : m_buildId.c_str(), static_cast<unsigned long long>(currentVsync));
-            constexpr int kFontSize = 18;
-            const int y = s_showFpsOverlay ? 44 : 8;
-            DrawRectangle(8, y, MeasureText(buildText, kFontSize) + 16, kFontSize + 10, Fade(BLACK, 0.75f));
-            DrawText(buildText, 16, y + 5, kFontSize, WHITE);
-        }
-        // Issue 027 v3: the result of F5 / F9 for a few seconds, centred at the bottom of the window. While a host screen
-        // pauses the game (027 v4: the states menu), that screen shows it in its own help line.
-        if (const std::string message = stateMessage(); !message.empty() && !IsWindowHidden() && !eeScheduler().hostPaused())
-        {
-            constexpr int kFontSize = 22;
-            const int textW = MeasureText(message.c_str(), kFontSize);
-            const int x = (GetRenderWidth() - textW) / 2, y = GetRenderHeight() - kFontSize - 40;
-            DrawRectangle(x - 12, y - 7, textW + 24, kFontSize + 14, Fade(BLACK, 0.75f));
-            DrawText(message.c_str(), x, y, kFontSize, WHITE);
-        }
+        overlayLines(presentWidth, presentHeight, currentVsync);
 
         // DW5XL-DEBUG issue 023 3S: PS2X_WINDOW_SHOT=<field>:<path.png> saves the whole window (overlays included)
         // on the first frame at or after that field — the frame dumps hold only the game picture.
@@ -5185,6 +5234,7 @@ void PS2Runtime::run()
     {
 #ifdef PS2X_HAS_GAME_WINDOW
         ps2x::host::setDevices(nullptr);
+        ps2x::host::setWindow(nullptr);
         s_gameWindow.reset();
 #endif
     }

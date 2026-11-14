@@ -588,6 +588,11 @@ if(DW5XL_BUILD_TESTS)
     # parallel-gs: the hand-over test is a stand-in presenter with a device object of its own (the library's headers).
     target_link_libraries(dw5xl_gs_renderer_tests PRIVATE ps2_runtime parallel-gs)
     target_include_directories(dw5xl_gs_renderer_tests PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/src/lib" "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    # Step 4: the window test draws a picture of the pages through Dear ImGui where the overlays are built.
+    if(TARGET imgui)
+        target_link_libraries(dw5xl_gs_renderer_tests PRIVATE imgui)
+        target_compile_definitions(dw5xl_gs_renderer_tests PRIVATE DW5XL_TEST_HAS_IMGUI)
+    endif()
     add_test(NAME gs_picture_reads COMMAND dw5xl_gs_renderer_tests gs_picture_reads)
     # DW5XL-TEST issue 049 (amendment v3.12 step 2): the renderer's device is made with window support where the
     # system offers it (skipped without a Vulkan device).

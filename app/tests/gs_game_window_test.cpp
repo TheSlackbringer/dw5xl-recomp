@@ -28,10 +28,15 @@
 //      (the one from main memory with half the rows and rows further apart than their pixels);
 //  20. a window without a Vulkan renderer: a device of its own, pictures from main memory only.
 //   The renderer numbers its pictures in the order it finished them, read back or handed over.
+//   Step 4 (after 19):
+//  21. the overlays: rectangles under and over the pages, a line of text and a picture of the pages are drawn
+//      over the game's picture in the turn they were asked for, and gone in the next;
+//  22. the window's settings: vsync on and off, its size and place, borderless fullscreen and back.
 // Exit code 77: no Vulkan device, or no Vulkan windows on this system (skipped).
 #include "runtime/gs/gs_game_window.h"
 #include "runtime/gs/gs_vulkan_backend.h"
 #include "runtime/host_devices.h"
+#include "runtime/host_window.h"
 #include "runtime/picture_rect.h"
 #include "gs/gs_vulkan_handover.h"
 #include "gs/gs_vulkan_window.h"
@@ -41,6 +46,9 @@
 #include "device.hpp"
 #include "context.hpp"
 #include "thread_id.hpp"
+#ifdef DW5XL_TEST_HAS_IMGUI
+#include "imgui.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -592,6 +600,142 @@ int run(uint32_t wantedScale)
                   "a picture from main memory and then a field in one turn: the field's picture is shown", scale);
             check(largestDifference(windowPicture(*window, look), expected(b, w, h, now, smooth)) <= allowed, "which is B", scale);
         }
+    }
+
+    // --- Step 4: the overlays drawn by the window, and the window's settings. The window shows B, with bars of 94
+    // pixels left and right.
+    {
+        ps2x::host::Window &ui = window->control();
+        using Layer = ps2x::host::Window::Layer;
+        uint32_t w = 0u, h = 0u;
+        window->drawableSize(w, h);
+        const ps2x::PictureRect now = ps2x::pictureRectInWindow(displayWidth, displayHeight, look.shape, static_cast<float>(w), static_cast<float>(h));
+        const int allowed = smooth ? 1 : 0;
+
+        // 21. Overlays over the picture.
+        check(ui.uiSetup(true), "the window draws the overlays itself", scale);
+#ifdef DW5XL_TEST_HAS_IMGUI
+        ImGui::GetIO().IniFilename = nullptr; // a test leaves no settings file behind
+#endif
+        Picture stamp = patterned(8u, 8u);
+        for (size_t i = 3u; i < stamp.rgba.size(); i += 4u)
+            stamp.rgba[i] = 0xFFu;
+        const uint64_t texture = ui.makeTexture(stamp.rgba.data(), 8, 8);
+        check(texture != 0u, "a picture for the overlays is made", scale);
+        ps2x::gs::GameWindowShown shown = window->take(tick, look);
+        check(shown.have && !shown.newPicture && shown.x == now.x && shown.y == now.y && shown.rectWidth == now.width && shown.rectHeight == now.height,
+              "the window's turn in two halves: the picture has its place before anything is drawn", scale);
+        const int inPicture = static_cast<int>(now.x) + 50;
+        ui.fillRect(Layer::OverPages, 10, 20, 30, 40, {255, 0, 0, 255});
+        ui.fillRect(Layer::UnderPages, 40, 100, 30, 40, {0, 0, 255, 128});
+        ui.fillRect(Layer::OverPages, inPicture, 60, 20, 20, {0, 255, 0, 255});
+        const int textWidth = ui.textWidth(18, "DW5XL 049");
+        ui.text(Layer::OverPages, 10, 300, 18, {255, 255, 255, 255}, "DW5XL 049");
+#ifdef DW5XL_TEST_HAS_IMGUI
+        ui.uiBegin();
+        ImGui::GetForegroundDrawList()->AddImage(ImTextureID(texture), ImVec2(10.0f, 200.0f), ImVec2(18.0f, 208.0f));
+        ui.uiEnd();
+#endif
+        window->present(shown, look);
+        check(shown.presented, "and is presented with the overlays", scale);
+        const Picture p = windowPicture(*window, look);
+        const auto is = [&](int x, int y, int r, int g, int b, int within) {
+            const uint8_t *c = &p.rgba[(static_cast<size_t>(y) * p.width + static_cast<size_t>(x)) * 4u];
+            return std::abs(c[0] - r) <= within && std::abs(c[1] - g) <= within && std::abs(c[2] - b) <= within;
+        };
+        const auto all = [&](int x0, int y0, int x1, int y1, int r, int g, int b, int within) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = x0; x < x1; ++x)
+                    if (!is(x, y, r, g, b, within))
+                        return false;
+            return true;
+        };
+        const bool sized = p.width == w && p.height == h;
+        check(sized && all(10, 20, 40, 60, 255, 0, 0, 0), "a rectangle over the bar: its colour in every pixel", scale);
+        check(sized && all(0, 20, 10, 60, 0, 0, 0, 0) && all(10, 10, 40, 20, 0, 0, 0, 0) && all(10, 60, 40, 70, 0, 0, 0, 0) && is(40, 30, 0, 0, 0, 0),
+              "and black right beside it on every side", scale);
+        check(sized && all(40, 100, 70, 140, 0, 0, 128, 1), "a half transparent rectangle under the pages: half its colour over black", scale);
+        check(sized && all(inPicture, 60, inPicture + 20, 80, 0, 255, 0, 0), "a rectangle over the picture covers it", scale);
+        {
+            // The picture itself is untouched right of the overlays.
+            const Picture want = expected(b, w, h, now, smooth);
+            int largest = 256;
+            if (sized)
+            {
+                largest = 0;
+                for (uint32_t y = 0; y < h; ++y)
+                    for (uint32_t x = static_cast<uint32_t>(inPicture) + 40u; x < w; ++x)
+                        for (size_t c = 0; c < 3u; ++c)
+                            largest = std::max(largest, std::abs(static_cast<int>(p.rgba[(static_cast<size_t>(y) * w + x) * 4u + c]) -
+                                                                 static_cast<int>(want.rgba[(static_cast<size_t>(y) * w + x) * 4u + c])));
+            }
+            check(largest <= allowed, "the picture beside the overlays is as without them", scale);
+        }
+        {
+            int bright = 0, astray = 0;
+            for (int y = 296; sized && y < 326; ++y)
+                for (int x = 10; x < 94; ++x)
+                    bright += is(x, y, 255, 255, 255, 60) ? 1 : 0;
+            for (int y = 340; sized && y < 360; ++y)
+                for (int x = 0; x < 94; ++x)
+                    astray += is(x, y, 0, 0, 0, 0) ? 0 : 1;
+            std::printf("note  scale %ux: a line of text 18 pixels high: %d pixels wide by the window's measure, %d bright pixels drawn\n", scale, textWidth, bright);
+            check(textWidth > 40 && bright >= 40 && astray == 0, "a line of text: it has a width, its letters are drawn at its place and nowhere below", scale);
+        }
+#ifdef DW5XL_TEST_HAS_IMGUI
+        {
+            bool same = sized;
+            for (int y = 0; same && y < 8; ++y)
+                for (int x = 0; same && x < 8; ++x)
+                {
+                    const uint8_t *s = &stamp.rgba[(static_cast<size_t>(y) * 8u + static_cast<size_t>(x)) * 4u];
+                    same = is(10 + x, 200 + y, s[0], s[1], s[2], 0);
+                }
+            check(same, "a picture of the pages drawn one to one: pixel for pixel", scale);
+        }
+#endif
+        shown = window->show(tick, look);
+        check(shown.presented && largestDifference(windowPicture(*window, look), expected(b, w, h, now, smooth)) <= allowed,
+              "in the next turn, with nothing drawn over it, the window shows the picture alone", scale);
+        ui.dropTexture(texture);
+
+        // 22. The window's settings.
+        check(ui.hidden() && !ui.maximized() && !ui.fullscreen() && !ui.vsync(), "the window says what it is: hidden, not maximized, not fullscreen, vsync off", scale);
+        ui.setVsync(true);
+        const bool on = ui.vsync();
+        ui.setVsync(false);
+        shown = window->show(tick, look);
+        check(on && !ui.vsync() && shown.presented, "vsync switched on and off again: the window presents", scale);
+        int screenW = 0, screenH = 0, renderW = 0, renderH = 0;
+        ui.screenSize(screenW, screenH);
+        ui.renderSize(renderW, renderH);
+        check(renderW == static_cast<int>(w) && renderH == static_cast<int>(h) && screenW > 0 && screenH > 0 && ui.displayWidth() > 0,
+              "it knows its size and its display's width", scale);
+        int placeX = 0, placeY = 0, movedX = 0, movedY = 0;
+        ui.position(placeX, placeY);
+        ui.setPosition(placeX + 7, placeY + 5);
+        window->poll();
+        ui.position(movedX, movedY);
+        check(movedX == placeX + 7 && movedY == placeY + 5, "it takes another place", scale);
+        ui.setPosition(placeX, placeY);
+        window->poll();
+        const uint64_t chains = window->counts().swapChains;
+        ui.setFullscreen(true);
+        window->poll();
+        int fullW = 0, fullH = 0;
+        ui.screenSize(fullW, fullH);
+        shown = window->show(tick, look);
+        check(ui.fullscreen() && fullW == ui.displayWidth() && shown.presented && window->counts().swapChains > chains,
+              "borderless fullscreen: the display's width, presented through a new swap chain", scale);
+        ui.setFullscreen(false);
+        window->poll();
+        ui.screenSize(fullW, fullH);
+        ui.position(movedX, movedY);
+        shown = window->show(tick, look);
+        check(!ui.fullscreen() && fullW == screenW && fullH == screenH && movedX == placeX && movedY == placeY && shown.presented,
+              "and back: the size and the place before", scale);
+        check(ui.takeDroppedFiles().empty(), "no file was dropped on it", scale);
+        check(largestDifference(windowPicture(*window, look), expected(b, w, h, now, smooth)) <= allowed, "the window still draws B", scale);
     }
 
     // 13. The renderer goes first.

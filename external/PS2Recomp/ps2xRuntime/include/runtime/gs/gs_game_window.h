@@ -22,6 +22,7 @@ struct GSVulkanPresenterLink;
 namespace ps2x::host
 {
     struct Devices;
+    struct Window;
 }
 
 namespace ps2x::gs
@@ -95,6 +96,9 @@ namespace ps2x::gs
         virtual void poll() = 0;
         virtual bool closeAsked() const = 0;
         virtual host::Devices &devices() = 0;
+        // What the pages and overlays ask of the window (runtime/host_window.h): the overlays' frame, pictures for
+        // them, lines of text over the picture, and the window's settings (step 4).
+        virtual host::Window &control() = 0;
 
         // A picture of the game that only exists in main memory. The next show() shows it unless a picture finished
         // later (a larger `order`) is there. The pixels are copied; the caller's can go.
@@ -104,14 +108,20 @@ namespace ps2x::gs
         // given from main memory if that one was finished later, draws the window (black, the picture letterboxed
         // to its shape) and presents it.
         virtual GameWindowShown show(uint64_t maxField, const GameWindowLook &look) = 0;
+        // show() in its two halves, for a caller that draws overlays between them: take() chooses the picture and
+        // says where it will lie; present() draws the window (the picture, then the overlays drawn since take())
+        // and hands it to the display, filling in `presented` and the times.
+        virtual GameWindowShown take(uint64_t maxField, const GameWindowLook &look) = 0;
+        virtual void present(GameWindowShown &shown, const GameWindowLook &look) = 0;
 
         // The picture the window shows, as the renderer finished it (its own size, no window scaling), in main
         // memory: RGBA, rows width * 4 bytes apart, opaque. A picture on the graphics card is read from there,
         // which waits for the card: only on request (a frame dump, a saved state's picture), never to show.
         virtual bool shownPixels(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) = 0;
 
-        // What show() draws now, drawn once more into a picture of the window's size and read into main memory
-        // (RGBA, 4 bytes a pixel, opaque). For window pictures on request; never part of showing.
+        // What the window drew last (the picture and the overlays of that turn), drawn once more into a picture of
+        // the window's size and read into main memory (RGBA, 4 bytes a pixel, opaque). For window pictures on
+        // request; never part of showing.
         virtual bool picture(const GameWindowLook &look, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) = 0;
 
         virtual void drawableSize(uint32_t &width, uint32_t &height) const = 0;

@@ -30,6 +30,7 @@
 #include <string>
 #include "runtime/hotkeys.h"
 #include "runtime/host_devices.h"
+#include "runtime/host_window.h"
 
 namespace fs = std::filesystem;
 using namespace dw5xl::setup;
@@ -221,14 +222,12 @@ void drawOverlay()
         g_panel.reset();
         return;
     }
-    if (IsFileDropped())
-    {
-        FilePathList files = LoadDroppedFiles();
-        if (files.count > 0 && g_panel)
-            g_panel->dropped(fromUtf8(files.paths[0]));
-        UnloadDroppedFiles(files);
-    }
-    const ImVec2 screen{float(GetScreenWidth()), float(GetScreenHeight())};
+    // Issue 049: the window that shows the game says what was dropped on it and how large it is.
+    if (const std::vector<std::string> files = ps2x::host::window().takeDroppedFiles(); !files.empty() && g_panel)
+        g_panel->dropped(fromUtf8(files[0].c_str()));
+    int screenWidth = 0, screenHeight = 0;
+    ps2x::host::window().screenSize(screenWidth, screenHeight);
+    const ImVec2 screen{float(screenWidth), float(screenHeight)};
     ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, screen.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(620.0f, 0.0f), ImGuiCond_Appearing);
     bool open = true;

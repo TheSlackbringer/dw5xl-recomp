@@ -25,7 +25,7 @@ The build uses additional projects rather than vendoring their complete source i
 | Dependency | Source | License information |
 | --- | --- | --- |
 | raylib | [raysan5/raylib](https://github.com/raysan5/raylib) | zlib/libpng-style license; see the dependency's LICENSE. |
-| Dear ImGui | [ocornut/imgui](https://github.com/ocornut/imgui) | MIT; see LICENSE.txt. |
+| Dear ImGui | [ocornut/imgui](https://github.com/ocornut/imgui) | MIT; see LICENSE.txt. Its two compiled shaders (from `backends/imgui_impl_vulkan.cpp`) are copied, with the licence notice, into `external/PS2Recomp/ps2xRuntime/src/lib/gs/gs_vulkan_ui_shaders.h`. |
 | rlImGui | [raylib-extras/rlImGui](https://github.com/raylib-extras/rlImGui) | zlib-style license; see LICENSE. |
 | sse2neon, where enabled | [DLTcollab/sse2neon](https://github.com/DLTcollab/sse2neon) | Preserve the license notices in the exact dependency revision used. |
 | FFmpeg | [FFmpeg](https://ffmpeg.org/legal.html) | Licensing depends on the configuration and components of the linked build; verify the actual libraries before redistributing them. |

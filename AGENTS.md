@@ -246,8 +246,10 @@ frames, new pictures, skipped fields per second; cheap) · `PS2X_FIELD_SCANOUT=0
 per 4x frame, never for timing) · `PS2X_VBL_DRAW_TRACE` (display-buffer draws per VBlank edge) · `PS2X_LATCH_TRACE` ·
 `PS2X_VSYNC=1` (swap-interval experiment) · `PS2X_WINDOW=vulkan` (issue 049: the game in the window the renderer
 draws itself, a Vulkan swap chain without OpenGL, instead of today's; frame dumps, `final.png` and saved states'
-pictures work, the CPU renderer is shown too; no overlays, in-between pictures shown, SHARPEN or fullscreen yet;
-`[present:own]` per second with `PS2X_PRESENT_STATS`, `PS2X_WINDOW_SHOT` works).
+pictures work, the CPU renderer is shown too, the pages and overlays are drawn (ImGui by a renderer of ours); no
+in-between pictures shown and no SHARPEN yet; `[present:own]` per second and `[present:own:slow]` for a turn over
+25 ms with `PS2X_PRESENT_STATS`, `PS2X_WINDOW_SHOT` works) · `PS2X_OVERLAY_HIDDEN=1` (the F2 and F8 lines and the
+state message are drawn in a hidden window too, for window pictures of hidden runs).
 Sound/IOP: `PS2X_SPU2_TRACE` · `PS2X_LIBSD_TRACE` · `PS2X_KSNG_TRACE` / `PS2X_KSNH_TRACE` (sound RPCs) ·
 `PS2X_AUDIO_DUMP=<wav>` (s16 stereo 48 kHz) · `PS2X_AUDIO_TRACE` · `PS2X_SIFAUDIO_TRACE` · `PS2X_MPEGAUDIO_TRACE` ·
 `PS2X_IOP_HEAP_TRACE` · `PS2X_IO_TRACE`. Heavy IOP tracing starves audio streams: judge audio untraced.
