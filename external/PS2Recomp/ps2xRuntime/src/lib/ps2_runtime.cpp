@@ -692,6 +692,7 @@ namespace ps2x_dev
         {
             GSPictureRead read;
             ps2x::display_clock::Timed info;
+            uint64_t windowPicture = 0u; // step 5: the window's number for a picture kept on the graphics card
         };
         std::deque<TimedPicture> timed;
         bool readerOwnsReads = false; // the reader thread collects the reads: collect() below leaves them alone
@@ -716,13 +717,20 @@ namespace ps2x_dev
             fresh.clear();
             reader.take(fresh);
             for (GSPictureRead &picture : fresh)
+                if (addTimed(picture, 0u) == Added::NotTimed)
+                    pictures.push_back(std::move(picture)); // not a timed picture: the test path (saved with its field)
+        }
+        // One finished picture into the queue of timed pictures, by the instant announced under its tag.
+        // `windowPicture`: the window's number for a picture that stayed on the graphics card (issue 049 v3.12 step
+        // 5; the read then holds no pixels), 0 for one read into main memory. NotTimed and Void: not queued; the
+        // caller keeps or drops the picture.
+        enum class Added { Timed, NotTimed, Void };
+        Added addTimed(GSPictureRead &picture, uint64_t windowPicture)
+        {
             {
                 ps2x::display_clock::Timed info;
                 if (!ps2x::display_clock::take(picture.tag, info))
-                {
-                    pictures.push_back(std::move(picture)); // not a timed picture: the test path (saved with its field)
-                    continue;
-                }
+                    return Added::NotTimed;
                 ++stats.arrived;
                 if (!haveFrame || info.frame != lastFrame)
                 {
@@ -749,14 +757,17 @@ namespace ps2x_dev
                 if (info.isVoid)
                 {
                     ++stats.isVoid;
-                    continue;
+                    return Added::Void;
                 }
                 auto at = timed.end();
                 while (at != timed.begin() && std::prev(at)->info.atMs > info.atMs)
                     --at;
-                timed.insert(at, TimedPicture{std::move(picture), info});
+                timed.insert(at, TimedPicture{std::move(picture), info, windowPicture});
             }
+            return Added::Timed;
         }
+        // Set by a window that keeps timed pictures on the graphics card: a picture leaves the queue unshown.
+        std::function<void(uint64_t)> dropWindowPicture;
         // The front picture is done with: `handedMs` >= 0: shown, handed to the window then; < 0: not shown (reason).
         enum class Dropped { Late, WrongSize };
         void dropFront(Dropped why)
@@ -774,6 +785,8 @@ namespace ps2x_dev
                 outcome.handMs = lastHandMs;
                 ps2x::display_clock::report(outcome);
             }
+            if (timed.front().windowPicture != 0u && dropWindowPicture)
+                dropWindowPicture(timed.front().windowPicture);
             if (ps2x::display_clock::logTimeline())
                 std::fprintf(stderr, "[smooth:missed] refresh=%lld at=%.3f frame=%u t=%.5f ready=%.3f started=%.3f reason=%s\n",
                              static_cast<long long>(timed.front().info.refresh), timed.front().info.atMs, timed.front().info.frame,
@@ -4657,8 +4670,39 @@ void PS2Runtime::run()
         ps2x::gs::GameWindow &window = *s_gameWindow;
         if (hostFpsOverride != 0)
             std::fprintf(stderr, "[window] PS2X_HOST_FPS is not used by the renderer's own window: one window frame per PS2 field\n");
-        if (s_smoothShow)
-            std::fprintf(stderr, "[window] the renderer's own window shows the game's fields only so far (in-between pictures: step 5)\n");
+        // Step 5: in-between pictures in this window. As in today's window they are shown in the test mode
+        // (PS2X_SMOOTH_SHOW=1 with a test display), each at the instant it was made for; here they stay on the
+        // graphics card: the window is handed them (GameWindow::takeTimed), the queue of timed pictures keeps each
+        // one's number with its instant, and the turn that presents one tells the window which.
+        const bool timedOwn = s_smoothShow && haveDisplay && hostFpsOverride == 0 && m_eeScheduler;
+        // The renderer memory that draws the pictures is made when the game first makes one (syncPictureGs): the
+        // window is attached to its hand-over in the turn after that.
+        GS *timedFor = nullptr;
+        std::mutex timedMutex;
+        std::deque<double> timedStartedAt; // GS side: when each in-between picture not yet taken was handed over
+        std::vector<ps2x::gs::GameWindowTimed> freshTimed;
+        std::vector<GSPictureRead> strayReads;
+        uint64_t strayPictures = 0u, statTimed = 0u;
+        auto &turnTimes = turnMs; // following display: what the last 32 turns took up to their present
+        if (timedOwn)
+        {
+            ps2x_dev::s_inBetween.readerOwnsReads = true; // collect() leaves the reads alone: there are none to read
+            ps2x_dev::s_inBetween.dropWindowPicture = [&window](uint64_t id) { window.dropTimed(id); };
+            setPictureReadSubmitted([this, &timedMutex, &timedStartedAt] {
+                {
+                    std::lock_guard<std::mutex> lock(timedMutex);
+                    timedStartedAt.push_back(dc::nowMs());
+                }
+                m_eeScheduler->wakePresentationWait();
+            });
+            std::fprintf(stderr, "[window] in-between pictures are taken on the graphics card and shown at their instants\n");
+        }
+        else if (s_smoothShow)
+        {
+            std::fprintf(stderr, "[window] in-between pictures are not shown: %s\n",
+                         !haveDisplay ? "no test display (PS2X_TEST_DISPLAY)" : hostFpsOverride != 0 ? "PS2X_HOST_FPS is set"
+                                                                                                    : "the game has no field clock");
+        }
         static const bool s_stats = [] { const char *v = std::getenv("PS2X_PRESENT_STATS"); return v && *v && *v != '0'; }();
         auto lastTurn = std::chrono::steady_clock::now(), statsSince = lastTurn;
         uint64_t statFrames = 0u, statNew = 0u, statFailed = 0u, statSlow = 0u, statFromMemory = 0u, statFetched = 0u;
@@ -4692,9 +4736,109 @@ void PS2Runtime::run()
                 shownLoads = loads;
                 lastShownField = ps2x::presentation::kNoField;
             }
-            const EeScheduler::PresentationField paced = m_eeScheduler->waitForPresentationField(lastShownField);
-            if (paced.fresh)
-                lastShownField = paced.field;
+            EeScheduler::PresentationField paced{};
+            bool inBetween = false; // this turn presents an in-between picture (the queue's front)
+            bool wokeEarly = false;
+            double turnStartMs = 0.0;
+            auto timedWake = SmoothClock::time_point::max();
+            if (timedOwn)
+            {
+                // Today's loop, step for step, with the pictures on the graphics card.
+                auto &queue = ps2x_dev::s_inBetween;
+                if (GS *picture = m_pictureGsPtr.load(std::memory_order_acquire); picture != timedFor)
+                {
+                    timedFor = picture;
+                    const std::shared_ptr<GSVulkanPresenterLink> link = picture ? picture->presenterLink() : nullptr;
+                    window.attachTimedPictures(link);
+                    if (picture && !link)
+                        std::fprintf(stderr, "[window] the renderer of the in-between pictures hands none over: they are not shown\n");
+                }
+                freshTimed.clear();
+                window.takeTimed(freshTimed);
+                for (const ps2x::gs::GameWindowTimed &handed : freshTimed)
+                {
+                    GSPictureRead picture; // what the queue keeps of it: its tag and times; the picture is the window's
+                    picture.tag = handed.tag;
+                    {
+                        std::lock_guard<std::mutex> lock(timedMutex);
+                        picture.startedMs = timedStartedAt.empty() ? dc::nowMs() : timedStartedAt.front();
+                        if (!timedStartedAt.empty())
+                            timedStartedAt.pop_front();
+                    }
+                    picture.readyMs = picture.startedMs; // handed over: the window can draw it from then on
+                    if (queue.addTimed(picture, handed.id) != ps2x_dev::InBetweenQueue::Added::Timed)
+                        window.dropTimed(handed.id); // its time line moved on, or no instant was announced for it
+                }
+                // A picture the hand-over had no place for was read back instead. It is not shown; it is taken out so
+                // that such reads do not fill the renderer's ring, and its instant is forgotten.
+                strayReads.clear();
+                pictureGs().collectPictureReads(strayReads);
+                for (const GSPictureRead &stray : strayReads)
+                {
+                    dc::Timed gone;
+                    dc::take(stray.tag, gone);
+                    {
+                        std::lock_guard<std::mutex> lock(timedMutex);
+                        if (!timedStartedAt.empty())
+                            timedStartedAt.pop_front();
+                    }
+                    if (strayPictures++ == 0u)
+                        std::fprintf(stderr, "[window] an in-between picture was read back instead of handed over (no place); such "
+                                             "pictures are not shown\n");
+                }
+                const double now = dc::nowMs();
+                // Fixed rate: a picture whose instant has passed missed its refresh. Following display: a picture is on
+                // screen when it is presented, so a late one is still shown unless the next one's instant has come too.
+                while (!queue.timed.empty() &&
+                       (displayGrid.follows ? queue.timed.size() >= 2u && now >= queue.timed[1].info.atMs
+                                            : now >= queue.timed.front().info.atMs))
+                    queue.dropFront(ps2x_dev::InBetweenQueue::Dropped::Late);
+                if (!queue.timed.empty())
+                {
+                    // Fixed rate: handed over in the refresh interval before its instant. Following display: presented
+                    // at its instant; the turn starts as much earlier as a turn has lately taken up to its present.
+                    const double at = queue.timed.front().info.atMs;
+                    const double lead = displayGrid.follows ? *std::max_element(turnTimes.begin(), turnTimes.end()) : displayGrid.periodMs;
+                    if (now >= at - lead)
+                    {
+                        inBetween = true;
+                        turnStartMs = now;
+                    }
+                    else
+                    {
+                        timedWake = dc::fromMs(at - lead);
+                    }
+                }
+            }
+            if (!inBetween)
+            {
+                if (timedOwn)
+                {
+                    // Also woken by a picture's arrival and at the next picture's hand-over time.
+                    const auto got = m_eeScheduler->waitForPresentationFieldUntil(lastShownField, timedWake);
+                    paced.field = got.field;
+                    paced.fresh = got.fresh;
+                    wokeEarly = got.early;
+                }
+                else
+                {
+                    paced = m_eeScheduler->waitForPresentationField(lastShownField);
+                }
+                if (paced.fresh)
+                {
+                    lastShownField = paced.field;
+                    // The field period as the window sees it (issue 049 P2.5): the time between two announcements, smoothed.
+                    const auto announced = SmoothClock::now();
+                    if (fieldAnnouncedAt != SmoothClock::time_point{})
+                    {
+                        const double ms = std::chrono::duration<double, std::milli>(announced - fieldAnnouncedAt).count();
+                        if (ms > 10.0 && ms < 40.0)
+                            fieldPeriodMs += (ms - fieldPeriodMs) * 0.05;
+                    }
+                    fieldAnnouncedAt = announced;
+                    ps2x_dev::s_inBetween.periodMs = fieldPeriodMs;
+                }
+            }
             // DW5XL-DEBUG PS2X_PRESENT_STATS=1: where a turn spends its time (the [present:own:slow] line below).
             using TurnClock = std::chrono::steady_clock;
             const auto partMs = [](TurnClock::time_point from, TurnClock::time_point to) {
@@ -4706,24 +4850,27 @@ void PS2Runtime::run()
             window.poll();
             ps2_host_input::poll(m_eeScheduler->currentVSyncTick());
             const TurnClock::time_point polled = s_stats ? TurnClock::now() : TurnClock::time_point{};
+            if (timedOwn && !inBetween && !paced.fresh && wokeEarly)
+                continue; // woken for a picture's arrival or its hand-over time: the next turn decides
             // As today's window (UploadFrame): a fresh field is waited for until the GS side has finished it, and
             // what the GS side read back is collected in every turn, so that a read finished between two fields
             // does not wait for the next field. A renderer read at window time is read once per fresh field.
-            if (paced.fresh || !latchedOnce || gs().fieldScanoutsActive())
+            // A turn that presents an in-between picture leaves the field's own picture alone, as today's does.
+            if (!inBetween && (paced.fresh || !latchedOnce || gs().fieldScanoutsActive()))
             {
                 gs().latchHostPresentationFrame(paced.fresh ? paced.field : std::numeric_limits<uint64_t>::max(), paced.field);
                 latchedOnce = true;
             }
-            if (paced.fresh)
+            if (!inBetween && paced.fresh)
                 s_windowFrameField = paced.field;
             const TurnClock::time_point latched = s_stats ? TurnClock::now() : TurnClock::time_point{};
             // Issue 049 v3.2 (P2.3b): in-between pictures read out on the GS side are collected as with today's
             // window (kept, counted, saved with a dumped field). This window shows them from step 5 on.
-            if (pictureGs().pictureReadsActive())
+            if (!inBetween && pictureGs().pictureReadsActive())
                 ps2x_dev::s_inBetween.collect(this, s_windowFrameField);
             // A picture that only exists in main memory (two fields put together by the CPU at 1x, the CPU
             // renderer): into s_lastFrame as today's window keeps it, and to the window, which uploads it.
-            if (const uint64_t generation = gs().hostPresentationGeneration(); generation != lastReadGeneration)
+            if (const uint64_t generation = gs().hostPresentationGeneration(); !inBetween && generation != lastReadGeneration)
             {
                 lastReadGeneration = generation;
                 uint32_t width = 0u, height = 0u, memoryDisplayWidth = 0u, memoryDisplayHeight = 0u;
@@ -4756,18 +4903,40 @@ void PS2Runtime::run()
             const TurnClock::time_point given = s_stats ? TurnClock::now() : TurnClock::time_point{};
             // The window's turn in two halves (step 4): the picture is chosen and placed, the overlays are drawn over
             // it by the code below, then the window is presented.
-            ps2x::gs::GameWindowShown shown = window.take(paced.field, look);
-            shownHave = shown.have;
-            shownOrder = shown.order;
-            s_windowFrameNewPicture = shown.newPicture;
-            // Issue 049: a frame dump holds the picture this window frame shows, named by the field it shows, as
-            // with today's window. The picture is read from the graphics card for it (fetchShownPicture).
-            const bool fieldDumped = devHarness.dumpPresented(s_windowFrameField);
-            if (pictureGs().pictureReadsActive())
+            ps2x::gs::GameWindowShown shown;
+            if (inBetween)
             {
-                if (fieldDumped)
-                    ps2x_dev::s_inBetween.dump(s_windowFrameField, shown.have ? shown.field : std::numeric_limits<uint64_t>::max());
-                ps2x_dev::s_inBetween.retire(s_windowFrameField);
+                // An in-between picture's turn: the queue's front, which the window holds under its number.
+                shown = window.takeTimedPicture(ps2x_dev::s_inBetween.timed.front().windowPicture, look);
+                if (!shown.have)
+                {
+                    ps2x_dev::s_inBetween.dropFront(ps2x_dev::InBetweenQueue::Dropped::WrongSize); // not the window's any more
+                    continue;
+                }
+            }
+            else
+            {
+                shown = window.take(paced.field, look);
+                shownHave = shown.have;
+                shownOrder = shown.order;
+                s_windowFrameNewPicture = shown.newPicture;
+                // Issue 049: a frame dump holds the picture this window frame shows, named by the field it shows, as
+                // with today's window. The picture is read from the graphics card for it (fetchShownPicture).
+                const bool fieldDumped = devHarness.dumpPresented(s_windowFrameField);
+                if (pictureGs().pictureReadsActive())
+                {
+                    if (fieldDumped)
+                        ps2x_dev::s_inBetween.dump(s_windowFrameField, shown.have ? shown.field : std::numeric_limits<uint64_t>::max());
+                    ps2x_dev::s_inBetween.retire(s_windowFrameField);
+                }
+                if (timedOwn && paced.fresh && ps2x_dev::s_inBetween.lastShownAtMs >= dc::nowMs() - fieldPeriodMs)
+                {
+                    // Timed pictures cover the present (one was shown for an instant less than a field ago): the
+                    // field's own picture was taken (and saved if a test asked) but is not shown. When they stop, or
+                    // miss their instants, the window shows fields again.
+                    ps2x_dev::s_inBetween.hiddenForStats += s_windowFrameNewPicture ? 1u : 0u;
+                    continue;
+                }
             }
             if (shown.have)
             {
@@ -4792,7 +4961,44 @@ void PS2Runtime::run()
             outputAndStateKeys();
             overlayLines(shown.width, shown.height, eeScheduler().currentVSyncTick());
             const TurnClock::time_point overlaid = s_stats ? TurnClock::now() : TurnClock::time_point{};
+            double handedMs = 0.0, handMs = 0.0;
+            if (inBetween)
+            {
+                handMs = dc::nowMs() - turnStartMs; // what this turn needed up to its present
+                turnTimes[turnAt++ % turnTimes.size()] = handMs;
+                if (displayGrid.follows)
+                {
+                    // Presented at its instant: sleep close to it, then spin.
+                    const auto due = dc::fromMs(ps2x_dev::s_inBetween.timed.front().info.atMs);
+                    if (due - SmoothClock::now() > std::chrono::milliseconds(2))
+                        std::this_thread::sleep_until(due - std::chrono::milliseconds(1));
+                    while (SmoothClock::now() < due)
+                        std::this_thread::yield();
+                }
+                handedMs = dc::nowMs();
+            }
             window.present(shown, look);
+            if (inBetween)
+            {
+                ps2x_dev::s_inBetween.shownFront(handedMs, handMs);
+                ++statTimed;
+            }
+            else if (paced.fresh && dc::logTimeline())
+            {
+                // DW5XL-DEBUG issue 049 v3.5: PS2X_SMOOTH_TIMELINE=1: a field's own picture and the refresh that shows it.
+                const double presented = dc::nowMs();
+                if (haveDisplay && !displayGrid.follows)
+                {
+                    const int64_t refresh = dc::refreshAfter(displayGrid, presented);
+                    std::fprintf(stderr, "[smooth:game] refresh=%lld at=%.3f field=%llu\n", static_cast<long long>(refresh),
+                                 dc::instantOf(displayGrid, refresh), static_cast<unsigned long long>(s_windowFrameField));
+                }
+                else
+                {
+                    std::fprintf(stderr, "[smooth:game] refresh=-1 at=%.3f field=%llu\n", presented,
+                                 static_cast<unsigned long long>(s_windowFrameField));
+                }
+            }
             const auto now = std::chrono::steady_clock::now();
             const double turnMs = std::chrono::duration<double, std::milli>(now - lastTurn).count();
             // DW5XL-DEBUG PS2X_PRESENT_STATS=1: a turn over 25 ms with its parts, in milliseconds. `before`: the
@@ -4868,14 +5074,15 @@ void PS2Runtime::run()
                 statFromMemory += shown.newPicture && shown.fromMemory ? 1u : 0u;
                 if (now - statsSince >= std::chrono::seconds(1))
                 {
-                    std::fprintf(stderr, "[present:own] tick=%llu frames=%llu newPictures=%llu fromMemory=%llu readsCopied=%llu fetched=%llu notPresented=%llu slow=%llu maxMs=%.1f\n",
+                    std::fprintf(stderr, "[present:own] tick=%llu frames=%llu newPictures=%llu fromMemory=%llu readsCopied=%llu fetched=%llu notPresented=%llu slow=%llu maxMs=%.1f inBetween=%llu\n",
                                  static_cast<unsigned long long>(m_eeScheduler->currentVSyncTick()),
                                  static_cast<unsigned long long>(statFrames), static_cast<unsigned long long>(statNew),
                                  static_cast<unsigned long long>(statFromMemory),
                                  static_cast<unsigned long long>(g_dw5xlReadsCopied.exchange(0u)),
                                  static_cast<unsigned long long>(statFetched),
-                                 static_cast<unsigned long long>(statFailed), static_cast<unsigned long long>(statSlow), statMaxMs);
-                    statFrames = statNew = statFailed = statSlow = statFromMemory = statFetched = 0u;
+                                 static_cast<unsigned long long>(statFailed), static_cast<unsigned long long>(statSlow), statMaxMs,
+                                 static_cast<unsigned long long>(statTimed));
+                    statFrames = statNew = statFailed = statSlow = statFromMemory = statFetched = statTimed = 0u;
                     statMaxMs = 0.0;
                     statsSince = now;
                 }
@@ -4888,6 +5095,12 @@ void PS2Runtime::run()
             }
         }
         ps2x_dev::s_fetchShownPicture = nullptr; // it refers to this block's variables
+        if (timedOwn)
+        {
+            setPictureReadSubmitted({});
+            ps2x_dev::s_inBetween.dropWindowPicture = nullptr;
+            window.attachTimedPictures(nullptr);
+        }
     }
 #endif
     while (!ownWindow && !isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))

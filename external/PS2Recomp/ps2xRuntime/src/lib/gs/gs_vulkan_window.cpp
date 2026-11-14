@@ -74,6 +74,7 @@ namespace
     using ps2x::gs::GameWindowOptions;
     using ps2x::gs::GameWindowPixels;
     using ps2x::gs::GameWindowShown;
+    using ps2x::gs::GameWindowTimed;
 
     // GLFW is started by the first window and ended by the last (the thread that owns the window events).
     int g_glfwUsers = 0;
@@ -185,6 +186,7 @@ namespace
             if (m_started)
             {
                 Util::register_thread_index(0);
+                attachTimedPictures(nullptr);
                 if (m_link)
                 {
                     if (m_current)
@@ -347,6 +349,11 @@ namespace
             Util::register_thread_index(0);
             GameWindowShown shown;
             m_uiDrawn = false; // a new turn: the overlays of the turn before are no longer the window's content
+            // A field's turn: an in-between picture chosen in a turn that could not present goes back unshown.
+            if (m_timedNext && m_pictureLink)
+                m_pictureLink->pictures->release(m_timedNext);
+            m_timedNext = {};
+            m_presentTimed = false;
             // The newest finished picture up to the field asked for, on the graphics card or given from main memory:
             // whichever was finished later, if it was finished after the one the window shows. A handed picture
             // shown until now goes back to the renderer: the last command buffer that used it was sent when the
@@ -388,19 +395,7 @@ namespace
                 ++m_counts.fromMemory;
             }
             describe(shown, look);
-            // Where the picture will lie, for overlays drawn before the window is presented.
-            uint32_t drawableWidth = 0u, drawableHeight = 0u;
-            drawableSize(drawableWidth, drawableHeight);
-            if (shown.have && drawableWidth != 0u && drawableHeight != 0u)
-            {
-                const ps2x::PictureRect placed = ps2x::pictureRectInWindow(shown.displayWidth, shown.displayHeight, look.shape,
-                                                                          static_cast<float>(drawableWidth),
-                                                                          static_cast<float>(drawableHeight));
-                shown.x = placed.x;
-                shown.y = placed.y;
-                shown.rectWidth = placed.width;
-                shown.rectHeight = placed.height;
-            }
+            place(shown, look);
             // Once the overlays exist they get a frame in every turn: ImGui takes the window's events as they come,
             // and a frame is what uses them up.
             if (m_uiReady)
@@ -439,10 +434,20 @@ namespace
             cmd->begin_render_pass(pass);
             const float targetWidth = static_cast<float>(device.get_swapchain_view().get_image().get_width());
             const float targetHeight = static_cast<float>(device.get_swapchain_view().get_image().get_height());
-            drawPicture(*cmd, look, targetWidth, targetHeight, shown);
+            drawPicture(*cmd, look, targetWidth, targetHeight, shown, m_presentTimed ? &m_timedNext : nullptr);
             drawOverlays(*cmd, overlays);
             cmd->end_render_pass();
             device.submit(cmd);
+            // The in-between picture presented before this one goes back to the renderer: the last command buffer
+            // that drew it was sent in an earlier turn.
+            if (m_timedShown && m_pictureLink)
+                m_pictureLink->pictures->release(m_timedShown);
+            m_timedShown = {};
+            if (m_presentTimed)
+                m_timedShown = std::move(m_timedNext);
+            m_timedNext = {};
+            m_lastPresentedTimed = m_presentTimed;
+            m_presentTimed = false;
             const auto drawn = std::chrono::steady_clock::now();
             shown.presented = m_wsi.end_frame();
             shown.acquireMs = msSince(started, acquired);
@@ -491,8 +496,18 @@ namespace
             pass.clear_color[0].float32[3] = 1.0f;
             cmd->begin_render_pass(pass);
             GameWindowShown shown;
-            describe(shown, look);
-            drawPicture(*cmd, look, static_cast<float>(width), static_cast<float>(height), shown);
+            const HandedPicture *timed = m_lastPresentedTimed && m_timedShown ? &m_timedShown : nullptr;
+            if (timed)
+            {
+                shown.have = true;
+                shown.displayWidth = timed->displayWidth ? timed->displayWidth : timed->width;
+                shown.displayHeight = timed->displayHeight ? timed->displayHeight : timed->height;
+            }
+            else
+            {
+                describe(shown, look);
+            }
+            drawPicture(*cmd, look, static_cast<float>(width), static_cast<float>(height), shown, timed);
             drawOverlays(*cmd, overlays);
             cmd->end_render_pass();
             cmd->image_barrier(*target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -603,6 +618,99 @@ namespace
             for (size_t i = 3u; i < rgba.size(); i += 4u)
                 rgba[i] = 0xFFu;
             return true;
+        }
+
+        // --- In-between pictures (step 5)
+        void attachTimedPictures(const std::shared_ptr<GSVulkanPresenterLink> &link) override
+        {
+            Util::register_thread_index(0);
+            if (m_pictureLink && m_pictureLink->pictures)
+            {
+                m_pictureLink->pictures->stop();
+                for (TimedHeld &held : m_timed)
+                    m_pictureLink->pictures->release(held.picture);
+                m_pictureLink->pictures->release(m_timedNext);
+                m_pictureLink->pictures->release(m_timedShown);
+            }
+            m_timed.clear();
+            m_timedNext = {};
+            m_timedShown = {};
+            m_presentTimed = false;
+            m_lastPresentedTimed = false;
+            m_pictureLink = link && link->pictures ? link : nullptr;
+            if (m_pictureLink)
+                m_pictureLink->pictures->start();
+        }
+
+        void takeTimed(std::vector<GameWindowTimed> &fresh) override
+        {
+            if (!m_pictureLink)
+                return;
+            while (HandedPicture picture = m_pictureLink->pictures->takeOldest())
+            {
+                GameWindowTimed timed;
+                timed.id = m_nextTimedId++;
+                timed.tag = picture.tag;
+                timed.order = picture.order;
+                timed.width = picture.width;
+                timed.height = picture.height;
+                timed.displayWidth = picture.displayWidth ? picture.displayWidth : picture.width;
+                timed.displayHeight = picture.displayHeight ? picture.displayHeight : picture.height;
+                fresh.push_back(timed);
+                m_timed.push_back(TimedHeld{timed.id, std::move(picture)});
+            }
+        }
+
+        void dropTimed(uint64_t id) override
+        {
+            for (size_t i = 0; i < m_timed.size(); ++i)
+            {
+                if (m_timed[i].id != id)
+                    continue;
+                m_pictureLink->pictures->release(m_timed[i].picture);
+                m_timed.erase(m_timed.begin() + static_cast<std::ptrdiff_t>(i));
+                return;
+            }
+        }
+
+        GameWindowShown takeTimedPicture(uint64_t id, const GameWindowLook &look) override
+        {
+            Util::register_thread_index(0);
+            GameWindowShown shown;
+            m_uiDrawn = false;
+            // One chosen in a turn that could not present goes back unshown.
+            if (m_timedNext && m_pictureLink)
+                m_pictureLink->pictures->release(m_timedNext);
+            m_timedNext = {};
+            m_presentTimed = false;
+            for (size_t i = 0; i < m_timed.size(); ++i)
+            {
+                if (m_timed[i].id != id)
+                    continue;
+                m_timedNext = std::move(m_timed[i].picture);
+                m_timed.erase(m_timed.begin() + static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+            if (m_timedNext)
+            {
+                m_presentTimed = true;
+                shown.have = true;
+                shown.newPicture = true;
+                shown.timed = true;
+                shown.tag = m_timedNext.tag;
+                shown.field = m_timedNext.field;
+                shown.order = m_timedNext.order;
+                shown.width = m_timedNext.width;
+                shown.height = m_timedNext.height;
+                shown.displayWidth = m_timedNext.displayWidth ? m_timedNext.displayWidth : m_timedNext.width;
+                shown.displayHeight = m_timedNext.displayHeight ? m_timedNext.displayHeight : m_timedNext.height;
+                ++m_counts.newPictures;
+                ++m_counts.timed;
+            }
+            place(shown, look);
+            if (m_uiReady)
+                beginUiFrame();
+            return shown;
         }
 
         void drawableSize(uint32_t &width, uint32_t &height) const override
@@ -1072,11 +1180,30 @@ namespace
 
         // Inside a render pass cleared to black: the picture letterboxed to its shape, by the one function every
         // window uses (runtime/picture_rect.h).
+        // Where the picture `shown` describes will lie in the window, for overlays drawn before it is presented.
+        void place(GameWindowShown &shown, const GameWindowLook &look) const
+        {
+            uint32_t drawableWidth = 0u, drawableHeight = 0u;
+            drawableSize(drawableWidth, drawableHeight);
+            if (!shown.have || drawableWidth == 0u || drawableHeight == 0u)
+                return;
+            const ps2x::PictureRect placed = ps2x::pictureRectInWindow(shown.displayWidth, shown.displayHeight, look.shape,
+                                                                      static_cast<float>(drawableWidth),
+                                                                      static_cast<float>(drawableHeight));
+            shown.x = placed.x;
+            shown.y = placed.y;
+            shown.rectWidth = placed.width;
+            shown.rectHeight = placed.height;
+        }
+
+        // `timed`: the in-between picture to draw; null: the field's own picture the window holds.
         void drawPicture(Vulkan::CommandBuffer &cmd, const GameWindowLook &look, float targetWidth, float targetHeight,
-                         GameWindowShown &shown)
+                         GameWindowShown &shown, const HandedPicture *timed = nullptr)
         {
             const Vulkan::ImageView *view = nullptr;
-            if (m_showMemory)
+            if (timed)
+                view = *timed ? m_views->view(*timed) : nullptr;
+            else if (m_showMemory)
                 view = m_memory.have && m_memoryImage && !m_memoryToUpload ? &m_memoryImage->get_view() : nullptr;
             else if (m_current)
                 view = m_views->view(m_current);
@@ -1106,6 +1233,19 @@ namespace
         bool m_showMemory = false;
         bool m_memoryToUpload = false;
         uint64_t m_shownOrder = 0u; // the shown picture's place among all finished pictures
+        // In-between pictures (step 5): the link of the renderer memory that draws them; the ones handed over and
+        // not presented yet; the one chosen for this turn; the one presented last.
+        struct TimedHeld
+        {
+            uint64_t id = 0u;
+            HandedPicture picture;
+        };
+        std::shared_ptr<GSVulkanPresenterLink> m_pictureLink;
+        std::vector<TimedHeld> m_timed;
+        HandedPicture m_timedNext, m_timedShown;
+        bool m_presentTimed = false;       // this turn's present draws m_timedNext
+        bool m_lastPresentedTimed = false; // the window's content is m_timedShown
+        uint64_t m_nextTimedId = 1u;
         ps2x::host::InputState m_input;
         GameWindowCounts m_counts;
         // What the pages and overlays asked of the window.

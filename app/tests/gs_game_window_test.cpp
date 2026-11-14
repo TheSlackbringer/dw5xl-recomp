@@ -32,6 +32,10 @@
 //  21. the overlays: rectangles under and over the pages, a line of text and a picture of the pages are drawn
 //      over the game's picture in the turn they were asked for, and gone in the next;
 //  22. the window's settings: vsync on and off, its size and place, borderless fullscreen and back.
+//   Step 5 (after 22):
+//  23. in-between pictures: handed over to the window oldest first with their tags; the one the caller chooses
+//      is presented, in any order; a dropped one cannot be chosen; the field's own picture is untouched; a
+//      field's turn follows; the renderer is never refused a place and every place comes back.
 // Exit code 77: no Vulkan device, or no Vulkan windows on this system (skipped).
 #include "runtime/gs/gs_game_window.h"
 #include "runtime/gs/gs_vulkan_backend.h"
@@ -736,6 +740,94 @@ int run(uint32_t wantedScale)
               "and back: the size and the place before", scale);
         check(ui.takeDroppedFiles().empty(), "no file was dropped on it", scale);
         check(largestDifference(windowPicture(*window, look), expected(b, w, h, now, smooth)) <= allowed, "the window still draws B", scale);
+    }
+
+    // --- Step 5: in-between pictures, handed over on the graphics card and presented when the caller asks.
+    // 23. The window shows B (a field's own picture).
+    {
+        uint32_t w = 0u, h = 0u;
+        window->drawableSize(w, h);
+        const ps2x::PictureRect now = ps2x::pictureRectInWindow(displayWidth, displayHeight, look.shape, static_cast<float>(w), static_cast<float>(h));
+        const int allowed = smooth ? 1 : 0;
+        VulkanGsHandover &pictures = *link->pictures;
+        const VulkanGsHandover::Counts before = pictures.counts();
+        window->attachTimedPictures(link);
+        check(pictures.started(), "attached: the in-between pictures' hand-over is switched on", scale);
+        const uint64_t tags[3] = {gsPictureTag(tick, 1u, 3u), gsPictureTag(tick, 2u, 3u), gsPictureTag(tick, 3u, 3u)};
+        bool submitted = true;
+        for (int i = 0; i < 3; ++i)
+        {
+            if (i == 1)
+                drawB(*backend);
+            else
+                drawA(*backend);
+            GSPresentationRequest r = request(tick);
+            r.pictureTag = tags[i];
+            submitted = backend->SubmitPictureRead(r) && submitted;
+        }
+        std::vector<ps2x::gs::GameWindowTimed> fresh;
+        window->takeTimed(fresh);
+        check(submitted && fresh.size() == 3u, "three in-between pictures come to the window", scale);
+        if (fresh.size() == 3u)
+        {
+            check(fresh[0].tag == tags[0] && fresh[1].tag == tags[1] && fresh[2].tag == tags[2] && fresh[0].order < fresh[1].order &&
+                      fresh[1].order < fresh[2].order && fresh[0].id != fresh[1].id && fresh[0].width == a.width && fresh[0].displayWidth == displayWidth,
+                  "oldest first, each with its tag, a number of its own and its sizes", scale);
+            std::vector<ps2x::gs::GameWindowTimed> again;
+            window->takeTimed(again);
+            check(again.empty(), "asked again, there is none new", scale);
+
+            // The second one (B) is presented.
+            const ps2x::gs::GameWindowCounts countsBefore = window->counts();
+            ps2x::gs::GameWindowShown shown = window->takeTimedPicture(fresh[1].id, look);
+            check(shown.have && shown.timed && shown.newPicture && shown.tag == tags[1] && shown.x == now.x && shown.rectWidth == now.width,
+                  "one of them chosen for the turn: it has its place before it is drawn", scale);
+            window->present(shown, look);
+            check(shown.presented && largestDifference(windowPicture(*window, look), expected(b, w, h, now, smooth)) <= allowed,
+                  "presented: the window draws that picture (B)", scale);
+            check(window->counts().timed == countsBefore.timed + 1u, "counted as an in-between picture", scale);
+            // The field's own picture the window holds is still the one from before (B, the last field).
+            Picture field;
+            check(window->shownPixels(field.rgba, field.width, field.height) && sameColours(field.rgba, b.rgba),
+                  "the field's own picture the window holds is untouched", scale);
+            // The first one (A) after it: the caller decides the order.
+            shown = window->takeTimedPicture(fresh[0].id, look);
+            window->present(shown, look);
+            check(shown.have && shown.presented && largestDifference(windowPicture(*window, look), expected(a, w, h, now, smooth)) <= allowed,
+                  "then an older one: the window draws it (A)", scale);
+            // The third is dropped; it cannot be chosen afterwards.
+            window->dropTimed(fresh[2].id);
+            shown = window->takeTimedPicture(fresh[2].id, look);
+            check(!shown.have && !shown.timed, "a dropped one cannot be chosen", scale);
+            window->present(shown, look);
+            // A field's turn after in-between pictures.
+            drawB(*backend);
+            check(backend->SubmitFieldScanout(request(++tick)), "a field of B is scanned out", scale);
+            shown = window->show(tick, look);
+            check(shown.presented && shown.newPicture && !shown.timed && largestDifference(windowPicture(*window, look), expected(b, w, h, now, smooth)) <= allowed,
+                  "a field's turn after them: the field's picture (B)", scale);
+        }
+        const VulkanGsHandover::Counts after = pictures.counts();
+        check(after.noPlace == before.noPlace && after.givenUp == before.givenUp && after.handed == before.handed + 3u,
+              "the renderer handed all three over, was never refused a place and gave none up", scale);
+        std::vector<GSPictureRead> read;
+        check(!backend->CollectPictureReads(read) && read.empty(), "none was read back", scale);
+        window->attachTimedPictures(nullptr);
+        check(!pictures.started(), "detached: the hand-over is switched off", scale);
+        // Every place is free again: twelve more pictures find one each.
+        pictures.start();
+        bool all = true;
+        for (int i = 0; i < 12; ++i)
+        {
+            GSPresentationRequest r = request(tick);
+            r.pictureTag = gsPictureTag(tick, static_cast<uint32_t>(i + 1), 12u);
+            all = backend->SubmitPictureRead(r) && all;
+        }
+        const VulkanGsHandover::Counts filled = pictures.counts();
+        check(all && filled.noPlace == after.noPlace && filled.givenUp == after.givenUp, "and the window gave every place back (twelve more find one each)", scale);
+        while (HandedPicture left = pictures.takeOldest())
+            pictures.release(left);
+        pictures.stop();
     }
 
     // 13. The renderer goes first.

@@ -54,12 +54,25 @@ namespace ps2x::gs
         uint64_t order = 0u; // ps2x::gs::nextPictureOrder() when it was finished (GS::hostPresentationOrder)
     };
 
+    // An in-between picture the window was handed on the graphics card (step 5): the window's number for it, and
+    // what it is.
+    struct GameWindowTimed
+    {
+        uint64_t id = 0u;    // the window's number for the picture
+        uint64_t tag = 0u;   // its picture read's tag (gsPictureTag): which picture of which game frame
+        uint64_t order = 0u; // its place among all finished pictures (ps2x::gs::nextPictureOrder)
+        uint32_t width = 0u, height = 0u;
+        uint32_t displayWidth = 0u, displayHeight = 0u;
+    };
+
     struct GameWindowShown
     {
         bool presented = false;  // the window's content went to the swap chain this time
         bool newPicture = false; // a picture of the game the window had not shown before
         bool have = false;       // the window has a picture of the game
         bool fromMemory = false; // it was given from main memory (memoryPicture), not taken on the graphics card
+        bool timed = false;      // it is an in-between picture (takeTimedPicture), not a field's own
+        uint64_t tag = 0u;       // then: its tag
         uint64_t field = 0u;     // that picture's field
         uint64_t order = 0u;     // its place among all finished pictures (ps2x::gs::nextPictureOrder)
         uint32_t width = 0u, height = 0u;               // its size as stored (grows with the output scale)
@@ -75,6 +88,7 @@ namespace ps2x::gs
         uint64_t presented = 0u;   // times the window's content went to the swap chain
         uint64_t newPictures = 0u; // pictures of the game the window took to show
         uint64_t fromMemory = 0u;  // of them, given from main memory and uploaded
+        uint64_t timed = 0u;       // of them, in-between pictures (takeTimedPicture)
         uint64_t olderNotShown = 0u; // pictures not shown: a picture finished later was shown already
         uint64_t notPresented = 0u; // times nothing could be presented (no size, no swap chain image)
         uint64_t swapChains = 0u;  // swap chains made (the first one, and one for every change of size)
@@ -114,8 +128,20 @@ namespace ps2x::gs
         virtual GameWindowShown take(uint64_t maxField, const GameWindowLook &look) = 0;
         virtual void present(GameWindowShown &shown, const GameWindowLook &look) = 0;
 
-        // The picture the window shows, as the renderer finished it (its own size, no window scaling), in main
-        // memory: RGBA, rows width * 4 bytes apart, opaque. A picture on the graphics card is read from there,
+        // --- In-between pictures (issue 049 v3.5), each presented at an instant of its own (step 5).
+        // `link`: the link of the renderer memory that draws them. From now on its picture reads stay on the
+        // graphics card and come to this window. Null: no more; the ones the window holds go back.
+        virtual void attachTimedPictures(const std::shared_ptr<GSVulkanPresenterLink> &link) = 0;
+        // The pictures handed over since the last call, oldest first, added to `fresh`. Each is the window's until
+        // it is dropped, or until another picture has been presented after it.
+        virtual void takeTimed(std::vector<GameWindowTimed> &fresh) = 0;
+        virtual void dropTimed(uint64_t id) = 0; // not presented: it goes back to the renderer
+        // As take(), with the in-between picture `id` as the one present() draws. `have` is false when the window
+        // does not hold it. The field's own picture the window holds is untouched (shownPixels gives that one).
+        virtual GameWindowShown takeTimedPicture(uint64_t id, const GameWindowLook &look) = 0;
+
+        // The field's own picture the window holds (the one take() chose last), as the renderer finished it (its
+        // own size, no window scaling), in main memory: RGBA, rows width * 4 bytes apart, opaque. A picture on the graphics card is read from there,
         // which waits for the card: only on request (a frame dump, a saved state's picture), never to show.
         virtual bool shownPixels(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) = 0;
 
