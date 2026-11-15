@@ -417,7 +417,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_runtime.cpp
     src/lib/ps2_save_state.cpp
     src/lib/ps2_stdio_pump.cpp
-    src/lib/ps2_present_feedback.cpp
+    src/lib/ps2_fatal_message.cpp
     src/lib/ps2_display_clock.cpp
     src/lib/ps2_screen_on.cpp
     src/lib/gs/gs_shader_store.cpp

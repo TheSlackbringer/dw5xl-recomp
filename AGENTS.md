@@ -242,28 +242,27 @@ store of compiled shader programs; the game's is `shaders.bin` beside `dw5xl.ini
 in the build folder; `[gs] shader store` lines say what was read and written) · `PS2X_NO_WEAVE` · `PS2X_GS_SYNCREADBACK` · `PS2X_GS_TRACE=<file>` +
 `_FROM/_TO` · `PS2X_GS_RECORD=<file>` + `_FROM/_TO` · `PS2X_VRAM_DUMP=<file>` (decode: `tools/debug/gs_vram_ct32.py`) ·
 `PS2X_XGKICK_CAPTURE=<prefix>` + `_FROM/_TO` · `PS2X_DEBUG_ZALWAYS`, `PS2X_ZWATCH` (experiments only).
-Window/presentation (issue 023): `PS2X_HOST_FPS=field` (one window frame per PS2 field) · `PS2X_PRESENT_STATS` (window
-frames, new pictures, skipped fields per second; cheap) · `PS2X_FIELD_SCANOUT=0` (old window-time field read, A/B) ·
-`PS2X_WEAVE_TRACE` (per picture: weave, fingerprint, row profile `[upload:rows]` used by the 023 test; costs ~30 ms
-per 4x frame, never for timing; the renderer's own window writes the same lines for every picture it shows, reading
-it from the graphics card for them: `[upload:hash]`, `[upload:rows]`, `[weave:out]` with `kind=card`, and
-`[draw:rect]` when the picture's place in the window changes) · `PS2X_VBL_DRAW_TRACE` (display-buffer draws per VBlank edge) · `PS2X_LATCH_TRACE` ·
-`PS2X_VSYNC=1` (swap-interval experiment) · `PS2X_SCREEN_ON_HIDDEN=1` (issue 067: a hidden window counts as shown
-for the rule that keeps the screen on while the game is played; `[display]` lines say when the screen is asked for
-and let go, the screen's state at the start and every switch of the screen the system tells the game of, with its
-field: the go plays a timed run again, once, when one fell inside what the run judges) · `PS2X_WINDOW=opengl` (issue 049: the old raylib/OpenGL window instead of the window the renderer
-draws itself, which is the default since 2026-11-14: a Vulkan swap chain without OpenGL that shows the game's
-pictures from the graphics card, the pages and overlays (ImGui by a renderer of ours), SHARPEN, and the CPU
-renderer's pictures; the old window stays until 049's step 7, and the tests that still read its own log lines
-run on it (`dw5test.TODAYS_WINDOW`, shrinking as step 7 gives the new window their lines). In the new window: `[present:own]` per second and
-`[present:own:slow]` for a turn over 25 ms with `PS2X_PRESENT_STATS` (the old one writes `[present:stats]`);
-`PS2X_HOST_FPS` belongs to the old window (the new one shows one window frame per PS2 field); in-between pictures
-are shown from the graphics card in the test mode (`PS2X_SMOOTH_SHOW=1`) on a test display, or in a shown window by
-the real display's clock, made from the driver's reports of shown pictures (`PS2X_DISPLAY_TRACE=1` logs them:
-`[display:report]`, `[display:timed]`); `PS2X_WINDOW_SHOT` works, and with `PS2X_WINDOW_SHOT_PARTS=1` every window
-picture is saved with its parts beside it: `.frame.png` the game's picture it shows, `.picture.png` that picture
-alone as the window draws it, `.black.png` and `.white.png` what the port draws over it) · `PS2X_OVERLAY_HIDDEN=1` (the F2 and F8 lines and the
-state message are drawn in a hidden window too, for window pictures of hidden runs).
+Window/presentation (issues 023, 049): the game has one window, drawn by the Vulkan renderer itself (a swap chain
+without OpenGL; the raylib/OpenGL window and its switches `PS2X_WINDOW`, `PS2X_HOST_FPS`, `PS2X_PRESENT_LOG` and
+`PS2X_DRAW_TRACE` went with 049's step 7 on 2026-11-15). It shows one window frame per PS2 field, the game's pictures
+from the graphics card, the pages and overlays (ImGui by a renderer of ours), SHARPEN, and the CPU renderer's
+pictures. Where it cannot be opened the game says what is missing and ends (`PS2X_WINDOW_FAIL=<reason>` makes that
+happen for a test). `PS2X_PRESENT_STATS` (`[present:own]` per second: window frames, new pictures, pictures from main
+memory, reads; `[present:own:slow]` for a turn over 25 ms; cheap) · `PS2X_FIELD_SCANOUT=0` (old window-time field
+read, A/B) · `PS2X_WEAVE_TRACE` (for every picture the window shows, read from the graphics card for it:
+`[upload:hash]`, `[upload:rows]` (the row profile the 023 tests read), `[weave:out]` with `kind=card`, and `[draw:rect]`
+when the picture's place in the window changes; never for timing: a read waits for the card) · `PS2X_VBL_DRAW_TRACE`
+(display-buffer draws per VBlank edge) · `PS2X_LATCH_TRACE` · `PS2X_VSYNC=1` (swap-interval experiment) ·
+`PS2X_SCREEN_ON_HIDDEN=1` (issue 067: a hidden window counts as shown for the rule that keeps the screen on while the
+game is played; `[display]` lines say when the screen is asked for and let go, the screen's state at the start and
+every switch of the screen the system tells the game of, with its field: the go plays a timed run again, once, when
+one fell inside what the run judges) · in-between pictures are shown from the graphics card in the test mode
+(`PS2X_SMOOTH_SHOW=1`) on a test display, or in a shown window by the real display's clock, made from the driver's
+reports of shown pictures (`PS2X_DISPLAY_TRACE=1` logs them: `[display:report]`, `[display:timed]`) ·
+`PS2X_WINDOW_SHOT=<field>:<png>` (the window as shown; with `PS2X_WINDOW_SHOT_PARTS=1` its parts beside it:
+`.frame.png` the game's picture it shows, `.picture.png` that picture alone as the window draws it, `.black.png` and
+`.white.png` what the port draws over it) · `PS2X_OVERLAY_HIDDEN=1` (the F2 and F8 lines and the state message are
+drawn in a hidden window too, for window pictures of hidden runs).
 Sound/IOP: `PS2X_SPU2_TRACE` · `PS2X_LIBSD_TRACE` · `PS2X_KSNG_TRACE` / `PS2X_KSNH_TRACE` (sound RPCs) ·
 `PS2X_AUDIO_DUMP=<wav>` (s16 stereo 48 kHz) · `PS2X_AUDIO_TRACE` · `PS2X_SIFAUDIO_TRACE` · `PS2X_MPEGAUDIO_TRACE` ·
 `PS2X_IOP_HEAP_TRACE` · `PS2X_IO_TRACE`. Heavy IOP tracing starves audio streams: judge audio untraced.

@@ -48,7 +48,8 @@
 #include <string>
 #include <cmath>
 #include "runtime/hotkeys.h"
-#include "runtime/ps2_present_feedback.h"
+#include "runtime/fatal_message.h"
+#include "runtime/gs/gs_window_message.h"
 #include "runtime/ps2_display_clock.h"
 #include "runtime/ps2_screen_on.h"
 #include "runtime/gs/gs_shader_store.h"
@@ -463,24 +464,12 @@ namespace
 static std::atomic<float> s_pictureShape{0.0f};
 // DW5XL issue 047: PC SETTINGS' SHARPEN, contrast-adaptive sharpening of the picture as the window draws it (above 1x).
 static std::atomic<bool> s_presentSharpen{false};
-// DW5XL (issue 049, amendment v3.12 step 3 part 4): the game's window drawn by the renderer itself, when the switch
-// asks for it and the renderer can present (openRendererWindow). Empty: today's window.
+// DW5XL (issue 049, amendment v3.12): the game's one window, drawn by the renderer itself (openRendererWindow).
+// A runtime built without the Vulkan renderer has no window (the PS2Recomp tree's own build, for its recompiler
+// and its tests); the game's build refuses to be made that way (app/CMakeLists.txt).
 #ifdef PS2X_HAS_GAME_WINDOW
 static std::unique_ptr<ps2x::gs::GameWindow> s_gameWindow;
-static bool rendererWindowOpen() { return static_cast<bool>(s_gameWindow); }
-#else
-static bool rendererWindowOpen() { return false; }
 #endif
-static const char *const kPresentSharpenShader = R"(#version 330
-in vec2 fragTexCoord; in vec4 fragColor; out vec4 finalColor; uniform sampler2D texture0; uniform vec2 texel;
-void main() {
-  vec3 c = texture(texture0, fragTexCoord).rgb;
-  vec3 n = texture(texture0, fragTexCoord + vec2(0.0, -texel.y)).rgb, e = texture(texture0, fragTexCoord + vec2(texel.x, 0.0)).rgb;
-  vec3 w = texture(texture0, fragTexCoord + vec2(-texel.x, 0.0)).rgb, u = texture(texture0, fragTexCoord + vec2(0.0, texel.y)).rgb;
-  vec3 lo = min(c, min(n, min(e, min(w, u)))), hi = max(c, max(n, max(e, max(w, u))));
-  vec3 a = clamp(min(lo, 1.0 - hi) / max(hi, vec3(0.001)), 0.0, 1.0); vec3 k = -sqrt(a) * 0.2;
-  finalColor = vec4(clamp((c + (n + e + w + u) * k) / (1.0 + 4.0 * k), 0.0, 1.0), 1.0);
-})";
 
 namespace ps2x_dev
 {
@@ -499,7 +488,7 @@ namespace ps2x_dev
     static uint32_t s_lastFrameRows = 1u; // rows in s_lastFrame (FB_HEIGHT)
     // DW5XL (issue 049, amendment v3.12 step 3 part 5): the renderer's own window keeps the game's picture on the
     // graphics card. Whatever needs the shown picture in s_lastFrame (a frame dump, a saved state's picture) calls
-    // this first; that window's loop sets it. Empty with today's window, which copies every shown picture there.
+    // this first; the window's loop sets it.
     static std::function<void()> s_fetchShownPicture;
     static void fetchShownPicture()
     {
@@ -602,108 +591,14 @@ namespace ps2x_dev
     // pictures waiting for the dumped field are saved as <dir>/inb_<frame field>_<index>of<count>.png, on the frame
     // dumps' pixel grid (frame field: the field their game frame's list was sent in, normally the one before). So an
     // in-between picture and its field's own picture are always saved together.
-    // Issue 049 v3.5 (P2.5c): finished picture reads as events. The window cannot wait for the GPU and for the next
-    // field at once, so a thread of its own waits for each read to finish, stamps the time and wakes the window.
-    struct PictureReader
-    {
-        PS2Runtime *rt = nullptr;
-        std::thread thread;
-        std::mutex mutex;
-        std::condition_variable cv;
-        bool stop = false;
-        uint64_t submitted = 0u, handled = 0u;
-        std::vector<GSPictureRead> ready;
-        std::deque<double> startedAt; // when each read not yet delivered was started, oldest first
-
-        ~PictureReader() { shutdown(); }
-        void start(PS2Runtime *runtime)
-        {
-            rt = runtime;
-            rt->setPictureReadSubmitted([this] {
-                {
-                    std::lock_guard<std::mutex> lock(mutex);
-                    ++submitted;
-                    startedAt.push_back(ps2x::display_clock::nowMs());
-                }
-                cv.notify_one();
-            });
-            thread = std::thread([this] { run(); });
-        }
-        void run()
-        {
-            ThreadNaming::SetCurrentThreadName("PictureReader");
-            std::vector<GSPictureRead> fresh;
-            std::unique_lock<std::mutex> lock(mutex);
-            while (!stop)
-            {
-                cv.wait(lock, [this] { return stop || submitted != handled; });
-                if (stop)
-                    break;
-                const uint64_t target = submitted;
-                lock.unlock();
-                // Waits for the GPU with no lock of the GS held (the window's field read is not kept waiting).
-                const bool inTheWorks = rt->pictureGs().waitPictureRead(20'000'000ull);
-                fresh.clear();
-                rt->pictureGs().collectPictureReads(fresh);
-                const double now = ps2x::display_clock::nowMs();
-                const bool any = !fresh.empty();
-                lock.lock();
-                for (GSPictureRead &picture : fresh)
-                {
-                    picture.readyMs = now;
-                    if (!startedAt.empty())
-                    {
-                        picture.startedMs = startedAt.front(); // reads finish in the order they were started in
-                        startedAt.pop_front();
-                    }
-                    ready.push_back(std::move(picture));
-                    ++handled;
-                }
-                if (!inTheWorks && !any)
-                {
-                    handled = target; // a read that gave no picture: nothing left to wait for
-                    startedAt.clear();
-                }
-                if (handled > submitted)
-                    handled = submitted;
-                if (any)
-                {
-                    lock.unlock();
-                    rt->eeScheduler().wakePresentationWait();
-                    lock.lock();
-                }
-            }
-        }
-        void take(std::vector<GSPictureRead> &out)
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            for (GSPictureRead &picture : ready)
-                out.push_back(std::move(picture));
-            ready.clear();
-        }
-        void shutdown()
-        {
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                stop = true;
-            }
-            cv.notify_all();
-            if (thread.joinable())
-                thread.join();
-            if (rt)
-                rt->setPictureReadSubmitted({});
-            rt = nullptr;
-        }
-    };
-
     struct InBetweenQueue
     {
         std::deque<GSPictureRead> pictures;
         std::vector<GSPictureRead> fresh;
 
         // Issue 049 v3.5 (P2.5c): timed pictures, each made for one instant on screen, in the order of those
-        // instants. The reader thread delivers the reads; the code that made a picture announced its instant under
-        // the read's tag (ps2x::display_clock).
+        // instants. The window hands them in as they are finished on the graphics card; the code that made a
+        // picture announced its instant under the read's tag (ps2x::display_clock).
         struct TimedPicture
         {
             GSPictureRead read;
@@ -711,7 +606,7 @@ namespace ps2x_dev
             uint64_t windowPicture = 0u; // step 5: the window's number for a picture kept on the graphics card
         };
         std::deque<TimedPicture> timed;
-        bool readerOwnsReads = false; // the reader thread collects the reads: collect() below leaves them alone
+        bool readerOwnsReads = false; // the window takes the pictures on the graphics card: collect() below leaves the reads alone
         struct TimedStats
         {
             uint64_t arrived = 0u, shown = 0u, late = 0u, isVoid = 0u, wrongSize = 0u, handedLate = 0u, frames = 0u;
@@ -728,14 +623,6 @@ namespace ps2x_dev
         double lastHandMs = 0.0;    // what the window last needed from taking a picture to handing it over
         uint64_t shownForStats = 0u, hiddenForStats = 0u; // for [present:stats]: pictures shown / new field pictures not shown
 
-        void collectTimed(PictureReader &reader)
-        {
-            fresh.clear();
-            reader.take(fresh);
-            for (GSPictureRead &picture : fresh)
-                if (addTimed(picture, 0u) == Added::NotTimed)
-                    pictures.push_back(std::move(picture)); // not a timed picture: the test path (saved with its field)
-        }
         // One finished picture into the queue of timed pictures, by the instant announced under its tag.
         // `windowPicture`: the window's number for a picture that stayed on the graphics card (issue 049 v3.12 step
         // 5; the read then holds no pixels), 0 for one read into main memory. NotTimed and Void: not queued; the
@@ -926,7 +813,7 @@ namespace ps2x_dev
                 const size_t stride = f.strideBytes ? f.strideBytes : static_cast<size_t>(f.width) * 4u;
                 if (stride * f.height > f.pixels.size())
                     continue;
-                // The same limits as the window's own copy of a field's picture (UploadFrame).
+                // The same limits as the window's own copy of a field's picture.
                 const uint32_t width = std::min<uint32_t>(f.width, FB_WIDTH * 4u);
                 const uint32_t height = std::min<uint32_t>(f.height, FB_HEIGHT * 4u);
                 char name[96];
@@ -1141,24 +1028,6 @@ namespace ps2x_dev
                     std::_Exit(0);
                 }
             }
-        }
-
-        void captureHostFrame()
-        {
-            if (hostShots.empty()) return;
-            // Flush the game and overlay into the backbuffer before EndDrawing
-            // swaps it. ExportImage preserves the requested absolute path.
-            rlDrawRenderBatchActive();
-            Image image = LoadImageFromScreen();
-            for (const std::string &path : hostShots)
-            {
-                const bool ok = image.data && ExportImage(image, path.c_str());
-                const auto indicator = ps2_host_input::mouseCaptureIndicator();
-                std::cerr << "[dev] hostshot " << path << (ok ? " ok" : " FAILED")
-                          << " mouse=" << indicator.captured << " alpha=" << indicator.alpha << std::endl;
-            }
-            UnloadImage(image);
-            hostShots.clear();
         }
 
         // PS2X_STATS=1: once per wall-clock second, print guest VSync ticks
@@ -1540,353 +1409,10 @@ namespace ps2x::settings
 
 
 
-// Host window rate: field pacing by default, the window paced on every guest VBlankEnd (one host frame per field;
-// issue 015; the default since issue 023, owner 2026-10-24, after its jump was fixed by reading each field at its end
-// on the GS side). PS2X_HOST_FPS=<n> sets a fixed rate instead (60 = the earlier default); PS2X_HOST_FPS=field is
-// the default spelled out. Returns 0 for field pacing.
-static int configuredHostTargetFps()
-{
-    if (const char *env = std::getenv("PS2X_HOST_FPS"))
-    {
-        if (std::strcmp(env, "field") == 0)
-            return 0;
-        const int fps = std::atoi(env);
-        if (fps > 0)
-            return fps;
-    }
-    return 0;
-}
-
-// DW5XL-DEBUG issue 023 3S: the field the window frame being drawn shows and whether it carries a new picture
-// (set by UploadFrame, logged after the swap with PS2X_PRESENT_LOG).
+// The field the window frame being drawn shows and whether it carries a new picture (set by the window's loop;
+// frame dumps and the picture trace name the field by it).
 static uint64_t s_windowFrameField = 0;
 static bool s_windowFrameNewPicture = false;
-
-// Issue 049 P2.5 (step 1): an in-between picture into the window's texture, as UploadFrame puts a field's picture
-// there. The texture keeps the size the field pictures gave it; a picture of another size is not shown.
-static bool UploadPicture(Texture2D &tex, const PresentationFrame &frame)
-{
-    const size_t stride = frame.strideBytes ? frame.strideBytes : static_cast<size_t>(frame.width) * 4u;
-    const uint32_t copyWidth = std::min<uint32_t>(frame.width, FB_WIDTH * 4u);
-    const uint32_t copyHeight = std::min<uint32_t>(frame.height, FB_HEIGHT * 4u);
-    const uint32_t texWidth = static_cast<uint32_t>(tex.width), texHeight = static_cast<uint32_t>(tex.height);
-    if (copyWidth == 0u || copyHeight == 0u || copyWidth > texWidth || copyHeight > texHeight ||
-        stride * frame.height > frame.pixels.size())
-        return false;
-    if (frame.width == texWidth && frame.height == texHeight && stride == static_cast<size_t>(texWidth) * 4u)
-    {
-        UpdateTexture(tex, frame.pixels.data());
-        return true;
-    }
-    static std::vector<uint8_t> s_padded;
-    s_padded.assign(static_cast<size_t>(texWidth) * texHeight * 4u, 0u);
-    for (uint32_t y = 0; y < copyHeight; ++y)
-        std::memcpy(s_padded.data() + static_cast<size_t>(y) * texWidth * 4u, frame.pixels.data() + static_cast<size_t>(y) * stride,
-                    static_cast<size_t>(copyWidth) * 4u);
-    UpdateTexture(tex, s_padded.data());
-    return true;
-}
-
-// The texture grows to the largest presented image (4x output); smaller frames
-// occupy its top-left corner. Display dimensions keep the logical aspect ratio.
-// paced (field pacing, issue 023 fix 2): the field the scheduler announced for this frame; nullptr = 60 FPS loop.
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight,
-                        uint32_t &outDisplayWidth, uint32_t &outDisplayHeight,
-                        const EeScheduler::PresentationField *paced = nullptr)
-{
-    static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-    static uint64_t s_lastUploadedGeneration = 0u;
-    static bool s_hasLatchedInitialFrame = false;
-    static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
-    static uint32_t s_lastSourceFbp = std::numeric_limits<uint32_t>::max();
-    static bool s_lastPreferred = false;
-    static uint32_t s_lastWidth = 0u;
-    static uint32_t s_lastHeight = 0u;
-    static uint32_t s_lastDisplayWidth = 0u;
-    static uint32_t s_lastDisplayHeight = 0u;
-    static bool s_hasUploadedFrame = false;
-
-    const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
-    // DW5XL-DEBUG issue 023: PS2X_PRESENT_STATS=1 prints once a second the window frames, new pictures,
-    // field reads copied, copies of more than one field (skipped fields), frames over 25 ms and the longest gap.
-    {
-        static const bool s_stats = [] { const char *v = std::getenv("PS2X_PRESENT_STATS"); return v && *v && *v != '0'; }();
-        static uint64_t s_frames = 0, s_slow = 0, s_windowStartNs = 0, s_lastNs = 0, s_lastGen = 0, s_newPictures = 0;
-        static double s_maxMs = 0.0;
-        if (s_stats)
-        {
-            const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count());
-            if (s_lastNs != 0u)
-            {
-                const double ms = static_cast<double>(now - s_lastNs) / 1e6;
-                s_maxMs = std::max(s_maxMs, ms);
-                s_slow += ms > 25.0 ? 1u : 0u;
-            }
-            if (s_windowStartNs == 0u)
-                s_windowStartNs = now;
-            const uint64_t gen = rt->gs().hostPresentationGeneration();
-            s_newPictures += gen != s_lastGen ? 1u : 0u;
-            s_lastGen = gen;
-            // Issue 049 v3.5: timed pictures shown count as new pictures; a field's new picture that was not shown does not.
-            s_newPictures += ps2x_dev::s_inBetween.shownForStats;
-            s_newPictures -= std::min(s_newPictures, ps2x_dev::s_inBetween.hiddenForStats);
-            ps2x_dev::s_inBetween.shownForStats = ps2x_dev::s_inBetween.hiddenForStats = 0u;
-            ++s_frames;
-            s_lastNs = now;
-            if (now - s_windowStartNs >= 1000000000ull)
-            {
-                std::fprintf(stderr, "[present:stats] tick=%llu frames=%llu newPictures=%llu readsCopied=%llu multiReadCopies=%llu slow=%llu maxMs=%.1f\n",
-                             static_cast<unsigned long long>(currentTick), static_cast<unsigned long long>(s_frames),
-                             static_cast<unsigned long long>(s_newPictures),
-                             static_cast<unsigned long long>(g_dw5xlReadsCopied.exchange(0u)),
-                             static_cast<unsigned long long>(g_dw5xlMultiReadCopies.exchange(0u)),
-                             static_cast<unsigned long long>(s_slow), s_maxMs);
-                s_frames = s_slow = s_newPictures = 0u;
-                s_maxMs = 0.0;
-                s_windowStartNs = now;
-            }
-        }
-    }
-    // Fields read on the GS side (issue 023) finish a little after their field ends: the window collects every frame,
-    // so a field finished between two field changes is not skipped (a frame without a new field uploads nothing).
-    bool needsLatch = false;
-    if (paced)
-    {
-        // Field pacing (issue 023 fix 2): the frame shows exactly the field the scheduler announced, and collects no
-        // newer field's read. A frame while the game is stalled (not fresh) shows the last picture again; it only
-        // collects a late read of the field already announced.
-        constexpr uint64_t kNone = std::numeric_limits<uint64_t>::max();
-        needsLatch = paced->fresh || !s_hasLatchedInitialFrame || rt->gs().fieldScanoutsActive();
-        if (needsLatch)
-        {
-            rt->gs().latchHostPresentationFrame(paced->fresh ? paced->field : kNone, paced->field);
-            if (paced->fresh)
-                s_windowFrameField = paced->field;
-            s_hasLatchedInitialFrame = true;
-        }
-    }
-    else
-    {
-        needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick || rt->gs().fieldScanoutsActive();
-        if (needsLatch)
-        {
-            rt->gs().latchHostPresentationFrame();
-            s_windowFrameField = currentTick;
-            s_lastPresentationTick = currentTick;
-            s_hasLatchedInitialFrame = true;
-        }
-    }
-
-    // Issue 049 v3.2 (P2.3b): in-between pictures read out on the GS side (nothing to do unless they are made).
-    if (rt->pictureGs().pictureReadsActive())
-        ps2x_dev::s_inBetween.collect(rt, s_windowFrameField);
-
-    const uint64_t generation = rt->gs().hostPresentationGeneration();
-    // DW5XL-DEBUG issue 023: PS2X_WEAVE_TRACE=1 also logs every window frame: field it shows, whether it latched a new
-    // picture and whether that picture was uploaded (a repeat shows the previous one again).
-    static const bool s_presentTrace = [] { const char *v = std::getenv("PS2X_WEAVE_TRACE"); return v && *v && *v != '0'; }();
-    if (s_presentTrace)
-    {
-        static uint64_t s_hostFrame = 0u;
-        const auto nowNs = std::chrono::duration_cast<std::chrono::microseconds>(
-                               std::chrono::steady_clock::now().time_since_epoch()).count();
-        std::fprintf(stderr, "[present] host=%llu us=%lld tick=%llu latched=%d gen=%llu upload=%d\n",
-                     static_cast<unsigned long long>(s_hostFrame++), static_cast<long long>(nowNs),
-                     static_cast<unsigned long long>(currentTick), needsLatch ? 1 : 0,
-                     static_cast<unsigned long long>(generation),
-                     (!s_hasUploadedFrame || (needsLatch && generation != s_lastUploadedGeneration)) ? 1 : 0);
-    }
-    s_windowFrameNewPicture = false;
-    if (s_hasUploadedFrame && (!needsLatch || generation == s_lastUploadedGeneration))
-    {
-        outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
-        outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
-        outDisplayWidth = (s_lastDisplayWidth != 0u) ? s_lastDisplayWidth : outWidth;
-        outDisplayHeight = (s_lastDisplayHeight != 0u) ? s_lastDisplayHeight : outHeight;
-        return;
-    }
-
-    uint32_t width = 0u;
-    uint32_t height = 0u;
-    uint32_t displayFbp = 0u;
-    uint32_t sourceFbp = 0u;
-    bool usedPreferredDisplaySource = false;
-    uint32_t displayWidth = 0u;
-    uint32_t displayHeight = 0u;
-    if (!rt->gs().copyLatchedHostPresentationFrame(ps2x_dev::s_lastFrame,
-                                                   width,
-                                                   height,
-                                                   &displayFbp,
-                                                   &sourceFbp,
-                                                   &usedPreferredDisplaySource,
-                                                   &displayWidth,
-                                                   &displayHeight))
-    {
-        Image blank = GenImageColor(tex.width, tex.height, MAGENTA);
-        UpdateTexture(tex, blank.data);
-        UnloadImage(blank);
-        outWidth = FB_WIDTH;
-        outHeight = DEFAULT_DISPLAY_HEIGHT;
-        outDisplayWidth = outWidth;
-        outDisplayHeight = outHeight;
-        s_lastWidth = outWidth;
-        s_lastHeight = outHeight;
-        s_lastDisplayWidth = outDisplayWidth;
-        s_lastDisplayHeight = outDisplayHeight;
-        s_hasUploadedFrame = true;
-        return;
-    }
-
-    PS2_IF_AGRESSIVE_LOGS({
-        static uint32_t s_uploadDebugCount = 0u;
-        if (s_uploadDebugCount < 128u ||
-            displayFbp != s_lastDisplayFbp ||
-            sourceFbp != s_lastSourceFbp ||
-            usedPreferredDisplaySource != s_lastPreferred ||
-            width != s_lastWidth ||
-            height != s_lastHeight)
-        {
-            std::cout << "[frame:upload] idx=" << s_uploadDebugCount
-                      << " tick=" << currentTick
-                      << " displayFbp=" << displayFbp
-                      << " sourceFbp=" << sourceFbp
-                      << " size=" << width << "x" << height
-                      << " preferred=" << static_cast<uint32_t>(usedPreferredDisplaySource ? 1u : 0u)
-                      << std::endl;
-        }
-        ++s_uploadDebugCount;
-    });
-    s_lastDisplayFbp = displayFbp;
-    s_lastSourceFbp = sourceFbp;
-    s_lastPreferred = usedPreferredDisplaySource;
-    s_lastUploadedGeneration = generation;
-
-    // 4x output is at most four times the native framebuffer in each direction.
-    const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH * 4u);
-    const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT * 4u);
-    const uint32_t texWidth = std::max<uint32_t>(FB_WIDTH, copyWidth);
-    const uint32_t texHeight = std::max<uint32_t>(FB_HEIGHT, copyHeight);
-    if (texWidth != static_cast<uint32_t>(tex.width) || texHeight != static_cast<uint32_t>(tex.height))
-    {
-        UnloadTexture(tex);
-        Image blank = GenImageColor(static_cast<int>(texWidth), static_cast<int>(texHeight), BLANK);
-        tex = LoadTextureFromImage(blank);
-        UnloadImage(blank);
-    }
-
-    if (width == texWidth && height == texHeight)
-    {
-        UpdateTexture(tex, ps2x_dev::s_lastFrame.data());
-    }
-    else
-    {
-        static std::vector<uint8_t> s_paddedUploadBuffer;
-        s_paddedUploadBuffer.assign(static_cast<size_t>(texWidth) * texHeight * 4u, 0u);
-        const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(texWidth) * 4u;
-        const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
-        for (uint32_t y = 0; y < copyHeight; ++y)
-        {
-            const size_t srcOffset = static_cast<size_t>(y) * srcRowBytes;
-            const size_t dstOffset = static_cast<size_t>(y) * dstRowBytes;
-            if (srcOffset + copyRowBytes > ps2x_dev::s_lastFrame.size() ||
-                dstOffset + copyRowBytes > s_paddedUploadBuffer.size())
-            {
-                break;
-            }
-            std::memcpy(s_paddedUploadBuffer.data() + dstOffset, ps2x_dev::s_lastFrame.data() + srcOffset, copyRowBytes);
-        }
-        UpdateTexture(tex, s_paddedUploadBuffer.data());
-        ps2x_dev::s_lastFrame.swap(s_paddedUploadBuffer);
-    }
-    s_windowFrameNewPicture = true;
-
-    // DW5XL-DEBUG issue 023: PS2X_WEAVE_TRACE=1 logs a fingerprint of every uploaded picture (FNV-1a over the copied
-    // rows) and of its top and bottom half, so a picture that alternates between two versions shows up.
-    {
-        static const bool s_hashTrace = [] { const char *v = std::getenv("PS2X_WEAVE_TRACE"); return v && *v && *v != '0'; }();
-        if (s_hashTrace)
-        {
-            const size_t rowBytes = static_cast<size_t>(texWidth) * 4u;
-            // Row profile (mean brightness of every row, two hex digits per row): a picture that moves vertically shows
-            // up as a shifted profile without writing whole frames (PNG dumps change the timing and hide the jump).
-            // PS2X_WEAVE_TRACE_COLS=x0:x1 (DW5XL-DEBUG issue 023 2J): the row profile covers only these columns, e.g. a
-            // part of the HUD that never changes, so a picture that moves by one line shows without the 3D scene's noise.
-            static const std::pair<uint32_t, uint32_t> s_cols = []
-            {
-                unsigned a = 0u, b = 0u;
-                const char *v = std::getenv("PS2X_WEAVE_TRACE_COLS");
-                if (v && std::sscanf(v, "%u:%u", &a, &b) == 2 && b > a)
-                    return std::pair<uint32_t, uint32_t>(a, b);
-                return std::pair<uint32_t, uint32_t>(0u, 0xFFFFFFFFu);
-            }();
-            const uint32_t x0 = std::min(s_cols.first, copyWidth), x1 = std::max(x0 + 1u, std::min(s_cols.second, copyWidth));
-            // Both lines are computed and written on the log helper from a copy of the uploaded rows (issue 023
-            // criterion 6: the window does not spend its frame on the trace).
-            std::vector<uint8_t> rowsCopy(ps2x_dev::s_lastFrame.begin(),
-                                          ps2x_dev::s_lastFrame.begin() +
-                                              static_cast<std::ptrdiff_t>(std::min(ps2x_dev::s_lastFrame.size(),
-                                                                                   rowBytes * copyHeight)));
-            const size_t copyBytes = rowsCopy.size();
-            ps2x::stdio_pump::postDeferred([pixels = std::move(rowsCopy), rowBytes, copyWidth, copyHeight, x0, x1,
-                                            tick = currentTick]
-            {
-                auto fnv = [&](uint32_t y0, uint32_t y1)
-                {
-                    uint64_t h = 1469598103934665603ull;
-                    for (uint32_t y = y0; y < y1; ++y)
-                    {
-                        const uint8_t *row = pixels.data() + static_cast<size_t>(y) * rowBytes;
-                        for (size_t i = 0; i < static_cast<size_t>(copyWidth) * 4u; ++i)
-                            h = (h ^ row[i]) * 1099511628211ull;
-                    }
-                    return h;
-                };
-                std::fprintf(stderr, "[upload:hash] tick=%llu all=%016llx top=%016llx bottom=%016llx h=%u\n",
-                             static_cast<unsigned long long>(tick), static_cast<unsigned long long>(fnv(0, copyHeight)),
-                             static_cast<unsigned long long>(fnv(0, copyHeight / 2u)),
-                             static_cast<unsigned long long>(fnv(copyHeight / 2u, copyHeight)), copyHeight);
-                std::string rows;
-                for (uint32_t y = 0; y < copyHeight; ++y)
-                {
-                    const uint8_t *row = pixels.data() + static_cast<size_t>(y) * rowBytes;
-                    uint32_t sum = 0u;
-                    for (uint32_t x = x0; x < x1 && x < copyWidth; ++x)
-                        sum += row[x * 4u] + row[x * 4u + 1u] + row[x * 4u + 2u];
-                    const uint32_t mean = sum / ((x1 - x0) * 3u);
-                    static const char kHex[] = "0123456789abcdef";
-                    rows.push_back(kHex[(mean >> 4) & 15u]);
-                    rows.push_back(kHex[mean & 15u]);
-                }
-                std::fprintf(stderr, "[upload:rows] tick=%llu w=%u h=%u %s\n", static_cast<unsigned long long>(tick),
-                             copyWidth, copyHeight, rows.c_str());
-            }, copyBytes);
-        }
-    }
-    ps2x_dev::s_lastFrameW = copyWidth;
-    ps2x_dev::s_lastFrameH = copyHeight;
-    ps2x_dev::s_lastFrameRows = texHeight;
-    s_lastWidth = copyWidth;
-    s_lastHeight = copyHeight;
-    s_lastDisplayWidth = displayWidth ? displayWidth : copyWidth;
-    s_lastDisplayHeight = displayHeight ? displayHeight : copyHeight;
-    outWidth = copyWidth;
-    outHeight = copyHeight;
-    outDisplayWidth = s_lastDisplayWidth;
-    outDisplayHeight = s_lastDisplayHeight;
-    s_hasUploadedFrame = true;
-    // DW5XL-DEBUG: PS2X_DRAW_TRACE=1 logs every upload whose image or display size differs from the previous one.
-    static const bool s_drawTrace = [] { const char *e = std::getenv("PS2X_DRAW_TRACE"); return e && *e && *e != '0'; }();
-    static uint32_t s_tw = 0, s_th = 0, s_tdw = 0, s_tdh = 0;
-    if (s_drawTrace && (s_tw != outWidth || s_th != outHeight || s_tdw != outDisplayWidth || s_tdh != outDisplayHeight))
-    {
-        std::fprintf(stderr, "[draw] tick=%llu image=%ux%u display=%ux%u tex=%ux%u\n",
-                     static_cast<unsigned long long>(currentTick), outWidth, outHeight, outDisplayWidth,
-                     outDisplayHeight, texWidth, texHeight);
-        s_tw = outWidth; s_th = outHeight; s_tdw = outDisplayWidth; s_tdh = outDisplayHeight;
-    }
-}
 
 namespace
 {
@@ -2472,51 +1998,55 @@ bool PS2Runtime::syncCoreSubsystems()
 }
 
 // DW5XL (issue 049, amendment v3.12): the game is shown by the window the renderer draws itself
-// (runtime/gs/gs_game_window.h), a Vulkan swap chain without OpenGL. The default since step 6 (owner 2026-11-14,
-// after the owner's look). It shows the game's pictures: those finished on the graphics card straight from there,
-// those that only exist in main memory uploaded; frame dumps and the pictures of saved states read the shown
-// picture when they need it; the pages and overlays, SHARPEN and fullscreen are drawn by it. With a renderer that
-// does not draw with Vulkan (the CPU renderer) the window makes a Vulkan device of its own.
-// DW5XL-DEBUG PS2X_WINDOW=opengl: today's raylib window instead, until it goes (step 7). It is also what the game
-// falls back to where the new window cannot be opened (the log says why).
-// True: the renderer's own window is open, and its keys, mouse and pads are the ones the game reads.
+// (runtime/gs/gs_game_window.h), a Vulkan swap chain without OpenGL. The default since step 6 (owner 2026-11-14)
+// and the game's only window since step 7 (owner 2026-11-15). It shows the game's pictures: those finished on the
+// graphics card straight from there, those that only exist in main memory uploaded; frame dumps and the pictures
+// of saved states read the shown picture when they need it; the pages and overlays, SHARPEN and fullscreen are
+// drawn by it. With a renderer that does not draw with Vulkan (the CPU renderer) the window makes a Vulkan
+// device of its own.
+// Where the window cannot be opened (no Vulkan driver, no device, no swap chain) the game says what is missing
+// and ends: there is no second window to fall back on (runtime/gs/gs_window_message.h; the message also in a
+// box where the system has one, unless the window was asked for hidden).
+// DW5XL-DEBUG PS2X_WINDOW_FAIL=<reason>: the window is not opened, as on a PC without a Vulkan driver, with
+// that reason (a hidden test of the message and of the game's end).
+// True: the window is open, and its keys, mouse and pads are the ones the game reads.
 static bool openRendererWindow(const std::shared_ptr<GSVulkanPresenterLink> &link, const char *title)
 {
-#ifdef PS2X_HAS_GAME_WINDOW
-    const char *wanted = std::getenv("PS2X_WINDOW");
-    if (wanted && std::strcmp(wanted, "opengl") == 0)
-    {
-        std::fprintf(stderr, "[window] today's window (PS2X_WINDOW=opengl)\n");
-        return false;
-    }
-    if (wanted && *wanted && std::strcmp(wanted, "vulkan") != 0)
-        std::fprintf(stderr, "[window] PS2X_WINDOW=%s is not known (vulkan, opengl): the renderer's own window is used\n", wanted);
     const char *hidden = std::getenv("PS2X_HIDDEN");
+    const bool wantHidden = hidden && *hidden && *hidden != '0';
+    std::string why = "this program was built without the Vulkan renderer";
+#ifdef PS2X_HAS_GAME_WINDOW
     const char *vsyncSource = "default";
     ps2x::gs::GameWindowOptions options;
     firstWindowSize(options.width, options.height);
     options.title = title ? title : "";
-    options.hidden = hidden && *hidden && *hidden != '0';
+    options.hidden = wantHidden;
     options.vsync = loadVsyncSetting(vsyncSource);
-    std::string why;
-    s_gameWindow = ps2x::gs::GameWindow::open(link, options, why);
-    if (!s_gameWindow)
+    why.clear();
+    if (const char *fail = std::getenv("PS2X_WINDOW_FAIL"); fail && *fail)
+        why = fail;
+    else
+        s_gameWindow = ps2x::gs::GameWindow::open(link, options, why);
+    if (s_gameWindow)
     {
-        std::fprintf(stderr, "[window] the renderer's window could not be opened: %s; today's window is used\n", why.c_str());
-        return false;
+        ps2x::host::setDevices(&s_gameWindow->devices());
+        ps2x::host::setWindow(&s_gameWindow->control());
+        if (loadFullscreenSetting() && !s_gameWindow->hidden()) // issue 023 3S: display=fullscreen (borderless)
+            s_gameWindow->control().setFullscreen(true);
+        std::fprintf(stderr, "[window] the renderer's own window%s%s\n", options.hidden ? ", hidden" : "",
+                     link ? "" : ", on a graphics device of its own (the renderer does not draw with Vulkan)");
+        return true;
     }
-    ps2x::host::setDevices(&s_gameWindow->devices());
-    ps2x::host::setWindow(&s_gameWindow->control());
-    if (loadFullscreenSetting() && !s_gameWindow->hidden()) // issue 023 3S: display=fullscreen (borderless)
-        s_gameWindow->control().setFullscreen(true);
-    std::fprintf(stderr, "[window] the renderer's own window%s%s\n", options.hidden ? ", hidden" : "",
-                 link ? "" : ", on a graphics device of its own (the renderer does not draw with Vulkan)");
-    return true;
 #else
     (void)link;
-    (void)title;
-    return false;
 #endif
+    const std::string message = ps2x::gs::windowNotOpenedMessage(why);
+    std::string oneLine = message;
+    std::replace(oneLine.begin(), oneLine.end(), '\n', ' ');
+    std::fprintf(stderr, "[window] %s\n", oneLine.c_str());
+    if (!wantHidden)
+        ps2x::showFatalMessage(title ? title : "", message);
+    return false;
 }
 
 // Issue 067: the window's title, for the reason the system shows for the game's request to keep the screen on.
@@ -2542,29 +2072,17 @@ bool PS2Runtime::initialize(const char *title)
         }
 
         applySavedOutputSettings(m_gs);
-#if defined(PLATFORM_VITA)
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
-#else
         {
-            const char *hidden = std::getenv("PS2X_HIDDEN");
-            // Issue 023 step 3S: with vsync on the window swaps on a display refresh (swap interval 1) instead of
-            // immediately; with field pacing (the default) that is one picture per PS2 field, shown on a refresh.
+            // Issue 023 step 3S: with vsync on the window presents on a display refresh instead of immediately;
+            // one picture per PS2 field, shown on a refresh.
             const char *vsyncSource = "default";
             const bool vsyncOn = loadVsyncSetting(vsyncSource);
-            SetConfigFlags(FLAG_WINDOW_RESIZABLE |
-                           ((hidden && *hidden && *hidden != '0') ? FLAG_WINDOW_HIDDEN : 0) |
-                           (vsyncOn ? FLAG_VSYNC_HINT : 0));
             std::fprintf(stderr, "[window] vsync %s (%s)\n", vsyncOn ? "on" : "off", vsyncSource);
         }
-        if (!openRendererWindow(gs().presenterLink(), title)) // issue 049: the default; PS2X_WINDOW=opengl for today's
-        {
-            int firstWidth = 0, firstHeight = 0;
-            firstWindowSize(firstWidth, firstHeight);
-            InitWindow(firstWidth, firstHeight, title);
-            ps2x::present_feedback::start(GetWindowHandle()); // DW5XL-DEBUG issue 023 3S: PS2X_PRESENT_LOG
-            if (loadFullscreenSetting() && !IsWindowHidden())   // issue 023 3S: display=fullscreen (borderless)
-                ToggleBorderlessWindowed();
-        }
+        // Issue 049 (amendment v3.12 step 7): the game has one window. Where it cannot be opened the game has said
+        // why (openRendererWindow) and ends here.
+        if (!openRendererWindow(gs().presenterLink(), title))
+            return false;
         InitAudioDevice();
         // DW5XL-DEBUG (issue 025): PS2X_MUTE=1 silences the output for test runs where no silent sink exists
         // (Windows); the audio device and stream keep running exactly as in normal play, only the volume is 0.
@@ -2572,11 +2090,6 @@ bool PS2Runtime::initialize(const char *title)
             SetMasterVolume(0.0f);
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         m_audioBackend.startPcmStream();
-#endif
-        // The renderer's own window (issue 049) has no OpenGL: raylib's frame limiter belongs to today's window.
-        // The overlays start up with either window (the window that shows the game draws them, step 4).
-        if (!rendererWindowOpen())
-            SetTargetFPS(configuredHostTargetFps());
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -4448,21 +3961,6 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
-    // DW5XL (issue 049, amendment v3.12 step 3 part 4): the renderer's own window has no OpenGL; nothing of
-    // raylib's window is touched then.
-    const bool ownWindow = rendererWindowOpen();
-    Texture2D frameTex{};
-    if (!ownWindow)
-    {
-        // A blank image to use as a framebuffer
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
-        frameTex = LoadTextureFromImage(blank);
-        UnloadImage(blank);
-
-        // Escape belongs to the game's menu controls. Close the native window with
-        // its close button or Alt+F4 instead of Raylib's default Escape shortcut.
-        SetExitKey(KEY_NULL);
-    }
     ps2_host_input::poll();
     std::atomic<bool> gameThreadFinished{false};
 
@@ -4497,8 +3995,6 @@ void PS2Runtime::run()
         }
         gameThreadFinished.store(true, std::memory_order_release); });
 
-    uint64_t tick = 0;
-    const int hostFpsOverride = configuredHostTargetFps();
     uint64_t lastShownField = ps2x::presentation::kNoField; // issue 023 fix 2: the field the last frame showed
     uint64_t shownLoads = stateLoadCount();                  // issue 027: states loaded when lastShownField was set
     ps2x_dev::Harness devHarness;
@@ -4523,22 +4019,12 @@ void PS2Runtime::run()
             std::fprintf(stderr, "[window] test display: fixed rate, %.4f ms per refresh (%.3f Hz)\n", displayGrid.periodMs,
                          1000.0 / displayGrid.periodMs);
     }
-    const bool timedMode = !ownWindow && s_smoothShow && haveDisplay && hostFpsOverride == 0 && m_eeScheduler;
-    ps2x_dev::PictureReader pictureReader;
-    if (timedMode)
-    {
-        ps2x_dev::s_inBetween.readerOwnsReads = true;
-        pictureReader.start(this);
-    }
     SmoothClock::time_point fieldAnnouncedAt{};
     double fieldPeriodMs = 20.0;
     // Following display: how long a turn takes from its start to its swap, the longest of the last 32 (measured).
     std::array<double, 32> turnMs{};
     size_t turnAt = 0u;
-    uint32_t presentWidth = FB_WIDTH, presentHeight = DEFAULT_DISPLAY_HEIGHT;
-    uint32_t displayWidth = FB_WIDTH, displayHeight = DEFAULT_DISPLAY_HEIGHT;
-    // DW5XL (issue 049, amendment v3.12 step 3 part 4): what both windows do alike, as one code: the function keys
-    // of the output and of the saved states, and the F2 numbers ([hud]).
+    // The function keys of the output and of the saved states, and the F2 numbers ([hud]).
     const auto outputAndStateKeys = [this]()
     {
         // F4 cycles native/2x/4x output; F3 cycles the anti-aliasing choice (1-16 samples
@@ -4644,9 +4130,9 @@ void PS2Runtime::run()
         hudGameFps = s_gameFps;
         hudVsyncRate = s_vsyncRate;
     };
-    // DW5XL (issue 049, amendment v3.12 step 4): the F2 and F8 lines and the state message, one code for both
-    // loops, drawn by whichever window shows the game (runtime/host_window.h): the same boxes, places, sizes and
-    // colours as raylib drew them (its Fade(BLACK, 0.75), GREEN, YELLOW, RED and WHITE). Not drawn in a hidden
+    // DW5XL (issue 049, amendment v3.12 step 4): the F2 and F8 lines and the state message, drawn by the window
+    // (runtime/host_window.h): the boxes, places, sizes and colours the raylib window had (its Fade(BLACK, 0.75),
+    // GREEN, YELLOW, RED and WHITE), the letters in the pages' font. Not drawn in a hidden
     // window, unless a test asks for them there (DW5XL-DEBUG PS2X_OVERLAY_HIDDEN=1: window pictures of hidden runs).
     static const bool s_overlayHidden = [] { const char *v = std::getenv("PS2X_OVERLAY_HIDDEN"); return v && *v && *v != '0'; }();
     bool showBuildOverlay = false; // F8: build ID and game tick, to match screenshots with logs (off by default)
@@ -4698,7 +4184,7 @@ void PS2Runtime::run()
     // Issue 067 (rule A, owner 2026-11-14): the system is asked to keep the screen on while the game runs in a
     // shown window; not while the port's MENU or a page holds the game, not hidden or minimised, not at exit. A
     // controller does not count as input to the system, and a movie has none. Asked once per change
-    // (ps2x::screen_on::Keeper), by either window's loop at the start of its turn.
+    // (ps2x::screen_on::Keeper), by the window's loop at the start of its turn.
     // DW5XL-DEBUG PS2X_SCREEN_ON_HIDDEN=1: a hidden window counts as shown, for the test (issue_067_screen_on.py).
     static const bool s_screenOnHidden = [] { const char *v = std::getenv("PS2X_SCREEN_ON_HIDDEN"); return v && *v && *v != '0'; }();
     const std::unique_ptr<ps2x::screen_on::System> screenSystem = ps2x::screen_on::makeSystem(s_programTitle);
@@ -4727,13 +4213,11 @@ void PS2Runtime::run()
         }
     };
 #ifdef PS2X_HAS_GAME_WINDOW
-    if (ownWindow)
+    if (s_gameWindow)
     {
         // The renderer's own window: one window frame per PS2 field, the field's picture taken on the graphics card.
         ps2x::gs::GameWindow &window = *s_gameWindow;
-        if (hostFpsOverride != 0)
-            std::fprintf(stderr, "[window] PS2X_HOST_FPS is not used by the renderer's own window: one window frame per PS2 field\n");
-        // Step 5: in-between pictures in this window. As in today's window they are shown in the test mode
+        // Step 5: in-between pictures in this window. They are shown in the test mode
         // (PS2X_SMOOTH_SHOW=1 with a test display), each at the instant it was made for; here they stay on the
         // graphics card: the window is handed them (GameWindow::takeTimed), the queue of timed pictures keeps each
         // one's number with its instant, and the turn that presents one tells the window which.
@@ -4756,7 +4240,7 @@ void PS2Runtime::run()
         bool displayKnown = haveDisplay; // a test display, or the real one once its clock is known
         int realSaid = -1;               // what the log last said of the real display
         uint64_t realChains = 0u;        // the window's swap chains when the clock last started
-        const bool timedOwn = s_smoothShow && (haveDisplay || realDisplay) && hostFpsOverride == 0 && m_eeScheduler;
+        const bool timedOwn = s_smoothShow && (haveDisplay || realDisplay) && m_eeScheduler;
         // The renderer memory that draws the pictures is made when the game first makes one (syncPictureGs): the
         // window is attached to its hand-over in the turn after that.
         GS *timedFor = nullptr;
@@ -4784,11 +4268,10 @@ void PS2Runtime::run()
         {
             std::fprintf(stderr, "[window] in-between pictures are not shown: %s\n",
                          !(haveDisplay || realDisplay) ? "a hidden window has no display; it needs a test display (PS2X_TEST_DISPLAY)"
-                         : hostFpsOverride != 0 ? "PS2X_HOST_FPS is set"
-                                                                                                    : "the game has no field clock");
+                                                       : "the game has no field clock");
         }
         static const bool s_stats = [] { const char *v = std::getenv("PS2X_PRESENT_STATS"); return v && *v && *v != '0'; }();
-        // DW5XL-DEBUG issue 023 / 049 step 7a: the picture trace, as today's window writes it (see below).
+        // DW5XL-DEBUG issue 023 / 049 step 7a: the picture trace (see below).
         static const bool s_weaveTrace = [] { const char *v = std::getenv("PS2X_WEAVE_TRACE"); return v && *v && *v != '0'; }();
         auto lastTurn = std::chrono::steady_clock::now(), statsSince = lastTurn;
         uint64_t statFrames = 0u, statNew = 0u, statFailed = 0u, statSlow = 0u, statFromMemory = 0u, statFetched = 0u;
@@ -5012,7 +4495,7 @@ void PS2Runtime::run()
             const TurnClock::time_point polled = s_stats ? TurnClock::now() : TurnClock::time_point{};
             if (timedOwn && !inBetween && !paced.fresh && wokeEarly)
                 continue; // woken for a picture's arrival or its hand-over time: the next turn decides
-            // As today's window (UploadFrame): a fresh field is waited for until the GS side has finished it, and
+            // A fresh field is waited for until the GS side has finished it, and
             // what the GS side read back is collected in every turn, so that a read finished between two fields
             // does not wait for the next field. A renderer read at window time is read once per fresh field.
             // A turn that presents an in-between picture leaves the field's own picture alone, as today's does.
@@ -5029,7 +4512,7 @@ void PS2Runtime::run()
             if (!inBetween && pictureGs().pictureReadsActive())
                 ps2x_dev::s_inBetween.collect(this, s_windowFrameField);
             // A picture that only exists in main memory (two fields put together by the CPU at 1x, the CPU
-            // renderer): into s_lastFrame as today's window keeps it, and to the window, which uploads it.
+            // renderer): into s_lastFrame, and to the window, which uploads it.
             if (const uint64_t generation = gs().hostPresentationGeneration(); !inBetween && generation != lastReadGeneration)
             {
                 lastReadGeneration = generation;
@@ -5076,8 +4559,8 @@ void PS2Runtime::run()
                 shownHave = shown.have;
                 shownOrder = shown.order;
                 s_windowFrameNewPicture = shown.newPicture;
-                // Issue 049: a frame dump holds the picture this window frame shows, named by the field it shows, as
-                // with today's window. The picture is read from the graphics card for it (fetchShownPicture).
+                // Issue 049: a frame dump holds the picture this window frame shows, named by the field it shows.
+                // The picture is read from the graphics card for it (fetchShownPicture).
                 const bool fieldDumped = devHarness.dumpPresented(s_windowFrameField);
                 if (pictureGs().pictureReadsActive())
                 {
@@ -5099,7 +4582,7 @@ void PS2Runtime::run()
                 m_pictureRect[0] = shown.x; m_pictureRect[1] = shown.y;
                 m_pictureRect[2] = shown.rectWidth; m_pictureRect[3] = shown.rectHeight;
                 // DW5XL-DEBUG issue 023 / 049 step 7a: PS2X_WEAVE_TRACE=1 logs the window's size and the picture's
-                // rectangle whenever they change, as today's window does (issue 047's window-place test reads it).
+                // rectangle whenever they change (issue 047's window-place test reads it).
                 if (s_weaveTrace)
                 {
                     static float s_lastRect[6] = {};
@@ -5207,13 +4690,13 @@ void PS2Runtime::run()
                              shown.fromMemory ? 1 : 0);
             lastTurn = now;
             hudNumbers(static_cast<float>(turnMs), eeScheduler().currentVSyncTick());
-            // DW5XL-DEBUG issue 023 / 049 step 7a: PS2X_WEAVE_TRACE=1, the lines today's window writes for its
-            // pictures, so that the tests that follow the window's pictures read the same from this window. For
+            // DW5XL-DEBUG issue 023 / 049 step 7a: PS2X_WEAVE_TRACE=1, the lines the raylib window wrote for its
+            // pictures until step 7, so that the tests that follow the window's pictures read the same here. For
             // every new picture this window has shown: its fingerprints and row profile ([upload:hash],
             // [upload:rows]; columns from PS2X_WEAVE_TRACE_COLS). For one taken on the graphics card also the line
             // of a window picture, [weave:out] with kind=card and the field it was made for (the renderer writes
             // that line itself for a picture it read back into main memory, which is how every picture reached
-            // today's window). The picture is read from the card for it, after the present; the lines are made on
+            // the raylib window). The picture is read from the card for it, after the present; the lines are made on
             // the log helper from a copy. Never for timing: a read waits for the card.
             if (s_weaveTrace && !inBetween && shown.have && shown.newPicture)
             {
@@ -5245,7 +4728,7 @@ void PS2Runtime::run()
                     }, copyBytes);
                 }
             }
-            // DW5XL-DEBUG issue 023 3S: PS2X_WINDOW_SHOT=<field>:<path.png>, as today's window has it: what the window
+            // DW5XL-DEBUG issue 023 3S: PS2X_WINDOW_SHOT=<field>:<path.png>: what the window
             // shows on the first frame at or after that field, drawn once more into a picture of the window's size
             // and saved (the frame dumps hold only the game picture, at its own size).
             {
@@ -5312,7 +4795,7 @@ void PS2Runtime::run()
                 }
                 devHarness.hostShots.clear();
             }
-            // DW5XL-DEBUG PS2X_PRESENT_STATS=1: one line a second, as today's window has one ([present:stats]):
+            // DW5XL-DEBUG PS2X_PRESENT_STATS=1: one line a second ([present:own]):
             // window frames, the game's new pictures shown, of them the ones that came from main memory (uploaded),
             // reads the renderer copied into main memory, shown pictures read from the graphics card on request
             // (a frame dump, a saved state's picture), frames that could not be presented. `slow` and `maxMs` are
@@ -5364,334 +4847,7 @@ void PS2Runtime::run()
         }
     }
 #endif
-    while (!ownWindow && !isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
-    {
-        keepScreenOn(false); // issue 067
-        const bool fieldPaced = hostFpsOverride == 0 && m_eeScheduler;
-        EeScheduler::PresentationField paced{};
-        bool inBetween = false;                             // this turn shows a timed picture (the queue's front)
-        bool wokeEarly = false;
-        double turnStartMs = 0.0;
-        auto timedWake = SmoothClock::time_point::max();
-        if (timedMode)
-        {
-            auto &queue = ps2x_dev::s_inBetween;
-            queue.collectTimed(pictureReader);
-            const double now = dc::nowMs();
-            // Fixed rate: a picture whose instant has passed missed its refresh. Following display: a picture is on
-            // screen when it is presented, so a late one is still shown unless the next one's instant has come too.
-            while (!queue.timed.empty() &&
-                   (displayGrid.follows ? queue.timed.size() >= 2u && now >= queue.timed[1].info.atMs
-                                        : now >= queue.timed.front().info.atMs))
-                queue.dropFront(ps2x_dev::InBetweenQueue::Dropped::Late);
-            if (!queue.timed.empty())
-            {
-                // Fixed rate: handed over in the refresh interval before its instant. Following display: presented
-                // at its instant; the turn starts as much earlier as a turn has lately taken up to its swap.
-                const double at = queue.timed.front().info.atMs;
-                const double lead = displayGrid.follows ? *std::max_element(turnMs.begin(), turnMs.end()) : displayGrid.periodMs;
-                if (now >= at - lead)
-                {
-                    inBetween = true;
-                    turnStartMs = now;
-                }
-                else
-                {
-                    timedWake = dc::fromMs(at - lead);
-                }
-            }
-        }
-        if (fieldPaced && !inBetween)
-        {
-            // Issue 027: a state load sets the field number back; the loaded game's fields are new to the window
-            // (otherwise it would wait until the game passed the field it showed before the load).
-            if (const uint64_t loads = stateLoadCount(); loads != shownLoads)
-            {
-                shownLoads = loads;
-                lastShownField = ps2x::presentation::kNoField;
-            }
-            const auto waitStart = std::chrono::steady_clock::now();
-            if (timedMode)
-            {
-                // Also woken by a picture's arrival and at the next picture's hand-over time.
-                const auto got = m_eeScheduler->waitForPresentationFieldUntil(lastShownField, timedWake);
-                paced.field = got.field;
-                paced.fresh = got.fresh;
-                wokeEarly = got.early;
-            }
-            else
-            {
-                paced = m_eeScheduler->waitForPresentationField(lastShownField);
-            }
-            if (paced.fresh)
-            {
-                lastShownField = paced.field;
-                // The field period as the window sees it (issue 049 P2.5): the time between two announcements, smoothed.
-                const auto announced = SmoothClock::now();
-                if (fieldAnnouncedAt != SmoothClock::time_point{})
-                {
-                    const double ms = std::chrono::duration<double, std::milli>(announced - fieldAnnouncedAt).count();
-                    if (ms > 10.0 && ms < 40.0)
-                        fieldPeriodMs += (ms - fieldPeriodMs) * 0.05;
-                }
-                fieldAnnouncedAt = announced;
-                ps2x_dev::s_inBetween.periodMs = fieldPeriodMs;
-            }
-            // DW5XL-DEBUG issue 009 v4.7: the first window frames after a host pause ends (owner: "the picture takes a
-            // moment to start again").
-            if (const int64_t resumedNs = m_lastHostResumeNs.load(std::memory_order_acquire); resumedNs != 0)
-            {
-                static int64_t s_loggedFor = 0;
-                static int s_frames = 0;
-                static uint64_t s_generation = 0, s_pictures = 0;
-                static bool s_done = false;
-                if (s_loggedFor != resumedNs)
-                {
-                    s_loggedFor = resumedNs;
-                    s_frames = 0;
-                    s_generation = gs().hostPresentationGeneration();
-                    s_pictures = 0;
-                    s_done = false;
-                }
-                if (!s_done)
-                {
-                    const auto now = std::chrono::steady_clock::now();
-                    const double sinceMs = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count() - resumedNs) / 1e6;
-                    if (const uint64_t generation = gs().hostPresentationGeneration(); generation != s_generation)
-                    {
-                        s_generation = generation;
-                        ++s_pictures;
-                    }
-                    if (s_frames < 3)
-                        std::fprintf(stderr, "[pause] window frame %d: %.1f ms after the menu closed, field %llu, new field %s, waited %.1f ms\n",
-                                     s_frames, sinceMs, static_cast<unsigned long long>(paced.field), paced.fresh ? "yes" : "no",
-                                     std::chrono::duration<double, std::milli>(now - waitStart).count());
-                    ++s_frames;
-                    if (sinceMs >= 1000.0)
-                    {
-                        std::fprintf(stderr, "[pause] first second after the resume: %llu new pictures in %d window frames\n",
-                                     static_cast<unsigned long long>(s_pictures), s_frames);
-                        s_done = true;
-                    }
-                }
-            }
-        }
-        m_audioBackend.updatePcmStream();
-        devHarness.step(m_eeScheduler->currentVSyncTick());
-        ps2_host_input::poll(m_eeScheduler->currentVSyncTick());
-        PS2_IF_AGRESSIVE_LOGS({
-            tick++;
-            if ((tick % 120) == 0)
-            {
-                uint64_t curDma = m_memory.dmaStartCount();
-                uint64_t curGif = m_memory.gifCopyCount();
-                uint64_t curGs = m_memory.gsWriteCount();
-                uint64_t curVif = m_memory.vifWriteCount();
-                const GSRegisters &gs = m_memory.gs();
-                const uint32_t dbgPc = m_debugPc.load(std::memory_order_relaxed);
-                const uint32_t dbgRa = m_debugRa.load(std::memory_order_relaxed);
-                const uint32_t dbgSp = m_debugSp.load(std::memory_order_relaxed);
-                const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
-                const auto eeSnapshot = m_eeScheduler->snapshot();
-
-                RUNTIME_LOG("[run:tick] tick=" << tick
-                                               << " pc=0x" << std::hex << dbgPc
-                                               << " ra=0x" << dbgRa
-                                               << " sp=0x" << dbgSp
-                                               << " gp=0x" << dbgGp
-                                               << " dispfb1=0x" << gs.dispfb1
-                                               << " display1=0x" << gs.display1
-                                               << std::dec
-                                               << " activeThreads=" << eeSnapshot.threads.size()
-                                               << " dma=" << curDma
-                                               << " gif=" << curGif
-                                               << " gsw=" << curGs
-                                               << " vif=" << curVif
-                                               << std::endl);
-
-            }
-        });
-        if (timedMode && !inBetween && !paced.fresh && wokeEarly)
-            continue; // woken for a picture's arrival or its hand-over time: the next turn decides
-        if (inBetween)
-        {
-            // A timed picture: the window keeps the last field's sizes.
-            if (!UploadPicture(frameTex, ps2x_dev::s_inBetween.timed.front().read.frame))
-            {
-                ps2x_dev::s_inBetween.dropFront(ps2x_dev::InBetweenQueue::Dropped::WrongSize);
-                continue;
-            }
-        }
-        else
-        {
-            presentWidth = FB_WIDTH;
-            presentHeight = DEFAULT_DISPLAY_HEIGHT;
-            displayWidth = FB_WIDTH;
-            displayHeight = DEFAULT_DISPLAY_HEIGHT;
-            UploadFrame(frameTex, this, presentWidth, presentHeight, displayWidth, displayHeight, fieldPaced ? &paced : nullptr);
-        }
-        const bool fieldDumped = !inBetween && devHarness.dumpPresented(s_windowFrameField);
-        if (!inBetween && pictureGs().pictureReadsActive())
-        {
-            // Issue 049 v3.2 (P2.3b): the in-between pictures that waited for this field.
-            if (fieldDumped)
-                ps2x_dev::s_inBetween.dump(s_windowFrameField, m_gs.hostPresentationField());
-            ps2x_dev::s_inBetween.retire(s_windowFrameField);
-        }
-        if (timedMode && !inBetween && paced.fresh && ps2x_dev::s_inBetween.lastShownAtMs >= dc::nowMs() - fieldPeriodMs)
-        {
-            // Timed pictures cover the present (one was shown for an instant less than a field ago): the field's own
-            // picture was taken (and saved if a test asked) but is not shown. When they stop, or miss their instants,
-            // the window shows fields again.
-            ps2x_dev::s_inBetween.hiddenForStats += s_windowFrameNewPicture ? 1u : 0u;
-            continue;
-        }
-
-        BeginDrawing();
-        ClearBackground(BLACK);
-        const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
-        const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
-        // Letterbox by the logical display size, not the stored image size, to the picture's shape (DW5XL issue 047).
-        // DW5XL issue 047: the real window. GetScreenWidth() already holds a size asked for, which the window manager may refuse.
-        const float screenWidth = static_cast<float>(GetRenderWidth());
-        const float screenHeight = static_cast<float>(GetRenderHeight());
-        // DW5XL issue 049 (amendment v3.12 step 3): one function for every window that shows the picture.
-        const ps2x::PictureRect placed = ps2x::pictureRectInWindow(
-            displayWidth, displayHeight, s_pictureShape.load(std::memory_order_relaxed), screenWidth, screenHeight);
-        const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
-        const Rectangle dstRect{placed.x, placed.y, placed.width, placed.height};
-        // DW5XL-DEBUG issue 023: PS2X_WEAVE_TRACE=1 logs the window size and the picture rectangle whenever they change.
-        {
-            static const bool s_rectTrace = [] { const char *v = std::getenv("PS2X_WEAVE_TRACE"); return v && *v && *v != '0'; }();
-            static float s_lastRect[6] = {};
-            const float rect[6] = {screenWidth, screenHeight, dstRect.x, dstRect.y, dstRect.width, dstRect.height};
-            if (s_rectTrace && std::memcmp(rect, s_lastRect, sizeof(rect)) != 0)
-            {
-                std::fprintf(stderr, "[draw:rect] tick=%llu screen=%.0fx%.0f dst=%.1f,%.1f %.1fx%.1f src=%.0fx%.0f\n",
-                             static_cast<unsigned long long>(m_eeScheduler->currentVSyncTick()), screenWidth, screenHeight,
-                             dstRect.x, dstRect.y, dstRect.width, dstRect.height, srcWidth, srcHeight);
-                std::memcpy(s_lastRect, rect, sizeof(rect));
-            }
-        }
-        // DW5XL issue 047: above 1x the picture is scaled smoothly; nearest would repeat whole rows. 1x stays as it was.
-        SetTextureFilter(frameTex, m_gs.getResolutionScale() > 1u ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
-        const bool sharpen = s_presentSharpen.load(std::memory_order_relaxed) && m_gs.getResolutionScale() > 1u;
-        static Shader s_sharpenShader{};
-        if (sharpen)
-        {
-            if (!s_sharpenShader.id) s_sharpenShader = LoadShaderFromMemory(nullptr, kPresentSharpenShader);
-            const float texel[2] = {1.0f / static_cast<float>(frameTex.width), 1.0f / static_cast<float>(frameTex.height)};
-            SetShaderValue(s_sharpenShader, GetShaderLocation(s_sharpenShader, "texel"), texel, SHADER_UNIFORM_VEC2);
-            BeginShaderMode(s_sharpenShader);
-        }
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-        if (sharpen) EndShaderMode();
-        m_pictureRect[0] = dstRect.x; m_pictureRect[1] = dstRect.y;   // issue 023 3S: for overlays over the picture
-        m_pictureRect[2] = dstRect.width; m_pictureRect[3] = dstRect.height;
-        ps2_host_input::drawMouseCaptureIndicator(dstRect.x, dstRect.y, dstRect.width, dstRect.height);
-        if (m_debugUiInitialized && m_debugUiDrawCallback)
-        {
-            m_debugUiDrawCallback(*this, m_debugUiUserData);
-        }
-        devHarness.captureHostFrame();
-
-        // Function keys: one table, runtime/hotkeys.h (owner layout 2026-10-20: F2 FPS, F3 AA, F4 scale, F8 build ID).
-        // On-screen FPS & VSync rate overlay: the show_fps setting (PC SETTINGS, issue 023 3S), toggled and saved
-        // with F2 too; PS2X_FPS=1 turns it on for a run.
-        static const bool s_showFpsInit = [this]() { m_showFps.store(loadShowFpsSetting(), std::memory_order_relaxed); return true; }();
-        (void)s_showFpsInit;
-        if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::FpsOverlay)))
-        {
-            setShowFps(!showFps());
-            ps2x::settings::saveText("show_fps", showFps() ? "on" : "off");
-        }
-        if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::BuildOverlay)))
-        {
-            showBuildOverlay = !showBuildOverlay;
-        }
-        outputAndStateKeys();
-
-        // F2 overlay numbers (issue 014), about once a second. VSync = guest fields per second, timed by the fields'
-        // own emission times (so a steady 50 reads 50.0, not 49/51 from where the window falls). FPS = the
-        // game's frame rate over the same span: fields in which it finished a frame (ps2x::device::gameFrameCount)
-        // or, during movies, the pictures the movie decoder handed to the game (its frame syncs do not always
-        // have device work), whichever is higher. The host window loop itself is paced by VBlankEnd (50 Hz) and is not shown.
-        const uint64_t currentVsync = eeScheduler().currentVSyncTick();
-        hudNumbers(GetFrameTime() * 1000.0f, currentVsync);
-        overlayLines(presentWidth, presentHeight, currentVsync);
-
-        // DW5XL-DEBUG issue 023 3S: PS2X_WINDOW_SHOT=<field>:<path.png> saves the whole window (overlays included)
-        // on the first frame at or after that field — the frame dumps hold only the game picture.
-        {
-            static uint64_t s_shotTick = 0; static std::string s_shotPath; static bool s_shotInit = false;
-            if (!s_shotInit) {
-                s_shotInit = true;
-                if (const char *v = std::getenv("PS2X_WINDOW_SHOT"); v && std::strchr(v, ':')) {
-                    s_shotTick = std::strtoull(v, nullptr, 10); s_shotPath = std::strchr(v, ':') + 1;
-                }
-            }
-            if (!m_windowShotRequest.empty() && s_shotPath.empty()) { s_shotPath = m_windowShotRequest; s_shotTick = 0; m_windowShotRequest.clear(); }
-            if (!s_shotPath.empty() && currentVsync >= s_shotTick) {
-                rlDrawRenderBatchActive(); // raylib's text and boxes of this frame are still batched until now
-                ::Image shot = LoadImageFromScreen();
-                ExportImage(shot, s_shotPath.c_str());
-                UnloadImage(shot);
-                std::fprintf(stderr, "[window:shot] field %llu -> %s\n", static_cast<unsigned long long>(currentVsync), s_shotPath.c_str());
-                s_shotPath.clear();
-            }
-        }
-        double handedMs = 0.0, handMs = 0.0;
-        if (inBetween)
-        {
-            handMs = dc::nowMs() - turnStartMs; // what this turn needed up to the swap
-            turnMs[turnAt++ % turnMs.size()] = handMs;
-            if (displayGrid.follows)
-            {
-                // Presented at its instant: sleep close to it, then spin.
-                const auto due = dc::fromMs(ps2x_dev::s_inBetween.timed.front().info.atMs);
-                if (due - SmoothClock::now() > std::chrono::milliseconds(2))
-                    std::this_thread::sleep_until(due - std::chrono::milliseconds(1));
-                while (SmoothClock::now() < due)
-                    std::this_thread::yield();
-            }
-            handedMs = dc::nowMs();
-        }
-        EndDrawing();
-        if (inBetween)
-        {
-            ps2x_dev::s_inBetween.shownFront(handedMs, handMs);
-        }
-        else
-        {
-            ps2x::present_feedback::frameSwapped(s_windowFrameField, s_windowFrameNewPicture); // DW5XL-DEBUG issue 023 3S
-            // DW5XL-DEBUG issue 049 v3.5: PS2X_SMOOTH_TIMELINE=1: a field's own picture and the refresh that shows it.
-            if (paced.fresh && dc::logTimeline())
-            {
-                const double swapped = dc::nowMs();
-                if (haveDisplay && !displayGrid.follows)
-                {
-                    const int64_t refresh = dc::refreshAfter(displayGrid, swapped);
-                    std::fprintf(stderr, "[smooth:game] refresh=%lld at=%.3f field=%llu\n", static_cast<long long>(refresh),
-                                 dc::instantOf(displayGrid, refresh), static_cast<unsigned long long>(s_windowFrameField));
-                }
-                else
-                {
-                    std::fprintf(stderr, "[smooth:game] refresh=-1 at=%.3f field=%llu\n", swapped,
-                                 static_cast<unsigned long long>(s_windowFrameField));
-                }
-            }
-        }
-
-        if (WindowShouldClose())
-        {
-            RUNTIME_LOG("[run] window close requested, breaking out of loop");
-            requestStop();
-            break;
-        }
-    }
-
     keepScreenOn(true); // issue 067: the game is closing, the screen is the system's again
-    pictureReader.shutdown(); // issue 049 v3.5: before the GS goes
     requestStop();
     if (gameThread.joinable())
     {
@@ -5706,19 +4862,11 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
-    if (ownWindow)
-    {
 #ifdef PS2X_HAS_GAME_WINDOW
-        ps2x::host::setDevices(nullptr);
-        ps2x::host::setWindow(nullptr);
-        s_gameWindow.reset();
+    ps2x::host::setDevices(nullptr);
+    ps2x::host::setWindow(nullptr);
+    s_gameWindow.reset();
 #endif
-    }
-    else
-    {
-        UnloadTexture(frameTex);
-        CloseWindow();
-    }
 
     RUNTIME_LOG("[run] exiting loop");
 }

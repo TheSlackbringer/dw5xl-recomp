@@ -35,6 +35,13 @@ if(DW5XL_DEVELOPER_DIAGNOSTICS)
     endif()
 endif()
 add_subdirectory("${PS2RECOMP_DIR}" ps2recomp EXCLUDE_FROM_ALL)
+# Issue 049 (amendment v3.12 step 7, owner 2026-11-15): the game has one window, the one the Vulkan renderer draws
+# itself; there is no second window to fall back on. A game built without it could not show anything.
+get_target_property(DW5XL_RUNTIME_DEFINITIONS ps2_runtime INTERFACE_COMPILE_DEFINITIONS)
+if(NOT "${DW5XL_RUNTIME_DEFINITIONS}" MATCHES "PS2X_HAS_GAME_WINDOW")
+    message(FATAL_ERROR "The game's window is drawn by the Vulkan renderer: configure with -DPS2X_ENABLE_VULKAN_GS=ON "
+        "and PS2X_PARALLEL_GS_SOURCE_DIR (notes: PROJECT_SETUP), with raylib built from its sources (its GLFW is the window's library)")
+endif()
 # Runtime stubs also instantiate guest arithmetic helpers.
 target_compile_options(ps2_runtime PRIVATE ${DW5XL_STRICT_FP_FLAGS})
 if(DW5XL_DEVELOPER_DIAGNOSTICS)
@@ -660,6 +667,13 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_picture_trace_test tests/picture_trace_test.cpp)
     target_include_directories(dw5xl_picture_trace_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
     add_test(NAME picture_trace COMMAND dw5xl_picture_trace_test)
+    # DW5XL-TEST issue 049 (amendment v3.12 step 7): the game has one window. Reads the sources: the raylib/OpenGL
+    # window is gone from the runtime, the build needs the Vulkan renderer, and the message of a PC on which the
+    # window cannot be opened names what is missing.
+    add_executable(dw5xl_one_window_test tests/one_window_test.cpp)
+    target_include_directories(dw5xl_one_window_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
+    target_compile_definitions(dw5xl_one_window_test PRIVATE DW5XL_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
+    add_test(NAME one_window COMMAND dw5xl_one_window_test)
     set_tests_properties(gs_picture_reads PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     set_tests_properties(gs_window_support PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     set_tests_properties(gs_second_memory PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)

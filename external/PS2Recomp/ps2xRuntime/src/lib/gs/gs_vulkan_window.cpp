@@ -1159,7 +1159,7 @@ namespace
 
 #ifdef PS2X_HAS_WINDOW_UI
         // The overlays' context, fonts and renderer, made when something first asks for them. The default font as
-        // rlImGui sets it up for today's window: 13 pixels times the display's scale.
+        // rlImGui set it up for the raylib window: 13 pixels times the display's scale.
         void ensureUi()
         {
             if (m_uiReady)

@@ -23,8 +23,8 @@ namespace ps2x::host
     {
         virtual ~Window() = default;
 
-        // --- The overlays' frame (Dear ImGui). A window that draws the overlays itself answers true and does the
-        // work; today's window answers false and the caller uses rlImGui as before (it goes with that window).
+        // --- The overlays' frame (Dear ImGui). The window draws the overlays itself: it answers true and does the
+        // work. False: there are no overlays (no window, or a build without them).
         virtual bool uiSetup(bool dark) { (void)dark; return false; } // the ImGui context, its fonts and style
         virtual bool uiShutdown() { return false; }
         virtual bool uiBegin() { return false; } // a frame of overlays begins (or goes on, if one has begun)
@@ -60,8 +60,9 @@ namespace ps2x::host
         virtual std::vector<std::string> takeDroppedFiles() = 0;
     };
 
-    // The window that shows the game: today's raylib window unless another was set.
+    // The window that shows the game (the renderer's own window sets itself). Without one: a window that is
+    // hidden and draws nothing.
     Window &window();
-    // nullptr: today's raylib window again. The object must outlive its use.
+    // nullptr: no window again. The object must outlive its use.
     void setWindow(Window *replacement);
 } // namespace ps2x::host

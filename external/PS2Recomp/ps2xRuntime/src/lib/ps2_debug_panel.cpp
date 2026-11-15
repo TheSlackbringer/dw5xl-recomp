@@ -12,7 +12,6 @@
 
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "imgui.h"
-#include "rlImGui.h"
 #include "runtime/host_window.h"
 #include "raylib.h"
 #endif
@@ -2184,11 +2183,9 @@ void PS2DebugPanel::initialize()
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     if (!m_initialized)
     {
-        // DW5XL (issue 049, amendment v3.12 step 4): the window that shows the game draws the overlays itself, or
-        // leaves them to rlImGui (today's window).
-        if (!ps2x::host::window().uiSetup(true))
-            rlImGuiSetup(true);
-        m_initialized = true;
+        // DW5XL (issue 049, amendment v3.12 step 4): the window that shows the game draws the overlays itself.
+        // Without a window that can, there are none.
+        m_initialized = ps2x::host::window().uiSetup(true);
     }
 #endif
 }
@@ -2198,8 +2195,7 @@ void PS2DebugPanel::shutdown()
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     if (m_initialized)
     {
-        if (!ps2x::host::window().uiShutdown())
-            rlImGuiShutdown();
+        ps2x::host::window().uiShutdown();
         m_initialized = false;
     }
 #endif
@@ -2226,15 +2222,14 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
     }
 
     if (!ps2x::host::window().uiBegin())
-        rlImGuiBegin();
+        return;
     if (overlay)
     {
         m_overlayDraw();
     }
     if (!debugger)
     {
-        if (!ps2x::host::window().uiEnd())
-            rlImGuiEnd();
+        ps2x::host::window().uiEnd();
         return;
     }
 
@@ -2323,8 +2318,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
     }
     ImGui::End();
 
-    if (!ps2x::host::window().uiEnd())
-        rlImGuiEnd();
+    ps2x::host::window().uiEnd();
 #else
     (void)runtime;
 #endif
