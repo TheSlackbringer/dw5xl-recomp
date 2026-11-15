@@ -643,6 +643,11 @@ if(DW5XL_BUILD_TESTS)
     add_executable(dw5xl_smooth_builder_test tests/smooth_builder_test.cpp src/dw5xl_smooth_list.cpp)
     target_include_directories(dw5xl_smooth_builder_test PRIVATE src)
     add_test(NAME smooth_builder COMMAND dw5xl_smooth_builder_test)
+    # DW5XL-TEST issue 049 (amendment v3.4, P2.7): the GIF packets of two consecutive frames paired by place and
+    # blended at t (effects, gauges and HUD at the in-between rate). No game data.
+    add_executable(dw5xl_smooth_gif_test tests/smooth_gif_test.cpp src/dw5xl_smooth_gif.cpp)
+    target_include_directories(dw5xl_smooth_gif_test PRIVATE src)
+    add_test(NAME smooth_gif COMMAND dw5xl_smooth_gif_test)
     # DW5XL-TEST issue 049 v3.5: the time line of the in-between pictures and the display's clock; no game data.
     add_executable(dw5xl_smooth_time_test tests/smooth_time_test.cpp src/dw5xl_smooth_time.cpp)
     target_include_directories(dw5xl_smooth_time_test PRIVATE src)
