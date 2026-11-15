@@ -861,7 +861,8 @@ void inPlayProgress()
 // in hidden runs (the guest field stops while paused, so later steps count window frames after the previous one).
 // Issue 027 v7: "@<field>:<step>" is due at that guest field (steps while the game runs), and window frames while a
 // save or load asked from the screen is in progress do not count (the screen takes no input then).
-// Steps: esc, hold (Back held), up, down, left, right, cross, back (Triangle), shot=<file.png>.
+// Steps: esc, hold (Back held), up, down, left, right, cross, back (Triangle), shot=<file.png>, discs (issue 049: the
+// Discs window opens or closes, as on its key; taken in the frame after the step).
 struct ScriptStep { uint64_t wait = 0; std::string action; bool atField = false; };
 std::vector<ScriptStep> g_script;
 size_t g_scriptNext = 0;
@@ -1019,6 +1020,9 @@ void inPlayInput(const Presses &p, bool back)
 namespace dw5xl::pcsettings {
 void sizeWindowForAspect();
 
+namespace { std::atomic<bool> g_discsStep{false}; }   // DW5XL-DEBUG issue 049: the script's step `discs`
+bool takeDiscsStep() { return g_discsStep.exchange(false, std::memory_order_acq_rel); }
+
 bool frame(bool allowOpen)
 {
     if (!g_runtime) return false;
@@ -1026,6 +1030,7 @@ bool frame(bool allowOpen)
     const std::string script = scriptAction();
     std::string shot;
     if (script.rfind("shot=", 0) == 0) shot = script.substr(5);
+    if (script == "discs") g_discsStep.store(true, std::memory_order_release);
     const bool esc = (ps2x::host::devices().keyPressed(KEY_ESCAPE) && !ps2_host_input::scripted()) || script == "esc";
     const bool held = g_backHeld.exchange(false, std::memory_order_acq_rel) || script == "hold";
     const Mode mode = snapshot().mode;

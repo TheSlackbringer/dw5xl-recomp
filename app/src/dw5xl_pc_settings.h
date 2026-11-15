@@ -37,6 +37,9 @@ void clearChanged();                    // window thread: after applying and sav
 // Window thread, every frame (the overlay's check): the doors and the in-play input; true while the screen is shown.
 // allowOpen is false while another host window (the disc prompt) is up.
 bool frame(bool allowOpen);
+// DW5XL-DEBUG issue 049 (criterion 9b): the script's step `discs` since the last call, once. The Discs window
+// opens or closes on it as on its key, so a hidden test run can take a window picture of it.
+bool takeDiscsStep();
 // Window thread, inside the overlay's imgui frame: draws the screen over the game.
 void drawOverlay();
 }

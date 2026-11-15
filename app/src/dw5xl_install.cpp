@@ -210,7 +210,8 @@ const DiscSpec &dw5Disc() { return kSupportedDiscs[1]; }
 
 bool overlayWanted()
 {
-    if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::Discs)))
+    // The key, or a test script's step `discs` (DW5XL-DEBUG issue 049, PS2X_PCSETTINGS_SCRIPT).
+    if (ps2x::host::devices().keyPressed(ps2x::hotkeys::key(ps2x::hotkeys::Action::Discs)) || dw5xl::pcsettings::takeDiscsStep())
         g_discsWindow = !g_discsWindow;
     return g_discWait.waiting() || g_discsWindow || (g_panel && g_panel->running());
 }
