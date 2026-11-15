@@ -33,7 +33,14 @@ int main()
 {
     const std::string runtimeDir = std::string(DW5XL_SOURCE_DIR) + "/external/PS2Recomp/ps2xRuntime/";
 
-    std::string runtime;
+    // CI's Windows test job runs the programs without the source tree at the path they were built from (they are
+    // cross-built on Linux): then the checks that read sources are skipped, as in hotkeys_test. The Linux job and
+    // every local build run them.
+    std::string runtime, readme;
+    if (!readFile(std::string(DW5XL_SOURCE_DIR) + "/README.md", readme))
+        std::printf("SKIP  the sources are not available here: the checks that read them are not made\n");
+    else
+    {
     check(readFile(runtimeDir + "src/lib/ps2_runtime.cpp", runtime) && runtime.size() > 100000u, "the runtime's source is read");
     // The switch between two windows, and what only the raylib window used.
     const char *const gone[] = {
@@ -57,6 +64,7 @@ int main()
     check(readFile(std::string(DW5XL_SOURCE_DIR) + "/app/CMakeLists.txt", cmake) &&
               cmake.find("message(FATAL_ERROR \"The game's window is drawn by the Vulkan renderer") != std::string::npos,
           "the game's build refuses to be made without the Vulkan renderer (app/CMakeLists.txt)");
+    }
 
     // The message of a PC on which the window cannot be opened: the reason as the window gave it, and what to do.
     const std::string message = ps2x::gs::windowNotOpenedMessage("no Vulkan driver was found");
