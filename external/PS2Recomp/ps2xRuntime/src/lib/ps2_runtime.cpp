@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <ctime>
 #include <cfenv>
 #include <initializer_list>
 #include <limits>
@@ -2009,7 +2010,28 @@ bool PS2Runtime::syncCoreSubsystems()
 // box where the system has one, unless the window was asked for hidden).
 // DW5XL-DEBUG PS2X_WINDOW_FAIL=<reason>: the window is not opened, as on a PC without a Vulkan driver, with
 // that reason (a hidden test of the message and of the game's end).
+// Issue 049, amendment v3.13: the window's waits for the graphics driver have a limit (GameWindowOptions::
+// waitLimitMs); one that ran into it is written down by the window's loop (ps2x::gs::noAnswerRecord).
 // True: the window is open, and its keys, mouse and pads are the ones the game reads.
+#ifdef PS2X_HAS_GAME_WINDOW
+static double s_windowWaitLimitMs = 0.0;
+
+// The record of such a wait is also added to a small file beside the settings file that is never started anew (the
+// installed game's own log is, at every start), with the date: it is still there when the game was started again.
+static void appendWindowWaitRecord(const std::string &line)
+{
+    const std::filesystem::path file = std::filesystem::path(iniPath()).parent_path() / "window-waits.log";
+    std::ofstream out(file, std::ios::app);
+    if (!out.is_open())
+        return;
+    char stamp[32] = {};
+    const std::time_t now = std::time(nullptr);
+    if (const std::tm *local = std::localtime(&now))
+        std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", local);
+    out << stamp << ' ' << line << '\n';
+}
+#endif
+
 static bool openRendererWindow(const std::shared_ptr<GSVulkanPresenterLink> &link, const char *title)
 {
     const char *hidden = std::getenv("PS2X_HIDDEN");
@@ -2022,6 +2044,26 @@ static bool openRendererWindow(const std::shared_ptr<GSVulkanPresenterLink> &lin
     options.title = title ? title : "";
     options.hidden = wantHidden;
     options.vsync = loadVsyncSetting(vsyncSource);
+    // DW5XL-DEBUG issue 049, amendment v3.13: PS2X_WINDOW_NO_ANSWER=<image|shown>:<from turn>:<how many>: after
+    // that many turns of the window, that many of its waits for the graphics driver (for a free swap chain image, or
+    // for the answer that an earlier picture was shown) get no answer, as when the driver stays silent.
+    if (const char *v = std::getenv("PS2X_WINDOW_NO_ANSWER"); v && *v)
+    {
+        char kind[16] = {};
+        unsigned long long from = 0u;
+        unsigned count = 0u;
+        if (std::sscanf(v, "%15[a-z]:%llu:%u", kind, &from, &count) == 3 && (!std::strcmp(kind, "image") || !std::strcmp(kind, "shown")))
+        {
+            options.noAnswerWait = !std::strcmp(kind, "image") ? ps2x::gs::GameWindowNoAnswer::FreeImage : ps2x::gs::GameWindowNoAnswer::ShownPicture;
+            options.noAnswerFrom = from;
+            options.noAnswerCount = count;
+            std::fprintf(stderr, "[window] PS2X_WINDOW_NO_ANSWER: after %llu turns, %u waits for %s get no answer\n", from, count,
+                         !std::strcmp(kind, "image") ? "a free swap chain image" : "the answer that a picture was shown");
+        }
+        else
+            std::fprintf(stderr, "[window] PS2X_WINDOW_NO_ANSWER=%s is not <image|shown>:<from turn>:<how many>: ignored\n", v);
+    }
+    s_windowWaitLimitMs = options.waitLimitMs;
     why.clear();
     if (const char *fail = std::getenv("PS2X_WINDOW_FAIL"); fail && *fail)
         why = fail;
@@ -4231,6 +4273,8 @@ void PS2Runtime::run()
         const bool realDisplay = !haveDisplay && (s_smoothShow || s_displayTrace) && window.askShownReports(true);
         dc::RealDisplay realClock;
         std::vector<ps2x::gs::GameWindowReport> shownReports;
+        std::vector<ps2x::gs::GameWindowNoAnswer> noAnswers; // amendment v3.13
+        const auto loopBegan = std::chrono::steady_clock::now();
         std::deque<std::pair<uint64_t, double>> aimedPresents; // presents of pictures aimed at a refresh: its instant
         // Known and open (work log 2026-11-14): a picture handed over on the graphics card counts as ready when it
         // was sent there, though the card may still be drawing it. The driver's report says when the card had
@@ -4636,6 +4680,35 @@ void PS2Runtime::run()
                 handedMs = dc::nowMs();
             }
             window.present(shown, look);
+            // Issue 049, amendment v3.13: a wait for the graphics driver that ran into its limit in this turn. The
+            // window has gone on by itself; here it is written down, with what is needed to find out why.
+            noAnswers.clear();
+            window.takeNoAnswers(noAnswers);
+            for (const ps2x::gs::GameWindowNoAnswer &one : noAnswers)
+            {
+                ps2x::gs::NoAnswerFacts facts;
+                facts.wait = one.wait;
+                facts.present = one.present;
+                facts.swapChain = one.swapChain;
+                facts.waitedMs = one.waitedMs;
+                facts.limitMs = s_windowWaitLimitMs;
+                facts.renewed = one.renewed;
+                facts.vsync = ps2x::host::window().vsync();
+                uint32_t contentWidth = 0u, contentHeight = 0u;
+                window.drawableSize(contentWidth, contentHeight);
+                facts.width = static_cast<int>(contentWidth);
+                facts.height = static_cast<int>(contentHeight);
+                facts.kind = window.hidden() ? 3 : ps2x::host::window().fullscreen() ? 2 : ps2x::host::window().maximized() ? 1 : 0;
+                facts.screen = !screenLog.known() ? -1 : screenLog.screen() == ps2x::screen_on::Screen::Off ? 0
+                               : screenLog.screen() == ps2x::screen_on::Screen::On ? 1 : 2;
+                facts.reports = realDisplay;
+                facts.field = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+                facts.paused = m_eeScheduler && m_eeScheduler->hostPaused();
+                facts.ranSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - loopBegan).count();
+                const std::string line = ps2x::gs::noAnswerRecord(facts);
+                std::fprintf(stderr, "%s\n", line.c_str());
+                appendWindowWaitRecord(line);
+            }
             if (inBetween && realDisplay && shown.presented)
             {
                 if (!displayGrid.follows)

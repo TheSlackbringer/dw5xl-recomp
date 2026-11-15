@@ -74,6 +74,57 @@ int main()
     check(message.find("today's window") == std::string::npos && message.find("OpenGL") == std::string::npos,
           "the message promises no second window");
 
+    // Issue 049, amendment v3.13 (criterion G3): the record of a wait for the graphics driver that ran into its
+    // limit names everything needed to find out why: which wait, which present of which swap chain, VSYNC, the
+    // window's size and kind, whether the screen is on, whether the driver's reports are on, where the game was
+    // and how long it has run, and what the window did about it.
+    {
+        ps2x::gs::NoAnswerFacts f;
+        f.wait = 2;
+        f.present = 2u;
+        f.swapChain = 5u;
+        f.waitedMs = 1000.4;
+        f.limitMs = 1000.0;
+        f.renewed = true;
+        f.vsync = true;
+        f.width = 2455;
+        f.height = 1566;
+        f.kind = 1;
+        f.screen = 1;
+        f.reports = true;
+        f.field = 12645u;
+        f.paused = true;
+        f.ranSeconds = 962.0;
+        const std::string line = ps2x::gs::noAnswerRecord(f);
+        const auto has = [&line](const char *part) { return line.find(part) != std::string::npos; };
+        check(line.rfind("[window] no answer from the graphics driver within 1.00 s (waited 1000 ms)", 0) == 0,
+              "the record begins with what happened, the limit and how long was waited");
+        check(has("for the answer that present 2 was shown, swap chain 5;"), "it names the wait, the present and the swap chain");
+        check(has("vsync on;") && has("window 2455x1566, maximised;"), "VSYNC, the window's size and its kind");
+        check(has("screen on;") && has("the driver's reports on;"), "the screen and the driver's reports");
+        check(has("game field 12645 (paused), running 962 s;"), "where the game was and how long it has run");
+        check(has("the swap chain is made anew") && line.find('\n') == std::string::npos, "what the window did, on one line");
+        f.wait = 1;
+        f.present = 1u;
+        f.renewed = false;
+        f.vsync = false;
+        f.kind = 2;
+        f.screen = 0;
+        f.reports = false;
+        f.paused = false;
+        const std::string other = ps2x::gs::noAnswerRecord(f);
+        const auto hasOther = [&other](const char *part) { return other.find(part) != std::string::npos; };
+        check(hasOther("for a free swap chain image (for present 1), swap chain 5;") && hasOther("vsync off;") &&
+                  hasOther(", borderless;") && hasOther("screen off;") && hasOther("the driver's reports off;") &&
+                  hasOther("game field 12645, running") && hasOther("no new swap chain (one was made for the wait before)"),
+              "the other wait, a borderless window, a dark screen and a wait in a row are told apart");
+        f.screen = -1;
+        f.kind = 3;
+        check(ps2x::gs::noAnswerRecord(f).find("screen not known;") != std::string::npos &&
+                  ps2x::gs::noAnswerRecord(f).find(", hidden;") != std::string::npos,
+              "a screen the system has said nothing of yet, and a hidden window");
+    }
+
     std::printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

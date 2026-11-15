@@ -28,6 +28,28 @@ if git diff --cached --name-only | grep -q '^vendor/parallel-gs-patches/'; then
     tmp=$(mktemp -d)
     trap 'rm -rf -- "$tmp"' EXIT
     pgs_git -C "$pgs_repo" archive "$pgs_rev" | tar -x -C "$tmp"
+    # A patch may reach into the Granite submodule (0008, issue 049 v3.13). An archive of paraLLEl-GS has no file
+    # of it, so Granite's files at the revision the pinned paraLLEl-GS names are put under Granite/, as a checkout
+    # with the submodule has them. Only asked for when a staged patch of the series touches Granite.
+    touches_granite=no
+    for path in $(git ls-files --cached 'vendor/parallel-gs-patches/*.patch'); do
+        if git show ":$path" | grep -q '^diff --git a/Granite/'; then touches_granite=yes; fi
+    done
+    if [ "$touches_granite" = yes ]; then
+        granite_rev=$(pgs_git -C "$pgs_repo" ls-tree "$pgs_rev" Granite | awk '$2 == "commit" { print $3 }')
+        granite_archive() { return 1; }
+        if [ -n "$granite_rev" ] && pgs_git --git-dir="$pgs_repo/.git/modules/Granite" cat-file -e "$granite_rev^{commit}" 2>/dev/null; then
+            granite_archive() { pgs_git --git-dir="$pgs_repo/.git/modules/Granite" archive "$granite_rev"; }
+        elif [ -n "$granite_rev" ] && pgs_git -C "$pgs_repo/Granite" cat-file -e "$granite_rev^{commit}" 2>/dev/null; then
+            granite_archive() { pgs_git -C "$pgs_repo/Granite" archive "$granite_rev"; }
+        fi
+        mkdir -p "$tmp/Granite"
+        if ! granite_archive | tar -x -C "$tmp/Granite"; then
+            echo "Commit blocked: a renderer patch changes Granite, and Granite at the pinned revision (${granite_rev:-unknown}) is not" >&2
+            echo "in $pgs_repo. Get it with: git -C $pgs_repo submodule update --init Granite" >&2
+            exit 1
+        fi
+    fi
     # The staged version of every patch in the series, in file name order.
     for path in $(git ls-files --cached 'vendor/parallel-gs-patches/*.patch' | sort); do
         if ! git show ":$path" | (cd "$tmp" && pgs_git apply --whitespace=nowarn -); then

@@ -247,7 +247,11 @@ without OpenGL; the raylib/OpenGL window and its switches `PS2X_WINDOW`, `PS2X_H
 `PS2X_DRAW_TRACE` went with 049's step 7 on 2026-11-15). It shows one window frame per PS2 field, the game's pictures
 from the graphics card, the pages and overlays (ImGui by a renderer of ours), SHARPEN, and the CPU renderer's
 pictures. Where it cannot be opened the game says what is missing and ends (`PS2X_WINDOW_FAIL=<reason>` makes that
-happen for a test). `PS2X_PRESENT_STATS` (`[present:own]` per second: window frames, new pictures, pictures from main
+happen for a test). The window's waits for the graphics driver end after one second (049 v3.13: for a free swap chain
+image, and for the answer that an earlier picture was shown; renderer patch 0008): the window then makes its swap
+chain anew and goes on, and writes `[window] no answer from the graphics driver ...` into the log and, with the
+date, into `window-waits.log` beside the settings file, which is never started anew
+(`PS2X_WINDOW_NO_ANSWER=<image|shown>:<from turn>:<how many>` makes such waits for a test). `PS2X_PRESENT_STATS` (`[present:own]` per second: window frames, new pictures, pictures from main
 memory, reads; `[present:own:slow]` for a turn over 25 ms; cheap) · `PS2X_FIELD_SCANOUT=0` (old window-time field
 read, A/B) · `PS2X_WEAVE_TRACE` (for every picture the window shows, read from the graphics card for it:
 `[upload:hash]`, `[upload:rows]` (the row profile the 023 tests read), `[weave:out]` with `kind=card`, and `[draw:rect]`

@@ -1,0 +1,217 @@
+The presenter's waits for the driver have a limit (Granite's WSI)
+
+DW5XL issue 049, amendment v3.13 (2026-11-15). The thread that presents is the window's message loop. With vsync
+on, WSI::begin_frame() waits for an earlier present to have been shown (wait_swapchain_latency ->
+vkWaitForPresent2KHR) and for a free swapchain image (vkAcquireNextImageKHR), both without a time limit. On
+2026-11-15 the driver never answered the first of them after a vsynced swapchain had been made anew, and the
+window stopped for good; a dark screen ends in the same wait.
+
+WSI::set_wait_limit(ns): the longest either wait lasts, and the waits for a swapchain's last presents in
+drain_swapchain() with it. UINT64_MAX (the default) keeps the library's own behaviour. A wait of begin_frame()
+that ran into the limit is noted for the caller (take_wait_timeout): begin_frame() returns false when there was
+no image, and goes on with the frame when it was the wait for an earlier present. request_new_swapchain() has
+the swapchain made anew at the next begin_frame(), as after a resize, without waiting for the old one's presents.
+set_wait_test_fault() is the tests' silent driver: waits that last the limit and are noted.
+
+This is the first patch to a file of the Granite submodule: `git -C <parallel-gs checkout> apply` applies it as
+the others.
+
+Applies on top of 0001-0007.
+
+diff --git a/Granite/vulkan/wsi.cpp b/Granite/vulkan/wsi.cpp
+--- a/Granite/vulkan/wsi.cpp
++++ b/Granite/vulkan/wsi.cpp
+@@ -76,6 +76,46 @@
+ 	present_frame_latency = latency;
+ }
+ 
++// DW5XL (issue 049, amendment v3.13): no wait for the driver without a limit. See wsi.hpp.
++void WSI::set_wait_limit(uint64_t nanoseconds)
++{
++	wait_limit_ns = nanoseconds ? nanoseconds : UINT64_MAX;
++}
++
++bool WSI::take_wait_timeout(WaitTimeout &timeout)
++{
++	if (wait_timeout.kind == WaitKind::None)
++		return false;
++	timeout = wait_timeout;
++	wait_timeout = {};
++	return true;
++}
++
++void WSI::request_new_swapchain()
++{
++	// begin_frame() makes a swapchain anew when the current one is suboptimal, without blocking on the old one.
++	swapchain_is_suboptimal = true;
++}
++
++void WSI::set_wait_test_fault(WaitKind kind, uint64_t after_frames, uint32_t count)
++{
++	wait_fault_kind = kind;
++	wait_fault_after_frames = after_frames;
++	wait_fault_count = count;
++}
++
++// The test's silent driver: true when this wait gets no answer (it has lasted the limit and is noted).
++bool WSI::wait_test_fault(WaitKind kind, uint64_t present_id)
++{
++	if (kind != wait_fault_kind || !wait_fault_now || wait_fault_count == 0)
++		return false;
++	wait_fault_count--;
++	const uint64_t waited = wait_limit_ns != UINT64_MAX ? wait_limit_ns : 1000000000ull;
++	std::this_thread::sleep_for(std::chrono::nanoseconds(waited));
++	wait_timeout = { kind, present_id, waited };
++	return true;
++}
++
+ void WSI::set_hdr_metadata(const VkHdrMetadataEXT &hdr)
+ {
+ 	hdr_metadata = hdr;
+@@ -510,16 +550,25 @@
+ 		// If we're just resizing, there's no need to block, defer deletions for later.
+ 		if (in_tear_down)
+ 		{
++			// DW5XL (issue 049, amendment v3.13): these waits for a swapchain's last presents have the limit too
++			// (a swapchain whose presents are never shown must not hold the tear-down for ever).
++			const auto wait_bounded = [this](Fence &fence) {
++				if (wait_limit_ns == UINT64_MAX)
++					fence->wait();
++				else if (!fence->wait_timeout(wait_limit_ns))
++					LOGW("A swapchain's last present was not done within the wait limit; going on.\n");
++			};
++
+ 			if (last_present_fence)
+ 			{
+-				last_present_fence->wait();
++				wait_bounded(last_present_fence);
+ 				last_present_fence.reset();
+ 			}
+ 
+ 			for (auto &old_swap : deferred_swapchains)
+ 			{
+ 				if (old_swap.fence)
+-					old_swap.fence->wait();
++					wait_bounded(old_swap.fence);
+ 				platform->destroy_swapchain_resources(old_swap.swapchain);
+ 				table->vkDestroySwapchainKHR(context->get_device(), old_swap.swapchain, nullptr);
+ 			}
+@@ -530,7 +579,7 @@
+ 	}
+ 	else if (swapchain != VK_NULL_HANDLE)
+ 	{
+-		wait_for_present(present_last_id);
++		wait_for_present(present_last_id, wait_limit_ns); // DW5XL (amendment v3.13): with the limit
+ 
+ 		device->external_queue_lock();
+ 		table->vkDeviceWaitIdle(device->get_device());
+@@ -617,6 +666,12 @@
+ {
+ 	unsigned effective_latency = low_latency_mode_enable_present ? 0 : present_frame_latency;
+ 
++	// DW5XL (issue 049, amendment v3.13): the test's silent driver. It is noted under the present the wait would
++	// be for, or the one about to be made where there is none to wait for yet.
++	if (wait_test_fault(WaitKind::PresentShown,
++	                    present_last_id > effective_latency ? present_last_id - effective_latency : next_present_id))
++		return;
++
+ 	if (device->get_device_features().supports_low_latency2_nv && swapchain && low_latency_mode_enable_gpu_submit)
+ 	{
+ 		if (!low_latency_semaphore)
+@@ -689,7 +744,12 @@
+ 		auto begin_wait = Util::get_current_time_nsecs();
+ #endif
+ 		auto wait_ts = device->write_calibrated_timestamp();
+-		auto wait_result = wait_for_present(target);
++		// DW5XL (issue 049, amendment v3.13): this wait has a limit. Seen 2026-11-15: after a vsynced swapchain
++		// was made anew the driver never answered; the thread that waits here is the window's message loop.
++		const auto wait_begin_ns = Util::get_current_time_nsecs();
++		auto wait_result = wait_for_present(target, wait_limit_ns);
++		if (wait_result == VK_TIMEOUT && wait_limit_ns != UINT64_MAX)
++			wait_timeout = { WaitKind::PresentShown, target, uint64_t(Util::get_current_time_nsecs() - wait_begin_ns) };
+ 
+ 		device->register_time_interval("WSI", std::move(wait_ts),
+ 		                               device->write_calibrated_timestamp(), "wait_frame_latency");
+@@ -1508,6 +1568,11 @@
+ 	if (frame_is_external)
+ 		return begin_frame_external();
+ 
++	// DW5XL (issue 049, amendment v3.13): the test's silent driver begins after the frames asked for.
++	wait_fault_now = wait_fault_count != 0 && wait_fault_after_frames == 0;
++	if (wait_fault_after_frames)
++		wait_fault_after_frames--;
++
+ #ifdef VULKAN_WSI_TIMING_DEBUG
+ 	auto next_frame_start = Util::get_current_time_nsecs();
+ #endif
+@@ -1565,10 +1630,21 @@
+ 			fence = device->request_legacy_fence();
+ 		}
+ 
++		// DW5XL (issue 049, amendment v3.13): the wait for a free image has a limit; without an image there is
++		// no frame (the caller presents nothing and comes again).
++		if (wait_test_fault(WaitKind::AcquireImage, next_present_id))
++			return false;
++		const auto acquire_begin_ns = Util::get_current_time_nsecs();
+ 		auto acquire_ts = device->write_calibrated_timestamp();
+-		result = table->vkAcquireNextImageKHR(context->get_device(), swapchain, UINT64_MAX, acquire->get_semaphore(),
++		result = table->vkAcquireNextImageKHR(context->get_device(), swapchain, wait_limit_ns, acquire->get_semaphore(),
+ 		                                      fence ? fence->get_fence() : VK_NULL_HANDLE, &swapchain_index);
+ 		device->register_time_interval("WSI", std::move(acquire_ts), device->write_calibrated_timestamp(), "acquire");
++		if (result == VK_TIMEOUT || result == VK_NOT_READY)
++		{
++			wait_timeout = { WaitKind::AcquireImage, next_present_id,
++			                 uint64_t(Util::get_current_time_nsecs() - acquire_begin_ns) };
++			return false;
++		}
+ 
+ 		if (fence)
+ 			fence->wait();
+diff --git a/Granite/vulkan/wsi.hpp b/Granite/vulkan/wsi.hpp
+--- a/Granite/vulkan/wsi.hpp
++++ b/Granite/vulkan/wsi.hpp
+@@ -316,6 +316,29 @@
+ 	// 2 -> Conservative, but useful when GPU bound to avoid pumping. Forced when using low gpu submit latency path.
+ 	void set_present_wait_latency(uint32_t latency);
+ 
++	// DW5XL (issue 049, amendment v3.13): no wait for the driver without a limit.
++	// The longest the presenter waits in one place for the driver: for a free swapchain image, for an earlier
++	// present to have been shown (the present wait of a vsynced swapchain), and for a swapchain's last presents when
++	// it is torn down. UINT64_MAX (the default): no limit, the library's own behaviour.
++	// A wait of begin_frame() that ran into the limit is noted (take_wait_timeout). begin_frame() returns false
++	// when it was the wait for an image; when it was the wait for an earlier present it goes on with the frame.
++	enum class WaitKind { None, AcquireImage, PresentShown };
++	struct WaitTimeout
++	{
++		WaitKind kind = WaitKind::None;
++		uint64_t present_id = 0; // PresentShown: the present waited for; AcquireImage: the one about to be made
++		uint64_t waited_ns = 0;
++	};
++	void set_wait_limit(uint64_t nanoseconds);
++	// The wait that ran into the limit since the last call, if any (the latest one).
++	bool take_wait_timeout(WaitTimeout &timeout);
++	// The swapchain is made anew at the next begin_frame(), as after a resize: the old one's presents are not
++	// waited for.
++	void request_new_swapchain();
++	// Tests: after `after_frames` more calls of begin_frame(), the next `count` waits of `kind` get no answer:
++	// each lasts the limit and is noted, as when the driver stays silent.
++	void set_wait_test_fault(WaitKind kind, uint64_t after_frames, uint32_t count);
++
+ 	// For external swapchains we don't have a normal acquire -> present cycle.
+ 	// - set_external_frame()
+ 	//   - index replaces the acquire next image index.
+@@ -415,6 +438,14 @@
+ 	VkImageUsageFlags current_extra_usage = 0;
+ 	VkImageUsageFlags extra_usage = 0;
+ 	bool swapchain_is_suboptimal = false;
++	// DW5XL (issue 049, amendment v3.13): see set_wait_limit().
++	uint64_t wait_limit_ns = UINT64_MAX;
++	WaitTimeout wait_timeout;
++	WaitKind wait_fault_kind = WaitKind::None;
++	uint64_t wait_fault_after_frames = 0;
++	uint32_t wait_fault_count = 0;
++	bool wait_fault_now = false; // this frame's waits are the test's silent ones
++	bool wait_test_fault(WaitKind kind, uint64_t present_id);
+ 	ImageCompression current_compression, compression;
+ 
+ 	enum class SwapchainError

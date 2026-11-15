@@ -1013,6 +1013,123 @@ bool windowWithoutRenderer(std::string &why)
           "and still after more turns", scale);
     return true;
 }
+
+// 24. Issue 049, amendment v3.13: the graphics driver gives no answer. The window's two waits for the driver (for a
+// free swap chain image; for the answer that an earlier picture was shown) end at their limit: the turn comes back
+// (G1), the window says what it waited for (G3's source), it makes the swap chain anew once and shows pictures
+// again (G2), and while the answer keeps not coming its turns go on, one per limit, with one new swap chain only
+// (G4). The silent driver is made by the window's own test switch (GameWindowOptions::noAnswer...): no test can
+// make a real one. A window of its own on a device of its own, hidden, pictures from main memory.
+void driverGivesNoAnswer()
+{
+    const uint32_t scale = 1u;
+    using ps2x::gs::GameWindowNoAnswer;
+    check(ps2x::gs::GameWindowOptions().waitLimitMs == 1000.0, "the window's limit for a wait is one second unless asked otherwise", scale);
+    const double limitMs = 300.0; // the test's own, to stay short; the measure is the same at any limit
+    const Picture m = patterned(640u, 448u);
+    struct Case { int wait; uint32_t count; const char *name; };
+    for (const Case c : {Case{GameWindowNoAnswer::ShownPicture, 1u, "the answer that a picture was shown, once"},
+                         Case{GameWindowNoAnswer::FreeImage, 1u, "a free swap chain image, once"},
+                         Case{GameWindowNoAnswer::ShownPicture, 6u, "the answer that a picture was shown, six times in a row"},
+                         Case{GameWindowNoAnswer::FreeImage, 6u, "a free swap chain image, six times in a row"}})
+    {
+        const std::string name = std::string("no answer for ") + c.name + ": ";
+        ps2x::gs::GameWindowOptions options;
+        options.width = 640;
+        options.height = 480;
+        options.hidden = true;
+        options.vsync = false;
+        options.title = "DW5XL test window (hidden)";
+        options.waitLimitMs = limitMs;
+        options.noAnswerWait = c.wait;
+        options.noAnswerFrom = 4u;
+        options.noAnswerCount = c.count;
+        std::string why;
+        std::unique_ptr<ps2x::gs::GameWindow> window = ps2x::gs::GameWindow::open(nullptr, options, why);
+        check(static_cast<bool>(window), name + "the window opens" + (window ? std::string() : " (" + why + ")"), scale);
+        if (!window)
+            continue;
+        ps2x::gs::GameWindowLook look;
+        std::vector<GameWindowNoAnswer> said;
+        uint64_t field = 0u;
+        const auto turn = [&](double &tookMs) {
+            window->poll();
+            window->memoryPicture(asPixels(m, 640u, 448u, ++field, ps2x::gs::nextPictureOrder()));
+            const double began = steadyNowMs();
+            const ps2x::gs::GameWindowShown shown = window->show(field, look);
+            tookMs = steadyNowMs() - began;
+            window->takeNoAnswers(said);
+            return shown;
+        };
+        // Four turns with a driver that answers.
+        bool healthy = true;
+        double took = 0.0, longestHealthy = 0.0;
+        for (int i = 0; i < 4; ++i)
+        {
+            healthy = turn(took).presented && healthy;
+            longestHealthy = std::max(longestHealthy, took);
+        }
+        check(healthy && said.empty() && longestHealthy < limitMs, name + "before it, four turns present and none waits as long as the limit", scale);
+        const uint64_t chainsBefore = window->counts().swapChains;
+
+        // The silent turns.
+        double longest = 0.0;
+        uint32_t presentedWhileSilent = 0u;
+        const double silentBegan = steadyNowMs();
+        for (uint32_t i = 0; i < c.count; ++i)
+        {
+            if (turn(took).presented)
+                ++presentedWhileSilent;
+            longest = std::max(longest, took);
+        }
+        const double silentMs = steadyNowMs() - silentBegan;
+        check(longest <= limitMs + 200.0, name + "no turn lasts longer than the limit plus 0.2 s (G1)", scale);
+        std::printf("      longest turn %.0f ms of a limit of %.0f ms; %u turns in %.0f ms\n", longest, limitMs, c.count, silentMs);
+        check(said.size() == c.count, name + "the window says so for every such wait", scale);
+        bool kinds = !said.empty(), waited = !said.empty(), numbered = !said.empty();
+        uint32_t renewed = 0u;
+        for (const GameWindowNoAnswer &one : said)
+        {
+            kinds = kinds && one.wait == c.wait;
+            waited = waited && one.waitedMs >= limitMs * 0.9 && one.waitedMs <= limitMs + 200.0;
+            numbered = numbered && one.present >= 1u && one.swapChain >= chainsBefore;
+            renewed += one.renewed ? 1u : 0u;
+        }
+        check(kinds, name + "with the kind of wait it was", scale);
+        check(waited, name + "with how long it waited: the limit", scale);
+        check(numbered, name + "with the present and the swap chain it was about", scale);
+        check(!said.empty() && said.front().renewed && renewed == 1u, name + "and a new swap chain is asked for once, at the first of them (G4)", scale);
+        // A turn without an image presents nothing; a turn whose image was there goes to the swap chain.
+        check(c.wait == GameWindowNoAnswer::FreeImage ? presentedWhileSilent == 0u : presentedWhileSilent == c.count,
+              name + (c.wait == GameWindowNoAnswer::FreeImage ? "a turn without an image presents nothing" : "the turn's picture still goes to the swap chain"), scale);
+        check(window->counts().noAnswers == c.count, name + "the window's count of such waits is theirs", scale);
+        if (c.count > 1u)
+            check(silentMs >= (c.count - 1u) * limitMs * 0.9 && silentMs <= c.count * (limitMs + 200.0),
+                  name + "while it lasts the window turns once per limit (G4)", scale);
+
+        // The driver answers again: pictures are shown on a new swap chain, within a second (G2).
+        said.clear();
+        const double answeredAt = steadyNowMs();
+        bool shownAgain = false;
+        double longestAfter = 0.0;
+        for (int i = 0; i < 4; ++i)
+        {
+            const ps2x::gs::GameWindowShown shown = turn(took);
+            longestAfter = std::max(longestAfter, took);
+            shownAgain = shownAgain || shown.presented;
+        }
+        check(shownAgain && steadyNowMs() - answeredAt < 1000.0 && longestAfter < limitMs,
+              name + "afterwards pictures are presented again within a second, no turn near the limit (G2)", scale);
+        check(window->counts().swapChains == chainsBefore + 1u, name + "on one new swap chain (" +
+              std::to_string(window->counts().swapChains - chainsBefore) + " made)", scale);
+        check(said.empty(), name + "and nothing more is said", scale);
+        uint32_t w = 0u, h = 0u;
+        window->drawableSize(w, h);
+        const ps2x::PictureRect rect = ps2x::pictureRectInWindow(640u, 448u, look.shape, static_cast<float>(w), static_cast<float>(h));
+        check(largestDifference(windowPicture(*window, look), expected(m, w, h, rect, false)) == 0,
+              name + "the window's picture is the game's, pixel for pixel", scale);
+    }
+}
 } // namespace
 
 int DW5XL_TEST_MAIN(gs_game_window)()
@@ -1025,6 +1142,7 @@ int DW5XL_TEST_MAIN(gs_game_window)()
     check(alone, "a window opens without a Vulkan renderer, on a device of its own" + (alone ? std::string() : " (" + aloneWhy + ")"), 1u);
     run(4u);
     windowGoesFirst();
+    driverGivesNoAnswer();
     std::printf(g_failures ? "FAILED: %d check(s)\n" : "PASSED\n", g_failures);
     return g_failures ? 1 : 0;
 }

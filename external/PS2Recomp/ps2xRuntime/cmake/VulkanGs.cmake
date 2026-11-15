@@ -21,9 +21,14 @@ if(PS2X_ENABLE_VULKAN_GS)
     # DW5XL: and a second GS memory for pictures drawn between the game's: pages copied into it and the two memories
     # drawing in turns (issue 049; patch 0007. Its rollback point was removed on 2026-11-13, issue 049 M3).
     string(FIND "${PS2X_PARALLEL_GS_INTERFACE}" "set_frame_context_hold" PS2X_PARALLEL_GS_SECOND_MEMORY_PATCHED)
+    # DW5XL: and the presenter's waits for the driver with a limit (issue 049, amendment v3.13; patch 0008, the
+    # first one to a file of the Granite submodule).
+    file(READ "${PS2X_PARALLEL_GS_SOURCE_DIR}/Granite/vulkan/wsi.hpp" PS2X_GRANITE_WSI)
+    string(FIND "${PS2X_GRANITE_WSI}" "set_wait_limit" PS2X_PARALLEL_GS_WAIT_LIMIT_PATCHED)
     if(PS2X_PARALLEL_GS_PATCHED EQUAL -1 OR PS2X_PARALLEL_GS_SPRITE_PATCHED EQUAL -1 OR
        PS2X_PARALLEL_GS_FIELDS_PATCHED EQUAL -1 OR PS2X_PARALLEL_GS_CLAMP_PATCHED EQUAL -1 OR
-       PS2X_PARALLEL_GS_SMOOTH_PATCHED EQUAL -1 OR PS2X_PARALLEL_GS_SECOND_MEMORY_PATCHED EQUAL -1)
+       PS2X_PARALLEL_GS_SMOOTH_PATCHED EQUAL -1 OR PS2X_PARALLEL_GS_SECOND_MEMORY_PATCHED EQUAL -1 OR
+       PS2X_PARALLEL_GS_WAIT_LIMIT_PATCHED EQUAL -1)
         message(FATAL_ERROR "paraLLEl-GS checkout lacks vendor/parallel-gs-patches; apply them with: git -C <checkout> apply <repo>/vendor/parallel-gs-patches/*.patch")
     endif()
     set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)

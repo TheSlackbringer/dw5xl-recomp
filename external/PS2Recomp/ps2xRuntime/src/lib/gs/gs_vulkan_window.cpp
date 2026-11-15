@@ -102,6 +102,7 @@ namespace
     using ps2x::gs::GameWindowShown;
     using ps2x::gs::GameWindowTimed;
     using ps2x::gs::GameWindowReport;
+    using ps2x::gs::GameWindowNoAnswer;
     using ps2x::gs::WindowPicturePart;
 
     // Milliseconds on the PC's steady clock (as ps2x::display_clock::nowMs).
@@ -304,6 +305,14 @@ namespace
             // renderer's lock.
             Util::register_thread_index(0);
             m_wsi.set_platform(&m_platform);
+            // Issue 049, amendment v3.13: the presenter's waits for the driver have a limit (a runtime patch to the
+            // library): this thread is also the window's message loop, and a driver that never answers would stop
+            // the window for good (seen 2026-11-15).
+            m_wsi.set_wait_limit(options.waitLimitMs > 0.0 ? static_cast<uint64_t>(options.waitLimitMs * 1e6) : 0u);
+            if (options.noAnswerWait != 0 && options.noAnswerCount != 0u) // DW5XL-DEBUG: the tests' silent driver
+                m_wsi.set_wait_test_fault(options.noAnswerWait == GameWindowNoAnswer::FreeImage ? Vulkan::WSI::WaitKind::AcquireImage
+                                                                                                : Vulkan::WSI::WaitKind::PresentShown,
+                                          options.noAnswerFrom, options.noAnswerCount);
             m_wsi.set_present_mode(options.vsync ? Vulkan::PresentMode::SyncToVBlank : Vulkan::PresentMode::UnlockedMaybeTear);
             // The picture's bytes as they are, in a swap chain of eight bits a colour: what today's window has and
             // what the PS2's picture has. The library's own choice takes the first format the driver lists, which
@@ -465,7 +474,10 @@ namespace
             const auto msSince = [](std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) {
                 return std::chrono::duration<float, std::milli>(to - from).count();
             };
-            if (width == 0u || height == 0u || !m_wsi.begin_frame())
+            const bool began = width != 0u && height != 0u && m_wsi.begin_frame();
+            if (width != 0u && height != 0u)
+                noteWaits(); // amendment v3.13: a wait of this turn that ran into its limit
+            if (!began)
             {
                 // No size (minimised) or no swap chain image: nothing is presented; the game goes on.
                 ++m_counts.notPresented;
@@ -846,6 +858,43 @@ namespace
         bool hidden() const override
         {
             return m_hidden;
+        }
+
+        void takeNoAnswers(std::vector<GameWindowNoAnswer> &out) override
+        {
+            out.insert(out.end(), m_noAnswers.begin(), m_noAnswers.end());
+            m_noAnswers.clear();
+        }
+
+        // Amendment v3.13, after every begin of a window frame: a wait for the driver that ran into its limit is
+        // kept for the caller, and the first of a row asks for a new swap chain. No other does until three turns in
+        // a row got their answers: a driver that stays silent (a dark screen) must not make swap chain after swap
+        // chain.
+        void noteWaits()
+        {
+            Vulkan::WSI::WaitTimeout waited;
+            if (!m_wsi.take_wait_timeout(waited))
+            {
+                if (m_renewAsked && ++m_answeredTurns >= 3u)
+                    m_renewAsked = false;
+                return;
+            }
+            m_answeredTurns = 0u;
+            GameWindowNoAnswer said;
+            said.wait = waited.kind == Vulkan::WSI::WaitKind::AcquireImage ? GameWindowNoAnswer::FreeImage : GameWindowNoAnswer::ShownPicture;
+            said.present = waited.present_id;
+            said.swapChain = m_platform.chains;
+            said.waitedMs = static_cast<double>(waited.waited_ns) * 1e-6;
+            said.renewed = !m_renewAsked;
+            if (!m_renewAsked)
+            {
+                m_wsi.request_new_swapchain();
+                m_renewAsked = true;
+            }
+            m_noAnswers.push_back(said);
+            if (m_noAnswers.size() > 64u) // nobody takes them: the newest are kept
+                m_noAnswers.erase(m_noAnswers.begin());
+            ++m_counts.noAnswers;
         }
 
         bool askShownReports(bool on) override
@@ -1487,6 +1536,11 @@ namespace
         GameWindowCounts m_counts;
         // The driver's reports of shown pictures (askShownReports): the presents not reported yet with the time
         // of their hand-over, the reports not taken yet, and what the driver says of the display.
+        // Amendment v3.13: the waits for the driver that ran into their limit and were not taken yet; whether a
+        // new swap chain was asked for because of one, and the turns in a row that got their answers since.
+        std::vector<GameWindowNoAnswer> m_noAnswers;
+        bool m_renewAsked = false;
+        uint32_t m_answeredTurns = 0u;
         bool m_reportsOn = false;
         std::deque<GameWindowReport> m_called;
         std::deque<GameWindowReport> m_reports;

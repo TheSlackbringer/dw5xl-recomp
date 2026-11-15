@@ -101,6 +101,9 @@ namespace ps2x::screen_on
         // The line for this report (without a line end), or "" when there is nothing to say.
         std::string report(Screen screen, uint64_t field);
         uint64_t switches() const { return m_switches; }
+        // What the system last said of the screen; `known` is false before its first report (issue 049 v3.13).
+        bool known() const { return m_known; }
+        Screen screen() const { return m_screen; }
 
     private:
         bool m_known = false;

@@ -35,6 +35,28 @@ namespace ps2x::gs
         std::string title;
         bool hidden = false; // made, never shown (test runs)
         bool vsync = true;   // a picture is handed to the display on its refresh; off: at once
+        // Issue 049, amendment v3.13: the longest the window waits for the graphics driver in one place (for a free
+        // swap chain image; for the answer that an earlier picture was shown). 0: no limit, as the library was.
+        double waitLimitMs = 1000.0;
+        // DW5XL-DEBUG (tests; in the game PS2X_WINDOW_NO_ANSWER=<wait>:<from turn>:<how many>): after `noAnswerFrom`
+        // turns of the window, the next `noAnswerCount` waits of the kind `noAnswerWait` (GameWindowNoAnswer::wait;
+        // 0: none) get no answer: each lasts the limit, as when the driver stays silent.
+        int noAnswerWait = 0;
+        uint64_t noAnswerFrom = 0u;
+        uint32_t noAnswerCount = 0u;
+    };
+
+    // Issue 049, amendment v3.13: a wait for the graphics driver that ran into its limit.
+    struct GameWindowNoAnswer
+    {
+        enum { FreeImage = 1, ShownPicture = 2 };
+        int wait = 0;            // FreeImage: for a swap chain image to draw on; ShownPicture: for the driver's
+                                 // answer that an earlier picture was shown (asked with vsync on)
+        uint64_t present = 0u;   // ShownPicture: the present waited for; FreeImage: the one about to be made
+                                 // (counted from 1 on every swap chain)
+        uint64_t swapChain = 0u; // which of the window's swap chains (GameWindowCounts::swapChains then)
+        double waitedMs = 0.0;
+        bool renewed = false;    // the window asked for a new swap chain because of it
     };
 
     // How the picture is drawn, asked every time (the settings can change while the game runs).
@@ -116,6 +138,7 @@ namespace ps2x::gs
         uint64_t olderNotShown = 0u; // pictures not shown: a picture finished later was shown already
         uint64_t notPresented = 0u; // times nothing could be presented (no size, no swap chain image)
         uint64_t swapChains = 0u;  // swap chains made (the first one, and one for every change of size)
+        uint64_t noAnswers = 0u;   // waits for the driver that ran into their limit (takeNoAnswers)
         uint32_t colourBits = 0u;  // bits a colour of the swap chain in use: 8, as today's window and the PS2's
                                    // picture; 10 only where the system offers no 8-bit one; 0: none made yet
     };
@@ -189,6 +212,11 @@ namespace ps2x::gs
         // The reports that came since the last call, oldest first, and what the driver says of the display: its
         // refresh time in milliseconds (0: not known) and whether it names it as one that follows the window.
         virtual void takeShownReports(std::vector<GameWindowReport> &out, double &refreshMs, bool &saysFollows) = 0;
+
+        // Issue 049, amendment v3.13: the waits for the driver that ran into their limit since the last call, oldest
+        // first. The window has dealt with each: nothing was presented in a turn without an image; after the
+        // first of a row the swap chain is made anew (once, until three turns in a row got their answers).
+        virtual void takeNoAnswers(std::vector<GameWindowNoAnswer> &out) = 0;
 
         virtual void drawableSize(uint32_t &width, uint32_t &height) const = 0;
         virtual void resize(int width, int height) = 0; // the window's content size, as the system allows
