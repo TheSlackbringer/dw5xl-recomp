@@ -72,6 +72,7 @@ add_executable(dw5xl
     src/dw5xl_main_menu.cpp
     src/dw5xl_frame_probe.cpp
     src/dw5xl_smoothing.cpp
+    src/dw5xl_smooth_gif.cpp
     src/dw5xl_smooth_list.cpp
     src/dw5xl_smooth_time.cpp
     setup/wizard_console.cpp
@@ -637,10 +638,10 @@ if(DW5XL_BUILD_TESTS)
     target_include_directories(dw5xl_host_input_state_test PRIVATE "${PS2RECOMP_DIR}/ps2xRuntime/include")
     add_test(NAME host_input_state COMMAND dw5xl_host_input_state_test)
     # DW5XL-TEST issue 049 P2.4: a frame's command list as our own data (stream, map, matrix tags); no game data.
-    add_executable(dw5xl_smooth_list_test tests/smooth_list_test.cpp src/dw5xl_smooth_list.cpp)
+    add_executable(dw5xl_smooth_list_test tests/smooth_list_test.cpp src/dw5xl_smooth_list.cpp src/dw5xl_smooth_gif.cpp)
     target_include_directories(dw5xl_smooth_list_test PRIVATE src)
     add_test(NAME smooth_list COMMAND dw5xl_smooth_list_test)
-    add_executable(dw5xl_smooth_builder_test tests/smooth_builder_test.cpp src/dw5xl_smooth_list.cpp)
+    add_executable(dw5xl_smooth_builder_test tests/smooth_builder_test.cpp src/dw5xl_smooth_list.cpp src/dw5xl_smooth_gif.cpp)
     target_include_directories(dw5xl_smooth_builder_test PRIVATE src)
     add_test(NAME smooth_builder COMMAND dw5xl_smooth_builder_test)
     # DW5XL-TEST issue 049 (amendment v3.4, P2.7): the GIF packets of two consecutive frames paired by place and

@@ -8,9 +8,12 @@
 #ifndef DW5XL_SMOOTH_LIST_H
 #define DW5XL_SMOOTH_LIST_H
 
+#include "dw5xl_smooth_gif.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace dw5xl::smooth {
@@ -105,6 +108,7 @@ struct BuildStats
     uint32_t cameraCopies = 0; // camera matrices and positions replaced in the stream
     uint32_t unmatched = 0;    // matrices without a partner in the frame before (left at their newest value)
     uint32_t jumped = 0;       // matrices that moved too far in one frame to be the same motion (left at newest)
+    uint32_t gifPairs = 0;     // GIF parts given in-between values (amendment v3.4)
     bool cut = false;          // the camera jumped: the whole picture is left at the newest frame
 };
 
@@ -141,11 +145,45 @@ bool jumped(const Matrix &a, const Matrix &b);
 // (their VIF packets read as UNPACK V4-32 runs of whole matrices), the cameras.
 void extract(const List &list, const std::vector<BoneBuffer> &buffers, Values &out);
 
+// Amendment v3.4 (P2.7): effects, gauges and HUD. The newer list's GIF parts that have a partner by place in the
+// list before (dw5xl_smooth_gif.h), found once when a frame's list is copied and blended into each of the frame's
+// in-between streams.
+struct GifPlan
+{
+    struct Pair
+    {
+        uint32_t offset = 0;         // of the part's VIF data in the newer list's stream
+        uint32_t bytes = 0;
+        std::vector<uint8_t> before; // the partner's VIF data (the list before is gone when the pictures are built)
+        GifPart shape;               // the newer part, read
+    };
+    std::vector<Pair> pairs;
+    // For the report. Of the newer list's parts that the two lists do not share, the GIF parts, and what became of
+    // each: paired (pairs.size()), alone (no partner by place: its run holds another number of unshared parts in
+    // the list before), or refused by a rule.
+    uint32_t gifParts = 0, alone = 0;
+    uint32_t refusedSize = 0, refusedShape = 0, refusedState = 0, refusedMoved = 0;
+    uint64_t gifBytes = 0, pairedBytes = 0;
+    uint32_t differing = 0, held = 0; // the pairs' vertex writes that differ, and of them those the text rule holds
+    float largestMove = 0.0f;         // the furthest a vertex of a pair moves, in PS2 pixels
+    float largestRefusedMove = 0.0f;  // the same for the pairs refused for moving further than the limit
+};
+
+// The parts two lists share, as pairs of part numbers (before, now) in order: the longest run of parts that both
+// lists hold with the same bytes and in the same order (a part is one span, with its tag half where the stream has
+// them). The lists' own streams are compared, without in-between values.
+std::vector<std::pair<uint32_t, uint32_t>> sharedParts(const List &before, const List &now);
+
+// `plan` for the frame of `now`, whose frame before made `before`. `limitPixels`: the furthest a vertex may move in
+// one frame (guard 3).
+void planGif(const List &before, const List &now, float limitPixels, GifPlan &plan);
+
 // The stream of an in-between picture at t between the frame before (t = 0) and this frame (t = 1): `list`'s stream
 // with every keyed matrix that has a partner in `before` at its blended value, and every copy of a camera matrix or
 // camera position in the inline data replaced by the blended camera's. At t >= 1 it is the list's stream unchanged.
+// With `gif` (the plan of this list's frame) every paired GIF part is blended at t too; not after a camera cut.
 void build(const List &list, const Values &now, const Values &before, float t, std::vector<uint8_t> &stream,
-           BuildStats *stats = nullptr);
+           BuildStats *stats = nullptr, const GifPlan *gif = nullptr);
 
 struct SharedStats
 {

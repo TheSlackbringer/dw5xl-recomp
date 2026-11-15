@@ -187,7 +187,21 @@ struct RecordedCamera { uint64_t serial; dw5xl::smooth::Camera camera; };
 std::vector<RecordedCamera> g_recordedCameras;      // the cameras of the recorded camera blocks, by the tag's serial
 uint64_t g_tagSerial = 0;
 dw5xl::smooth::List g_list;                         // the newest frame's list
-dw5xl::smooth::List g_listBefore;                   // the list of the frame before (PS2X_SMOOTH_BLENDED_ONLY)
+dw5xl::smooth::List g_listBefore;                   // the list of the frame before (PS2X_SMOOTH_BLENDED_ONLY, PS2X_SMOOTH_GIF)
+// DW5XL-DEBUG PS2X_SMOOTH_GIF=1 (amendment v3.4, P2.7b; a switch until the owner has looked): effects, gauges and HUD
+// at the in-between rate. The GIF parts of a frame's list that have a partner by place in the list before are found
+// once when the list is copied (dw5xl::smooth::planGif) and blended into each of the frame's pictures.
+// PS2X_SMOOTH_GIF_LIMIT=<PS2 pixels>: the furthest a vertex may move in one frame (guard 3). 64 is a stand-in
+// until the owner sets the number from measured moves.
+bool g_gif = false;
+float g_gifLimit = 64.0f;
+dw5xl::smooth::GifPlan g_gifPlan;                   // of the newest frame
+struct GifTotals {
+    uint64_t frames = 0, gifParts = 0, gifBytes = 0, pairs = 0, pairedBytes = 0, alone = 0;
+    uint64_t size = 0, shape = 0, state = 0, moved = 0, differing = 0, held = 0;
+    float largestMove = 0.0f, largestRefusedMove = 0.0f;
+    double ms = 0.0;
+} g_gifTotals;
 // PS2X_SMOOTH_BLENDED_ONLY=1 (the spec's second test switch): two pictures per frame, both holding only what this
 // frame's list and the frame before's share (dw5xl::smooth::sharedOnly): picture 1 the list of the frame before,
 // picture 2 this frame's list with the frame before's values (t = 0). Both are drawn with the frame before's draw
@@ -621,6 +635,34 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
         dumpList(ram, runtime->eeScheduler().currentVSyncTick());
         dw5xl::smooth::extract(g_list, boneBuffers(ram), g_now);
         if (g_beforeFrame + 1u != g_newFrames) g_before = dw5xl::smooth::Values{};   // not the frame before this one
+        g_gifPlan = dw5xl::smooth::GifPlan{};
+        if (g_gif && g_beforeFrame + 1u == g_newFrames && !g_listBefore.stream.empty()) {
+            const auto planStart = Clock::now();
+            dw5xl::smooth::planGif(g_listBefore, g_list, g_gifLimit, g_gifPlan);
+            g_gifTotals.ms += std::chrono::duration<double, std::milli>(Clock::now() - planStart).count();
+            ++g_gifTotals.frames;
+            g_gifTotals.gifParts += g_gifPlan.gifParts;
+            g_gifTotals.gifBytes += g_gifPlan.gifBytes;
+            g_gifTotals.pairs += g_gifPlan.pairs.size();
+            g_gifTotals.pairedBytes += g_gifPlan.pairedBytes;
+            g_gifTotals.alone += g_gifPlan.alone;
+            g_gifTotals.size += g_gifPlan.refusedSize;
+            g_gifTotals.shape += g_gifPlan.refusedShape;
+            g_gifTotals.state += g_gifPlan.refusedState;
+            g_gifTotals.moved += g_gifPlan.refusedMoved;
+            g_gifTotals.differing += g_gifPlan.differing;
+            g_gifTotals.held += g_gifPlan.held;
+            g_gifTotals.largestMove = std::max(g_gifTotals.largestMove, g_gifPlan.largestMove);
+            g_gifTotals.largestRefusedMove = std::max(g_gifTotals.largestRefusedMove, g_gifPlan.largestRefusedMove);
+            // DW5XL-DEBUG PS2X_SMOOTH_TRACE=1: every frame's plan, for the measurement of the limit.
+            if (g_trace)
+                std::fprintf(stderr, "[smooth:gif:frame] field=%llu parts=%u pairs=%zu alone=%u size=%u shape=%u state=%u moved=%u "
+                             "writes=%u held=%u move=%.1f refusedMove=%.1f\n",
+                             static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), g_gifPlan.gifParts,
+                             g_gifPlan.pairs.size(), g_gifPlan.alone, g_gifPlan.refusedSize, g_gifPlan.refusedShape,
+                             g_gifPlan.refusedState, g_gifPlan.refusedMoved, g_gifPlan.differing, g_gifPlan.held,
+                             g_gifPlan.largestMove, g_gifPlan.largestRefusedMove);
+        }
         g_copyMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
         g_valuesMs += std::chrono::duration<double, std::milli>(Clock::now() - t1).count();
         ++g_copied;
@@ -732,7 +774,7 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
         const bool haveBefore = g_beforeFrame + 1u == g_newFrames && !g_listBefore.stream.empty();
         dw5xl::smooth::BuildStats stats;
         std::vector<uint8_t> atZero, beforeOnly;
-        if (haveBefore) dw5xl::smooth::build(g_list, g_now, g_before, 0.0f, atZero, &stats);
+        if (haveBefore) dw5xl::smooth::build(g_list, g_now, g_before, 0.0f, atZero, &stats, g_gif ? &g_gifPlan : nullptr);
         if (haveBefore && !stats.cut) {
             dw5xl::smooth::SharedStats shared;
             const auto t0 = Clock::now();
@@ -780,7 +822,7 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
             std::vector<uint8_t> built;
             const auto t0 = Clock::now();
             dw5xl::smooth::BuildStats stats;
-            dw5xl::smooth::build(g_list, g_now, g_before, t, built, &stats);
+            dw5xl::smooth::build(g_list, g_now, g_before, t, built, &stats, g_gif ? &g_gifPlan : nullptr);
             g_built.ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             ++g_built.pictures;
             g_built.objects += stats.objects;
@@ -1011,7 +1053,7 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
     const auto keepForNextFrame = [] {
         g_before = std::move(g_now);
         g_beforeFrame = g_newFrames;
-        if (g_blendedOnly) g_listBefore = std::move(g_list);
+        if (g_blendedOnly || g_gif) g_listBefore = std::move(g_list);
     };
     if (queued == 0u) {                             // nothing was drawn
         keepForNextFrame();
@@ -1058,6 +1100,19 @@ void makePictures(uint8_t *ram, PS2Runtime *runtime, uint32_t list, bool tte, co
                              g_copyMs / static_cast<double>(g_copied), g_valuesMs / static_cast<double>(g_copied));
             g_copyMs = g_valuesMs = 0.0;
             g_copied = 0;
+        }
+        if (g_gifTotals.frames != 0u) {
+            const double n = static_cast<double>(g_gifTotals.frames);
+            std::fprintf(stderr, "[smooth:gif] %llu frames: GIF parts the two lists do not share %.1f a frame (%.0f bytes); "
+                         "paired %.1f (%.0f bytes), alone %.1f, refused: size %.2f, shape %.2f, state %.2f, moved %.2f; in "
+                         "the pairs %.1f vertex writes differ, %.1f of them held; largest move %.1f pixels, of a refused "
+                         "pair %.1f; limit %.0f; the plan %.3f ms a frame\n",
+                         static_cast<unsigned long long>(g_gifTotals.frames), g_gifTotals.gifParts / n, g_gifTotals.gifBytes / n,
+                         g_gifTotals.pairs / n, g_gifTotals.pairedBytes / n, g_gifTotals.alone / n, g_gifTotals.size / n,
+                         g_gifTotals.shape / n, g_gifTotals.state / n, g_gifTotals.moved / n, g_gifTotals.differing / n,
+                         g_gifTotals.held / n, g_gifTotals.largestMove, g_gifTotals.largestRefusedMove, g_gifLimit,
+                         g_gifTotals.ms / n);
+            g_gifTotals = GifTotals{};
         }
         if (g_shared.frames != 0u || g_shared.cuts != 0u) {
             const double n = static_cast<double>(std::max<uint64_t>(g_shared.frames, 1u));
@@ -1333,6 +1388,11 @@ void install(PS2Runtime &runtime)
     // PS2X_SMOOTH_FIXED_T=<t> (the spec's test switch): every in-between picture at this t; 1 = an unchanged copy of
     // the frame, 0 = the frame with the frame before's values. Without it picture i of n is at t = i / (n + 1).
     if (const char *b = std::getenv("PS2X_SMOOTH_BLENDED_ONLY")) g_blendedOnly = *b && *b != '0';
+    if (const char *g = std::getenv("PS2X_SMOOTH_GIF")) g_gif = *g && *g != '0';
+    if (const char *l = std::getenv("PS2X_SMOOTH_GIF_LIMIT"); l && *l) g_gifLimit = static_cast<float>(std::strtod(l, nullptr));
+    if (g_gif)
+        std::fprintf(stderr, "[smooth] effects, gauges and HUD at the in-between rate (PS2X_SMOOTH_GIF): GIF parts paired by "
+                     "place, a vertex may move %.0f pixels a frame\n", g_gifLimit);
     if (const char *v = std::getenv("PS2X_SMOOTH_SHOW")) g_show = *v && *v != '0';
     if (const char *v = std::getenv("PS2X_SMOOTH_HEAD_START"); v && *v) {
         g_headFixed = true;

@@ -6,7 +6,9 @@
 //  - extract() / build(): object matrices by their tag, bone matrices by slot and place (whatever the buffer's
 //    address), every copy of a camera matrix and of the camera's position; at t = 1 the stream is the list's own,
 //    at t = 0 every blended value is the frame before's, bit for bit, and no other byte changes; a thing without a
-//    partner, with another model or that jumped stays at its newest value; a camera cut leaves the whole stream.
+//    partner, with another model or that jumped stays at its newest value; a camera cut leaves the whole stream;
+//  - sharedParts() / planGif() / build() with a plan (amendment v3.4, P2.7b): the GIF parts of two lists paired by
+//    place and blended into the in-between stream.
 #include "dw5xl_smooth_list.h"
 
 #include <cmath>
@@ -519,6 +521,90 @@ int main()
         check(mark(newerStream, 0u) == 0u && mark(newerStream, 1u) == 0u && mark(newerStream, 2u) == bonesX &&
                   mark(newerStream, 3u) == model,
               "of two equal model packets the one behind the shared bone packet is kept, the other left out");
+    }
+
+    // --- Amendment v3.4 (P2.7b): the GIF pairs of two lists, planned once a frame and blended into the stream.
+    {
+        struct Raw
+        {
+            std::vector<uint8_t> data;
+            void u32(uint32_t v) { for (int i = 0; i < 4; ++i) data.push_back(static_cast<uint8_t>(v >> (8 * i))); }
+            void u64(uint64_t v) { for (int i = 0; i < 8; ++i) data.push_back(static_cast<uint8_t>(v >> (8 * i))); }
+        };
+        // A GIF part: NOP NOP FLUSHA DIRECT(3), a packed tag (A+D, XYZ2), a texture register and one position.
+        const auto gifPart = [](uint32_t x, uint64_t tex0) {
+            Raw r;
+            r.u32(0); r.u32(0); r.u32(0x13000000u); r.u32(0x50000003u);
+            r.u64(1ull | (1ull << 15) | (2ull << 60)); r.u64(0x5Eull); // NLOOP 1, EOP, two registers: A+D, XYZ2
+            r.u64(tex0); r.u64(0x06);                                    // TEX0_1 by A+D
+            r.u32(x); r.u32(3200); r.u32(1000); r.u32(0);                // XYZ2, packed
+            return r.data;
+        };
+        const auto other = [](uint32_t marker) { // no GIF part: an UNPACK V4-32 of one vector
+            Raw r;
+            r.u32(0); r.u32(0); r.u32(0); r.u32(0x6C010000u);
+            r.u32(marker); r.u32(0); r.u32(0); r.u32(0);
+            return r.data;
+        };
+        const auto listOf = [](const std::vector<std::vector<uint8_t>> &parts) {
+            List list;
+            list.tagHalves = true;
+            for (const std::vector<uint8_t> &part : parts)
+            {
+                list.stream.insert(list.stream.end(), 8u, 0u); // the DMA tag's upper half
+                Span span;
+                span.offset = static_cast<uint32_t>(list.stream.size());
+                span.bytes = static_cast<uint32_t>(part.size());
+                span.id = 3u;
+                list.spans.push_back(span);
+                list.stream.insert(list.stream.end(), part.begin(), part.end());
+            }
+            return list;
+        };
+        const List older = listOf({other(1), gifPart(1600, 0x10), other(2), gifPart(1600, 0x10), other(3)});
+        const List newer = listOf({other(1), gifPart(1760, 0x10), other(2), gifPart(1760, 0x20), other(4)});
+        using Pairs = std::vector<std::pair<uint32_t, uint32_t>>;
+        check(sharedParts(older, newer) == Pairs{{0, 0}, {2, 2}}, "two lists share the parts that are equal, in order");
+        check(sharedParts(listOf({other(1), other(9), other(2), other(3)}), listOf({other(1), other(2), other(8), other(3)})) ==
+                  Pairs{{0, 0}, {2, 1}, {3, 3}},
+              "a part that moved up one place is still shared (the longest run in order)");
+        GifPlan plan;
+        planGif(older, newer, 64.0f, plan);
+        check(plan.gifParts == 2u && plan.pairs.size() == 1u && plan.refusedState == 1u && plan.alone == 0u &&
+                  plan.refusedMoved == 0u,
+              "of two changed GIF parts the moving one is paired, the one with another texture is refused");
+        check(plan.pairs.size() == 1u && plan.pairs[0].offset == newer.spans[1].offset && plan.largestMove > 9.99f &&
+                  plan.largestMove < 10.01f && plan.differing == 1u,
+              "the pair knows its place in the stream; its move is 10 pixels");
+        const Values none;
+        std::vector<uint8_t> built;
+        BuildStats gifStats;
+        build(newer, none, none, 0.5f, built, &gifStats, &plan);
+        const uint32_t x = newer.spans[1].offset + 16u + 16u + 16u; // behind the VIF codes, the tag and the A+D quadword
+        uint16_t halfX = 0;
+        std::memcpy(&halfX, built.data() + x, 2);
+        std::vector<uint8_t> expected = newer.stream;
+        const uint16_t wanted = 1680;
+        std::memcpy(expected.data() + x, &wanted, 2);
+        check(gifStats.gifPairs == 1u && halfX == 1680 && built == expected,
+              "the in-between stream holds the pair's position half way and no other byte changes");
+        build(newer, none, none, 1.0f, built, &gifStats, &plan);
+        check(built == newer.stream && gifStats.gifPairs == 0u, "t = 1 with a plan: the list's own stream");
+        build(newer, none, none, 0.0f, built, &gifStats, &plan);
+        check(std::memcmp(built.data() + newer.spans[1].offset, older.stream.data() + older.spans[1].offset, newer.spans[1].bytes) == 0 &&
+                  std::memcmp(built.data() + newer.spans[3].offset, newer.stream.data() + newer.spans[3].offset, newer.spans[3].bytes) == 0,
+              "t = 0: the paired part is the frame before's; the refused one stays the newer frame's");
+        build(newer, none, none, 0.5f, built, &gifStats);
+        check(built == newer.stream, "without a plan nothing of a GIF part changes");
+        planGif(older, newer, 5.0f, plan);
+        check(plan.pairs.empty() && plan.refusedMoved == 1u && plan.largestRefusedMove > 9.99f,
+              "a limit of 5 pixels refuses the 10 pixel move");
+        // A shape that is new in the frame: its run holds another number of parts, nothing in it is paired.
+        planGif(listOf({other(1), gifPart(1600, 0x10), other(2)}),
+                listOf({other(1), gifPart(1760, 0x10), gifPart(4000, 0x10), other(2)}), 64.0f, plan);
+        check(plan.pairs.empty() && plan.gifParts == 2u && plan.alone == 2u, "a run with a new part pairs nothing: both parts are alone");
+        planGif(List{}, newer, 64.0f, plan);
+        check(plan.pairs.empty() && plan.gifParts == 0u, "no list before: no plan");
     }
 
     std::printf("%s\n", failures == 0 ? "smooth_builder: PASS" : "smooth_builder: FAIL");

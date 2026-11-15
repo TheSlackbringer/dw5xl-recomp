@@ -468,7 +468,7 @@ void extract(const List &list, const std::vector<BoneBuffer> &buffers, Values &o
 }
 
 void build(const List &list, const Values &now, const Values &before, float t, std::vector<uint8_t> &stream,
-           BuildStats *stats)
+           BuildStats *stats, const GifPlan *gif)
 {
     BuildStats counted;
     stream = list.stream;
@@ -582,7 +582,159 @@ void build(const List &list, const Values &now, const Values &before, float t, s
             }
         }
     }
+
+    // Amendment v3.4: the paired GIF parts (finished screen shapes: effects, gauges, HUD), each from the list's own
+    // bytes and its partner's.
+    if (gif)
+    {
+        for (const GifPlan::Pair &pair : gif->pairs)
+        {
+            if (pair.before.size() != pair.bytes || static_cast<size_t>(pair.offset) + pair.bytes > stream.size())
+                continue;
+            blendGifPair(pair.before.data(), list.stream.data() + pair.offset, pair.bytes, pair.shape, t,
+                         stream.data() + pair.offset);
+            ++counted.gifPairs;
+        }
+    }
     finish();
+}
+
+std::vector<std::pair<uint32_t, uint32_t>> sharedParts(const List &before, const List &now)
+{
+    struct Part
+    {
+        uint32_t offset = 0, bytes = 0; // in its stream, the tag's upper half included
+        uint64_t hash = 0;
+    };
+    const auto parts = [](const List &list)
+    {
+        std::vector<Part> out;
+        out.reserve(list.spans.size());
+        const uint32_t half = list.tagHalves ? 8u : 0u;
+        for (const Span &span : list.spans)
+        {
+            Part part;
+            part.offset = span.offset - half;
+            part.bytes = span.bytes + half;
+            uint64_t h = 1469598103934665603ull; // FNV-1a over 8-byte words, as sharedOnly
+            for (uint32_t i = 0; i + 8u <= part.bytes; i += 8u)
+            {
+                uint64_t word;
+                std::memcpy(&word, list.stream.data() + part.offset + i, 8);
+                h = (h ^ word) * 1099511628211ull;
+            }
+            part.hash = h;
+            out.push_back(part);
+        }
+        return out;
+    };
+    const std::vector<Part> newer = parts(now), older = parts(before);
+    const auto same = [&](const Part &a, const Part &b)
+    {
+        return a.hash == b.hash && a.bytes == b.bytes &&
+               std::memcmp(now.stream.data() + a.offset, before.stream.data() + b.offset, a.bytes) == 0;
+    };
+    std::vector<std::pair<uint32_t, uint32_t>> shared, tail;
+    size_t head = 0, tailNow = newer.size(), tailBefore = older.size();
+    while (head < tailNow && head < tailBefore && same(newer[head], older[head]))
+    {
+        shared.emplace_back(static_cast<uint32_t>(head), static_cast<uint32_t>(head));
+        ++head;
+    }
+    while (tailNow > head && tailBefore > head && same(newer[tailNow - 1u], older[tailBefore - 1u]))
+    {
+        --tailNow;
+        --tailBefore;
+        tail.emplace_back(static_cast<uint32_t>(tailBefore), static_cast<uint32_t>(tailNow));
+    }
+    const size_t n = tailNow - head, m = tailBefore - head;
+    // Two lists with nothing in common in a long stretch (a change of scene): nothing to line up there.
+    if (n != 0u && m != 0u && n * m <= 4u * 1024u * 1024u)
+    {
+        std::vector<uint32_t> length((n + 1u) * (m + 1u), 0u);
+        const auto at = [&](size_t i, size_t j) -> uint32_t & { return length[i * (m + 1u) + j]; };
+        for (size_t i = n; i-- > 0u;)
+            for (size_t j = m; j-- > 0u;)
+                at(i, j) = same(newer[head + i], older[head + j]) ? at(i + 1u, j + 1u) + 1u
+                                                                  : std::max(at(i + 1u, j), at(i, j + 1u));
+        for (size_t i = 0, j = 0; i < n && j < m;)
+        {
+            if (same(newer[head + i], older[head + j]) && at(i, j) == at(i + 1u, j + 1u) + 1u)
+            {
+                shared.emplace_back(static_cast<uint32_t>(head + j), static_cast<uint32_t>(head + i));
+                ++i;
+                ++j;
+            }
+            else if (at(i + 1u, j) >= at(i, j + 1u))
+                ++i;
+            else
+                ++j;
+        }
+    }
+    shared.insert(shared.end(), tail.rbegin(), tail.rend());
+    return shared;
+}
+
+void planGif(const List &before, const List &now, float limitPixels, GifPlan &plan)
+{
+    plan = GifPlan{};
+    if (before.stream.empty() || now.stream.empty() || before.tagHalves != now.tagHalves)
+        return;
+    const std::vector<std::pair<uint32_t, uint32_t>> shared = sharedParts(before, now);
+    std::vector<uint8_t> isShared(now.spans.size(), 0u), isGif(now.spans.size(), 0u);
+    for (const auto &[older, newer] : shared)
+        isShared[newer] = 1u;
+    std::vector<GifPart> read(now.spans.size());
+    for (size_t i = 0; i < now.spans.size(); ++i)
+    {
+        const Span &span = now.spans[i];
+        if (isShared[i] || !readGifPart(now.stream.data() + span.offset, span.bytes, read[i]))
+            continue;
+        isGif[i] = 1u;
+        ++plan.gifParts;
+        plan.gifBytes += span.bytes;
+    }
+    uint32_t partnered = 0u;
+    for (const auto &[older, newer] : pairUnshared(shared, static_cast<uint32_t>(before.spans.size()),
+                                                  static_cast<uint32_t>(now.spans.size())))
+    {
+        if (!isGif[newer])
+            continue;
+        ++partnered;
+        const Span &spanNow = now.spans[newer], &spanBefore = before.spans[older];
+        const uint8_t *const bytesNow = now.stream.data() + spanNow.offset;
+        const uint8_t *const bytesBefore = before.stream.data() + spanBefore.offset;
+        GifPart shapeBefore;
+        GifPairStats stats;
+        GifRefusal why = spanBefore.bytes != spanNow.bytes ? GifRefusal::Size : GifRefusal::Shape;
+        if (spanBefore.bytes == spanNow.bytes && readGifPart(bytesBefore, spanBefore.bytes, shapeBefore))
+            why = checkGifPair(bytesBefore, spanBefore.bytes, shapeBefore, bytesNow, spanNow.bytes, read[newer], limitPixels, &stats);
+        switch (why)
+        {
+        case GifRefusal::Size: ++plan.refusedSize; break;
+        case GifRefusal::Shape: ++plan.refusedShape; break;
+        case GifRefusal::State: ++plan.refusedState; break;
+        case GifRefusal::Moved:
+            ++plan.refusedMoved;
+            plan.largestRefusedMove = std::max(plan.largestRefusedMove, stats.largestMove);
+            break;
+        case GifRefusal::None:
+        {
+            GifPlan::Pair pair;
+            pair.offset = spanNow.offset;
+            pair.bytes = spanNow.bytes;
+            pair.before.assign(bytesBefore, bytesBefore + spanBefore.bytes);
+            pair.shape = std::move(read[newer]);
+            plan.pairs.push_back(std::move(pair));
+            plan.pairedBytes += spanNow.bytes;
+            plan.differing += stats.differing;
+            plan.held += stats.held;
+            plan.largestMove = std::max(plan.largestMove, stats.largestMove);
+            break;
+        }
+        }
+    }
+    plan.alone = plan.gifParts - partnered;
 }
 
 void sharedOnly(const List &before, const List &now, std::vector<uint8_t> &nowStream, std::vector<uint8_t> &beforeStream,
